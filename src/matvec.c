@@ -405,23 +405,42 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             const uint8_t* blk = row + (size_t)b * 210;
             const float* xb = x + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[104]);
-            /* 按 16 个子组累加 q*x,组末再乘 d*s(每元素只 1 mul + 1 add) */
+            /* 每次 3 个 load 解出 4 个 6-bit 权重(无 per-element 索引运算) */
+            const uint8_t* ql = blk;
+            const uint8_t* qh = blk + 128;
+            const int8_t* sc = (const int8_t*)(blk + 192);
             float sums[16];
             memset(sums, 0, sizeof(sums));
-            uint32_t e;
-            for (e = 0; e < 256; e++) {
-                uint32_t half = e >> 7;
-                uint32_t k = e & 0x7f;
-                uint32_t quad = k >> 5;
-                uint32_t ll = k & 31;
-                uint8_t ql = blk[half * 64 + (quad & 1) * 32 + ll];
-                uint8_t qh = blk[128 + half * 32 + ll];
-                uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
-                int8_t q = (int8_t)bits - 32;
-                sums[half * 8 + quad * 2 + (ll >> 4)] += (float)q * xb[e];
+            int chunk;
+            for (chunk = 0; chunk < 2; chunk++) {
+                int is = chunk * 8;
+                const uint8_t* ql_c = ql + chunk * 64;
+                const uint8_t* qh_c = qh + chunk * 32;
+                const float* xp_c = xb + chunk * 128;
+                int l;
+                for (l = 0; l < 16; l++) {
+                    int q1 = (int)((ql_c[l] & 0xF) | (((qh_c[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int)((ql_c[l + 32] & 0xF) | (((qh_c[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int)((ql_c[l] >> 4) | (((qh_c[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int)((ql_c[l + 32] >> 4) | (((qh_c[l] >> 6) & 3) << 4)) - 32;
+                    sums[is + 0] += (float)q1 * xp_c[l];
+                    sums[is + 2] += (float)q2 * xp_c[l + 32];
+                    sums[is + 4] += (float)q3 * xp_c[l + 64];
+                    sums[is + 6] += (float)q4 * xp_c[l + 96];
+                }
+                for (l = 16; l < 32; l++) {
+                    int q1 = (int)((ql_c[l] & 0xF) | (((qh_c[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int)((ql_c[l + 32] & 0xF) | (((qh_c[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int)((ql_c[l] >> 4) | (((qh_c[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int)((ql_c[l + 32] >> 4) | (((qh_c[l] >> 6) & 3) << 4)) - 32;
+                    sums[is + 1] += (float)q1 * xp_c[l];
+                    sums[is + 3] += (float)q2 * xp_c[l + 32];
+                    sums[is + 5] += (float)q3 * xp_c[l + 64];
+                    sums[is + 7] += (float)q4 * xp_c[l + 96];
+                }
             }
-            uint32_t j;
-            for (j = 0; j < 16; j++) acc += d * (float)((const int8_t*)(blk + 192))[j] * sums[j];
+            int j;
+            for (j = 0; j < 16; j++) acc += d * (float)sc[j] * sums[j];
         }
         y[oo] = acc;
     }
