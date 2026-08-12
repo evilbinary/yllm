@@ -207,92 +207,33 @@ void wmap_close(WMap* m)
 
 void ws_prefetch(const Ws* ws, uint32_t layer)
 {
+#ifdef __linux__
     uint64_t off = ws->model.dir[layer].offset;
     uint64_t sz = ws->model.dir[layer].size;
     if (sz == 0) return;
-#ifdef __linux__
     madvise((char*)ws->map.base + off, (size_t)sz, MADV_WILLNEED);
+#else
+    (void)ws;
+    (void)layer;
 #endif
 }
 
 void ws_release(const Ws* ws, uint32_t layer)
 {
+#ifdef __linux__
     uint64_t off = ws->model.dir[layer].offset;
     uint64_t sz = ws->model.dir[layer].size;
     if (sz == 0) return;
-#ifdef __linux__
     madvise((char*)ws->map.base + off, (size_t)sz, MADV_DONTNEED);
+#else
+    (void)ws;
+    (void)layer;
 #endif
 }
 
 const void* ws_layer_ptr(const Ws* ws, uint32_t layer)
 {
     return (const uint8_t*)ws->map.base + ws->model.dir[layer].offset;
-}
-
-static uint64_t rd_u64(const void* p)
-{
-    uint64_t v;
-    memcpy(&v, p, 8);
-    return v;
-}
-
-static uint32_t rd_u32(const void* p)
-{
-    uint32_t v;
-    memcpy(&v, p, 4);
-    return v;
-}
-
-int llf_read(const WMap* map, LlModel* out)
-{
-    if (map->size < LLF_HEADER_SIZE) return -1;
-    LlfHeader* h = (LlfHeader*)map->base;
-    if (memcmp(h->magic, YLLM_MAGIC, 8) != 0 || h->version != YLLM_VERSION) return -1;
-    if (h->file_size != map->size) return -1;
-    uint32_t n_layers = h->n_blocks + 3;
-    uint64_t dir_off = LLF_HEADER_SIZE;
-    uint64_t need = dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE;
-    if (need > map->size) return -1;
-    out->h = *h;
-    out->n_layers = n_layers;
-    out->dir = (LlfLayerDir*)((uint8_t*)map->base + dir_off);
-    out->base_idx = (uint32_t*)ymalloc((size_t)n_layers * 4);
-    uint32_t total = 0;
-    uint32_t i;
-    for (i = 0; i < n_layers; i++) {
-        out->base_idx[i] = total;
-        total += rd_u32(&out->dir[i].n_tensors);
-    }
-    out->metas = (LlfTensorMeta*)((uint8_t*)map->base + dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE);
-    uint32_t j;
-    for (j = 0; j < n_layers; j++) {
-        LlfLayerDir* d = &out->dir[j];
-        if (d->offset % LLF_ALIGN != 0) { free(out->base_idx); return -1; }
-        if (d->offset + d->size > map->size) { free(out->base_idx); return -1; }
-    }
-    return 0;
-}
-
-int llf_check(const char* path, char* err, size_t errlen)
-{
-    WMap map;
-    if (wmap_open(path, &map) != 0) { snprintf(err, errlen, "cannot open %s", path); return -1; }
-    int rc = 0;
-    if (map.size < LLF_HEADER_SIZE) { snprintf(err, errlen, "file too small"); rc = -1; goto done; }
-    {
-        LlfHeader* h = (LlfHeader*)map.base;
-        if (memcmp(h->magic, YLLM_MAGIC, 8) != 0) { snprintf(err, errlen, "bad magic"); rc = -1; goto done; }
-        if (h->version != YLLM_VERSION) { snprintf(err, errlen, "bad version %u", h->version); rc = -1; goto done; }
-        if (h->file_size != map.size) { snprintf(err, errlen, "size mismatch"); rc = -1; goto done; }
-        printf("llf: blocks=%u vocab=%u hidden=%u heads=%u kv_heads=%u head_dim=%u max_seq=%u dtype=%u arch=%u\n",
-               h->n_blocks, h->vocab, h->hidden, h->n_heads, h->n_kv_heads, h->head_dim, h->max_seq, h->dtype, h->arch);
-        printf("llf: file_size=%llu (%.2f MB), %u layers\n",
-               (unsigned long long)map.size, (double)map.size / 1048576.0, h->n_blocks + 3);
-    }
-done:
-    wmap_close(&map);
-    return rc;
 }
 
 float f16_to_f32(uint16_t h)

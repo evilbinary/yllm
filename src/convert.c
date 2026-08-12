@@ -1,9 +1,9 @@
 #include "yllm.h"
+#include "convert.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
-static uint64_t align_up(uint64_t v, uint64_t a)
+uint64_t align_up(uint64_t v, uint64_t a)
 {
     return (v + a - 1) & ~(a - 1);
 }
@@ -14,371 +14,57 @@ static void write_at(FILE* f, uint64_t off, const void* data, size_t n)
     if (fwrite(data, 1, n, f) != n) { fprintf(stderr, "write failed\n"); exit(1); }
 }
 
-enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4 };
-
-static int st_slot_for(const char* name, int* layer)
+int conv_item_compare(const void* a, const void* b)
 {
-    static const struct { const char* key; int slot; } tab[] = {
-        { "model.embed_tokens.weight", SLOT_EMBED },
-        { "model.norm.weight", SP_FINALNORM },
-        { "model.layers.*.input_layernorm.weight", SLOT_NORM1 },
-        { "model.layers.*.post_attention_layernorm.weight", SLOT_NORM2 },
-        { "model.layers.*.self_attn.q_proj.weight", SLOT_Q },
-        { "model.layers.*.self_attn.k_proj.weight", SLOT_K },
-        { "model.layers.*.self_attn.v_proj.weight", SLOT_V },
-        { "model.layers.*.self_attn.o_proj.weight", SLOT_O },
-        { "model.layers.*.mlp.gate_proj.weight", SLOT_GATE },
-        { "model.layers.*.mlp.up_proj.weight", SLOT_UP },
-        { "model.layers.*.mlp.down_proj.weight", SLOT_DOWN },
-        { "lm_head.weight", SP_OUTPUT },
-    };
-    size_t i;
-    for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
-        const char* p = tab[i].key;
-        const char* star = strstr(p, "*");
-        int slot = (int)tab[i].slot;
-        if (slot == SLOT_EMBED) slot = SP_EMBED;
-        if (!star) {
-            if (strcmp(name, p) == 0) {
-                *layer = slot;
-                return slot;
-            }
-            continue;
-        }
-        size_t l1 = (size_t)(star - p);
-        const char* q = star + 2;
-        size_t l2 = strlen(q);
-        if (strncmp(name, p, l1) != 0) continue;
-        if (strcmp(name + strlen(name) - l2, q) != 0) continue;
-        size_t mid = strlen(name) - l1 - l2;
-        if (mid == 0 || mid > 8) continue;
-        char nb[16];
-        size_t j;
-        for (j = 0; j < mid; j++) nb[j] = name[l1 + j];
-        nb[mid] = 0;
-        *layer = atoi(nb);
-        return (int)tab[i].slot;
-    }
-    return -1;
-}
-
-typedef struct {
-    char* name;
-    uint32_t dtype;
-    uint32_t ndim;
-    uint32_t shape[4];
-    uint64_t data_off;
-    uint64_t nbytes;
-} STTensor;
-
-typedef struct {
-    STTensor* t;
-    int n;
-    int cap;
-    uint64_t hlen;
-} STList;
-
-static void st_add(STList* l, STTensor* v)
-{
-    if (l->n == l->cap) {
-        l->cap = l->cap ? l->cap * 2 : 64;
-        l->t = (STTensor*)realloc(l->t, (size_t)l->cap * sizeof(STTensor));
-        if (!l->t) exit(1);
-    }
-    l->t[l->n++] = *v;
-}
-
-typedef struct {
-    const uint8_t* p;
-    const uint8_t* end;
-} JP;
-
-static void jp_ws(JP* j)
-{
-    while (j->p < j->end) {
-        uint8_t c = *j->p;
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') j->p++;
-        else break;
-    }
-}
-
-static int jp_match(JP* j, const char* s)
-{
-    jp_ws(j);
-    size_t n = strlen(s);
-    if ((size_t)(j->end - j->p) < n) return 0;
-    if (memcmp(j->p, s, n) != 0) return 0;
-    j->p += n;
-    return 1;
-}
-
-static int jp_str(JP* j, char* out, size_t max)
-{
-    jp_ws(j);
-    if (j->p >= j->end || *j->p != '"') return -1;
-    j->p++;
-    size_t n = 0;
-    while (j->p < j->end && *j->p != '"') {
-        if (*j->p == '\\') {
-            j->p++;
-            if (j->p >= j->end) return -1;
-            if (n + 1 < max) out[n++] = *j->p;
-            j->p++;
-        } else {
-            if (n + 1 < max) out[n++] = *j->p;
-            j->p++;
-        }
-    }
-    if (j->p >= j->end) return -1;
-    j->p++;
-    out[n] = 0;
-    return 0;
-}
-
-static int jp_num(JP* j, int64_t* out)
-{
-    jp_ws(j);
-    int neg = 0;
-    if (j->p < j->end && *j->p == '-') { neg = 1; j->p++; }
-    int64_t v = 0;
-    int any = 0;
-    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') { v = v * 10 + (*j->p - '0'); j->p++; any = 1; }
-    if (!any) return -1;
-    *out = neg ? -v : v;
-    return 0;
-}
-
-static int jp_skip_value(JP* j)
-{
-    jp_ws(j);
-    if (j->p >= j->end) return -1;
-    uint8_t c = *j->p;
-    if (c == '{') {
-        j->p++;
-        if (jp_match(j, "}")) return 0;
-        for (;;) {
-            if (jp_str(j, (char[1]){0}, 1) != 0) return -1;
-            if (!jp_match(j, ":")) return -1;
-            if (jp_skip_value(j) != 0) return -1;
-            if (jp_match(j, "}")) return 0;
-            if (!jp_match(j, ",")) return -1;
-        }
-    }
-    if (c == '[') {
-        j->p++;
-        if (jp_match(j, "]")) return 0;
-        for (;;) {
-            if (jp_skip_value(j) != 0) return -1;
-            if (jp_match(j, "]")) return 0;
-            if (!jp_match(j, ",")) return -1;
-        }
-    }
-    if (c == '"') { char t[1]; return jp_str(j, t, 1); }
-    if (jp_match(j, "true")) return 0;
-    if (jp_match(j, "false")) return 0;
-    if (jp_match(j, "null")) return 0;
-    {
-        int64_t v;
-        return jp_num(j, &v);
-    }
-}
-
-static int jp_array_of_int(JP* j, int64_t* out, int maxn)
-{
-    jp_ws(j);
-    if (!jp_match(j, "[")) return -1;
-    if (jp_match(j, "]")) return 0;
-    int n = 0;
-    for (;;) {
-        if (n >= maxn) return -1;
-        if (jp_num(j, &out[n++]) != 0) return -1;
-        if (jp_match(j, "]")) return 0;
-        if (!jp_match(j, ",")) return -1;
-    }
-}
-
-static int parse_safetensors_header(const uint8_t* data, uint64_t size, STList* list)
-{
-    if (size < 8) return -1;
-    memcpy(&list->hlen, data, 8);
-    if (8 + list->hlen > size) return -1;
-    JP j;
-    j.p = data + 8;
-    j.end = data + 8 + list->hlen;
-    if (!jp_match(&j, "{")) return -1;
-    if (jp_match(&j, "}")) return 0;
-    for (;;) {
-        char key[512];
-        if (jp_str(&j, key, sizeof(key)) != 0) return -1;
-        if (!jp_match(&j, ":")) return -1;
-        if (strcmp(key, "__metadata__") == 0) {
-            if (jp_skip_value(&j) != 0) return -1;
-        } else {
-            STTensor t;
-            memset(&t, 0, sizeof(t));
-            t.name = ystrdup(key);
-            if (!jp_match(&j, "{")) { free(t.name); return -1; }
-            char k[64], v[64];
-            for (;;) {
-                if (jp_str(&j, k, sizeof(k)) != 0) { free(t.name); return -1; }
-                if (!jp_match(&j, ":")) { free(t.name); return -1; }
-                if (strcmp(k, "dtype") == 0) {
-                    if (jp_str(&j, v, sizeof(v)) != 0) { free(t.name); return -1; }
-                    if (strcmp(v, "F16") == 0 || strcmp(v, "f16") == 0) t.dtype = DT_F16;
-                    else if (strcmp(v, "F32") == 0 || strcmp(v, "f32") == 0) t.dtype = DT_F32;
-                    else if (strcmp(v, "BF16") == 0 || strcmp(v, "bf16") == 0) t.dtype = DT_BF16;
-                    else { free(t.name); return -1; }
-                } else if (strcmp(k, "shape") == 0) {
-                    int64_t sh[4] = {0, 0, 0, 0};
-                    int nn;
-                    if (jp_array_of_int(&j, sh, 4) != 0) { free(t.name); return -1; }
-                    nn = 4;
-                    while (nn > 0 && sh[nn - 1] == 0) nn--;
-                    t.ndim = (uint32_t)nn;
-                    int d;
-                    for (d = 0; d < 4; d++) t.shape[d] = (uint32_t)sh[d];
-                } else if (strcmp(k, "data_offsets") == 0) {
-                    int64_t offs[2];
-                    if (jp_array_of_int(&j, offs, 2) != 0) { free(t.name); return -1; }
-                    t.data_off = (uint64_t)offs[0];
-                    t.nbytes = (uint64_t)(offs[1] - offs[0]);
-                } else {
-                    if (jp_skip_value(&j) != 0) { free(t.name); return -1; }
-                }
-                if (jp_match(&j, "}")) break;
-                if (!jp_match(&j, ",")) { free(t.name); return -1; }
-            }
-            st_add(list, &t);
-        }
-        if (jp_match(&j, "}")) return 0;
-        if (!jp_match(&j, ",")) return -1;
-    }
-}
-
-typedef struct {
-    uint32_t layer;
-    int slot;
-    const STTensor* t;
-} PlanItem;
-
-static int plan_compare(const void* a, const void* b)
-{
-    const PlanItem* x = (const PlanItem*)a;
-    const PlanItem* y = (const PlanItem*)b;
+    const ConvItem* x = (const ConvItem*)a;
+    const ConvItem* y = (const ConvItem*)b;
     if (x->layer != y->layer) return (int)(x->layer - y->layer);
-    return x->slot - y->slot;
+    return (int)(x->slot - y->slot);
 }
 
-static const STTensor* find_tensor(const STList* l, const char* name)
+int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
+             char* err, size_t errlen)
 {
-    int i;
-    for (i = 0; i < l->n; i++) {
-        if (strcmp(l->t[i].name, name) == 0) return &l->t[i];
-    }
-    return NULL;
-}
+    if (n <= 0) { snprintf(err, errlen, "no tensors to write"); return -1; }
+    qsort(items, (size_t)n, sizeof(ConvItem), conv_item_compare);
+    uint32_t n_layers = h->n_blocks + 3;
 
-int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_seq, char* err, size_t errlen)
-{
-    uint64_t fsize = 0;
-    if (yfile_size(in_path, &fsize) != 0) { snprintf(err, errlen, "cannot open %s", in_path); return -1; }
-    uint8_t* data = (uint8_t*)ymalloc((size_t)fsize);
-    FILE* f = fopen(in_path, "rb");
-    if (!f) { free(data); snprintf(err, errlen, "cannot open %s", in_path); return -1; }
-    if (fread(data, 1, (size_t)fsize, f) != fsize) { fclose(f); free(data); snprintf(err, errlen, "read failed"); return -1; }
-    fclose(f);
-
-    STList list;
-    memset(&list, 0, sizeof(list));
-    if (parse_safetensors_header(data, fsize, &list) != 0) {
-        free(data);
-        snprintf(err, errlen, "bad safetensors header");
-        return -1;
-    }
-
-    const STTensor* tt = find_tensor(&list, "model.embed_tokens.weight");
-    if (!tt) { free(data); snprintf(err, errlen, "no embedding tensor"); return -1; }
-    uint32_t vocab = tt->shape[0];
-    uint32_t hidden = tt->shape[1];
-
-    const STTensor* th = find_tensor(&list, "lm_head.weight");
-    if (th) vocab = th->shape[0];
-
-    uint32_t n_blocks = 0;
-    int i;
-    for (i = 0; i < list.n; i++) {
-        int layer;
-        int slot = st_slot_for(list.t[i].name, &layer);
-        if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN && layer > (int)n_blocks) n_blocks = (uint32_t)layer;
-    }
-    if (n_blocks == 0) { free(data); snprintf(err, errlen, "no transformer blocks found"); return -1; }
-
-    const STTensor* q = find_tensor(&list, "model.layers.0.self_attn.q_proj.weight");
-    const STTensor* k = find_tensor(&list, "model.layers.0.self_attn.k_proj.weight");
-    if (!q || !k) { free(data); snprintf(err, errlen, "no q/k proj"); return -1; }
-    uint32_t heads = q->shape[0] / hidden;
-    uint32_t kv_heads = k->shape[0] / hidden;
-    uint32_t head_dim = q->shape[0] / heads;
-
-    LlfHeader h;
-    memset(&h, 0, sizeof(h));
-    memcpy(h.magic, YLLM_MAGIC, 8);
-    h.version = YLLM_VERSION;
-    h.arch = ARCH_LLAMA;
-    h.n_blocks = n_blocks;
-    h.vocab = vocab;
-    h.hidden = hidden;
-    h.n_heads = heads;
-    h.n_kv_heads = kv_heads;
-    h.head_dim = head_dim;
-    h.max_seq = max_seq;
-    h.dtype = DT_F16;
-    {
-        float eps = 1e-5f;
-        memcpy(&h.norm_eps_bits, &eps, 4);
-        float theta = 10000.0f;
-        memcpy(&h.rope_theta_bits, &theta, 4);
-    }
-
-    PlanItem* plan = (PlanItem*)ymalloc((size_t)list.n * sizeof(PlanItem));
-    int nplan = 0;
-    for (i = 0; i < list.n; i++) {
-        int layer;
-        int slot = st_slot_for(list.t[i].name, &layer);
-        if (slot == SP_EMBED) { plan[nplan].layer = 0; plan[nplan].slot = 0; }
-        else if (slot == SP_FINALNORM) { plan[nplan].layer = n_blocks + 1; plan[nplan].slot = 0; }
-        else if (slot == SP_OUTPUT) { plan[nplan].layer = n_blocks + 2; plan[nplan].slot = 0; }
-        else if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN) { plan[nplan].layer = (uint32_t)layer; plan[nplan].slot = slot; }
-        else continue;
-        plan[nplan].t = &list.t[i];
-        nplan++;
-    }
-    if (nplan == 0) { free(plan); free(data); snprintf(err, errlen, "no recognized tensors"); return -1; }
-    qsort(plan, (size_t)nplan, sizeof(PlanItem), plan_compare);
-
-    uint32_t n_layers = n_blocks + 3;
     uint32_t* per = (uint32_t*)ycalloc(n_layers, 4);
-    for (i = 0; i < nplan; i++) per[plan[i].layer]++;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (items[i].layer >= n_layers || items[i].slot >= BLOCK_TENSORS) {
+            free(per);
+            snprintf(err, errlen, "bad layer/slot in plan");
+            return -1;
+        }
+        per[items[i].layer]++;
+    }
+    for (i = 0; i < (int)n_layers; i++) {
+        if (per[i] == 0) {
+            free(per);
+            snprintf(err, errlen, "layer %d has no tensors", i);
+            return -1;
+        }
+    }
 
-    LlfTensorMeta* metas = (LlfTensorMeta*)ycalloc((size_t)n_layers * 9, LLF_TENSOR_META_SIZE);
+    LlfTensorMeta* metas = (LlfTensorMeta*)ycalloc((size_t)n_layers * BLOCK_TENSORS, LLF_TENSOR_META_SIZE);
     LlfLayerDir* dir = (LlfLayerDir*)ycalloc(n_layers, LLF_DIR_ENTRY_SIZE);
     uint64_t dir_size = (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE;
     uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size, LLF_ALIGN);
 
-    for (i = 0; i < nplan; i++) {
-        uint32_t li = plan[i].layer;
-        int slot = plan[i].slot;
-        LlfTensorMeta* tm = &metas[(size_t)li * 9 + slot];
-        const STTensor* t = plan[i].t;
+    for (i = 0; i < n; i++) {
+        uint32_t li = items[i].layer;
+        uint32_t slot = items[i].slot;
+        LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS + slot];
         memset(tm, 0, sizeof(*tm));
-        snprintf(tm->name, sizeof(tm->name), "%s", t->name);
-        tm->dtype = DT_F16;
-        tm->ndim = t->ndim;
-        memcpy(tm->shape, t->shape, sizeof(tm->shape));
+        snprintf(tm->name, sizeof(tm->name), "%s", items[i].name);
+        tm->dtype = items[i].dtype;
+        tm->ndim = items[i].ndim;
+        memcpy(tm->shape, items[i].shape, sizeof(tm->shape));
         if (per[li] == 0) dir[li].offset = cursor;
         tm->offset = cursor - dir[li].offset;
-        tm->size = (uint64_t)t->shape[0] * (t->ndim > 1 ? t->shape[1] : 1) * 2;
-        cursor += tm->size;
+        tm->size = items[i].nbytes;
+        cursor += items[i].nbytes;
         per[li]++;
     }
     for (i = 0; i < (int)n_layers; i++) {
@@ -387,7 +73,7 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
         uint64_t lend = 0;
         uint32_t s2;
         for (s2 = 0; s2 < per[i]; s2++) {
-            LlfTensorMeta* tm = &metas[(size_t)i * 9 + s2];
+            LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + s2];
             tm->offset += loff - first;
             if (tm->offset + tm->size > lend) lend = tm->offset + tm->size;
         }
@@ -396,43 +82,55 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
         dir[i].size = lend - loff;
         dir[i].n_tensors = per[i];
     }
-    h.file_size = align_up(cursor, LLF_ALIGN);
+    h->file_size = align_up(cursor, LLF_ALIGN);
 
     FILE* out = fopen(out_path, "wb");
     if (!out) {
-        free(per); free(metas); free(dir); free(plan); free(data);
+        free(per); free(metas); free(dir);
         snprintf(err, errlen, "cannot write %s", out_path);
         return -1;
     }
     {
         uint8_t hb[LLF_HEADER_SIZE];
         memset(hb, 0, sizeof(hb));
-        memcpy(hb, &h, sizeof(h));
+        memcpy(hb, h, sizeof(*h));
         write_at(out, 0, hb, sizeof(hb));
     }
     write_at(out, LLF_HEADER_SIZE, dir, dir_size);
-    write_at(out, LLF_HEADER_SIZE + dir_size, metas, (size_t)n_layers * 9 * LLF_TENSOR_META_SIZE);
+    write_at(out, LLF_HEADER_SIZE + dir_size, metas, (size_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE);
 
     uint8_t* buf = (uint8_t*)ymalloc(1 << 22);
-    for (i = 0; i < nplan; i++) {
-        const STTensor* t = plan[i].t;
-        uint32_t li = plan[i].layer;
-        int slot = plan[i].slot;
-        LlfTensorMeta* tm = &metas[(size_t)li * 9 + slot];
-        const uint8_t* sp = data + 8 + list.hlen + t->data_off;
-        if (t->dtype == DT_F16) {
-            memcpy(buf, sp, t->nbytes);
-        } else if (t->dtype == DT_BF16) {
-            bf16_to_f16_buf((const uint16_t*)sp, (uint16_t*)buf, t->nbytes / 2);
-        } else {
-            f32_to_f16_buf((const float*)sp, (uint16_t*)buf, t->nbytes / 4);
+    for (i = 0; i < n; i++) {
+        uint32_t li = items[i].layer;
+        uint32_t slot = items[i].slot;
+        LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS + slot];
+        const uint8_t* sp = items[i].src + items[i].src_off;
+        uint64_t done = 0;
+        while (done < items[i].nbytes) {
+            uint64_t take = items[i].nbytes - done;
+            if (take > (1 << 22)) take = 1 << 22;
+            memcpy(buf, sp + done, (size_t)take);
+            write_at(out, dir[li].offset + tm->offset + done, buf, (size_t)take);
+            done += take;
         }
-        write_at(out, dir[li].offset + tm->offset, buf, tm->size);
     }
     free(buf);
     fclose(out);
-    free(per); free(metas); free(dir); free(plan); free(data);
+    free(per); free(metas); free(dir);
     return 0;
+}
+
+int convert_model(const char* fmt, const char* in, const char* out, const char* vocab_out,
+                  uint32_t max_seq, char* err, size_t errlen)
+{
+    if (strcmp(fmt, "safetensors") == 0) {
+        return convert_safetensors(in, out, max_seq, err, errlen);
+    }
+    if (strcmp(fmt, "gguf") == 0) {
+        return convert_gguf(in, out, vocab_out, max_seq, err, errlen);
+    }
+    snprintf(err, errlen, "unknown source format '%s'", fmt);
+    return -1;
 }
 
 static uint16_t rnd_f16(uint64_t* s)

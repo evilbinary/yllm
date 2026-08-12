@@ -23,7 +23,8 @@ static int parse_args(int argc, char** argv, int start, Arg* args, int maxn)
     int i;
     for (i = start; i + 1 < argc; i += 2) {
         if (argv[i][0] != '-' || n >= maxn) break;
-        args[n].key = argv[i] + 1;
+        args[n].key = argv[i];
+        while (*args[n].key == '-') args[n].key++;
         args[n].val = argv[i + 1];
         n++;
     }
@@ -44,6 +45,7 @@ static int cmd_convert(int argc, char** argv)
     Arg a[16];
     int n = parse_args(argc, argv, 2, a, 16);
     const char* in = opt(a, n, "safetensors", NULL);
+    const char* gguf = opt(a, n, "gguf", NULL);
     const char* out = opt(a, n, "out", NULL);
     const char* vocab_out = opt(a, n, "vocab", NULL);
     uint32_t seq = (uint32_t)atoi(opt(a, n, "seq", "2048"));
@@ -55,8 +57,17 @@ static int cmd_convert(int argc, char** argv)
     uint32_t seed = (uint32_t)atoi(opt(a, n, "seed", "42"));
     char err[1024];
 
+    if (gguf && out) {
+        if (convert_model("gguf", gguf, out, vocab_out, seq, err, sizeof(err)) != 0) {
+            fprintf(stderr, "convert failed: %s\n", err);
+            return 1;
+        }
+        printf("converted %s -> %s (max_seq %u)\n", gguf, out, seq);
+        llf_check(out, err, sizeof(err));
+        return 0;
+    }
     if (in && out) {
-        if (convert_safetensors(in, out, seq, err, sizeof(err)) != 0) {
+        if (convert_model("safetensors", in, out, vocab_out, seq, err, sizeof(err)) != 0) {
             fprintf(stderr, "convert failed: %s\n", err);
             return 1;
         }
@@ -89,6 +100,7 @@ static int cmd_convert(int argc, char** argv)
         return 0;
     }
     fprintf(stderr, "usage: yllm convert --safetensors <file> --out <file.llf> [--seq 2048]\n");
+    fprintf(stderr, "   or: yllm convert --gguf <file.gguf> --out <file.llf> [--vocab <file.txt>] [--seq 2048]\n");
     fprintf(stderr, "   or: yllm convert --out <file.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab V --seq S --seed N] [--vocab <file.txt>]\n");
     return 1;
 }

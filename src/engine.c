@@ -167,13 +167,103 @@ void engine_free(Engine* e)
     memset(e, 0, sizeof(*e));
 }
 
-static void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps)
+static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m)
+{
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+static float q6k_val(const uint8_t* blk, uint32_t e)
+{
+    float d = f16_to_f32(((const uint16_t*)blk)[104]);
+    uint32_t half = e >> 7;
+    uint32_t k = e & 0x7f;
+    uint32_t quad = k >> 5;
+    uint32_t ll = k & 31;
+    uint8_t ql = blk[half * 64 + (quad & 1) * 32 + ll];
+    uint8_t qh = blk[128 + half * 32 + ll];
+    uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
+    int8_t q = (int8_t)bits - 32;
+    int8_t s = ((const int8_t*)(blk + 192))[half * 8 + quad * 2 + (ll >> 4)];
+    return d * (float)s * (float)q;
+}
+
+static void embed_q4k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    const uint8_t* r = w + (size_t)row * nb * 144;
+    uint32_t b;
+    for (b = 0; b < nb; b++) {
+        const uint8_t* blk = r + (size_t)b * 144;
+        float d = f16_to_f32(((const uint16_t*)blk)[0]);
+        float min = f16_to_f32(((const uint16_t*)blk)[1]);
+        float d1[8], m1[8];
+        uint32_t g;
+        for (g = 0; g < 8; g++) {
+            uint8_t sc, m;
+            gsm_k4((int)g, blk + 4, &sc, &m);
+            d1[g] = d * (float)sc;
+            m1[g] = min * (float)m;
+        }
+        for (g = 0; g < 8; g++) {
+            uint32_t e;
+            for (e = 0; e < 32; e++) {
+                uint8_t nib = blk[16 + g * 16 + (e >> 1)];
+                nib = (e & 1) ? (nib >> 4) : (nib & 0xF);
+                y[b * 256 + g * 32 + e] = d1[g] * nib - m1[g];
+            }
+        }
+    }
+}
+
+static void embed_q6k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    const uint8_t* r = w + (size_t)row * nb * 210;
+    uint32_t b;
+    for (b = 0; b < nb; b++) {
+        const uint8_t* blk = r + (size_t)b * 210;
+        uint32_t e;
+        for (e = 0; e < 256; e++) y[b * 256 + e] = q6k_val(blk, e);
+    }
+}
+
+static void embed_f32(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
+{
+    const float* wp = (const float*)w + (size_t)row * hidden;
+    memcpy(y, wp, (size_t)hidden * 4);
+}
+
+static void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps, uint32_t dtype)
 {
     float s = 0.0f;
     uint32_t i;
     for (i = 0; i < n; i++) s += x[i] * x[i];
     float inv = 1.0f / sqrtf(s / (float)n + eps);
-    for (i = 0; i < n; i++) y[i] = x[i] * f16_to_f32(((const uint16_t*)w)[i]) * inv;
+    if (dtype == DT_F32) {
+        const float* wp = (const float*)w;
+        for (i = 0; i < n; i++) y[i] = x[i] * wp[i] * inv;
+    } else {
+        const uint16_t* wp = (const uint16_t*)w;
+        for (i = 0; i < n; i++) y[i] = x[i] * f16_to_f32(wp[i]) * inv;
+    }
+}
+
+static void matmul_f32(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    const float* wp = (const float*)w;
+    uint32_t oo;
+    for (oo = 0; oo < out; oo++) {
+        float acc = 0.0f;
+        uint32_t ii;
+        for (ii = 0; ii < in; ii++) acc += x[ii] * wp[(size_t)oo * in + ii];
+        y[oo] = acc;
+    }
 }
 
 static void matmul_f16(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
@@ -185,6 +275,94 @@ static void matmul_f16(float* y, const float* x, const uint8_t* w, uint32_t out,
         uint32_t ii;
         for (ii = 0; ii < in; ii++) acc += x[ii] * f16_to_f32(wp[(size_t)oo * in + ii]);
         y[oo] = acc;
+    }
+}
+
+static void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out)
+{
+    const float* wp = (const float*)w;
+    uint32_t oo;
+    for (oo = 0; oo < out; oo++) {
+        float acc = 0.0f;
+        uint32_t ii;
+        for (ii = 0; ii < in; ii++) acc += x[ii] * wp[(size_t)ii * out + oo];
+        y[oo] = acc;
+    }
+}
+
+static void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    uint32_t nb = in / 256;
+    uint32_t rowb = nb * 144;
+    uint32_t oo;
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 144;
+            const float* xb = x + (size_t)b * 256;
+            float d = f16_to_f32(((const uint16_t*)blk)[0]);
+            float min = f16_to_f32(((const uint16_t*)blk)[1]);
+            float d1[8], m1[8];
+            uint32_t g;
+            for (g = 0; g < 8; g++) {
+                uint8_t sc, m;
+                gsm_k4((int)g, blk + 4, &sc, &m);
+                d1[g] = d * (float)sc;
+                m1[g] = min * (float)m;
+            }
+            for (g = 0; g < 8; g++) {
+                uint32_t e;
+                for (e = 0; e < 32; e++) {
+                    uint8_t nib = blk[16 + g * 16 + (e >> 1)];
+                    nib = (e & 1) ? (nib >> 4) : (nib & 0xF);
+                    acc += xb[g * 32 + e] * (d1[g] * nib - m1[g]);
+                }
+            }
+        }
+        y[oo] = acc;
+    }
+}
+
+static void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    uint32_t nb = in / 256;
+    uint32_t rowb = nb * 210;
+    uint32_t oo;
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 210;
+            const float* xb = x + (size_t)b * 256;
+            float d = f16_to_f32(((const uint16_t*)blk)[104]);
+            uint32_t e;
+            for (e = 0; e < 256; e++) {
+                uint32_t half = e >> 7;
+                uint32_t k = e & 0x7f;
+                uint32_t quad = k >> 5;
+                uint32_t ll = k & 31;
+                uint8_t ql = blk[half * 64 + (quad & 1) * 32 + ll];
+                uint8_t qh = blk[128 + half * 32 + ll];
+                uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
+                int8_t q = (int8_t)bits - 32;
+                int8_t s = ((const int8_t*)(blk + 192))[half * 8 + quad * 2 + (ll >> 4)];
+                acc += xb[e] * d * (float)s * (float)q;
+            }
+        }
+        y[oo] = acc;
+    }
+}
+
+static void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
+{
+    switch (dtype) {
+    case DT_F32: matmul_f32(y, x, w, out, in); break;
+    case DT_Q4K: matmul_q4k(y, x, w, out, in); break;
+    case DT_Q6K: matmul_q6k(y, x, w, out, in); break;
+    default: matmul_f16(y, x, w, out, in); break;
     }
 }
 
@@ -262,21 +440,13 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
     float* att_out = e->hb2 + hidden + 2 * kv_dim;
     uint32_t hidx = m->base_idx[layer];
 
-    const uint16_t* wnorm1 = (const uint16_t*)(base + m->metas[hidx + SLOT_NORM1].offset);
-    const uint16_t* wq = (const uint16_t*)(base + m->metas[hidx + SLOT_Q].offset);
-    const uint16_t* wk = (const uint16_t*)(base + m->metas[hidx + SLOT_K].offset);
-    const uint16_t* wv = (const uint16_t*)(base + m->metas[hidx + SLOT_V].offset);
-    const uint16_t* wo = (const uint16_t*)(base + m->metas[hidx + SLOT_O].offset);
-    const uint16_t* wnorm2 = (const uint16_t*)(base + m->metas[hidx + SLOT_NORM2].offset);
-    const uint16_t* wg = (const uint16_t*)(base + m->metas[hidx + SLOT_GATE].offset);
-    const uint16_t* wu = (const uint16_t*)(base + m->metas[hidx + SLOT_UP].offset);
-    const uint16_t* wd = (const uint16_t*)(base + m->metas[hidx + SLOT_DOWN].offset);
-    uint32_t inter = m->metas[hidx + SLOT_GATE].shape[0];
+    const LlfTensorMeta* mt = &m->metas[hidx];
+    uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
 
-    rmsnorm(x2, x, (const uint8_t*)wnorm1, hidden, eps);
-    matmul_f16(q, x2, (const uint8_t*)wq, hidden, hidden);
-    matmul_f16(k, x2, (const uint8_t*)wk, kv_dim, hidden);
-    matmul_f16(v, x2, (const uint8_t*)wv, kv_dim, hidden);
+    rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+    matmul(q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype);
+    matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
+    matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
 
     uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
     uint16_t* vcache = kcache + (size_t)e->max_seq * kv_dim;
@@ -315,14 +485,14 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
             for (j = 0; j < h->head_dim; j++) out[j] += a * f16_to_f32(vh[j]);
         }
     }
-    matmul_f16(att_out, att_out, (const uint8_t*)wo, hidden, hidden);
+    matmul(att_out, att_out, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
 
-    rmsnorm(x2, x, (const uint8_t*)wnorm2, hidden, eps);
-    matmul_f16(q, x2, (const uint8_t*)wg, inter, hidden);
-    matmul_f16(k, x2, (const uint8_t*)wu, inter, hidden);
+    rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
+    matmul(q, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+    matmul(k, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
     swiglu(x2, q, k, inter);
-    matmul_f16(att_out, x2, (const uint8_t*)wd, hidden, inter);
+    matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
     return 0;
 }
@@ -339,18 +509,31 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
         const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
         if (i == 0) {
             const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
-            embed_f16(e->x, base + tm->offset, token, h->hidden);
+            switch (tm->dtype) {
+            case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
+            case DT_Q4K: embed_q4k(e->x, base + tm->offset, token, h->hidden); break;
+            case DT_Q6K: embed_q6k(e->x, base + tm->offset, token, h->hidden); break;
+            default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
+            }
         } else if (i <= h->n_blocks) {
             forward_block(e, i, pos);
         } else if (i == h->n_blocks + 1) {
             float eps;
             memcpy(&eps, &h->norm_eps_bits, 4);
             const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-            rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps);
+            rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
         } else {
             const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-            if (tm->shape[0] == h->vocab) matmul_f16(e->logits, e->x, base + tm->offset, h->vocab, h->hidden);
-            else matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab);
+            if (tm->shape[0] == h->vocab) {
+                matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+            } else {
+                switch (tm->dtype) {
+                case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+                case DT_Q4K: matmul_q4k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+                case DT_Q6K: matmul_q6k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+                default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+                }
+            }
         }
         if (w) {
             uint32_t d = (uint32_t)ws->depth;
