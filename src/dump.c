@@ -79,17 +79,37 @@ static int dump_llf(const uint8_t* data, uint64_t fsize)
     uint32_t i;
     for (i = 0; i < n_layers; i++) {
         fmtsize(dir[i].size, b1, sizeof(b1));
+        /* 层内 dtype 汇总 */
+        char dtbuf[128];
+        dtbuf[0] = 0;
+        {
+            uint32_t dtc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            uint32_t j;
+            for (j = 0; j < dir[i].n_tensors && j < BLOCK_TENSORS; j++) {
+                const LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + j];
+                if (tm->size == 0 && tm->offset == 0 && tm->name[0] == 0) continue;
+                if (tm->dtype < 8) dtc[tm->dtype]++;
+            }
+            uint32_t k;
+            for (k = 0; k < 8; k++) {
+                if (dtc[k]) {
+                    char tmp[32];
+                    snprintf(tmp, sizeof(tmp), "%s%sx%u", dtbuf[0] ? " " : "", llf_dtype_name_c(k), dtc[k]);
+                    strncat(dtbuf, tmp, sizeof(dtbuf) - strlen(dtbuf) - 1);
+                }
+            }
+        }
         const char* lname;
         if (i == 0) lname = "embed";
         else if (i <= h->n_blocks) lname = "transformer block";
         else if (i == h->n_blocks + 1) lname = "final norm";
         else lname = "output (lm_head)";
         if (i >= 1 && i <= h->n_blocks) {
-            printf("layer %2u [%s %u]  off=%-12llu size=%-10s n_tensors=%u\n",
-                   i, lname, i - 1, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors);
+            printf("layer %2u [%s %u]  off=%-12llu size=%-10s n_tensors=%u  dtypes: %s\n",
+                   i, lname, i - 1, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors, dtbuf);
         } else {
-            printf("layer %2u [%s]      off=%-12llu size=%-10s n_tensors=%u\n",
-                   i, lname, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors);
+            printf("layer %2u [%s]      off=%-12llu size=%-10s n_tensors=%u  dtypes: %s\n",
+                   i, lname, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors, dtbuf);
         }
         if (!g_verbose) continue;
         uint32_t j;
@@ -97,10 +117,13 @@ static int dump_llf(const uint8_t* data, uint64_t fsize)
             const LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + j];
             if (tm->size == 0 && tm->offset == 0 && tm->name[0] == 0) continue;
             fmtsize(tm->size, b2, sizeof(b2));
-            printf("  [%2u] %-24s %-7s dims=%u shape=(%u,%u,%u,%u) off=%-12llu size=%-10s\n",
-                   j, tm->name, llf_dtype_name_c(tm->dtype), tm->ndim,
-                   tm->shape[0], tm->shape[1], tm->shape[2], tm->shape[3],
-                   (unsigned long long)tm->offset, b2);
+            if (g_verbose > 1)
+                printf("  [%2u] %-24s %-7s dims=%u shape=(%u,%u,%u,%u) off=%-12llu size=%-10s\n",
+                       j, tm->name, llf_dtype_name_c(tm->dtype), tm->ndim,
+                       tm->shape[0], tm->shape[1], tm->shape[2], tm->shape[3],
+                       (unsigned long long)tm->offset, b2);
+            else
+                printf("  [%2u] %-24s %-7s %s\n", j, tm->name, llf_dtype_name_c(tm->dtype), b2);
         }
     }
     return 0;
@@ -375,11 +398,24 @@ static int dump_safetensors(const uint8_t* data, uint64_t fsize)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: llfdump <file.llf|file.gguf|file.safetensors> [-v]\n");
+        fprintf(stderr, "usage: llfdump <file.llf|file.gguf|file.safetensors> [-v|-vv]\n");
         return 1;
     }
-    g_fname = argv[1];
-    if (argc > 2 && strcmp(argv[2], "-v") == 0) g_verbose = 1;
+    g_fname = NULL;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (argv[i][0] == '-') {
+            if (strcmp(argv[i], "-v") == 0) g_verbose = 1;
+            else if (strcmp(argv[i], "-vv") == 0) g_verbose = 2;
+            else { fprintf(stderr, "llfdump: unknown option %s\n", argv[i]); return 1; }
+        } else if (!g_fname) {
+            g_fname = argv[i];
+        }
+    }
+    if (!g_fname) {
+        fprintf(stderr, "usage: llfdump <file.llf|file.gguf|file.safetensors> [-v|-vv]\n");
+        return 1;
+    }
 
     uint64_t fsize = 0;
     if (yfile_size(g_fname, &fsize) != 0) { fprintf(stderr, "llfdump: cannot open %s\n", g_fname); return 1; }
