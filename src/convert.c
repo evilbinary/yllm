@@ -123,6 +123,21 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
             done += take;
         }
     }
+    /* pad the file to the aligned size declared in the header */
+    {
+        uint64_t pos = align_up(cursor, LLF_ALIGN);
+        if (pos > cursor) {
+            uint64_t rest = pos - cursor;
+            memset(buf, 0, 4096);
+            uint64_t done = 0;
+            while (done < rest) {
+                uint64_t take = rest - done;
+                if (take > 4096) take = 4096;
+                write_at(out, cursor + done, buf, (size_t)take);
+                done += take;
+            }
+        }
+    }
     free(buf);
     fclose(out);
     free(per); free(metas); free(dir);

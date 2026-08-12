@@ -251,7 +251,7 @@ float f16_to_f32(uint16_t h)
             x = s | ((uint32_t)(113 - sh) << 23) | ((mm & 0x3ff) << 13);
         }
     } else if (e == 0x7c00) {
-        x = 0x7f800000 | (m ? 0x7fc000u : 0);
+        x = s | 0x7f800000 | (m ? 0x7fc000u : 0);
     } else {
         x = s | ((e + 0x1c000u) << 13) | (m << 13);
     }
@@ -264,28 +264,38 @@ uint16_t f32_to_f16(float f)
 {
     uint32_t x;
     memcpy(&x, &f, 4);
-    uint16_t s = (uint16_t)((x >> 16) & 0x8000);
-    uint32_t e = (x >> 23) & 0xff;
-    uint32_t m = x & 0x7fffff;
+    uint32_t sign = (x >> 16) & 0x8000;
+    int exp = (int)((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = x & 0x7fffff;
     uint16_t h;
-    if (e == 0xff) {
-        h = (uint16_t)(s | (m ? 0x7e00 : 0x7c00));
-    } else if (e >= 0x8f) {
-        h = (uint16_t)(s | 0x7c00);
-    } else if (e <= 0x70) {
-        h = s;
-    } else {
-        uint32_t re = e - 0x70;
-        if (re == 0) {
-            h = s;
+    if (((x >> 23) & 0xff) == 0) {
+        h = (uint16_t)sign; /* zero or f32 subnormal -> fp16 zero */
+    } else if (((x >> 23) & 0xff) == 0xff) {
+        h = (uint16_t)(sign | 0x7c00 | (mant ? 0x0200 : 0));
+    } else if (exp >= 31) {
+        h = (uint16_t)(sign | 0x7c00);
+    } else if (exp <= 0) {
+        if (exp < -10) {
+            h = (uint16_t)sign;
         } else {
-            uint32_t rm = m >> 13;
-            uint32_t rem = m & 0x1fff;
-            h = (uint16_t)(s | (re << 10) | rm);
-            if (rem > 0x1000 || (rem == 0x1000 && (rm & 1))) {
-                h = (uint16_t)(h + 1);
-                if ((h & 0x7c00) == 0x7c00) h = (uint16_t)(s | 0x7c00);
+            mant |= 0x800000;
+            uint32_t shift = (uint32_t)(14 - exp);
+            uint32_t round_bit = 1U << (shift - 1);
+            mant = (mant + round_bit) >> shift;
+            h = (uint16_t)(sign | mant);
+        }
+    } else {
+        mant += 0x00001000;
+        if (mant & 0x00800000) {
+            mant = 0;
+            exp++;
+            if (exp >= 31) {
+                h = (uint16_t)(sign | 0x7c00);
+            } else {
+                h = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
             }
+        } else {
+            h = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
         }
     }
     return h;

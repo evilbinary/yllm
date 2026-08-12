@@ -14,7 +14,7 @@ static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m)
     }
 }
 
-static void q4k_block(float* y, const uint8_t* blk, uint32_t stride)
+void q4k_block(float* y, const uint8_t* blk, uint32_t stride)
 {
     float d = f16_to_f32(((const uint16_t*)blk)[0]);
     float min = f16_to_f32(((const uint16_t*)blk)[1]);
@@ -36,7 +36,7 @@ static void q4k_block(float* y, const uint8_t* blk, uint32_t stride)
     (void)stride;
 }
 
-static float q6k_val(const uint8_t* blk, uint32_t e)
+float q6k_val(const uint8_t* blk, uint32_t e)
 {
     float d = f16_to_f32(((const uint16_t*)blk)[104]);
     uint32_t half = e >> 7;

@@ -21,4 +21,8 @@ void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta);
 void softmax(float* v, uint32_t n);
 void swiglu(float* y, const float* gate, const float* up, uint32_t n);
 
+/* 单块解量化(导出供测试/embed 使用) */
+void q4k_block(float* y, const uint8_t* blk, uint32_t stride);
+float q6k_val(const uint8_t* blk, uint32_t e);
+
 #endif

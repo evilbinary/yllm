@@ -14,7 +14,10 @@ static int g_pass = 0;
 
 #define CHECK_NEAR(a, b, eps, msg) do { \
     double _a = (double)(a), _b = (double)(b); \
-    if (fabs(_a - _b) <= (eps)) { g_pass++; } \
+    int _ok = 0; \
+    if (isinf(_a) || isinf(_b)) _ok = (isinf(_a) && isinf(_b) && (signbit(_a) == signbit(_b))); \
+    else _ok = (fabs(_a - _b) <= (eps)); \
+    if (_ok) { g_pass++; } \
     else { g_fail++; printf("FAIL: %s: %.9g vs %.9g (%s:%d)\n", msg, _a, _b, __FILE__, __LINE__); } \
 } while (0)
 
@@ -81,14 +84,11 @@ static void test_q6k_decode(void)
 /* ---- embed_q4k regression (token 15043 embedding) ---- */
 static void test_embed_q4k(void)
 {
-    /* build a synthetic 8-block row identical to the real embedding row by
-       reusing K4_RAW data is not representative; use golden from gen_ref.py
-       instead via full-row check below with matmul test. */
-    float out[8];
-    uint8_t row[1152];
+    float out[2048];
+    uint8_t row[2 * 1152];
     uint32_t i;
-    /* construct simple row: d=1, dmin=0, scales=1, qs=0x12 -> values 2 or 1 */
-    for (i = 0; i < 8; i++) {
+    /* construct 2 rows: d=1, dmin=0, scales=1, qs=0x12 -> values 2 */
+    for (i = 0; i < 2 * 8; i++) {
         uint8_t* blk = row + i * 144;
         memset(blk, 0, 144);
         blk[0] = 0x00; blk[1] = 0x3c;  /* d = 1.0 */
@@ -101,8 +101,8 @@ static void test_embed_q4k(void)
     CHECK_NEAR(out[0], 2.0, 1e-6, "embed_q4k synthetic d1 v0");
     CHECK_NEAR(out[1], 2.0, 1e-6, "embed_q4k synthetic v1");
     CHECK_NEAR(out[2], 2.0, 1e-6, "embed_q4k synthetic v2");
-    /* row 1 must differ (different data) */
-    memset(row + 0 * 144 + 16, 0x34, 128);  /* low 4, high 3 */
+    /* row 1 differs: low nibble 4, high nibble 3 */
+    memset(row + 1 * 1152 + 16, 0x34, 128);
     embed_q4k(out, row, 1, 2048);
     CHECK_NEAR(out[0], 4.0, 1e-6, "embed_q4k synthetic row1 v0");
 }
@@ -129,8 +129,10 @@ static void test_matmul_q4k(void)
     for (s = 0; s < 512; s++) x[s] = 1.0f;
     float y[2];
     matmul_q4k(y, x, w, 2, 512);
-    CHECK_NEAR(y[0], 2.0 * 512, 1e-3, "matmul_q4k row0 (all 2)");
-    CHECK_NEAR(y[1], 1.0 * 512, 1e-3, "matmul_q4k row1 (all 1)");
+    /* row0: qs=0x12 -> low nibble 2 (256 elems) + high nibble 1 (256 elems) = 768 */
+    CHECK_NEAR(y[0], 2.0 * 256 + 1.0 * 256, 1e-3, "matmul_q4k row0 (2/1 mix)");
+    /* row1: qs=0x01 -> low nibble 1 (256) + high nibble 0 (256) = 256 */
+    CHECK_NEAR(y[1], 1.0 * 256 + 0.0 * 256, 1e-3, "matmul_q4k row1 (1/0 mix)");
     /* same call through generic matmul dispatch */
     float y2[2];
     matmul(y2, x, w, 2, 512, DT_Q4K);
@@ -213,15 +215,25 @@ static void test_swiglu(void)
 
 int main(void)
 {
+    printf("running test_f16...\n"); fflush(stdout);
     test_f16();
+    printf("running test_q4k_decode...\n"); fflush(stdout);
     test_q4k_decode();
+    printf("running test_q6k_decode...\n"); fflush(stdout);
     test_q6k_decode();
+    printf("running test_embed_q4k...\n"); fflush(stdout);
     test_embed_q4k();
+    printf("running test_matmul_q4k...\n"); fflush(stdout);
     test_matmul_q4k();
+    printf("running test_matmul_q6k...\n"); fflush(stdout);
     test_matmul_q6k();
+    printf("running test_rmsnorm...\n"); fflush(stdout);
     test_rmsnorm();
+    printf("running test_rope...\n"); fflush(stdout);
     test_rope();
+    printf("running test_softmax...\n"); fflush(stdout);
     test_softmax();
+    printf("running test_swiglu...\n"); fflush(stdout);
     test_swiglu();
     printf("matvec tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

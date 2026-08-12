@@ -36,14 +36,14 @@ static void test_bpe_hello(const char* vocab_path)
         int n = vocab_encode(&v, "Hello world", ids, 64);
         CHECK(n == 2, "Hello world -> 2 tokens");
     }
-    /* byte fallback for unknown bytes still works */
+    /* byte fallback for unknown bytes still works (with leading ▁) */
     {
         uint32_t ids[64];
         int n = vocab_encode(&v, "\xff\xfe", ids, 64);
-        CHECK(n == 2, "raw bytes -> 2 byte tokens");
-        if (n == 2) {
-            CHECK(strcmp(v.pieces[ids[0]], "<0xFF>") == 0, "0xFF byte token");
-            CHECK(strcmp(v.pieces[ids[1]], "<0xFE>") == 0, "0xFE byte token");
+        CHECK(n == 3, "raw bytes -> ▁ + 2 byte tokens");
+        if (n == 3) {
+            CHECK(strcmp(v.pieces[ids[1]], "<0xFF>") == 0, "0xFF byte token");
+            CHECK(strcmp(v.pieces[ids[2]], "<0xFE>") == 0, "0xFE byte token");
         }
     }
     vocab_free(&v);

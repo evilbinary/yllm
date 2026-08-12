@@ -42,6 +42,7 @@ static void test_emit_layout(void)
     int n = 0;
     int l;
     uint32_t i;
+    memset(items, 0, sizeof(items));
 
     items[n].layer = 0; items[n].slot = 0;
     items[n].dtype = DT_Q4K; items[n].ndim = 2;
@@ -116,7 +117,11 @@ static void test_emit_layout(void)
     for (li = 0; li < m.n_layers; li++) {
         CHECK(m.dir[li].offset % LLF_ALIGN == 0, "layer offset aligned");
         CHECK(m.dir[li].size > 0, "layer size positive (was negative)");
-        if (li > 0) CHECK(m.dir[li].offset == prev_end, "layers contiguous");
+        if (li > 0) {
+            /* layer starts at or after previous end (may have alignment padding) */
+            CHECK(m.dir[li].offset >= prev_end, "layers non-overlapping");
+            CHECK(m.dir[li].offset < prev_end + LLF_ALIGN, "layers with small padding");
+        }
         prev_end = m.dir[li].offset + m.dir[li].size;
         CHECK(m.dir[li].offset + m.dir[li].size <= map.size, "layer within file");
     }
