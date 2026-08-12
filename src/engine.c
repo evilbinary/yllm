@@ -393,11 +393,3 @@ uint64_t engine_resident(const Engine* e)
 {
     return e->ws.resident;
 }
-
-uint32_t engine_argmax(const float* logits, uint32_t n)
-{
-    uint32_t bi = 0;
-    uint32_t i;
-    for (i = 1; i < n; i++) if (logits[i] > logits[bi]) bi = i;
-    return bi;
-}
