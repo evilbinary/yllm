@@ -56,19 +56,19 @@ static int parse_sp(const uint8_t* data, uint64_t size, Vocab* v)
                     memcpy(pc, sub.p, (size_t)l2);
                     pc[l2] = 0;
                     sub.p += l2;
-                } else if (f2 == 3 && w2 == 0) {
+                } else if (f2 == 3 && (t2 & 7) == 0) {
                     pct = (uint32_t)pb_varint(&sub);
-                } else if (f2 == 2 && w2 == 5) {
+                } else if (f2 == 2 && (t2 & 7) == 5) {
                     sub.p += 4;
-                } else if (w2 == 0) {
+                } else if ((t2 & 7) == 0) {
                     pb_varint(&sub);
-                } else if (w2 == 2) {
+                } else if ((t2 & 7) == 2) {
                     uint64_t l2 = pb_varint(&sub);
                     if (sub.p + l2 > sub.end) break;
                     sub.p += l2;
-                } else if (w2 == 5) {
+                } else if ((t2 & 7) == 5) {
                     sub.p += 4;
-                } else if (w2 == 1) {
+                } else if ((t2 & 7) == 1) {
                     sub.p += 8;
                 }
             }
@@ -84,15 +84,15 @@ static int parse_sp(const uint8_t* data, uint64_t size, Vocab* v)
                 if (strcmp(pc, "</s>") == 0) v->eos = v->n;
             }
             v->n++;
-        } else if (w2 == 2) {
+        } else if ((tag & 7) == 2) {
             uint64_t l2 = pb_varint(&b);
             if (b.p + l2 > b.end) break;
             b.p += l2;
-        } else if (w2 == 0) {
+        } else if ((tag & 7) == 0) {
             pb_varint(&b);
-        } else if (w2 == 5) {
+        } else if ((tag & 7) == 5) {
             b.p += 4;
-        } else if (w2 == 1) {
+        } else if ((tag & 7) == 1) {
             b.p += 8;
         }
     }
@@ -251,7 +251,7 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max)
             continue;
         }
         size_t l = strlen(pc);
-        if (pc[0] == 0xe2 && pc[1] == 0x96 && pc[2] == 0x81) {
+        if (pc[0] == (char)0xe2 && pc[1] == (char)0x96 && pc[2] == (char)0x81) {
             if (o < max) out[o++] = ' ';
             pc += 3;
             l -= 3;
