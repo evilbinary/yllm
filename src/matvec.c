@@ -287,10 +287,10 @@ void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta)
         float ang = freq * (float)pos;
         float c = cosf(ang);
         float s = sinf(ang);
-        float a = v[j];
-        float b = v[j + half];
-        v[j] = a * c - b * s;
-        v[j + half] = a * s + b * c;
+        float a = v[2 * j];
+        float b = v[2 * j + 1];
+        v[2 * j] = a * c - b * s;
+        v[2 * j + 1] = a * s + b * c;
     }
 }
 

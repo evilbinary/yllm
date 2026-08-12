@@ -248,7 +248,7 @@ float f16_to_f32(uint16_t h)
             uint32_t mm = m;
             int sh = 0;
             while (!(mm & 0x400)) { mm <<= 1; sh++; }
-            x = ((uint32_t)(113 - sh) << 23) | ((mm & 0x3ff) << 13);
+            x = s | ((uint32_t)(113 - sh) << 23) | ((mm & 0x3ff) << 13);
         }
     } else if (e == 0x7c00) {
         x = 0x7f800000 | (m ? 0x7fc000u : 0);

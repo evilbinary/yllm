@@ -155,50 +155,11 @@ static int cmd_gen(int argc, char** argv)
         vocab_free(&v);
         return 1;
     }
-    {
-        uint32_t li;
-        for (li = 0; li < e.ws.model.n_layers && li < 5; li++) {
-            printf("DBG layer %u: off=%llu size=%llu nt=%u\n", li,
-                   (unsigned long long)e.ws.model.dir[li].offset,
-                   (unsigned long long)e.ws.model.dir[li].size,
-                   e.ws.model.dir[li].n_tensors);
-        }
-    }
 
     uint32_t* ids = (uint32_t*)ymalloc((size_t)ntokens + 4096);
     uint32_t sz = (uint32_t)(ntokens + 4096);
     int nprompt = vocab_encode(&v, prompt, ids, (int)sz);
-    printf("prompt tokens: %d", nprompt);
-    {
-        int di;
-        for (di = 0; di < nprompt; di++) printf(" %u", (unsigned)ids[di]);
-        printf(" (scores=%u)\n", v.n_scores);
-    }
-    printf("DBG prompt bytes:");
-    {
-        const unsigned char* p = (const unsigned char*)prompt;
-        for (; *p; p++) printf(" %02X", *p);
-        printf("\n");
-    }
-    {
-        int di2;
-        int foundH = -1, foundG = -1;
-        for (di2 = 0; di2 < v.n; di2++) {
-            if (strcmp(v.pieces[di2], "H") == 0) foundH = di2;
-            if (strcmp(v.pieces[di2], "\xe2\x96\x81") == 0) foundG = di2;
-        }
-        printf("DBG H id=%d piece0=%s sorted0->piece=%s\n", foundH, v.pieces[0],
-               v.pieces[v.sorted[0]]);
-        {
-            int si;
-            for (si = 0; si < 5; si++) {
-                const unsigned char* pp = (const unsigned char*)v.pieces[v.sorted[si]];
-                printf("DBG sorted[%d]=%d piecebytes:", si, v.sorted[si]);
-                for (; *pp; pp++) printf(" %02X", *pp);
-                printf("\n");
-            }
-        }
-    }
+    printf("prompt tokens: %d\n", nprompt);
     printf("\n");
     uint64_t t0 = ynow_ms();
     int rc = 0;

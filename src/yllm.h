@@ -82,6 +82,7 @@ typedef struct {
     float* x;
     float* hb;
     float* hb2;
+    float* ffn;
     float* att;
     float* logits;
     uint64_t stat_reads;

@@ -85,16 +85,11 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
             LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + s2];
             tm->offset += loff - first;
             if (loff + tm->offset + tm->size > lend) lend = loff + tm->offset + tm->size;
-            if (i == 1 && s2 < 3) fprintf(stderr, "DBG l1 t%d: off=%lld sz=%lld sum=%lld\n",
-                s2, (long long)tm->offset, (long long)tm->size, (long long)(loff + tm->offset + tm->size));
         }
         lend = align_up(lend, LLF_ALIGN);
         dir[i].offset = loff;
         dir[i].size = lend - loff;
         dir[i].n_tensors = per[i];
-        if (i < 3) fprintf(stderr, "DBG emit layer %u: first=%llu loff=%llu lend=%llu size=%lld per=%u\n",
-            i, (unsigned long long)first, (unsigned long long)loff, (unsigned long long)lend,
-            (long long)dir[i].size, per[i]);
     }
     h->file_size = align_up(cursor, LLF_ALIGN);
 

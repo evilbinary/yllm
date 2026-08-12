@@ -123,6 +123,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->x = (float*)ycalloc(hidden, 4);
     e->hb = (float*)ycalloc(hidden, 4 * 9);
     e->hb2 = (float*)ycalloc(hidden, 4 * 9);
+    e->ffn = (float*)ycalloc(hidden, 4 * 9);
     e->att = (float*)ymalloc((size_t)e->max_seq * 4);
     e->logits = (float*)ymalloc((size_t)vocab * 4);
 
@@ -158,6 +159,7 @@ void engine_free(Engine* e)
     free(e->x);
     free(e->hb);
     free(e->hb2);
+    free(e->ffn);
     free(e->att);
     free(e->logits);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
@@ -190,36 +192,27 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
 
     const LlfTensorMeta* mt = &m->metas[hidx];
     uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
-    if (layer <= 1) printf("DBG L%u base=%p koff=%llu kbytes=%02x %02x %02x %02x %02x %02x\n", layer,
-        (const void*)base, (unsigned long long)mt[SLOT_K].offset,
-        base[mt[SLOT_K].offset + 0], base[mt[SLOT_K].offset + 1],
-        base[mt[SLOT_K].offset + 2], base[mt[SLOT_K].offset + 3],
-        base[mt[SLOT_K].offset + 4], base[mt[SLOT_K].offset + 5]);
 
     rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
-    printf("DBG L%u norm x[0..2]=%g %g %g x2[0..2]=%g %g %g\n", layer,
-        (double)x[0], (double)x[1], (double)x[2],
-        (double)x2[0], (double)x2[1], (double)x2[2]);
     matmul(q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype);
     matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
     matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
-    printf("DBG L%u q[0..2]=%g %g %g k[0]=%g v[0]=%g\n", layer,
-        (double)q[0], (double)q[1], (double)q[2], (double)k[0], (double)v[0]);
 
     uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
     uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
-    uint32_t j;
-    for (j = 0; j < kv_dim; j++) {
-        kcache[kvp + j] = f32_to_f16(k[j]);
-        vcache[kvp + j] = f32_to_f16(v[j]);
-    }
     uint32_t hh;
     for (hh = 0; hh < h->n_heads; hh++) {
         rope_inplace(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
     }
     for (hh = 0; hh < h->n_kv_heads; hh++) {
         rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+    }
+
+    uint32_t j;
+    for (j = 0; j < kv_dim; j++) {
+        kcache[kvp + j] = f32_to_f16(k[j]);
+        vcache[kvp + j] = f32_to_f16(v[j]);
     }
 
     float* att = e->att;
@@ -243,13 +236,15 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
             for (j = 0; j < h->head_dim; j++) out[j] += a * f16_to_f32(vh[j]);
         }
     }
-    matmul(att_out, att_out, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype);
+    memcpy(x2, att_out, (size_t)hidden * 4);
+    matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
-
     rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
-    matmul(q, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
-    matmul(k, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
-    swiglu(x2, q, k, inter);
+    float* fg = e->ffn;
+    float* fu = e->ffn + inter;
+    matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+    matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+    swiglu(x2, fg, fu, inter);
     matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
     return 0;
@@ -274,8 +269,6 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
             case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
             default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
             }
-            printf("DBG fwd token=%u x[0..4]=%g %g %g %g %g\n", token,
-                (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3], (double)e->x[4]);
         } else if (i <= h->n_blocks) {
             forward_block(e, i, pos);
         } else if (i == h->n_blocks + 1) {
@@ -296,10 +289,6 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
                 default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
                 }
             }
-            printf("DBG logits[0..4]=%g %g %g %g %g argmax=%u\n",
-                (double)e->logits[0], (double)e->logits[1], (double)e->logits[2],
-                (double)e->logits[3], (double)e->logits[4],
-                (unsigned)engine_argmax(e->logits, h->vocab));
         }
         if (w) {
             uint32_t d = (uint32_t)ws->depth;
