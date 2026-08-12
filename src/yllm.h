@@ -77,7 +77,6 @@ int vocab_id(Vocab* v, const char* piece);
 /* chat template: render a single-turn user message, returns number of ids */
 int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos);
 int vocab_has_template(Vocab* v);
-
 /* ---- 引擎 ---- */
 typedef struct {
     Ws ws;

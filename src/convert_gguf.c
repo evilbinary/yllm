@@ -402,6 +402,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     memset(&g, 0, sizeof(g));
     g.freq_base = 10000.0f;
     g.rms_eps = 1e-5f;
+    g.add_bos = 1; /* llama architecture default */
 
     uint64_t i;
     for (i = 0; i < n_kv && !b.err; i++) {

@@ -577,11 +577,7 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
     int n_out = 0;
     if (add_bos && v->bos >= 0 && n_out < max) ids[n_out++] = (uint32_t)v->bos;
 
-    size_t len = strlen(v->chat_template);
-    char* t = (char*)ymalloc(len + 1);
-    memcpy(t, v->chat_template, len + 1);
-
-    /* parse template into statements */
+    /* parse template into statements by scanning {% %} / {{ }} blocks */
     enum { ST_FOR, ST_IF, ST_ELIF, ST_ENDIF, ST_END_FOR, ST_EXPR, ST_IF_LAST, ST_NONE };
     typedef struct {
         int kind;
@@ -591,57 +587,60 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
     TStmt stmts[128];
     int n_stmts = 0;
 
-    char* save = NULL;
-    char* line = strtok_r(t, "\n", &save);
-    while (line && n_stmts < 128) {
-        char* ls = line;
-        while (*ls == ' ' || *ls == '\t') ls++;
-        char* le = ls + strlen(ls);
-        while (le > ls && (le[-1] == ' ' || le[-1] == '\t')) *--le = 0;
-
-        if (strncmp(ls, "{% for", 6) == 0) {
-            stmts[n_stmts].kind = ST_FOR;
-            n_stmts++;
-        } else if (strncmp(ls, "{% if loop.last", 15) == 0) {
-            stmts[n_stmts].kind = ST_IF_LAST;
-            n_stmts++;
-        } else if (strncmp(ls, "{% if", 5) == 0) {
-            stmts[n_stmts].kind = ST_IF;
-            char* c0 = ls + 5;
-            char* c1 = strstr(c0, "%}");
-            if (c1) { *c1 = 0; snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", c0); }
-            n_stmts++;
-        } else if (strncmp(ls, "{% elif", 7) == 0) {
-            stmts[n_stmts].kind = ST_ELIF;
-            char* c0 = ls + 7;
-            char* c1 = strstr(c0, "%}");
-            if (c1) { *c1 = 0; snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", c0); }
-            n_stmts++;
-        } else if (strncmp(ls, "{% endif %}", 11) == 0) {
-            stmts[n_stmts].kind = ST_ENDIF;
-            n_stmts++;
-        } else if (strncmp(ls, "{% endfor %}", 12) == 0) {
-            stmts[n_stmts].kind = ST_END_FOR;
-            n_stmts++;
-        } else if (strncmp(ls, "{{", 2) == 0) {
-            stmts[n_stmts].kind = ST_EXPR;
-            size_t el = strlen(ls);
-            if (el > 4 && ls[el - 2] == '}' && ls[el - 1] == '}') {
-                memcpy(stmts[n_stmts].expr, ls + 2, el - 4);
-                stmts[n_stmts].expr[el - 4] = 0;
+    {
+        const char* p = v->chat_template;
+        while (*p && n_stmts < 128) {
+            if (p[0] == '{' && p[1] == '%') {
+                /* control block: {% ... %} */
+                const char* e = strstr(p + 2, "%}");
+                if (!e) break;
+                size_t bl = (size_t)(e - (p + 2));
+                char tmp[512];
+                if (bl >= sizeof(tmp)) bl = sizeof(tmp) - 1;
+                memcpy(tmp, p + 2, bl);
+                tmp[bl] = 0;
+                char* t2 = tmp;
+                while (*t2 == ' ') t2++;
+                if (strncmp(t2, "for", 3) == 0) {
+                    stmts[n_stmts].kind = ST_FOR;
+                    n_stmts++;
+                } else if (strncmp(t2, "if loop.last", 12) == 0) {
+                    stmts[n_stmts].kind = ST_IF_LAST;
+                    n_stmts++;
+                } else if (strncmp(t2, "if", 2) == 0) {
+                    stmts[n_stmts].kind = ST_IF;
+                    snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", t2 + 2);
+                    n_stmts++;
+                } else if (strncmp(t2, "elif", 4) == 0) {
+                    stmts[n_stmts].kind = ST_ELIF;
+                    snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", t2 + 4);
+                    n_stmts++;
+                } else if (strncmp(t2, "endif", 5) == 0) {
+                    stmts[n_stmts].kind = ST_ENDIF;
+                    n_stmts++;
+                } else if (strncmp(t2, "endfor", 6) == 0) {
+                    stmts[n_stmts].kind = ST_END_FOR;
+                    n_stmts++;
+                }
+                p = e + 2;
+            } else if (p[0] == '{' && p[1] == '{') {
+                /* expression block: {{ ... }} (may span newlines) */
+                const char* e = strstr(p + 2, "}}");
+                if (!e) break;
+                size_t bl = (size_t)(e - (p + 2));
+                char tmp[2048];
+                if (bl >= sizeof(tmp)) bl = sizeof(tmp) - 1;
+                memcpy(tmp, p + 2, bl);
+                tmp[bl] = 0;
+                stmts[n_stmts].kind = ST_EXPR;
+                snprintf(stmts[n_stmts].expr, sizeof(stmts[n_stmts].expr), "%s", tmp);
+                n_stmts++;
+                p = e + 2;
             } else {
-                stmts[n_stmts].expr[0] = 0;
+                p++;
             }
-            n_stmts++;
-        } else if (ls[0] != 0) {
-            /* bare text line -> treat as literal expression */
-            stmts[n_stmts].kind = ST_EXPR;
-            snprintf(stmts[n_stmts].expr, sizeof(stmts[n_stmts].expr), "'%s'", ls);
-            n_stmts++;
         }
-        line = strtok_r(NULL, "\n", &save);
     }
-    free(t);
 
     /* execute statements, iterating messages */
     char out[4096];

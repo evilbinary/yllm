@@ -193,9 +193,11 @@ static int cmd_chat(int argc, char** argv)
     float temp = (float)atof(opt(a, n, "temp", "0.8"));
     float top_p = (float)atof(opt(a, n, "top-p", "0.9"));
     uint64_t seed = (uint64_t)strtoull(opt(a, n, "seed", "42"), NULL, 10);
+    int no_template = atoi(opt(a, n, "no-template", "0"));
+    int no_bos = atoi(opt(a, n, "no-bos", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -217,14 +219,25 @@ static int cmd_chat(int argc, char** argv)
     uint32_t* ids = (uint32_t*)ymalloc((size_t)ntokens + 8192);
     uint32_t sz = (uint32_t)(ntokens + 8192);
     int nprompt;
-    if (prompt && vocab_has_template(&v)) {
-        nprompt = vocab_chat_ids(&v, prompt, ids, (int)sz, v.add_bos);
+    int use_bos = no_bos ? 0 : v.add_bos;
+    if (prompt && vocab_has_template(&v) && !no_template) {
+        nprompt = vocab_chat_ids(&v, prompt, ids, (int)sz, use_bos);
         if (nprompt <= 0) {
             fprintf(stderr, "chat template render failed, falling back to plain encode\n");
             nprompt = vocab_encode(&v, prompt, ids, (int)sz);
+            if (use_bos && v.bos >= 0 && nprompt < (int)sz) {
+                memmove(ids + 1, ids, (size_t)nprompt * 4);
+                ids[0] = (uint32_t)v.bos;
+                nprompt++;
+            }
         }
     } else {
         nprompt = vocab_encode(&v, prompt ? prompt : "Hello", ids, (int)sz);
+        if (use_bos && v.bos >= 0 && nprompt < (int)sz) {
+            memmove(ids + 1, ids, (size_t)nprompt * 4);
+            ids[0] = (uint32_t)v.bos;
+            nprompt++;
+        }
     }
     printf("chat prompt tokens: %d (bos=%d)\n", nprompt, v.bos);
     printf("\n");
