@@ -18,6 +18,7 @@ OBJ           := $(SRC:src/%.c=$(OBJDIR)/%.o)
 
 # ---- AVX2 版本(加 -mavx2 -mfma) ----
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
+LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
 BIN_AVX2      := build/avx2/yllm
 OBJ_AVX2      := $(SRC:src/%.c=$(OBJDIR_AVX2)/%.o)
@@ -30,7 +31,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS_BASE) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
 
 $(BIN_AVX2): $(OBJ_AVX2)
-	$(CC) $(CFLAGS_AVX2) -o $@ $(OBJ_AVX2) $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -o $@ $(OBJ_AVX2) $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -c -o $@ $<
@@ -54,16 +55,16 @@ $(OBJDIR)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h src/platform.c src/llf.c src/matvec.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -Itests -o $@ $< src/platform.c src/llf.c src/matvec.c $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -Isrc -Itests -o $@ $< src/platform.c src/llf.c src/matvec.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c src/platform.c src/llf.c src/tokenizer.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 TEST_BIN     := $(TEST_SRC:tests/%.c=$(OBJDIR)/%.exe)
 TEST_BIN_AVX := $(TEST_SRC:tests/%.c=$(OBJDIR_AVX2)/%.exe)

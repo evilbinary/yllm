@@ -4,12 +4,22 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-
 typedef struct {
     Ws* ws;
     uint32_t next;
     uint32_t end;
 } PFJob;
+
+typedef struct { float prob; int index; } ProbIdx;
+
+static int cmp_prob_desc(const void* a, const void* b)
+{
+    float pa = ((const ProbIdx*)a)->prob;
+    float pb = ((const ProbIdx*)b)->prob;
+    if (pa > pb) return -1;
+    if (pa < pb) return 1;
+    return 0;
+}
 
 typedef struct {
     Ws* ws;
@@ -321,34 +331,28 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
     for (i = 0; i < vocab; i++) { logits[i] = expf(logits[i] - m); s += logits[i]; }
     for (i = 0; i < vocab; i++) logits[i] /= s;
     if (top_p < 1.0f) {
-        uint32_t* idx = (uint32_t*)ymalloc((size_t)vocab * 4);
+        ProbIdx* sorted = (ProbIdx*)ymalloc((size_t)vocab * sizeof(ProbIdx));
         uint32_t j;
-        for (j = 0; j < vocab; j++) idx[j] = j;
-        uint32_t k;
-        for (k = 0; k < vocab; k++) {
-            uint32_t best = k;
-            for (j = k + 1; j < vocab; j++) if (logits[idx[j]] > logits[idx[best]]) best = j;
-            uint32_t t2 = idx[k];
-            idx[k] = idx[best];
-            idx[best] = t2;
+        for (j = 0; j < vocab; j++) {
+            sorted[j].prob = logits[j];
+            sorted[j].index = (int)j;
         }
+        qsort(sorted, (size_t)vocab, sizeof(ProbIdx), cmp_prob_desc);
         float cum = 0.0f;
         uint32_t keep = vocab;
-        for (k = 0; k < vocab; k++) {
-            cum += logits[idx[k]];
-            if (cum >= top_p) { keep = k + 1; break; }
+        for (j = 0; j < vocab; j++) {
+            cum += sorted[j].prob;
+            if (cum >= top_p) { keep = j + 1; break; }
         }
-        float c2 = 0.0f;
-        for (k = 0; k < keep; k++) c2 += logits[idx[k]];
-        for (k = 0; k < keep; k++) logits[idx[k]] /= c2;
         float r = (float)(yrng(rng) >> 40) / 16777216.0f;
         float acc = 0.0f;
+        uint32_t k;
         for (k = 0; k < keep; k++) {
-            acc += logits[idx[k]];
-            if (r < acc) { *out = idx[k]; free(idx); return 0; }
+            acc += sorted[k].prob;
+            if (r < acc) { *out = (uint32_t)sorted[k].index; free(sorted); return 0; }
         }
-        *out = idx[keep - 1];
-        free(idx);
+        *out = (uint32_t)sorted[keep - 1].index;
+        free(sorted);
         return 0;
     }
     {

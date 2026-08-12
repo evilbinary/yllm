@@ -29,6 +29,8 @@ static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m)
     }
 }
 
+#define get_scale_min_k4 gsm_k4
+
 void q4k_block(float* y, const uint8_t* blk, uint32_t stride)
 {
     float d = f16_to_f32(((const uint16_t*)blk)[0]);
@@ -204,58 +206,70 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t rowb = nb * 144;
     uint32_t oo;
 #ifdef __AVX2__
+#ifdef _OPENMP
+#endif
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
-            const float* xb = x + (size_t)b * 256;
-            float d = f16_to_f32(((const uint16_t*)blk)[0]);
+            const float* xp = x + (size_t)b * 256;
+            float d    = f16_to_f32(((const uint16_t*)blk)[0]);
             float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* q = blk + 16;
             const uint8_t* scp = blk + 4;
+
             int is = 0;
             for (int j = 0; j < 4; j++) {
                 uint8_t sc, mn;
-                gsm_k4(is, scp, &sc, &mn);
+                get_scale_min_k4(is, scp, &sc, &mn);
                 float d1 = d * (float)sc;
                 float m1 = dmin * (float)mn;
-                gsm_k4(is + 1, scp, &sc, &mn);
+                get_scale_min_k4(is + 1, scp, &sc, &mn);
                 float d2 = d * (float)sc;
                 float m2 = dmin * (float)mn;
 
-                __m256 sum_qx1 = _mm256_setzero_ps();
-                __m256 sum_x1 = _mm256_setzero_ps();
-                __m256 sum_qx2 = _mm256_setzero_ps();
-                __m256 sum_x2 = _mm256_setzero_ps();
-                for (int l = 0; l < 32; l += 16) {
-                    /* 16 bytes: bytes 0..15 -> low nibbles for x[l..l+15],
-                       high nibbles for x[l+32..l+47] */
-                    __m128i q16 = _mm_loadu_si128((const __m128i*)(q + l));
-                    __m128i lo = _mm_and_si128(q16, _mm_set1_epi8(0x0F));
-                    __m128i hi = _mm_and_si128(_mm_srli_epi16(q16, 4), _mm_set1_epi8(0x0F));
-                    __m256i lo16 = _mm256_cvtepu8_epi16(lo);
-                    __m256 lo_f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(lo16)));
-                    __m256 lo_f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(lo16, 1)));
-                    __m256 x_l0 = _mm256_loadu_ps(xb + l);
-                    __m256 x_l1 = _mm256_loadu_ps(xb + l + 8);
-                    sum_qx1 = _mm256_fmadd_ps(lo_f0, x_l0, sum_qx1);
-                    sum_qx1 = _mm256_fmadd_ps(lo_f1, x_l1, sum_qx1);
-                    sum_x1 = _mm256_add_ps(sum_x1, _mm256_add_ps(x_l0, x_l1));
+                __m256 sum_qx1_v = _mm256_setzero_ps();
+                __m256 sum_x1_v  = _mm256_setzero_ps();
+                __m256 sum_qx2_v = _mm256_setzero_ps();
+                __m256 sum_x2_v  = _mm256_setzero_ps();
 
-                    __m256i hi16 = _mm256_cvtepu8_epi16(hi);
-                    __m256 hi_f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(hi16)));
-                    __m256 hi_f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(hi16, 1)));
-                    __m256 x_h0 = _mm256_loadu_ps(xb + l + 32);
-                    __m256 x_h1 = _mm256_loadu_ps(xb + l + 40);
-                    sum_qx2 = _mm256_fmadd_ps(hi_f0, x_h0, sum_qx2);
-                    sum_qx2 = _mm256_fmadd_ps(hi_f1, x_h1, sum_qx2);
-                    sum_x2 = _mm256_add_ps(sum_x2, _mm256_add_ps(x_h0, x_h1));
+                for (int l = 0; l < 32; l += 16) {
+                    __m128i q16 = _mm_loadu_si128((const __m128i*)(q + l));
+
+                    __m128i lo16 = _mm_and_si128(q16, _mm_set1_epi8(0x0F));
+                    __m128i hi16 = _mm_and_si128(_mm_srli_epi16(q16, 4), _mm_set1_epi8(0x0F));
+
+                    /* Low nibbles: bytes 0-7 -> x[l..l+7], 8-15 -> x[l+8..l+15] */
+                    __m256i lo16_0 = _mm256_cvtepu8_epi16(lo16);
+                    __m256 lo_f_a0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(lo16_0)));
+                    __m256 lo_f_a1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(lo16_0, 1)));
+                    __m256 x_l0 = _mm256_loadu_ps(xp + l);
+                    __m256 x_l1 = _mm256_loadu_ps(xp + l + 8);
+                    sum_qx1_v = _mm256_fmadd_ps(lo_f_a0, x_l0, sum_qx1_v);
+                    sum_qx1_v = _mm256_fmadd_ps(lo_f_a1, x_l1, sum_qx1_v);
+                    sum_x1_v  = _mm256_add_ps(sum_x1_v, _mm256_add_ps(x_l0, x_l1));
+
+                    /* High nibbles: bytes 0-7 -> x[l+32..l+39], 8-15 -> x[l+40..l+47] */
+                    __m256i hi16_0 = _mm256_cvtepu8_epi16(hi16);
+                    __m256 hi_f_a0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(hi16_0)));
+                    __m256 hi_f_a1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(hi16_0, 1)));
+                    __m256 x_h0 = _mm256_loadu_ps(xp + l + 32);
+                    __m256 x_h1 = _mm256_loadu_ps(xp + l + 40);
+                    sum_qx2_v = _mm256_fmadd_ps(hi_f_a0, x_h0, sum_qx2_v);
+                    sum_qx2_v = _mm256_fmadd_ps(hi_f_a1, x_h1, sum_qx2_v);
+                    sum_x2_v  = _mm256_add_ps(sum_x2_v, _mm256_add_ps(x_h0, x_h1));
                 }
-                acc += d1 * hsum_avx2(sum_qx1) - m1 * hsum_avx2(sum_x1)
-                     + d2 * hsum_avx2(sum_qx2) - m2 * hsum_avx2(sum_x2);
-                q += 32;
+
+                float sum_qx1 = hsum_avx2(sum_qx1_v);
+                float sum_x1  = hsum_avx2(sum_x1_v);
+                float sum_qx2 = hsum_avx2(sum_qx2_v);
+                float sum_x2  = hsum_avx2(sum_x2_v);
+                acc += d1 * sum_qx1 - m1 * sum_x1 + d2 * sum_qx2 - m2 * sum_x2;
+
+                xp += 64;
+                q  += 32;
                 is += 2;
             }
         }
@@ -298,6 +312,8 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t rowb = nb * 210;
     uint32_t oo;
 #ifdef __AVX2__
+#ifdef _OPENMP
+#endif
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
