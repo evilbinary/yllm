@@ -24,8 +24,8 @@ $(BIN): $(OBJ)
 build/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-build/test_matvec.exe: tests/test_matvec.c src/platform.c src/llf.c src/matvec.c | build
-	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+build/test_matvec.exe: tests/test_matvec.c tests/ref_data.h src/platform.c src/llf.c src/matvec.c | build
+	$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< src/platform.c src/llf.c src/matvec.c $(LDFLAGS) $(LIBS)
 
 build/test_tokenizer.exe: tests/test_tokenizer.c src/platform.c src/llf.c src/tokenizer.c | build
 	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
