@@ -79,8 +79,18 @@ static int dump_llf(const uint8_t* data, uint64_t fsize)
     uint32_t i;
     for (i = 0; i < n_layers; i++) {
         fmtsize(dir[i].size, b1, sizeof(b1));
-        printf("\nlayer %2u  off=%-12llu size=%-10s n_tensors=%u\n",
-               i, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors);
+        const char* lname;
+        if (i == 0) lname = "embed";
+        else if (i <= h->n_blocks) lname = "transformer block";
+        else if (i == h->n_blocks + 1) lname = "final norm";
+        else lname = "output (lm_head)";
+        if (i >= 1 && i <= h->n_blocks) {
+            printf("layer %2u [%s %u]  off=%-12llu size=%-10s n_tensors=%u\n",
+                   i, lname, i - 1, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors);
+        } else {
+            printf("layer %2u [%s]      off=%-12llu size=%-10s n_tensors=%u\n",
+                   i, lname, (unsigned long long)dir[i].offset, b1, dir[i].n_tensors);
+        }
         if (!g_verbose) continue;
         uint32_t j;
         for (j = 0; j < BLOCK_TENSORS; j++) {
