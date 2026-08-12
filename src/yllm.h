@@ -97,6 +97,8 @@ typedef struct {
     uint32_t kv_dim;
     uint32_t max_seq;
     uint32_t inter;   /* FFN 中间维度(gate/up 输出宽) */
+    uint32_t layer_begin; /* 分布式分片: 本进程层区间 [begin, end) */
+    uint32_t layer_end;
     float* x;
     float* hb;
     float* hb2;
@@ -118,6 +120,9 @@ typedef struct {
 int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, char* err, size_t errlen);
 void engine_free(Engine* e);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
+int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,
+                         float* x_out, float* logits_out);
+void engine_set_layers(Engine* e, uint32_t begin, uint32_t end);
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out);
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,

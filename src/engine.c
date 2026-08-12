@@ -203,6 +203,8 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         }
     }
     e->inter = inter;
+    e->layer_begin = 0;
+    e->layer_end = m->n_layers;
     e->kv_dim = kv_dim;
     e->max_seq = m->h.max_seq;
     e->kv = (uint16_t*)ycalloc((size_t)(2 * m->h.n_blocks + 1) * e->max_seq * kv_dim, 2);
@@ -361,7 +363,61 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
     return 0;
 }
 
+/* 单层前向(含 embed / block / final norm / head 分派) */
+static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
+    if (i == 0) {
+        const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
+        switch (tm->dtype) {
+        case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
+        case DT_Q4K: embed_q4k(e->x, base + tm->offset, token, h->hidden); break;
+        case DT_Q6K: embed_q6k(e->x, base + tm->offset, token, h->hidden); break;
+        case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
+        default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
+        }
+    } else if (i <= h->n_blocks) {
+        forward_block(e, i, pos);
+    } else if (i == h->n_blocks + 1) {
+        float eps;
+        memcpy(&eps, &h->norm_eps_bits, 4);
+        const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
+        rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
+    } else {
+        const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
+        if (tm->shape[0] == h->vocab) {
+            matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+        } else {
+            switch (tm->dtype) {
+            case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+            case DT_Q4K: matmul_q4k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+            case DT_Q6K: matmul_q6k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+            case DT_IQ4XS: matmul_iq4xs(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+            default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+            }
+        }
+    }
+}
+
 int engine_forward(Engine* e, uint32_t token, uint32_t pos)
+{
+    return engine_forward_range(e, token, 1, pos, NULL, NULL);
+}
+
+void engine_set_layers(Engine* e, uint32_t begin, uint32_t end)
+{
+    e->layer_begin = begin;
+    e->layer_end = end;
+}
+
+/* 分布式分片前向: 只处理 [layer_begin, layer_end) 区间。
+ * need_embed=1 时先用 token 做 embed(rank0); e->x 须在调用前含输入(中段 rank 由
+ * 上层 recv 填充)。x_out/logits_out 非空时分别拷贝输出激活/最终 logits。 */
+int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,
+                         float* x_out, float* logits_out)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -372,41 +428,13 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
         sched_refresh_resident(ws);
         sched_adapt_budget(ws);
     }
-    for (i = 0; i < m->n_layers; i++) {
+    if (need_embed && e->layer_begin == 0) {
+        forward_layer(e, 0, token, pos);
+    }
+    for (i = e->layer_begin; i < e->layer_end; i++) {
+        if (i == 0) continue; /* embed 已在上方处理 */
         sched_ensure(ws, i);
-        const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
-        if (getenv("YLLM_DBG"))
-            fprintf(stderr, "ENG layer %u x0=%.4f x1=%.4f x2=%.4f x3=%.4f\n", i, e->x[0], e->x[1], e->x[2], e->x[3]);
-        if (i == 0) {
-            const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
-            switch (tm->dtype) {
-            case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
-            case DT_Q4K: embed_q4k(e->x, base + tm->offset, token, h->hidden); break;
-            case DT_Q6K: embed_q6k(e->x, base + tm->offset, token, h->hidden); break;
-            case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
-            default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
-            }
-        } else if (i <= h->n_blocks) {
-            forward_block(e, i, pos);
-        } else if (i == h->n_blocks + 1) {
-            float eps;
-            memcpy(&eps, &h->norm_eps_bits, 4);
-            const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-            rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
-        } else {
-            const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-            if (tm->shape[0] == h->vocab) {
-                matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
-            } else {
-                switch (tm->dtype) {
-                case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
-                case DT_Q4K: matmul_q4k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
-                case DT_Q6K: matmul_q6k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
-                case DT_IQ4XS: matmul_iq4xs(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
-                default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
-                }
-            }
-        }
+        forward_layer(e, i, token, pos);
         if (w) {
             uint32_t d = (uint32_t)ws->depth;
             uint32_t nb = i + d;
@@ -422,6 +450,8 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
         }
         sched_release_budget(ws, i);
     }
+    if (x_out) memcpy(x_out, e->x, (size_t)h->hidden * 4);
+    if (logits_out) memcpy(logits_out, e->logits, (size_t)h->vocab * 4);
     return 0;
 }
 

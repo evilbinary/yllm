@@ -50,10 +50,29 @@ build/avx2/yllm gen   --model model.llf --vocab vocab.txt --prompt "Hello" --tok
 build/avx2/yllm chat  --model model.llf --vocab vocab.txt --prompt "你好啊" --tokens 80 --temp 0.8 --top-p 0.9
 ```
 
+## 分布式推理(层流水线)
+
+多台机器各跑一个进程,模型按层切分,每台只 mmap/计算自己的层段;机器间每 token 只传
+激活向量(hidden fp32)。所有 rank 用同一条命令:
+
+```sh
+# 2 台机器(机器 A 和 B 分别执行, 端口一致即可)
+yllm gen --model model.llf --vocab vocab.txt --prompt "Hello" --tokens 64 \
+         --ranks 2 --rank 0 --port-base 8900     # 机器 A
+yllm gen --model model.llf --vocab vocab.txt --prompt "Hello" --tokens 64 \
+         --ranks 2 --rank 1 --port-base 8900     # 机器 B
+```
+
+- `--ranks N --rank R`:进程总数与自身编号;rank 0 同时是 master(采样/输出)。
+- `--port-base P`:TCP 端口基址(默认 8900,每 rank 用 P+rank)。
+- rank 0 的 stdout 是生成结果;其余 rank 只打印框架信息。
+- 单机验证:`--ranks 2 --rank 0` 与 `--rank 1` 同机跑即可(正确性应等于单机输出)。
+- 吞吐模型与分片方案见 `docs/distributed-cpu-inference.md`。
+
 ## 目录
 
 ```
-src/         核心代码(platform / convert / tokenizer / matvec / engine / main)
+src/         核心代码(platform / convert / tokenizer / matvec / engine / dist / main)
 tests/       单元与回归测试
 docs/        设计文档
 ```

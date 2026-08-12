@@ -1,4 +1,5 @@
 #include "yllm.h"
+#include "dist.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -135,9 +136,17 @@ static int cmd_gen(int argc, char** argv)
     float temp = (float)atof(opt(a, n, "temp", "1.0"));
     float top_p = (float)atof(opt(a, n, "top-p", "0.9"));
     uint64_t seed = (uint64_t)strtoull(opt(a, n, "seed", "42"), NULL, 10);
+    int rank = atoi(opt(a, n, "rank", "0"));
+    int ranks = atoi(opt(a, n, "ranks", "1"));
+    int port_base = atoi(opt(a, n, "port-base", "8900"));
 
     if (!m) {
         fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
+        fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
+        return 1;
+    }
+    if (rank < 0 || rank >= ranks || ranks < 1) {
+        fprintf(stderr, "bad rank/ranks: rank=%d ranks=%d\n", rank, ranks);
         return 1;
     }
 
@@ -155,6 +164,17 @@ static int cmd_gen(int argc, char** argv)
         vocab_free(&v);
         return 1;
     }
+    /* 分布式分片: 按层区间切 */
+    if (ranks > 1) {
+        uint32_t blocks = e.ws.model.h.n_blocks;
+        if ((uint32_t)ranks > blocks) { fprintf(stderr, "ranks %d > blocks %u\n", ranks, blocks); return 1; }
+        uint32_t bp = blocks / (uint32_t)ranks;
+        uint32_t begin = (uint32_t)rank * bp + 1;   /* 层 1 = 第一个 block */
+        uint32_t end = (uint32_t)(rank + 1) * bp + 1;
+        if (rank == 0) begin = 0;                   /* rank0 含 embed */
+        if (rank == ranks - 1) end = e.ws.model.n_layers; /* 末 rank 含 norm+head */
+        engine_set_layers(&e, begin, end);
+    }
 
     uint32_t* ids = (uint32_t*)ymalloc(((size_t)ntokens + 4096) * 4);
     uint32_t sz = (uint32_t)(ntokens + 4096);
@@ -165,6 +185,86 @@ static int cmd_gen(int argc, char** argv)
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));
     int rc = 0;
+
+    if (ranks > 1) {
+        /* ================= 分布式层流水线 ================= */
+        Dist dist;
+        if (dist_init(&dist, rank, ranks, (uint16_t)port_base) != 0) {
+            fprintf(stderr, "dist init failed\n");
+            engine_free(&e);
+            vocab_free(&v);
+            free(ids);
+            return 1;
+        }
+        uint32_t hidden = e.ws.model.h.hidden;
+        uint32_t vocab_sz = e.ws.model.h.vocab;
+        float* xbuf = (float*)ymalloc((size_t)hidden * 4);
+        float* logbuf = (float*)ymalloc((size_t)vocab_sz * 4);
+        uint64_t rng = ysrand(seed);
+        int ngen = 0;
+
+        if (rank == 0) {
+            /* master: embed + 自己块段, 采样由收到的 logits 决定 */
+            uint32_t pos = 0;
+            int i;
+            for (i = 0; i < nprompt; i++) {
+                engine_forward_range(&e, ids[i], 1, pos, xbuf, NULL);
+                dist_send_x(&dist, pos, xbuf, hidden);
+                pos++;
+            }
+            /* 丢弃 prompt 阶段多余的 logits(末 rank 对每个 X 帧都回 logits,
+               采样第一个生成 token 需要最后那个 prompt token 的 logits) */
+            for (i = 0; i < nprompt - 1; i++) {
+                if (dist_recv(&dist, NULL, NULL, 0, logbuf, vocab_sz) != 2) { rc = -1; break; }
+            }
+            for (i = 0; i < ntokens && rc == 0; i++) {
+                if (pos >= e.max_seq) break;
+                int t = dist_recv(&dist, NULL, NULL, 0, logbuf, vocab_sz);
+                if (t != 2) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed (type %d)", t); break; }
+                memcpy(e.logits, logbuf, (size_t)vocab_sz * 4);
+                uint32_t nxt;
+                if (engine_sample(&e, vocab_sz, temp, top_p, &rng, &nxt) != 0) { rc = -1; break; }
+                on_token_cb(nxt, &v);
+                if (nxt == (uint32_t)v.eos) break;
+                engine_forward_range(&e, nxt, 1, pos, xbuf, NULL);
+                dist_send_x(&dist, pos, xbuf, hidden);
+                pos++;
+                ngen++;
+            }
+            dist_send_done(&dist);
+            printf("\n\n");
+            printf("decode:  %d tokens in %.2f s (%.1f tok/s)\n", ngen,
+                   (double)(ynow_ms() - t0) / 1000.0,
+                   (double)ngen * 1000.0 / (double)(ynow_ms() - t0 > 0 ? ynow_ms() - t0 : 1));
+        } else {
+            /* 中段/末段 rank: 收激活 → 算自己块段 → 转发/出 logits */
+            uint32_t pos;
+            int t;
+            while ((t = dist_recv(&dist, &pos, xbuf, hidden, NULL, 0)) >= 0) {
+                if (t == 3) { /* DONE: 向后转发并退出 */
+                    dist_send_done(&dist);
+                    break;
+                }
+                if (t != 1) break;
+                memcpy(e.x, xbuf, (size_t)hidden * 4); /* 输入激活入引擎缓冲 */
+                if (rank == ranks - 1) {
+                    engine_forward_range(&e, 0, 0, pos, NULL, logbuf);
+                    if (dist_send_logits(&dist, logbuf, vocab_sz) != 0) { rc = -1; break; }
+                } else {
+                    engine_forward_range(&e, 0, 0, pos, xbuf, NULL);
+                    if (dist_send_x(&dist, pos, xbuf, hidden) != 0) { rc = -1; break; }
+                }
+            }
+        }
+        free(xbuf);
+        free(logbuf);
+        dist_close(&dist);
+        engine_free(&e);
+        vocab_free(&v);
+        free(ids);
+        return rc == 0 ? 0 : 1;
+    }
+
     if (nprompt >= 0) {
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, &tim, err, sizeof(err));
     }
