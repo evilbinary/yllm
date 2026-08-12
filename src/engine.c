@@ -118,7 +118,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     uint32_t vocab = m->h.vocab;
     e->kv_dim = kv_dim;
     e->max_seq = m->h.max_seq;
-    e->kv = (uint16_t*)ycalloc((size_t)m->h.n_blocks * e->max_seq * kv_dim, 2);
+    e->kv = (uint16_t*)ycalloc((size_t)(2 * m->h.n_blocks + 1) * e->max_seq * kv_dim, 2);
     e->x = (float*)ycalloc(hidden, 4);
     e->hb = (float*)ycalloc(hidden, 4 * 9);
     e->hb2 = (float*)ycalloc(hidden, 4 * 9);
@@ -171,10 +171,10 @@ static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m)
 {
     if (j < 4) {
         *d = q[j] & 63;
-        *m = q[j + 4] & 63;
+        *m = q[j + 8] & 63;
     } else {
-        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        *d = (q[j + 4] >> 6) | ((q[j] >> 4) << 2);
+        *m = (q[j + 12] >> 6) | ((q[j + 8] >> 4) << 2);
     }
 }
 
@@ -190,7 +190,28 @@ static float q6k_val(const uint8_t* blk, uint32_t e)
     uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
     int8_t q = (int8_t)bits - 32;
     int8_t s = ((const int8_t*)(blk + 192))[half * 8 + quad * 2 + (ll >> 4)];
-    return d * (float)s * (float)q;
+    return d * ((float)s + 32.0f) * (float)q;
+}
+
+static const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+static void iq4xs_block(float* y, const uint8_t* blk, float d)
+{
+    const uint8_t* qs = blk + 2;
+    const uint8_t* sc_h = blk + 130;
+    const uint8_t* sc_l = blk + 134;
+    uint32_t ib;
+    for (ib = 0; ib < 8; ib++) {
+        int ls = ((sc_l[ib / 2] >> 4 * (ib % 2)) & 0xF) | (((sc_h[ib / 2] >> 2 * (ib % 2)) & 3) << 4);
+        float dl = d * (float)(ls - 32);
+        uint32_t j;
+        for (j = 0; j < 16; j++) {
+            y[ib * 32 + j] = dl * (float)kvalues_iq4nl[qs[ib * 16 + j] & 0xF];
+            y[ib * 32 + j + 16] = dl * (float)kvalues_iq4nl[qs[ib * 16 + j] >> 4];
+        }
+    }
 }
 
 static void embed_q4k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
@@ -278,6 +299,38 @@ static void matmul_f16(float* y, const float* x, const uint8_t* w, uint32_t out,
     }
 }
 
+static void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    uint32_t nb = in / 256;
+    uint32_t rowb = nb * 144;
+    float tmp[256];
+    uint32_t oo;
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            float d = f16_to_f32(((const uint16_t*)row)[0]);
+            iq4xs_block(tmp, row + (size_t)b * 144, d);
+            const float* xb = x + (size_t)b * 256;
+            uint32_t e;
+            for (e = 0; e < 256; e++) acc += xb[e] * tmp[e];
+        }
+        y[oo] = acc;
+    }
+}
+
+static void embed_iq4xs(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    const uint8_t* r = w + (size_t)row * nb * 144;
+    uint32_t b;
+    for (b = 0; b < nb; b++) {
+        float d = f16_to_f32(((const uint16_t*)r)[0]);
+        iq4xs_block(y + (size_t)b * 256, r + (size_t)b * 144, d);
+    }
+}
+
 static void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out)
 {
     const float* wp = (const float*)w;
@@ -362,6 +415,7 @@ static void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uin
     case DT_F32: matmul_f32(y, x, w, out, in); break;
     case DT_Q4K: matmul_q4k(y, x, w, out, in); break;
     case DT_Q6K: matmul_q6k(y, x, w, out, in); break;
+    case DT_IQ4XS: matmul_iq4xs(y, x, w, out, in); break;
     default: matmul_f16(y, x, w, out, in); break;
     }
 }
@@ -449,7 +503,7 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
     matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
 
     uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
-    uint16_t* vcache = kcache + (size_t)e->max_seq * kv_dim;
+    uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t j;
     for (j = 0; j < kv_dim; j++) {
@@ -513,6 +567,7 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
             case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
             case DT_Q4K: embed_q4k(e->x, base + tm->offset, token, h->hidden); break;
             case DT_Q6K: embed_q6k(e->x, base + tm->offset, token, h->hidden); break;
+            case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
             default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
             }
         } else if (i <= h->n_blocks) {
@@ -531,6 +586,7 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
                 case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
                 case DT_Q4K: matmul_q4k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
                 case DT_Q6K: matmul_q6k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+                case DT_IQ4XS: matmul_iq4xs(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
                 default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
                 }
             }
@@ -615,6 +671,15 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
     uint64_t rng = ysrand(seed);
     uint32_t pos = 0;
     int i;
+    {
+        int bi = 0;
+        uint32_t bj;
+        for (bj = 1; bj < e->ws.model.h.vocab; bj++) if (e->logits[bj] > e->logits[bi]) bi = (int)bj;
+        printf("DEBUG logits[0..5]=%.3g %.3g %.3g %.3g %.3g %.3g argmax=%d=%.3g finite=%d\n",
+            (double)e->logits[0], (double)e->logits[1], (double)e->logits[2], (double)e->logits[3],
+            (double)e->logits[4], (double)e->logits[5], bi, (double)e->logits[bi],
+            (int)(e->logits[0] == e->logits[0]));
+    }
     for (i = 0; i < nprompt; i++) {
         if (pos >= e->max_seq) {
             if (err) snprintf(err, errlen, "prompt too long");

@@ -16,6 +16,7 @@
 #define DT_BF16 2
 #define DT_Q4K 3
 #define DT_Q6K 4
+#define DT_IQ4XS 5
 
 #define ARCH_LLAMA 0
 #define ARCH_QWEN 1

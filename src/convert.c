@@ -8,9 +8,15 @@ uint64_t align_up(uint64_t v, uint64_t a)
     return (v + a - 1) & ~(a - 1);
 }
 
+#if defined(_WIN32)
+#define YFSEEK(f, off) _fseeki64((f), (__int64)(off), SEEK_SET)
+#else
+#define YFSEEK(f, off) fseeko((f), (off_t)(off), SEEK_SET)
+#endif
+
 static void write_at(FILE* f, uint64_t off, const void* data, size_t n)
 {
-    if (fseeko(f, (off_t)off, SEEK_SET) != 0) { fprintf(stderr, "seek failed\n"); exit(1); }
+    if (YFSEEK(f, off) != 0) { fprintf(stderr, "seek failed: offset=%llu\n", (unsigned long long)off); exit(1); }
     if (fwrite(data, 1, n, f) != n) { fprintf(stderr, "write failed\n"); exit(1); }
 }
 
@@ -50,7 +56,7 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
     LlfTensorMeta* metas = (LlfTensorMeta*)ycalloc((size_t)n_layers * BLOCK_TENSORS, LLF_TENSOR_META_SIZE);
     LlfLayerDir* dir = (LlfLayerDir*)ycalloc(n_layers, LLF_DIR_ENTRY_SIZE);
     uint64_t dir_size = (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE;
-    uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size, LLF_ALIGN);
+    uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size + (uint64_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE, LLF_ALIGN);
 
     for (i = 0; i < n; i++) {
         uint32_t li = items[i].layer;
@@ -175,7 +181,7 @@ int convert_dummy(const char* out_path, uint32_t blocks, uint32_t hidden, uint32
 
     uint32_t n_layers = blocks + 3;
     uint64_t dir_size = (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE;
-    uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size, LLF_ALIGN);
+    uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size + (uint64_t)n_layers * 9 * LLF_TENSOR_META_SIZE, LLF_ALIGN);
     LlfLayerDir* dir = (LlfLayerDir*)ycalloc(n_layers, LLF_DIR_ENTRY_SIZE);
     LlfTensorMeta* metas = (LlfTensorMeta*)ycalloc((size_t)n_layers * 9, LLF_TENSOR_META_SIZE);
 
@@ -198,7 +204,7 @@ int convert_dummy(const char* out_path, uint32_t blocks, uint32_t hidden, uint32
         uint32_t r0;
         if (li == 0) { nt = 1; r0 = 0; }
         else if (li == blocks + 1) { nt = 1; r0 = 5; }
-        else if (li == blocks + 2) { nt = 1; r0 = 1; }
+        else if (li == blocks + 2) { nt = 1; r0 = 0; }
         else { nt = 9; r0 = 0; }
         dir[li].offset = cursor;
         dir[li].n_tensors = nt;
@@ -207,7 +213,7 @@ int convert_dummy(const char* out_path, uint32_t blocks, uint32_t hidden, uint32
             uint32_t idx = (li == 0 || li == blocks + 1 || li == blocks + 2) ? r0 : s2;
             LlfTensorMeta* tm = &metas[(size_t)li * 9 + s2];
             memset(tm, 0, sizeof(*tm));
-            snprintf(tm->name, sizeof(tm->name), "%s", nm[idx]);
+            snprintf(tm->name, sizeof(tm->name), "%s", li == blocks + 2 ? "output" : nm[idx]);
             tm->dtype = DT_F16;
             tm->ndim = 2;
             tm->shape[0] = sh[idx][0];

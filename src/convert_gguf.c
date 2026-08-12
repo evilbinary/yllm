@@ -191,28 +191,86 @@ static void gg_add(GGList* l, GGTensor* v)
     l->t[l->n++] = *v;
 }
 
-/* ggml type -> (llf dtype, nbytes) for supported types */
-static int gg_type_info(uint32_t gtype, uint64_t nelem, uint32_t* dt, uint64_t* nbytes)
+/* probe per-type byte layout from actual tensor sizes; map[gtype] -> llf dtype,
+   or 255 for unsupported.  Some quantizers emit non-standard ggml type ids,
+   so the fixed enum cannot be trusted. */
+static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start, uint64_t fsize, uint8_t map[256])
 {
-    switch (gtype) {
-    case 0:
-        if (dt) *dt = DT_F32;
-        if (nbytes) *nbytes = nelem * 4;
-        return 0;
-    case 1:
-        if (dt) *dt = DT_F16;
-        if (nbytes) *nbytes = nelem * 2;
-        return 0;
-    case 10:
-        if (dt) *dt = DT_Q4K;
-        if (nbytes) *nbytes = nelem / 256 * 144;
-        return 0;
-    case 12:
-        if (dt) *dt = DT_Q6K;
-        if (nbytes) *nbytes = nelem / 256 * 210;
-        return 0;
-    default:
-        return -1;
+    static const struct { uint64_t nb; uint32_t dt; } cand[] = {
+        { 210, DT_Q6K },
+        { 144, DT_Q4K },
+        { 144, DT_IQ4XS },
+        { 66, 0 },
+        { 176, 0 },
+        { 80, 0 },
+        { 110, 0 },
+        { 36, 0 },
+    };
+    size_t i;
+    unsigned* idx = (unsigned*)ymalloc((size_t)l->n * sizeof(unsigned));
+    for (i = 0; i < (size_t)l->n; i++) idx[i] = (unsigned)i;
+    /* sort by offset to measure each tensor's real size */
+    size_t a, b2;
+    for (a = 1; a < (size_t)l->n; a++) {
+        unsigned k = idx[a];
+        for (b2 = a; b2 > 0 && l->t[idx[b2 - 1]].offset > l->t[k].offset; b2--) idx[b2] = idx[b2 - 1];
+        idx[b2] = k;
+    }
+    for (i = 0; i < (size_t)l->n; i++) {
+        GGTensor* t = &l->t[idx[i]];
+        t->nbytes = i + 1 < (size_t)l->n
+                        ? l->t[idx[i + 1]].offset - t->offset
+                        : fsize - (data_start + t->offset);
+        if (i + 1 >= (size_t)l->n && t->nbytes > (uint64_t)0 - data_start) t->nbytes = 0;
+    }
+    free(idx);
+    for (a = 0; a < 256; a++) map[a] = 255;
+    map[0] = DT_F32;
+    map[1] = DT_F16;
+    for (a = 2; a < 256; a++) {
+        int seen = 0;
+        size_t c;
+        for (c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
+            if (cand[c].dt == 0) continue;
+            int ok = 1;
+            for (i = 0; i < (size_t)l->n; i++) {
+                const GGTensor* t = &l->t[i];
+                if (t->gtype != a) continue;
+                seen = 1;
+                uint64_t nelem = 1;
+                uint32_t d;
+                for (d = 0; d < t->ndims; d++) nelem *= t->dims[d];
+                if (nelem == 0 || nelem % 256 != 0 || t->nbytes != nelem / 256 * cand[c].nb) { ok = 0; break; }
+            }
+            if (ok && seen) {
+                map[a] = (uint8_t)cand[c].dt;
+                if (cand[c].nb == 144) {
+                    /* 144 B/block matches both Q4_K and IQ4_XS: inspect content.
+                       Q4_K has fp16 dmin at bytes 2..3 (should be a sane small
+                       value); IQ4_XS starts quants right after d. */
+                    const GGTensor* t0 = NULL;
+                    for (i = 0; i < (size_t)l->n; i++) { if (l->t[i].gtype == a) { t0 = &l->t[i]; break; } }
+                    if (t0) {
+                        uint16_t u16;
+                        memcpy(&u16, dptr + data_start + t0->offset, 2);
+                        float dmin = f16_to_f32(u16);
+                        if (dmin < -0.5f || dmin > 0.5f) map[a] = DT_IQ4XS;
+                    }
+                }
+                break;
+            }
+        }
+        if (seen && map[a] == 255) {
+            const GGTensor* t0 = NULL;
+            for (i = 0; i < (size_t)l->n; i++) { if (l->t[i].gtype == a) { t0 = &l->t[i]; break; } }
+            if (t0 && t0->nbytes) {
+                uint64_t nelem = 1;
+                uint32_t d;
+                for (d = 0; d < t0->ndims; d++) nelem *= t0->dims[d];
+                printf("gguf: unsupported quant type %u (%.2f bytes per 256 elems)\n",
+                    (unsigned)a, (double)t0->nbytes / (double)(nelem / 256));
+            }
+        }
     }
 }
 
@@ -325,13 +383,6 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         }
         t.gtype = gb_u32(&b);
         t.offset = gb_u64(&b);
-        {
-            uint32_t dt;
-            if (gg_type_info(t.gtype, nelem, &dt, &t.nbytes) != 0) {
-                free(t.name);
-                continue;
-            }
-        }
         gg_add(&list, &t);
     }
     if (b.err) {
@@ -351,6 +402,33 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
 
+    uint8_t type_map[256];
+    gg_probe_layout(&list, data, data_start, fsize, type_map);
+    {
+        /* compute nbytes and drop unsupported tensors */
+        GGList keep;
+        memset(&keep, 0, sizeof(keep));
+        for (i = 0; i < (uint64_t)list.n; i++) {
+            const GGTensor* t = &list.t[i];
+            uint64_t nelem = 1;
+            uint32_t d;
+            for (d = 0; d < t->ndims; d++) nelem *= t->dims[d];
+            uint32_t dt = type_map[t->gtype];
+            if (dt == 255) { free(t->name); continue; }
+            GGTensor c;
+            c = *t;
+            if (dt == DT_F32) c.nbytes = nelem * 4;
+            else if (dt == DT_F16) c.nbytes = nelem * 2;
+            else {
+                uint64_t nb = (dt == DT_Q6K) ? 210 : 144;
+                c.nbytes = nelem / 256 * nb;
+            }
+            gg_add(&keep, &c);
+        }
+        free(list.t);
+        list = keep;
+    }
+
     ConvItem* items = (ConvItem*)ymalloc((size_t)list.n * sizeof(ConvItem));
     int n = 0;
     for (i = 0; i < (uint64_t)list.n; i++) {
@@ -359,10 +437,10 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         if (slot == SP_EMBED) { items[n].layer = 0; items[n].slot = 0; }
         else if (slot == SP_FINALNORM) { items[n].layer = g.n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
-        else if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN) { items[n].layer = (uint32_t)layer; items[n].slot = (uint32_t)slot; }
+        else if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else continue;
         const GGTensor* t = &list.t[i];
-        gg_type_info(t->gtype, 0, &items[n].dtype, NULL);
+        items[n].dtype = type_map[t->gtype];
         items[n].ndim = t->ndims;
         uint32_t d;
         for (d = 0; d < t->ndims; d++) items[n].shape[d] = (uint32_t)t->dims[d];

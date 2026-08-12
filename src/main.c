@@ -53,7 +53,7 @@ static int cmd_convert(int argc, char** argv)
     uint32_t hidden = (uint32_t)atoi(opt(a, n, "hidden", "64"));
     uint32_t heads = (uint32_t)atoi(opt(a, n, "heads", "4"));
     uint32_t kv_heads = (uint32_t)atoi(opt(a, n, "kv-heads", "2"));
-    uint32_t vocab = (uint32_t)atoi(opt(a, n, "vocab", "1024"));
+    uint32_t vocab = (uint32_t)atoi(opt(a, n, "vocab-size", "1024"));
     uint32_t seed = (uint32_t)atoi(opt(a, n, "seed", "42"));
     char err[1024];
 
@@ -101,7 +101,7 @@ static int cmd_convert(int argc, char** argv)
     }
     fprintf(stderr, "usage: yllm convert --safetensors <file> --out <file.llf> [--seq 2048]\n");
     fprintf(stderr, "   or: yllm convert --gguf <file.gguf> --out <file.llf> [--vocab <file.txt>] [--seq 2048]\n");
-    fprintf(stderr, "   or: yllm convert --out <file.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab V --seq S --seed N] [--vocab <file.txt>]\n");
+    fprintf(stderr, "   or: yllm convert --out <file.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab-size V --seq S --seed N] [--vocab <file.txt>]\n");
     return 1;
 }
 

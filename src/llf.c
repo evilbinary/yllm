@@ -3,13 +3,6 @@
 #include <string.h>
 #include <stdio.h>
 
-static uint32_t rd_u32(const void* p)
-{
-    uint32_t v;
-    memcpy(&v, p, 4);
-    return v;
-}
-
 const char* llf_dtype_name(uint32_t dtype)
 {
     switch (dtype) {
@@ -18,6 +11,7 @@ const char* llf_dtype_name(uint32_t dtype)
     case DT_BF16: return "bf16";
     case DT_Q4K: return "q4_k";
     case DT_Q6K: return "q6_k";
+    case DT_IQ4XS: return "iq4_xs";
     default: return "?";
     }
 }
@@ -36,11 +30,9 @@ int llf_read(const WMap* map, LlModel* out)
     out->n_layers = n_layers;
     out->dir = (LlfLayerDir*)((uint8_t*)map->base + dir_off);
     out->base_idx = (uint32_t*)ymalloc((size_t)n_layers * 4);
-    uint32_t total = 0;
     uint32_t i;
     for (i = 0; i < n_layers; i++) {
-        out->base_idx[i] = total;
-        total += rd_u32(&out->dir[i].n_tensors);
+        out->base_idx[i] = i * BLOCK_TENSORS;
     }
     out->metas = (LlfTensorMeta*)((uint8_t*)map->base + dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE);
     uint32_t j;

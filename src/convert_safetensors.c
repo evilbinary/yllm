@@ -284,7 +284,7 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
     for (i = 0; i < list.n; i++) {
         int layer;
         int slot = st_slot_for(list.t[i].name, &layer);
-        if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN && layer > (int)n_blocks) n_blocks = (uint32_t)layer;
+        if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN && layer + 1 > (int)n_blocks) n_blocks = (uint32_t)layer + 1;
     }
     if (n_blocks == 0) { free(data); snprintf(err, errlen, "no transformer blocks found"); return -1; }
 
@@ -324,7 +324,7 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
         if (slot == SP_EMBED) { items[n].layer = 0; items[n].slot = 0; }
         else if (slot == SP_FINALNORM) { items[n].layer = n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = n_blocks + 2; items[n].slot = 0; }
-        else if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN) { items[n].layer = (uint32_t)layer; items[n].slot = (uint32_t)slot; }
+        else if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else continue;
         const STTensor* t = &list.t[i];
         items[n].dtype = DT_F16;
