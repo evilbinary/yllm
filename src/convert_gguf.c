@@ -521,7 +521,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         }
     }
     {
-        /* compute nbytes and drop unsupported tensors */
+        /* compute nbytes and drop unsupported tensors; validate data bounds */
         GGList keep;
         memset(&keep, 0, sizeof(keep));
         for (i = 0; i < (uint64_t)list.n; i++) {
@@ -538,6 +538,16 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             else {
                 uint64_t nb = (dt == DT_Q6K) ? 210 : 144;
                 c.nbytes = nelem / 256 * nb;
+            }
+            /* reject truncated/corrupt file: tensor data must fit inside the file */
+            if (c.offset > fsize - data_start || c.nbytes > fsize - data_start - c.offset) {
+                for (int k = 0; k < keep.n; k++) free(keep.t[k].name);
+                free(keep.t);
+                while (i < (uint64_t)list.n) free(list.t[i++].name);
+                free(list.t);
+                free(data);
+                snprintf(err, errlen, "gguf tensor '%s' data out of range (truncated file?)", t->name);
+                return -1;
             }
             gg_add(&keep, &c);
         }

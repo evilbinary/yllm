@@ -331,6 +331,15 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
         items[n].ndim = t->ndim;
         memcpy(items[n].shape, t->shape, sizeof(items[n].shape));
         items[n].nbytes = (uint64_t)t->shape[0] * (t->ndim > 1 ? t->shape[1] : 1) * 2;
+        /* reject truncated/corrupt file: tensor data must fit inside the file */
+        {
+            uint64_t soff = (uint64_t)8 + list.hlen + t->data_off;
+            if (soff > fsize || items[n].nbytes > fsize - soff) {
+                free(stmap); free(items); free(data);
+                snprintf(err, errlen, "safetensors tensor '%s' data out of range (truncated file?)", t->name);
+                return -1;
+            }
+        }
         snprintf(items[n].name, sizeof(items[n].name), "%s", t->name);
         items[n].src = data + 8 + list.hlen + t->data_off;
         items[n].src_off = 0;
