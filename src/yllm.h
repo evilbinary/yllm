@@ -11,9 +11,12 @@ typedef struct {
     LlModel model;
     uint8_t* pstate;
     uint8_t* hot;
+    uint8_t* res;           /* mincore 真实驻留位图: 1=该层页缓存已驻留 */
     uint64_t* layer_size;
-    uint64_t budget;
-    uint64_t resident;
+    uint64_t budget;        /* 字节预算(0=不限) */
+    uint64_t resident;      /* 当前估算驻留字节 */
+    uint32_t budget_layers; /* 自适应层数预算(内存受限模式) */
+    long last_majflt;       /* 上次 getrusage majflt(缺页反馈) */
     int depth;
     void* worker;
     void* worker_th;
@@ -50,6 +53,7 @@ int wmap_open(const char* path, WMap* m);
 void wmap_close(WMap* m);
 void ws_prefetch(const Ws* ws, uint32_t layer);
 void ws_release(const Ws* ws, uint32_t layer);
+int wmap_resident(const WMap* m, uint64_t off, uint64_t sz);
 const void* ws_layer_ptr(const Ws* ws, uint32_t layer);
 
 float f16_to_f32(uint16_t h);

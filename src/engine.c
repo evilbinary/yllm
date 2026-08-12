@@ -4,6 +4,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 typedef struct {
     Ws* ws;
     uint32_t next;
@@ -74,9 +78,51 @@ static void sched_enqueue(Worker* w, uint32_t begin, uint32_t end)
 static void sched_ensure(Ws* ws, uint32_t layer)
 {
     if (ws->pstate[layer] != 0) return;
+    if (ws->budget > 0 && ws->res[layer] == 1) {
+        /* 页缓存已真实驻留 → 跳过预取 syscall(自适应跳过) */
+        ws->pstate[layer] = 2;
+        return;
+    }
     ws_prefetch(ws, layer);
     ws->pstate[layer] = 2;
     ws->resident += ws->layer_size[layer];
+}
+
+/* 用 mincore 刷新每层真实驻留位图,并重算驻留字节(内存受限模式才调用) */
+static void sched_refresh_resident(Ws* ws)
+{
+    uint32_t i;
+    uint64_t tot = 0;
+    for (i = 0; i < ws->model.n_layers; i++) {
+        int r = wmap_resident(&ws->map, ws->model.dir[i].offset, ws->model.dir[i].size);
+        if (r == 1) { ws->res[i] = 1; tot += ws->layer_size[i]; }
+        else if (r == 0) { ws->res[i] = 0; }
+    }
+    ws->resident = tot;
+}
+
+/* 预算自适应(§3.6): 缺页太多且内存富余 → 多驻留一层; 内存告急 → 缩驻留 */
+static void sched_adapt_budget(Ws* ws)
+{
+#ifndef _WIN32
+    if (ws->budget == 0) return;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return;
+    long pf = ru.ru_majflt;
+    long delta = pf - ws->last_majflt;
+    ws->last_majflt = pf;
+    long avph = sysconf(_SC_AVPHYS_PAGES);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    uint64_t mem_free = (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
+    uint64_t cap = ws->budget;
+    if (delta > 0 && mem_free > cap + cap / 2) {
+        if (ws->budget_layers < ws->model.n_layers) ws->budget_layers++;
+    } else if (mem_free < cap) {
+        if (ws->budget_layers > 1) ws->budget_layers--;
+    }
+#else
+    (void)ws;
+#endif
 }
 
 static void sched_release_budget(Ws* ws, uint32_t cur)
@@ -84,12 +130,18 @@ static void sched_release_budget(Ws* ws, uint32_t cur)
     if (ws->budget == 0) return;
     uint32_t i;
     for (;;) {
-        if (ws->resident <= ws->budget) return;
+        uint32_t n = 0;
+        uint64_t bytes = 0;
+        for (i = 0; i < ws->model.n_layers; i++) {
+            if (ws->pstate[i] == 2) { n++; bytes += ws->layer_size[i]; }
+        }
+        if (n <= ws->budget_layers && bytes <= ws->budget) return;
         int found = 0;
         for (i = 0; i < cur; i++) {
             if (ws->pstate[i] == 2 && !ws->hot[i]) {
                 ws_release(ws, i);
                 ws->pstate[i] = 3;
+                ws->res[i] = 0;
                 ws->resident -= ws->layer_size[i];
                 found = 1;
                 break;
@@ -117,12 +169,25 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     ws->depth = depth > 0 ? depth : 2;
     ws->pstate = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->hot = (uint8_t*)ycalloc(m->n_layers, 1);
+    ws->res = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->layer_size = (uint64_t*)ymalloc((size_t)m->n_layers * 8);
     uint32_t i;
     for (i = 0; i < m->n_layers; i++) {
         ws->layer_size[i] = m->dir[i].size;
         if (i == 0 || i == m->h.n_blocks + 1 || i == m->h.n_blocks + 2) ws->hot[i] = 1;
     }
+    /* 自适应层预算初值: 由字节预算按平均层大小折算 */
+    ws->budget_layers = m->n_layers;
+    if (budget > 0) {
+        uint64_t avg = 0;
+        for (i = 0; i < m->n_layers; i++) avg += ws->layer_size[i];
+        avg = m->n_layers ? avg / m->n_layers : 0;
+        uint32_t bl = avg ? (uint32_t)(budget / avg) : 1;
+        if (bl < 1) bl = 1;
+        if (bl > m->n_layers) bl = m->n_layers;
+        ws->budget_layers = bl;
+    }
+    ws->last_majflt = 0;
 
     uint32_t hidden = m->h.hidden;
     uint32_t kv_dim = m->h.n_kv_heads * m->h.head_dim;
@@ -175,6 +240,7 @@ void engine_free(Engine* e)
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
     if (e->ws.hot) free(e->ws.hot);
+    if (e->ws.res) free(e->ws.res);
     if (e->ws.layer_size) free(e->ws.layer_size);
     free(w);
     memset(e, 0, sizeof(*e));
@@ -269,6 +335,10 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
     Worker* w = (Worker*)ws->worker;
     const LlfHeader* h = &m->h;
     uint32_t i;
+    if (ws->budget > 0) {
+        sched_refresh_resident(ws);
+        sched_adapt_budget(ws);
+    }
     for (i = 0; i < m->n_layers; i++) {
         sched_ensure(ws, i);
         const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;

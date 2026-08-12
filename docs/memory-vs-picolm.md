@@ -47,6 +47,16 @@ engine.c, per forward:
 With `--budget-mb 200`, yllm keeps only ~200 MB of model pages resident and
 re-faults layers from disk on demand. picolm would keep all 667 MB resident.
 
+## Residency tracking and adaptive budget (v2)
+
+- **真实驻留位图**: 每个 token 用 `mincore()` 实测每层页缓存驻留状态(`ws.res[]`),
+  取代"预取即驻留"的乐观记账。实测值与 `resident estimate` 输出一致。
+- **自适应跳过**: 已实测驻留的层不再发 `madvise(WILLNEED)`(decode 稳态零预取 syscall)。
+- **预算自适应**: 层数预算由字节预算折算,并按反馈浮动——本 token 发生缺页且
+  系统空闲内存富余 → 多驻留一层;空闲内存告急 → 主动缩驻留。
+- **回收下限**: `embed` / `final norm` / `lm_head` 为 hot 层恒驻留(豁免回收);
+  因此驻留无法低于 hot 层之和(本模型 ~74MB),`--budget-mb 50` 时实测驻留 ~86MB。
+
 ## Key takeaway
 
 For memory-constrained devices the benefit is **control**: yllm can trade

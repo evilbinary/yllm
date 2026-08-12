@@ -236,6 +236,29 @@ const void* ws_layer_ptr(const Ws* ws, uint32_t layer)
     return (const uint8_t*)ws->map.base + ws->model.dir[layer].offset;
 }
 
+/* 查询 [off, off+sz) 是否完全驻留在页缓存: 1=完全驻留, 0=未完全, -1=平台不支持 */
+int wmap_resident(const WMap* m, uint64_t off, uint64_t sz)
+{
+#ifdef __linux__
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    size_t nvec = (size_t)((sz + (uint64_t)pg - 1) / (uint64_t)pg);
+    if (nvec == 0) return 1;
+    unsigned char* vec = (unsigned char*)ymalloc(nvec);
+    if (mincore((char*)m->base + off, (size_t)sz, vec) != 0) { free(vec); return -1; }
+    int all = 1;
+    size_t i;
+    for (i = 0; i < nvec; i++) {
+        if (!(vec[i] & 1)) { all = 0; break; }
+    }
+    free(vec);
+    return all;
+#else
+    (void)m; (void)off; (void)sz;
+    return -1;
+#endif
+}
+
 float f16_to_f32(uint16_t h)
 {
     uint32_t s = (uint32_t)(h & 0x8000) << 16;
