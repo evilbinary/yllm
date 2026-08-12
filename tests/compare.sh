@@ -11,6 +11,8 @@
 #
 # 说明:
 #   - yllm 与 picolm 均取"纯 decode" tok/s
+#   - picolm 标量版必须显式 `make picolm` 构建(裸 `make` 会走 native=-march=native,
+#     变成 AVX2 版);AVX2 版用 `make native-avx2`
 #   - 每个配置先跑一次 warm-up 再计时
 
 set -u

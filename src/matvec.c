@@ -290,20 +290,29 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             float d = f16_to_f32(((const uint16_t*)blk)[0]);
             float min = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* qs = blk + 16;
-            uint32_t g;
-            for (g = 0; g < 8; g++) {
+            /* 4 个独立累加器,同字节同时解出低/高 nibble,消除分支并给足 ILP */
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            uint32_t g, e;
+            for (g = 0; g < 8; g += 4) {
                 uint8_t sc, m;
-                gsm_k4((int)g, blk + 4, &sc, &m);
-                float d1 = d * (float)sc;
-                float m1 = min * (float)m;
-                const uint8_t* q = qs + (g >> 1) * 32;
-                uint32_t e;
+                float dg[4], mg[4];
+                uint32_t gg;
+                for (gg = 0; gg < 4; gg++) {
+                    gsm_k4((int)(g + gg), blk + 4, &sc, &m);
+                    dg[gg] = d * (float)sc;
+                    mg[gg] = min * (float)m;
+                }
+                const uint8_t* qa = qs + (g >> 1) * 32;
+                const uint8_t* qb = qa + 32;
                 for (e = 0; e < 32; e++) {
-                    uint8_t nib = q[e];
-                    nib = (g & 1) ? (nib >> 4) : (nib & 0xF);
-                    acc += xb[(size_t)g * 32 + e] * (d1 * (float)nib - m1);
+                    uint8_t ba = qa[e], bb = qb[e];
+                    a0 += xb[g * 32 + e]       * (dg[0] * (float)(ba & 0xF) - mg[0]);
+                    a1 += xb[g * 32 + e + 32]  * (dg[1] * (float)(ba >> 4) - mg[1]);
+                    a2 += xb[g * 32 + e + 64]  * (dg[2] * (float)(bb & 0xF) - mg[2]);
+                    a3 += xb[g * 32 + e + 96]  * (dg[3] * (float)(bb >> 4) - mg[3]);
                 }
             }
+            acc += a0 + a1 + a2 + a3;
         }
         y[oo] = acc;
     }
@@ -387,19 +396,31 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             const uint8_t* blk = row + (size_t)b * 210;
             const float* xb = x + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[104]);
+            /* 4 个独立累加器,避免单条 FMA 依赖链 */
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
             uint32_t e;
-            for (e = 0; e < 256; e++) {
-                uint32_t half = e >> 7;
-                uint32_t k = e & 0x7f;
-                uint32_t quad = k >> 5;
-                uint32_t ll = k & 31;
-                uint8_t ql = blk[half * 64 + (quad & 1) * 32 + ll];
-                uint8_t qh = blk[128 + half * 32 + ll];
-                uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
-                int8_t q = (int8_t)bits - 32;
-                int8_t s = ((const int8_t*)(blk + 192))[half * 8 + quad * 2 + (ll >> 4)];
-                acc += xb[e] * d * (float)s * (float)q;
+            for (e = 0; e < 256; e += 4) {
+                float v[4];
+                uint32_t j;
+                for (j = 0; j < 4; j++) {
+                    uint32_t idx = e + j;
+                    uint32_t half = idx >> 7;
+                    uint32_t k = idx & 0x7f;
+                    uint32_t quad = k >> 5;
+                    uint32_t ll = k & 31;
+                    uint8_t ql = blk[half * 64 + (quad & 1) * 32 + ll];
+                    uint8_t qh = blk[128 + half * 32 + ll];
+                    uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
+                    int8_t q = (int8_t)bits - 32;
+                    int8_t s = ((const int8_t*)(blk + 192))[half * 8 + quad * 2 + (ll >> 4)];
+                    v[j] = d * (float)s * (float)q;
+                }
+                a0 += xb[e] * v[0];
+                a1 += xb[e + 1] * v[1];
+                a2 += xb[e + 2] * v[2];
+                a3 += xb[e + 3] * v[3];
             }
+            acc += a0 + a1 + a2 + a3;
         }
         y[oo] = acc;
     }
