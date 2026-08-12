@@ -142,23 +142,28 @@ MODEL_GGUF  ?= tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 MODEL_LLF   ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
 MODEL_VOCAB ?= test/tinyllama.vocab.txt
 CHAT_PROMPT ?= "Once upon a time"
-CHAT_TOKENS ?= 32
+CHAT_TOKENS ?= 30
+
+# 推理线程数(OpenMP)。默认使用本机全部核心, 可用 NTHREADS=N 覆盖。
+NTHREADS ?= $(shell nproc 2>/dev/null || echo 4)
+RUN = OMP_NUM_THREADS=$(NTHREADS) $(BIN)
+RUN_AVX2 = OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2)
 
 $(MODEL_LLF): $(MODEL_GGUF) $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(MODEL_GGUF) --out $(MODEL_LLF) --vocab $(MODEL_VOCAB) --seq 2048
 
 chat: $(BIN) $(MODEL_LLF)
-	$(BIN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 gen: $(BIN) $(MODEL_LLF)
-	$(BIN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
-	$(BIN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
-	$(BIN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
