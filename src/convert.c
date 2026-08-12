@@ -63,6 +63,7 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         uint32_t li = items[i].layer;
         uint32_t slot = items[i].slot;
         if (li != last_li) {
+            cursor = align_up(cursor, LLF_ALIGN);
             dir[li].offset = cursor;
             last_li = li;
         }
