@@ -165,6 +165,14 @@ chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
 gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+# ---- 模型文件 dump 工具(LLF / GGUF / Safetensors) ----
+DUMP_BIN := $(OBJDIR)/llfdump
+
+$(DUMP_BIN): src/dump.c src/llf.c src/platform.c src/llf.h src/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+
+dump: $(DUMP_BIN)
+
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
@@ -174,4 +182,4 @@ $(OBJDIR_AVX2):
 clean:
 	rm -rf build
 
-.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2
+.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump
