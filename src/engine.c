@@ -369,13 +369,17 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
     return 0;
 }
 
+/* 返回 0 成功;-1 失败。timings 非空时填充 prefill/decode 分别的耗时与 token 数 */
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
-                    void (*on_token)(uint32_t id, void* ctx), void* ctx, char* err, size_t errlen)
+                    void (*on_token)(uint32_t id, void* ctx), void* ctx,
+                    EngineTimings* timings, char* err, size_t errlen)
 {
     uint64_t rng = ysrand(seed);
     uint32_t pos = 0;
     int i;
+    uint64_t t0 = 0, t1 = 0;
+    if (timings) { memset(timings, 0, sizeof(*timings)); t0 = ynow_ms(); }
     for (i = 0; i < nprompt; i++) {
         if (pos >= e->max_seq) {
             if (err) snprintf(err, errlen, "prompt too long");
@@ -384,6 +388,12 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         engine_forward(e, prompt[i], pos);
         pos++;
     }
+    if (timings) {
+        timings->n_prefill = nprompt > 0 ? (uint32_t)nprompt : 0;
+        t1 = ynow_ms();
+        timings->prefill_ms = t1 - t0;
+    }
+    uint32_t ngen = 0;
     for (i = 0; i < ntokens; i++) {
         if (pos >= e->max_seq) break;
         uint32_t nxt;
@@ -392,6 +402,11 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         if (eos_stop >= 0 && (int)nxt == eos_stop) break;
         engine_forward(e, nxt, pos);
         pos++;
+        ngen++;
+    }
+    if (timings) {
+        timings->n_decode = ngen;
+        timings->decode_ms = ynow_ms() - t1;
     }
     return 0;
 }

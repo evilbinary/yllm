@@ -94,13 +94,21 @@ typedef struct {
     uint64_t stat_faults;
 } Engine;
 
+typedef struct {
+    uint32_t n_prefill;
+    uint32_t n_decode;
+    uint64_t prefill_ms;
+    uint64_t decode_ms;
+} EngineTimings;
+
 int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, char* err, size_t errlen);
 void engine_free(Engine* e);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out);
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
-                    void (*on_token)(uint32_t id, void* ctx), void* ctx, char* err, size_t errlen);
+                    void (*on_token)(uint32_t id, void* ctx), void* ctx,
+                    EngineTimings* timings, char* err, size_t errlen);
 uint64_t engine_resident(const Engine* e);
 
 uint64_t ysrand(uint64_t seed);

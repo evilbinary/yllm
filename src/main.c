@@ -162,14 +162,21 @@ static int cmd_gen(int argc, char** argv)
     printf("prompt tokens: %d\n", nprompt);
     printf("\n");
     uint64_t t0 = ynow_ms();
+    EngineTimings tim;
+    memset(&tim, 0, sizeof(tim));
     int rc = 0;
-    if (nprompt > 0) {
-        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, err, sizeof(err));
+    if (nprompt >= 0) {
+        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
     printf("\n\n");
-    printf("generated %d tokens in %.2f s\n", ntokens, (double)ms / 1000.0);
-    if (ms > 0) printf("throughput: %.2f tok/s\n", (double)ntokens * 1000.0 / (double)ms);
+    printf("prefill: %u tokens in %.2f s (%.1f tok/s)\n", tim.n_prefill,
+           (double)tim.prefill_ms / 1000.0,
+           tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
+    printf("decode:  %u tokens in %.2f s (%.1f tok/s)\n", tim.n_decode,
+           (double)tim.decode_ms / 1000.0,
+           tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
+    printf("total:   %.2f s\n", (double)ms / 1000.0);
     printf("resident estimate: %.2f MB (budget: %s)\n",
            (double)engine_resident(&e) / 1048576.0,
            budget_mb > 0 ? "limited" : "unlimited");
@@ -242,14 +249,21 @@ static int cmd_chat(int argc, char** argv)
     printf("chat prompt tokens: %d (bos=%d)\n", nprompt, v.bos);
     printf("\n");
     uint64_t t0 = ynow_ms();
+    EngineTimings tim;
+    memset(&tim, 0, sizeof(tim));
     int rc = 0;
-    if (nprompt > 0) {
-        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, err, sizeof(err));
+    if (nprompt >= 0) {
+        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
     printf("\n\n");
-    printf("generated up to %d tokens in %.2f s\n", ntokens, (double)ms / 1000.0);
-    if (ms > 0) printf("throughput: %.2f tok/s\n", (double)ntokens * 1000.0 / (double)ms);
+    printf("prefill: %u tokens in %.2f s (%.1f tok/s)\n", tim.n_prefill,
+           (double)tim.prefill_ms / 1000.0,
+           tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
+    printf("decode:  %u tokens in %.2f s (%.1f tok/s)\n", tim.n_decode,
+           (double)tim.decode_ms / 1000.0,
+           tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
+    printf("total:   %.2f s\n", (double)ms / 1000.0);
     printf("resident estimate: %.2f MB (budget: %s)\n",
            (double)engine_resident(&e) / 1048576.0,
            budget_mb > 0 ? "limited" : "unlimited");
