@@ -190,11 +190,21 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
 
     const LlfTensorMeta* mt = &m->metas[hidx];
     uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
+    if (layer <= 1) printf("DBG L%u base=%p koff=%llu kbytes=%02x %02x %02x %02x %02x %02x\n", layer,
+        (const void*)base, (unsigned long long)mt[SLOT_K].offset,
+        base[mt[SLOT_K].offset + 0], base[mt[SLOT_K].offset + 1],
+        base[mt[SLOT_K].offset + 2], base[mt[SLOT_K].offset + 3],
+        base[mt[SLOT_K].offset + 4], base[mt[SLOT_K].offset + 5]);
 
     rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+    printf("DBG L%u norm x[0..2]=%g %g %g x2[0..2]=%g %g %g\n", layer,
+        (double)x[0], (double)x[1], (double)x[2],
+        (double)x2[0], (double)x2[1], (double)x2[2]);
     matmul(q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype);
     matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
     matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+    printf("DBG L%u q[0..2]=%g %g %g k[0]=%g v[0]=%g\n", layer,
+        (double)q[0], (double)q[1], (double)q[2], (double)k[0], (double)v[0]);
 
     uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
     uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
@@ -264,8 +274,8 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
             case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
             default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
             }
-            printf("DBG emb[%u] dt=%u x[0..3]=%g %g %g %g\n", token, tm->dtype,
-                (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+            printf("DBG fwd token=%u x[0..4]=%g %g %g %g %g\n", token,
+                (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3], (double)e->x[4]);
         } else if (i <= h->n_blocks) {
             forward_block(e, i, pos);
         } else if (i == h->n_blocks + 1) {
@@ -286,6 +296,10 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
                 default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
                 }
             }
+            printf("DBG logits[0..4]=%g %g %g %g %g argmax=%u\n",
+                (double)e->logits[0], (double)e->logits[1], (double)e->logits[2],
+                (double)e->logits[3], (double)e->logits[4],
+                (unsigned)engine_argmax(e->logits, h->vocab));
         }
         if (w) {
             uint32_t d = (uint32_t)ws->depth;
@@ -367,15 +381,6 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
     uint64_t rng = ysrand(seed);
     uint32_t pos = 0;
     int i;
-    {
-        int bi = 0;
-        uint32_t bj;
-        for (bj = 1; bj < e->ws.model.h.vocab; bj++) if (e->logits[bj] > e->logits[bi]) bi = (int)bj;
-        printf("DEBUG logits[0..5]=%.3g %.3g %.3g %.3g %.3g %.3g argmax=%d=%.3g finite=%d\n",
-            (double)e->logits[0], (double)e->logits[1], (double)e->logits[2], (double)e->logits[3],
-            (double)e->logits[4], (double)e->logits[5], bi, (double)e->logits[bi],
-            (int)(e->logits[0] == e->logits[0]));
-    }
     for (i = 0; i < nprompt; i++) {
         if (pos >= e->max_seq) {
             if (err) snprintf(err, errlen, "prompt too long");
@@ -398,4 +403,12 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
 uint64_t engine_resident(const Engine* e)
 {
     return e->ws.resident;
+}
+
+uint32_t engine_argmax(const float* logits, uint32_t n)
+{
+    uint32_t bi = 0;
+    uint32_t i;
+    for (i = 1; i < n; i++) if (logits[i] > logits[bi]) bi = i;
+    return bi;
 }

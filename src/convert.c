@@ -58,20 +58,23 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
     uint64_t dir_size = (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE;
     uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size + (uint64_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE, LLF_ALIGN);
 
+    uint32_t last_li = (uint32_t)-1;
     for (i = 0; i < n; i++) {
         uint32_t li = items[i].layer;
         uint32_t slot = items[i].slot;
+        if (li != last_li) {
+            dir[li].offset = cursor;
+            last_li = li;
+        }
         LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS + slot];
         memset(tm, 0, sizeof(*tm));
         snprintf(tm->name, sizeof(tm->name), "%s", items[i].name);
         tm->dtype = items[i].dtype;
         tm->ndim = items[i].ndim;
         memcpy(tm->shape, items[i].shape, sizeof(tm->shape));
-        if (per[li] == 0) dir[li].offset = cursor;
         tm->offset = cursor - dir[li].offset;
         tm->size = items[i].nbytes;
         cursor += items[i].nbytes;
-        per[li]++;
     }
     for (i = 0; i < (int)n_layers; i++) {
         uint64_t first = dir[i].offset;
@@ -81,12 +84,17 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         for (s2 = 0; s2 < per[i]; s2++) {
             LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + s2];
             tm->offset += loff - first;
-            if (tm->offset + tm->size > lend) lend = tm->offset + tm->size;
+            if (loff + tm->offset + tm->size > lend) lend = loff + tm->offset + tm->size;
+            if (i == 1 && s2 < 3) fprintf(stderr, "DBG l1 t%d: off=%lld sz=%lld sum=%lld\n",
+                s2, (long long)tm->offset, (long long)tm->size, (long long)(loff + tm->offset + tm->size));
         }
         lend = align_up(lend, LLF_ALIGN);
         dir[i].offset = loff;
         dir[i].size = lend - loff;
         dir[i].n_tensors = per[i];
+        if (i < 3) fprintf(stderr, "DBG emit layer %u: first=%llu loff=%llu lend=%llu size=%lld per=%u\n",
+            i, (unsigned long long)first, (unsigned long long)loff, (unsigned long long)lend,
+            (long long)dir[i].size, per[i]);
     }
     h->file_size = align_up(cursor, LLF_ALIGN);
 

@@ -84,6 +84,9 @@ typedef struct {
     char** tokens;
     uint32_t n_tokens;
     uint32_t cap_tokens;
+    float* scores;
+    uint32_t n_scores;
+    uint32_t cap_scores;
 } GgufMeta;
 
 static void gg_tokens_grow(GgufMeta* g, uint64_t need)
@@ -94,6 +97,16 @@ static void gg_tokens_grow(GgufMeta* g, uint64_t need)
     g->tokens = (char**)realloc(g->tokens, (size_t)cap * sizeof(char*));
     if (!g->tokens) exit(1);
     g->cap_tokens = cap;
+}
+
+static void gg_scores_grow(GgufMeta* g, uint64_t need)
+{
+    if (need <= g->cap_scores) return;
+    uint32_t cap = g->cap_scores ? g->cap_scores : 1024;
+    while (cap < need) cap *= 2;
+    g->scores = (float*)realloc(g->scores, (size_t)cap * sizeof(float));
+    if (!g->scores) exit(1);
+    g->cap_scores = cap;
 }
 
 static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
@@ -152,13 +165,20 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         uint32_t at = gb_u32(b);
         uint64_t n = gb_u64(b);
         int is_tokens = !strcmp(key, "tokenizer.ggml.tokens");
+        int is_scores = !strcmp(key, "tokenizer.ggml.scores");
         if (is_tokens) gg_tokens_grow(g, (uint64_t)g->n_tokens + n);
+        if (is_scores) gg_scores_grow(g, (uint64_t)g->n_scores + n);
         uint64_t i;
         for (i = 0; i < n && !b->err; i++) {
             if (is_tokens && at == GVT_STR) {
                 char* s = gb_str(b);
                 if (!s) break;
                 g->tokens[g->n_tokens++] = s;
+            } else if (is_scores && at == GVT_F32) {
+                uint32_t v = gb_u32(b);
+                float f;
+                memcpy(&f, &v, 4);
+                g->scores[g->n_scores++] = f;
             } else {
                 switch (at) {
                 case GVT_U8: case GVT_I8: case GVT_BOOL: gb_skip(b, 1); break;
@@ -381,21 +401,49 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         gg_kv_value(&b, key, type, &g);
         free(key);
     }
-    if (b.err) { free(g.arch); free(data); snprintf(err, errlen, "bad gguf kv section"); return -1; }
+    if (b.err) {
+        free(g.arch);
+        for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
+        free(g.tokens);
+        free(g.scores);
+        free(data);
+        snprintf(err, errlen, "bad gguf kv section");
+        return -1;
+    }
     if (!g.arch || strcmp(g.arch, "llama") != 0) {
         snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' supported)", g.arch ? g.arch : "?");
+        for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
+        free(g.tokens);
+        free(g.scores);
         free(g.arch); free(data);
         return -1;
     }
     free(g.arch);
     if (g.n_blocks == 0 || g.hidden == 0 || g.heads == 0) {
+        for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
+        free(g.tokens);
+        free(g.scores);
         free(data);
         snprintf(err, errlen, "missing model dims in metadata");
         return -1;
     }
     if (g.kv_heads == 0) g.kv_heads = g.heads;
-    if (g.hidden % g.heads != 0) { free(data); snprintf(err, errlen, "hidden %u not divisible by heads %u", g.hidden, g.heads); return -1; }
-    if (g.hidden % 256 != 0) { free(data); snprintf(err, errlen, "hidden %u not divisible by 256 (required for K-quants)", g.hidden); return -1; }
+    if (g.hidden % g.heads != 0) {
+        for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
+        free(g.tokens);
+        free(g.scores);
+        free(data);
+        snprintf(err, errlen, "hidden %u not divisible by heads %u", g.hidden, g.heads);
+        return -1;
+    }
+    if (g.hidden % 256 != 0) {
+        for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
+        free(g.tokens);
+        free(g.scores);
+        free(data);
+        snprintf(err, errlen, "hidden %u not divisible by 256 (required for K-quants)", g.hidden);
+        return -1;
+    }
 
     GGList list;
     memset(&list, 0, sizeof(list));
@@ -572,10 +620,25 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         if (vf) {
             fprintf(vf, "%u\n", g.n_tokens);
             for (i = 0; i < g.n_tokens; i++) {
-                fprintf(vf, "%u\t%s\n", (uint32_t)i, g.tokens[i]);
+                fprintf(vf, "%u\t", (uint32_t)i);
+                const char* s = g.tokens[i];
+                for (; *s; s++) {
+                    if (*s == '\n') fputs("\\n", vf);
+                    else if (*s == '\r') fputs("\\r", vf);
+                    else if (*s == '\t') fputs("\\t", vf);
+                    else if (*s == '\\') fputs("\\\\", vf);
+                    else fputc(*s, vf);
+                }
+                fputc('\n', vf);
+            }
+            if (g.n_scores > 0) {
+                fprintf(vf, "#SCORES#\n%u\n", g.n_scores);
+                for (i = 0; i < g.n_scores; i++) {
+                    fprintf(vf, "%.9g\n", (double)g.scores[i]);
+                }
             }
             fclose(vf);
-            printf("vocab written: %s (%u pieces)\n", vocab_out, g.n_tokens);
+            printf("vocab written: %s (%u pieces, %u scores)\n", vocab_out, g.n_tokens, g.n_scores);
         } else {
             snprintf(err, errlen, "cannot write %s", vocab_out);
             rc = -1;
@@ -583,6 +646,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     }
     for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
     free(g.tokens);
+    free(g.scores);
     for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
     free(list.t);
     free(items);

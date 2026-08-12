@@ -26,6 +26,9 @@ typedef struct {
     int unk;
     int bos;
     int eos;
+    int* sorted;      /* indices into pieces, dictionary order (for BPE lookup) */
+    float* scores;    /* tokenizer.ggml.scores, per-piece BPE priority */
+    uint32_t n_scores;
 } Vocab;
 
 /* ---- 平台层 ---- */
@@ -93,6 +96,7 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed,
                     void (*on_token)(uint32_t id, void* ctx), void* ctx, char* err, size_t errlen);
+uint32_t engine_argmax(const float* logits, uint32_t n);
 uint64_t engine_resident(const Engine* e);
 
 uint64_t ysrand(uint64_t seed);
