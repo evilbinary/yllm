@@ -543,9 +543,10 @@ static int chat_eval_cond(const char* e, const ChatMsg* msg)
 {
     /* patterns: message['role'] == 'user' / 'system' / 'assistant' */
     const char* role = msg ? msg->role : "";
-    const char* p = strstr(e, "message['role']");
-    if (!p) return 0;
-    const char* q = strstr(p, "'");
+    /* find the value after '==' */
+    const char* eq = strstr(e, "==");
+    if (!eq) return 0;
+    const char* q = strchr(eq, '\'');
     if (!q) return 0;
     const char* r = strchr(q + 1, '\'');
     if (!r) return 0;
@@ -641,13 +642,25 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
             }
         }
     }
+#ifdef CHAT_DEBUG
+    {
+        int di;
+        fprintf(stderr, "CHAT n_stmts=%d\n", n_stmts);
+        for (di = 0; di < n_stmts; di++) {
+            fprintf(stderr, "  stmt%d kind=%d cond=[%s] expr=[%s]\n", di, stmts[di].kind,
+                    stmts[di].cond, stmts[di].expr);
+        }
+    }
+#endif
 
     /* execute statements, iterating messages */
     char out[4096];
     int mi;
     for (mi = 0; mi < n_msgs; mi++) {
         int is_last = (mi == n_msgs - 1);
-        int in_if = 0;      /* 0 = no branch, 1 = active branch, 2 = skipped branch */
+        /* in_if: 0 = outside any if, 1 = in if-chain but not yet matched,
+           2 = in if-chain and matched (expressions active) */
+        int in_if = 0;
         int si;
         for (si = 0; si < n_stmts && n_out < max; si++) {
             TStmt* st = &stmts[si];
@@ -655,21 +668,25 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
             case ST_FOR:
                 break;
             case ST_IF:
-                in_if = chat_eval_cond(st->cond, &msgs[mi]) ? 1 : 2;
+                in_if = chat_eval_cond(st->cond, &msgs[mi]) ? 2 : 1;
                 break;
             case ST_ELIF:
-                if (in_if == 2 && chat_eval_cond(st->cond, &msgs[mi])) in_if = 1;
+                if (in_if == 2) {
+                    in_if = 1; /* this if-chain already matched; skip remaining elifs */
+                } else if (in_if == 1 && chat_eval_cond(st->cond, &msgs[mi])) {
+                    in_if = 2;
+                }
                 break;
             case ST_ENDIF:
                 in_if = 0;
                 break;
             case ST_IF_LAST:
-                in_if = is_last ? 1 : 2;
+                in_if = is_last ? 2 : 1;
                 break;
             case ST_END_FOR:
                 break;
             case ST_EXPR:
-                if (in_if != 2) {
+                if (in_if == 2) {
                     chat_eval_expr(st->expr, &msgs[mi], is_last, 1, v->eos, v->bos, v, out, sizeof(out));
                     chat_append_ids(v, out, ids, max, &n_out);
                 }
