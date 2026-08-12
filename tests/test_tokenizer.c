@@ -120,6 +120,35 @@ static void test_decode(const char* vocab_path)
     vocab_free(&v);
 }
 
+/* ---- chat template render: tinyllama <|user|>...<|assistant|> ---- */
+static void test_chat_template(const char* vocab_path)
+{
+    Vocab v;
+    if (vocab_load(vocab_path, &v) != 0) {
+        printf("SKIP: cannot load vocab %s\n", vocab_path);
+        return;
+    }
+    CHECK(vocab_has_template(&v), "chat template present");
+    if (!vocab_has_template(&v)) {
+        vocab_free(&v);
+        return;
+    }
+    uint32_t ids[256];
+    int n = vocab_chat_ids(&v, "Hello, how are you?", ids, 256, 0);
+    CHECK(n > 0, "chat render produces tokens");
+    if (n > 0) {
+        char out[1024];
+        vocab_decode(&v, ids, n, out, sizeof(out));
+        /* tinyllama template: <|user|>\nHello, how are you?</s>\n<|assistant|> */
+        CHECK(strstr(out, "<|user|>") != NULL, "chat has user tag");
+        CHECK(strstr(out, "Hello, how are you?") != NULL, "chat has content");
+        CHECK(strstr(out, "<|assistant|>") != NULL, "chat has generation prompt");
+        /* must NOT contain other role tags */
+        CHECK(strstr(out, "<|system|>") == NULL, "chat no system tag");
+    }
+    vocab_free(&v);
+}
+
 int main(int argc, char** argv)
 {
     const char* vocab_path = "test/tinyllama.vocab.txt";
@@ -128,6 +157,7 @@ int main(int argc, char** argv)
     test_encode_edge(vocab_path);
     test_decode(vocab_path);
     test_escaping();
+    test_chat_template(vocab_path);
     printf("tokenizer tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
