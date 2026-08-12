@@ -3,6 +3,21 @@
 #include <math.h>
 #include <string.h>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+static inline float hsum_avx2(__m256 v)
+{
+    __m128 low = _mm256_extractf128_ps(v, 0);
+    __m128 high = _mm256_extractf128_ps(v, 1);
+    low = _mm_add_ps(low, high);
+    __m128 shuf = _mm_movehl_ps(low, low);
+    __m128 sum = _mm_add_ps(low, shuf);
+    shuf = _mm_shuffle_ps(sum, sum, 1);
+    sum = _mm_add_ss(sum, shuf);
+    return _mm_cvtss_f32(sum);
+}
+#endif
+
 static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m)
 {
     if (j < 4) {
@@ -188,6 +203,65 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 144;
     uint32_t oo;
+#ifdef __AVX2__
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 144;
+            const float* xb = x + (size_t)b * 256;
+            float d = f16_to_f32(((const uint16_t*)blk)[0]);
+            float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
+            const uint8_t* q = blk + 16;
+            const uint8_t* scp = blk + 4;
+            int is = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc, mn;
+                gsm_k4(is, scp, &sc, &mn);
+                float d1 = d * (float)sc;
+                float m1 = dmin * (float)mn;
+                gsm_k4(is + 1, scp, &sc, &mn);
+                float d2 = d * (float)sc;
+                float m2 = dmin * (float)mn;
+
+                __m256 sum_qx1 = _mm256_setzero_ps();
+                __m256 sum_x1 = _mm256_setzero_ps();
+                __m256 sum_qx2 = _mm256_setzero_ps();
+                __m256 sum_x2 = _mm256_setzero_ps();
+                for (int l = 0; l < 32; l += 16) {
+                    /* 16 bytes: bytes 0..15 -> low nibbles for x[l..l+15],
+                       high nibbles for x[l+32..l+47] */
+                    __m128i q16 = _mm_loadu_si128((const __m128i*)(q + l));
+                    __m128i lo = _mm_and_si128(q16, _mm_set1_epi8(0x0F));
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(q16, 4), _mm_set1_epi8(0x0F));
+                    __m256i lo16 = _mm256_cvtepu8_epi16(lo);
+                    __m256 lo_f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(lo16)));
+                    __m256 lo_f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(lo16, 1)));
+                    __m256 x_l0 = _mm256_loadu_ps(xb + l);
+                    __m256 x_l1 = _mm256_loadu_ps(xb + l + 8);
+                    sum_qx1 = _mm256_fmadd_ps(lo_f0, x_l0, sum_qx1);
+                    sum_qx1 = _mm256_fmadd_ps(lo_f1, x_l1, sum_qx1);
+                    sum_x1 = _mm256_add_ps(sum_x1, _mm256_add_ps(x_l0, x_l1));
+
+                    __m256i hi16 = _mm256_cvtepu8_epi16(hi);
+                    __m256 hi_f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(hi16)));
+                    __m256 hi_f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(hi16, 1)));
+                    __m256 x_h0 = _mm256_loadu_ps(xb + l + 32);
+                    __m256 x_h1 = _mm256_loadu_ps(xb + l + 40);
+                    sum_qx2 = _mm256_fmadd_ps(hi_f0, x_h0, sum_qx2);
+                    sum_qx2 = _mm256_fmadd_ps(hi_f1, x_h1, sum_qx2);
+                    sum_x2 = _mm256_add_ps(sum_x2, _mm256_add_ps(x_h0, x_h1));
+                }
+                acc += d1 * hsum_avx2(sum_qx1) - m1 * hsum_avx2(sum_x1)
+                     + d2 * hsum_avx2(sum_qx2) - m2 * hsum_avx2(sum_x2);
+                q += 32;
+                is += 2;
+            }
+        }
+        y[oo] = acc;
+    }
+#else
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -215,6 +289,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         }
         y[oo] = acc;
     }
+#endif
 }
 
 void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
@@ -222,6 +297,68 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 210;
     uint32_t oo;
+#ifdef __AVX2__
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 210;
+            const float* xb = x + (size_t)b * 256;
+            float d = f16_to_f32(((const uint16_t*)blk)[104]);
+            const uint8_t* ql = blk;
+            const uint8_t* qh = blk + 128;
+            const int8_t* sc = (const int8_t*)(blk + 192);
+            float sums[16];
+            memset(sums, 0, sizeof(sums));
+            for (int chunk = 0; chunk < 2; chunk++) {
+                const uint8_t* ql_c = ql + chunk * 64;
+                const uint8_t* qh_c = qh + chunk * 32;
+                const float* xp_c = xb + chunk * 128;
+                int is = chunk * 8;
+                __m128i ql0 = _mm_loadu_si128((const __m128i*)ql_c);
+                __m128i ql1 = _mm_loadu_si128((const __m128i*)(ql_c + 16));
+                __m128i ql2 = _mm_loadu_si128((const __m128i*)(ql_c + 32));
+                __m128i ql3 = _mm_loadu_si128((const __m128i*)(ql_c + 48));
+                __m128i qh0 = _mm_loadu_si128((const __m128i*)qh_c);
+                __m128i qh1 = _mm_loadu_si128((const __m128i*)(qh_c + 16));
+                __m128i mF = _mm_set1_epi8(0x0F);
+                __m128i m3 = _mm_set1_epi8(3);
+                /* even groups */
+                __m128i e_q1 = _mm_or_si128(_mm_and_si128(ql0, mF), _mm_slli_epi16(_mm_and_si128(qh0, m3), 4));
+                __m128i e_q2 = _mm_or_si128(_mm_and_si128(ql2, mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 2), m3), 4));
+                __m128i e_q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql0, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 4), m3), 4));
+                __m128i e_q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql2, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 6), m3), 4));
+                /* odd groups */
+                __m128i o_q1 = _mm_or_si128(_mm_and_si128(ql1, mF), _mm_slli_epi16(_mm_and_si128(qh1, m3), 4));
+                __m128i o_q2 = _mm_or_si128(_mm_and_si128(ql3, mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 2), m3), 4));
+                __m128i o_q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql1, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 4), m3), 4));
+                __m128i o_q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql3, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 6), m3), 4));
+#define Q6_GROUP_SUM(qvals, xpos) ({ \
+    __m256i _e16 = _mm256_cvtepu8_epi16(qvals); \
+    __m128i _l = _mm256_castsi256_si128(_e16); \
+    __m128i _h = _mm256_extracti128_si256(_e16, 1); \
+    __m256 _fl = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_l)), _mm256_set1_ps(32.0f)); \
+    __m256 _fh = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_h)), _mm256_set1_ps(32.0f)); \
+    __m256 _p = _mm256_fmadd_ps(_fl, _mm256_loadu_ps(xp_c + (xpos)), \
+               _mm256_mul_ps(_fh, _mm256_loadu_ps(xp_c + (xpos) + 8))); \
+    hsum_avx2(_p); \
+})
+                sums[is+0] = Q6_GROUP_SUM(e_q1, 0);
+                sums[is+2] = Q6_GROUP_SUM(e_q2, 32);
+                sums[is+4] = Q6_GROUP_SUM(e_q3, 64);
+                sums[is+6] = Q6_GROUP_SUM(e_q4, 96);
+                sums[is+1] = Q6_GROUP_SUM(o_q1, 16);
+                sums[is+3] = Q6_GROUP_SUM(o_q2, 48);
+                sums[is+5] = Q6_GROUP_SUM(o_q3, 80);
+                sums[is+7] = Q6_GROUP_SUM(o_q4, 112);
+#undef Q6_GROUP_SUM
+            }
+            for (int j = 0; j < 16; j++) acc += d * (float)sc[j] * sums[j];
+        }
+        y[oo] = acc;
+    }
+#else
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -246,6 +383,7 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         }
         y[oo] = acc;
     }
+#endif
 }
 
 void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
