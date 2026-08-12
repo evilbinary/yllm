@@ -32,6 +32,15 @@ typedef struct {
     int* sorted;      /* indices into pieces, dictionary order (for BPE lookup) */
     float* scores;    /* tokenizer.ggml.scores, per-piece BPE priority */
     uint32_t n_scores;
+    uint32_t* ml;     /* merges: left piece ids (sorted by (ml,mr) for bisect) */
+    uint32_t* mr;     /* merges: right piece ids */
+    uint32_t* mid;    /* merges: merged piece id (l+r) */
+    uint32_t* mrank;  /* merges: original rank (0 = highest priority) */
+    uint32_t n_merges;
+    char** mls;       /* merges 原始串(解析期临时, resolve 后释放) */
+    char** mrs;
+    int byte_level;   /* 1 = tiktoken/GPT-2 byte-level BPE (qwen2), 0 = sentencepiece */
+    int32_t byte_ids[256]; /* tiktoken byte -> token id (byte_level 时预计算, -1=无) */
     char* chat_template; /* jinja2 chat template from gguf */
     int add_bos;      /* tokenizer.ggml.add_bos_token */
 } Vocab;
@@ -87,6 +96,7 @@ typedef struct {
     uint16_t* kv;
     uint32_t kv_dim;
     uint32_t max_seq;
+    uint32_t inter;   /* FFN 中间维度(gate/up 输出宽) */
     float* x;
     float* hb;
     float* hb2;

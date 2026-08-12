@@ -142,6 +142,18 @@ static char* unescape_piece(const char* s)
     return out;
 }
 
+static uint32_t* g_ml;
+static uint32_t* g_mr;
+static int merge_cmp(const void* a, const void* b)
+{
+    uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    if (g_ml[x] != g_ml[y]) return g_ml[x] < g_ml[y] ? -1 : 1;
+    if (g_mr[x] != g_mr[y]) return g_mr[x] < g_mr[y] ? -1 : 1;
+    return 0;
+}
+
+static void build_byte_ids(Vocab* v);
+
 static int parse_text(const char* path, Vocab* v)
 {
     FILE* f = fopen(path, "rb");
@@ -173,12 +185,13 @@ static int parse_text(const char* path, Vocab* v)
     }
     if (v->n == 0) { fclose(f); return -1; }
 
-    /* optional #SCORES# section: one float per piece */
-    if (fgets(line, sizeof(line), f)) {
+    /* optional sections: #SCORES#, #MERGES#, #CHAT# (任意顺序/缺失) */
+    for (;;) {
+        if (!fgets(line, sizeof(line), f)) break;
         size_t l = strlen(line);
         while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
         if (strcmp(line, "#SCORES#") == 0) {
-            if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+            if (!fgets(line, sizeof(line), f)) break;
             int ns = atoi(line);
             if (ns > 0 && ns <= 1000000) {
                 v->scores = (float*)ymalloc((size_t)ns * sizeof(float));
@@ -188,13 +201,30 @@ static int parse_text(const char* path, Vocab* v)
                     v->scores[si++] = (float)atof(line);
                 }
             }
+            continue;
         }
-    }
-
-    /* optional #CHAT# section: add_bos, eos_id, template */
-    if (fgets(line, sizeof(line), f)) {
-        size_t l = strlen(line);
-        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+        if (strcmp(line, "#MERGES#") == 0) {
+            if (!fgets(line, sizeof(line), f)) break;
+            int nm = atoi(line);
+            if (nm > 0 && nm <= 5000000) {
+                v->mls = (char**)ycalloc((size_t)nm, sizeof(char*));
+                v->mrs = (char**)ycalloc((size_t)nm, sizeof(char*));
+                uint32_t mi = 0;
+                char lr[65536];
+                while (mi < (uint32_t)nm && fgets(lr, sizeof(lr), f)) {
+                    size_t l2 = strlen(lr);
+                    while (l2 > 0 && (lr[l2 - 1] == '\n' || lr[l2 - 1] == '\r')) lr[--l2] = 0;
+                    char* sp = strchr(lr, ' ');
+                    if (!sp) continue;
+                    *sp = 0;
+                    v->mls[mi] = unescape_piece(lr);
+                    v->mrs[mi] = unescape_piece(sp + 1);
+                    mi++;
+                }
+                v->n_merges = mi;
+            }
+            continue;
+        }
         if (strcmp(line, "#CHAT#") == 0) {
             while (fgets(line, sizeof(line), f)) {
                 size_t l2 = strlen(line);
@@ -207,7 +237,9 @@ static int parse_text(const char* path, Vocab* v)
                     v->chat_template = unescape_piece(line + 9);
                 }
             }
+            break;
         }
+        break;
     }
     fclose(f);
     return 0;
@@ -228,6 +260,16 @@ static int dict_compare(const void* a, const void* b)
     const char* x = *(char* const*)a;
     const char* y = *(char* const*)b;
     return strcmp(x, y);
+}
+
+static char** g_pieces;
+static int idx_order_cmp(const void* a, const void* b)
+{
+    return order_compare(&g_pieces[*(const int*)a], &g_pieces[*(const int*)b]);
+}
+static int idx_dict_cmp(const void* a, const void* b)
+{
+    return dict_compare(&g_pieces[*(const int*)a], &g_pieces[*(const int*)b]);
 }
 
 int vocab_load(const char* path, Vocab* v)
@@ -255,24 +297,64 @@ int vocab_load(const char* path, Vocab* v)
     v->sorted = (int*)ymalloc((size_t)v->n * sizeof(int));
     int i;
     for (i = 0; i < v->n; i++) { v->order[i] = i; v->sorted[i] = i; }
-    {
-        char** tmp = (char**)ymalloc((size_t)v->n * sizeof(char*));
-        for (i = 0; i < v->n; i++) tmp[i] = v->pieces[i];
-        qsort(tmp, (size_t)v->n, sizeof(char*), order_compare);
-        for (i = 0; i < v->n; i++) {
-            int j;
-            for (j = 0; j < v->n; j++) {
-                if (strcmp(tmp[i], v->pieces[j]) == 0) v->order[i] = j;
-            }
+    g_pieces = v->pieces;
+    qsort(v->order, (size_t)v->n, sizeof(int), idx_order_cmp);
+    qsort(v->sorted, (size_t)v->n, sizeof(int), idx_dict_cmp);
+    /* 解析 merges 原始串 -> 词条 id(用 sorted 二分, 避免 O(n^2)) */
+    if (v->n_merges > 0) {
+        v->ml = (uint32_t*)ymalloc((size_t)v->n_merges * sizeof(uint32_t));
+        v->mr = (uint32_t*)ymalloc((size_t)v->n_merges * sizeof(uint32_t));
+        v->mid = (uint32_t*)ymalloc((size_t)v->n_merges * sizeof(uint32_t));
+        v->mrank = (uint32_t*)ymalloc((size_t)v->n_merges * sizeof(uint32_t));
+        uint32_t mi = 0;
+        for (i = 0; i < (int)v->n_merges; i++) {
+            int idl = -1, idr = -1, idm = -1;
+            if (vocab_bsearch_sorted(v, v->sorted, v->mls[i], strlen(v->mls[i]), &idl) != 0) continue;
+            if (vocab_bsearch_sorted(v, v->sorted, v->mrs[i], strlen(v->mrs[i]), &idr) != 0) continue;
+            size_t ll = strlen(v->mls[i]), lr2 = strlen(v->mrs[i]);
+            char* merged = (char*)ymalloc(ll + lr2 + 1);
+            memcpy(merged, v->mls[i], ll);
+            memcpy(merged + ll, v->mrs[i], lr2);
+            merged[ll + lr2] = 0;
+            int ok = vocab_bsearch_sorted(v, v->sorted, merged, ll + lr2, &idm);
+            free(merged);
+            if (ok != 0) continue;
+            v->ml[mi] = (uint32_t)idl;
+            v->mr[mi] = (uint32_t)idr;
+            v->mid[mi] = (uint32_t)idm;
+            v->mrank[mi] = mi;
+            mi++;
         }
-        qsort(tmp, (size_t)v->n, sizeof(char*), dict_compare);
-        for (i = 0; i < v->n; i++) {
-            int j;
-            for (j = 0; j < v->n; j++) {
-                if (strcmp(tmp[i], v->pieces[j]) == 0) { v->sorted[i] = j; break; }
-            }
+        v->n_merges = mi;
+        /* sort by (ml, mr) */
+        g_ml = v->ml;
+        g_mr = v->mr;
+        uint32_t* idx = (uint32_t*)ymalloc((size_t)mi * sizeof(uint32_t));
+        uint32_t qi;
+        for (qi = 0; qi < mi; qi++) idx[qi] = qi;
+        qsort(idx, (size_t)mi, sizeof(uint32_t), merge_cmp);
+        uint32_t* nml = (uint32_t*)ymalloc((size_t)mi * sizeof(uint32_t));
+        uint32_t* nmr = (uint32_t*)ymalloc((size_t)mi * sizeof(uint32_t));
+        uint32_t* nmid = (uint32_t*)ymalloc((size_t)mi * sizeof(uint32_t));
+        uint32_t* nmrk = (uint32_t*)ymalloc((size_t)mi * sizeof(uint32_t));
+        for (qi = 0; qi < mi; qi++) {
+            nml[qi] = v->ml[idx[qi]];
+            nmr[qi] = v->mr[idx[qi]];
+            nmid[qi] = v->mid[idx[qi]];
+            nmrk[qi] = v->mrank[idx[qi]];
         }
-        free(tmp);
+        free(idx);
+        free(v->ml); free(v->mr); free(v->mid); free(v->mrank);
+        v->ml = nml; v->mr = nmr; v->mid = nmid; v->mrank = nmrk;
+        /* 释放原始串 */
+        for (i = 0; i < (int)v->n_merges; i++) { free(v->mls[i]); free(v->mrs[i]); }
+        free(v->mls); free(v->mrs);
+        v->mls = NULL; v->mrs = NULL;
+    }
+    /* merges 存在且无 scores -> byte-level BPE(qwen2), 预计算字节表 */
+    if (v->n_merges > 0 && v->n_scores == 0) {
+        v->byte_level = 1;
+        build_byte_ids(v);
     }
     return 0;
 }
@@ -287,6 +369,16 @@ void vocab_free(Vocab* v)
     free(v->order);
     free(v->sorted);
     free(v->scores);
+    free(v->ml);
+    free(v->mr);
+    free(v->mid);
+    free(v->mrank);
+    if (v->mls) {
+        int mi;
+        for (mi = 0; mi < (int)v->n_merges; mi++) { free(v->mls[mi]); free(v->mrs[mi]); }
+        free(v->mls);
+        free(v->mrs);
+    }
     free(v->chat_template);
     memset(v, 0, sizeof(*v));
 }
@@ -334,6 +426,172 @@ static int vocab_encode_greedy(Vocab* v, const char* text, uint32_t* ids, int ma
     return nout;
 }
 
+static int utf8_clen(unsigned char c);
+
+/* ---- GPT-2/tiktoken byte->Unicode 映射(qwen2 等 byte-level BPE) ----
+ * 特殊字节 0x00-0x20, 0x7F-0x9F, 0xA0, 0xAD -> U+0100..U+0143(依序)
+ * 其余字节保持 Latin-1(0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF)
+ */
+static const unsigned char tiktoken_special[256] = {
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,0,0,0,0,0,0,0,0,0,0,0,0,
+    1,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
+
+/* 把原始字节 b 写成 tiktoken 映射后的 UTF-8 串, 返回长度 */
+static int gpt2_byte_str(unsigned int b, char out[4])
+{
+    unsigned int cp;
+    if (tiktoken_special[b]) {
+        /* 特殊字节按序: 0x00-0x20(33 个), 0x7F-0x9F(33 个), 0xA0, 0xAD */
+        unsigned int idx;
+        if (b <= 0x20) idx = b;
+        else if (b <= 0x9F) idx = 33 + (b - 0x7F);
+        else if (b == 0xA0) idx = 66;
+        else idx = 67;
+        cp = 0x100 + idx;
+    } else {
+        cp = b;
+    }
+    if (cp < 0x80) {
+        out[0] = (char)cp; return 1;
+    } else if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+}
+
+/* 预计算 256 字节的 token id(byte_level 时在 vocab_load 末尾调用) */
+static void build_byte_ids(Vocab* v)
+{
+    int b;
+    for (b = 0; b < 256; b++) {
+        char mapped[4];
+        int len = gpt2_byte_str((unsigned int)b, mapped);
+        int id = -1;
+        if (vocab_bsearch_sorted(v, v->sorted, mapped, (size_t)len, &id) == 0) {
+            v->byte_ids[b] = id;
+        } else {
+            v->byte_ids[b] = -1;
+        }
+    }
+}
+
+/* qwen2 特殊 token:<|im_start|> 等, 编码前整体匹配 */
+static int special_token_id(const Vocab* v, const char* text)
+{
+    static const char* specials[] = {
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>"
+    };
+    size_t i;
+    for (i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+        if (strncmp(text, specials[i], strlen(specials[i])) == 0) {
+            int id = -1;
+            if (vocab_bsearch_sorted(v, v->sorted, specials[i], strlen(specials[i]), &id) == 0)
+                return id;
+        }
+    }
+    return -1;
+}
+
+/* byte-level BPE encode using tokenizer.ggml.merges ranks (qwen2 etc.) */
+static int vocab_encode_merges(Vocab* v, const char* text, uint32_t* ids, int max)
+{
+    if (v->n_merges == 0) return 0;
+
+    size_t tlen = strlen(text);
+    size_t cap = tlen * 2 + 8;
+    uint32_t* syms = (uint32_t*)ymalloc((cap + 1) * 4);
+    uint32_t ns = 0;
+    size_t i = 0;
+
+    while (i < tlen) {
+        /* 特殊 token(<|im_start|> 等)整体匹配 */
+        int sid = special_token_id(v, text + i);
+        if (sid >= 0) {
+            const char* sp = NULL;
+            static const char* specials[] = {
+                "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+                "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>"
+            };
+            size_t k;
+            for (k = 0; k < sizeof(specials) / sizeof(specials[0]); k++) {
+                if (strncmp(text + i, specials[k], strlen(specials[k])) == 0) { sp = specials[k]; break; }
+            }
+            if (ns < (uint32_t)max) syms[ns++] = (uint32_t)sid;
+            i += strlen(sp);
+            continue;
+        }
+        /* 多字节 UTF-8 直接命中 */
+        int clen = utf8_clen((unsigned char)text[i]);
+        if (i + (size_t)clen > tlen) clen = (int)(tlen - i);
+        int id = -1;
+        if (clen > 1 && vocab_bsearch_sorted(v, v->sorted, text + i, (size_t)clen, &id) == 0) {
+            if (ns < (uint32_t)max) syms[ns++] = (uint32_t)id;
+            i += (size_t)clen;
+            continue;
+        }
+        /* tiktoken 字节映射 */
+        if (v->byte_ids[(unsigned char)text[i]] >= 0) {
+            if (ns < (uint32_t)max) syms[ns++] = (uint32_t)v->byte_ids[(unsigned char)text[i]];
+        } else if (v->unk >= 0) {
+            if (ns < (uint32_t)max) syms[ns++] = (uint32_t)v->unk;
+        }
+        i += 1;
+    }
+
+    /* merge loop: repeatedly apply the lowest-rank merge among adjacent pairs */
+    for (;;) {
+        int best_i = -1;
+        uint32_t best_out = 0;
+        uint32_t best_rank = 0xFFFFFFFFu;
+        uint32_t j;
+        for (j = 0; j + 1 < ns; j++) {
+            uint32_t a = syms[j], b = syms[j + 1];
+            uint32_t lo = 0, hi = v->n_merges;
+            while (lo < hi) {
+                uint32_t mid = (lo + hi) / 2;
+                if (v->ml[mid] < a || (v->ml[mid] == a && v->mr[mid] < b)) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo < v->n_merges && v->ml[lo] == a && v->mr[lo] == b) {
+                uint32_t rk = v->mrank[lo];
+                if (rk < best_rank) { best_rank = rk; best_i = (int)j; best_out = v->mid[lo]; }
+            }
+        }
+        if (best_i < 0 || ns >= (uint32_t)max) break;
+        syms[best_i] = best_out;
+        memmove(syms + best_i + 1, syms + best_i + 2, (size_t)(ns - best_i - 2) * 4);
+        ns--;
+    }
+
+    uint32_t nout = ns < (uint32_t)max ? ns : (uint32_t)max;
+    memcpy(ids, syms, (size_t)nout * 4);
+    free(syms);
+    return (int)nout;
+}
+
 /* sentencepiece-style BPE encode (llama/tinyllama etc.) */
 static int utf8_clen(unsigned char c)
 {
@@ -345,6 +603,9 @@ static int utf8_clen(unsigned char c)
 
 int vocab_encode(Vocab* v, const char* text, uint32_t* ids, int max)
 {
+    if (v->n_scores == 0 && v->n_merges > 0) {
+        return vocab_encode_merges(v, text, ids, max);
+    }
     if (v->n_scores == 0) return vocab_encode_greedy(v, text, ids, max);
 
     /* 1. build normalized text: leading ▁, spaces -> ▁ (U+2581 = E2 96 81) */
@@ -449,6 +710,38 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max)
             continue;
         }
         size_t l = strlen(pc);
+        if (v->byte_level) {
+            /* tiktoken 反向映射: 特殊字节 U+0100..U+0143 -> 原始字节;
+               Latin-1 非特殊(U+00A1-AC, U+00AE-FF)-> 原始字节 */
+            size_t k = 0;
+            while (k < l && o < max - 1) {
+                unsigned char c = (unsigned char)pc[k];
+                if (c >= 0xC2 && c < 0xE0 && k + 1 < l) {
+                    unsigned int cp = ((unsigned int)(c & 0x1F) << 6) | ((unsigned int)(unsigned char)pc[k + 1] & 0x3F);
+                    if (cp >= 0x0100 && cp <= 0x0143) {
+                        unsigned int ob;
+                        if (cp <= 0x0120) ob = cp - 0x0100;
+                        else if (cp <= 0x0141) ob = 0x7F + (cp - 0x0121);
+                        else if (cp == 0x0142) ob = 0xA0;
+                        else ob = 0xAD;
+                        out[o++] = (char)ob;
+                        k += 2;
+                        continue;
+                    }
+                    if ((cp >= 0x00A1 && cp <= 0x00AC) || cp >= 0x00AE) {
+                        out[o++] = (char)cp;
+                        k += 2;
+                        continue;
+                    }
+                    out[o++] = (char)c;
+                    k += 1;
+                    continue;
+                }
+                out[o++] = (char)c;
+                k += 1;
+            }
+            continue;
+        }
         if (pc[0] == (char)0xe2 && pc[1] == (char)0x96 && pc[2] == (char)0x81) {
             if (o < max) out[o++] = ' ';
             pc += 3;
@@ -509,6 +802,14 @@ static int chat_eval_expr(const char* e, const ChatMsg* msg, int is_last, int ad
                 else out[o++] = *p++;
             }
             if (*p == '\'') p++;
+        } else if (strncmp(p, "message.role", 12) == 0) {
+            const char* r = msg ? msg->role : "";
+            while (*r && o < max - 1) out[o++] = *r++;
+            p += 12;
+        } else if (strncmp(p, "message.content", 15) == 0) {
+            const char* c = msg ? msg->content : "";
+            while (*c && o < max - 1) out[o++] = *c++;
+            p += 15;
         } else if (strncmp(p, "message['role']", 15) == 0) {
             const char* r = msg ? msg->role : "";
             while (*r && o < max - 1) out[o++] = *r++;
@@ -539,19 +840,51 @@ static int chat_eval_expr(const char* e, const ChatMsg* msg, int is_last, int ad
 }
 
 /* returns 1 if the condition is true */
+static int chat_clause_true(const char* c, const ChatMsg* msg)
+{
+    while (*c == ' ' || *c == '(' || *c == ')') c++;
+    size_t l = strlen(c);
+    if (strncmp(c, "add_generation_prompt", 21) == 0) return 1;
+    if (strncmp(c, "loop.first", 10) == 0) return 1;      /* 单轮: 首条消息 */
+    if (strncmp(c, "not loop.first", 14) == 0) return 0;  /* 单轮: 非首条 = 假 */
+    if (strncmp(c, "tools", 5) == 0) return 0;
+    if (strncmp(c, "message.content", 15) == 0) return msg && msg->content && msg->content[0] ? 1 : 0;
+    {
+        const char* eq = strstr(c, "==");
+        if (eq) {
+            const char* q1 = strchr(eq, '\'');
+            const char* q2 = strchr(eq, '"');
+            const char* q = q1 && (!q2 || q1 < q2) ? q1 : q2;
+            if (q) {
+                char endc = *q;
+                const char* r = strchr(q + 1, endc);
+                if (r) {
+                    size_t rl = (size_t)(r - q - 1);
+                    const char* role = msg ? msg->role : "";
+                    if (rl == strlen(role) && strncmp(q + 1, role, rl) == 0) return 1;
+                    return 0;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int chat_eval_cond(const char* e, const ChatMsg* msg)
 {
-    /* patterns: message['role'] == 'user' / 'system' / 'assistant' */
-    const char* role = msg ? msg->role : "";
-    /* find the value after '==' */
-    const char* eq = strstr(e, "==");
-    if (!eq) return 0;
-    const char* q = strchr(eq, '\'');
-    if (!q) return 0;
-    const char* r = strchr(q + 1, '\'');
-    if (!r) return 0;
-    size_t rl = (size_t)(r - q - 1);
-    if (rl == strlen(role) && strncmp(q + 1, role, rl) == 0) return 1;
+    /* 按 " or " 拆子句,任一为真即可(qwen2.5 模板) */
+    const char* p = e;
+    while (*p) {
+        const char* orp = strstr(p, " or ");
+        size_t cl = orp ? (size_t)(orp - p) : strlen(p);
+        char tmp[512];
+        if (cl >= sizeof(tmp)) cl = sizeof(tmp) - 1;
+        memcpy(tmp, p, cl);
+        tmp[cl] = 0;
+        if (chat_clause_true(tmp, msg)) return 1;
+        if (!orp) break;
+        p = orp + 4;
+    }
     return 0;
 }
 
@@ -601,7 +934,13 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
                 memcpy(tmp, p + 2, bl);
                 tmp[bl] = 0;
                 char* t2 = tmp;
-                while (*t2 == ' ') t2++;
+                while (*t2 == ' ' || *t2 == '\n' || *t2 == '\t') t2++;
+                if (*t2 == '-') t2++;   /* {%- 空白控制语法 */
+                while (*t2 == ' ' || *t2 == '\n' || *t2 == '\t') t2++;
+                {
+                    size_t tl = strlen(t2);
+                    while (tl > 0 && (t2[tl - 1] == ' ' || t2[tl - 1] == '\n' || t2[tl - 1] == '\t' || t2[tl - 1] == '-')) t2[--tl] = 0;
+                }
                 if (strncmp(t2, "for", 3) == 0) {
                     stmts[n_stmts].kind = ST_FOR;
                     n_stmts++;

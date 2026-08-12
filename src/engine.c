@@ -192,13 +192,24 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     uint32_t hidden = m->h.hidden;
     uint32_t kv_dim = m->h.n_kv_heads * m->h.head_dim;
     uint32_t vocab = m->h.vocab;
+    /* FFN 中间维度(inter)从首个 block 的 gate 张量推出;gate+up 共需 2*inter 个 float */
+    uint32_t inter = hidden;
+    if (m->n_layers > 1 && m->base_idx && m->metas &&
+        (m->base_idx[1] + SLOT_GATE) < m->n_layers * BLOCK_TENSORS) {
+        const LlfTensorMeta* g = &m->metas[m->base_idx[1] + SLOT_GATE];
+        if (g->ndim >= 2 && g->shape[0] && g->shape[1]) {
+            uint64_t prod = (uint64_t)g->shape[0] * g->shape[1];
+            if (prod % hidden == 0) inter = (uint32_t)(prod / hidden);
+        }
+    }
+    e->inter = inter;
     e->kv_dim = kv_dim;
     e->max_seq = m->h.max_seq;
     e->kv = (uint16_t*)ycalloc((size_t)(2 * m->h.n_blocks + 1) * e->max_seq * kv_dim, 2);
     e->x = (float*)ycalloc(hidden, 4);
     e->hb = (float*)ycalloc(hidden, 4 * 9);
     e->hb2 = (float*)ycalloc(hidden, 4 * 9);
-    e->ffn = (float*)ycalloc(hidden, 4 * 9);
+    e->ffn = (float*)ycalloc((size_t)2 * inter, 4);
     e->att = (float*)ymalloc((size_t)e->max_seq * m->h.n_heads * 4);
     e->logits = (float*)ymalloc((size_t)vocab * 4);
 
@@ -273,16 +284,38 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
     matmul(q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype);
     matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
     matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+    /* 注意力 bias(qwen2.5 gguf 带有非零 bias) */
+    if (mt[SLOT_QBIAS].size > 0) {
+        const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
+        uint32_t j;
+        for (j = 0; j < hidden; j++) q[j] += bq[j];
+    }
+    if (mt[SLOT_KBIAS].size > 0) {
+        const float* bk = (const float*)(base + mt[SLOT_KBIAS].offset);
+        uint32_t j;
+        for (j = 0; j < kv_dim; j++) k[j] += bk[j];
+    }
+    if (mt[SLOT_VBIAS].size > 0) {
+        const float* bv = (const float*)(base + mt[SLOT_VBIAS].offset);
+        uint32_t j;
+        for (j = 0; j < kv_dim; j++) v[j] += bv[j];
+    }
 
     uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
     uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh;
     for (hh = 0; hh < h->n_heads; hh++) {
-        rope_inplace(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+        if (h->arch == ARCH_QWEN)
+            rope_inplace_qwen(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+        else
+            rope_inplace(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
     }
     for (hh = 0; hh < h->n_kv_heads; hh++) {
-        rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+        if (h->arch == ARCH_QWEN)
+            rope_inplace_qwen(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+        else
+            rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
     }
 
     uint32_t j;
@@ -342,6 +375,8 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos)
     for (i = 0; i < m->n_layers; i++) {
         sched_ensure(ws, i);
         const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
+        if (getenv("YLLM_DBG"))
+            fprintf(stderr, "ENG layer %u x0=%.4f x1=%.4f x2=%.4f x3=%.4f\n", i, e->x[0], e->x[1], e->x[2], e->x[3]);
         if (i == 0) {
             const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
             switch (tm->dtype) {

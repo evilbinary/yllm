@@ -156,7 +156,7 @@ static int cmd_gen(int argc, char** argv)
         return 1;
     }
 
-    uint32_t* ids = (uint32_t*)ymalloc((size_t)ntokens + 4096);
+    uint32_t* ids = (uint32_t*)ymalloc(((size_t)ntokens + 4096) * 4);
     uint32_t sz = (uint32_t)(ntokens + 4096);
     int nprompt = vocab_encode(&v, prompt, ids, (int)sz);
     printf("prompt tokens: %d\n", nprompt);
@@ -223,7 +223,7 @@ static int cmd_chat(int argc, char** argv)
         return 1;
     }
 
-    uint32_t* ids = (uint32_t*)ymalloc((size_t)ntokens + 8192);
+    uint32_t* ids = (uint32_t*)ymalloc(((size_t)ntokens + 8192) * 4);
     uint32_t sz = (uint32_t)(ntokens + 8192);
     int nprompt;
     int use_bos = no_bos ? 0 : v.add_bos;

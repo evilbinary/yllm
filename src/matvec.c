@@ -494,6 +494,23 @@ void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta)
     }
 }
 
+/* qwen2 interleaved RoPE: v[i] 与 v[i+half] 配对(llama 是 v[2j]/v[2j+1]) */
+void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
+{
+    uint32_t half = d / 2;
+    uint32_t j;
+    for (j = 0; j < half; j++) {
+        float freq = powf(theta, -2.0f * (float)j / (float)d);
+        float ang = freq * (float)pos;
+        float c = cosf(ang);
+        float s = sinf(ang);
+        float a = v[j];
+        float b = v[j + half];
+        v[j] = a * c - b * s;
+        v[j + half] = a * s + b * c;
+    }
+}
+
 void softmax(float* v, uint32_t n)
 {
     float m = v[0];

@@ -18,6 +18,7 @@ void embed_iq4xs(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 
 void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps, uint32_t dtype);
 void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta);
+void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta);
 void softmax(float* v, uint32_t n);
 void swiglu(float* y, const float* gate, const float* up, uint32_t n);
 

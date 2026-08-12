@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #define YLLM_MAGIC "YLLMLLF1"
-#define YLLM_VERSION 1
+#define YLLM_VERSION 2
 #define LLF_HEADER_SIZE 128
 #define LLF_DIR_ENTRY_SIZE 32
 #define LLF_TENSOR_META_SIZE 64
@@ -31,7 +31,10 @@
 #define SLOT_GATE 6
 #define SLOT_UP 7
 #define SLOT_DOWN 8
-#define BLOCK_TENSORS 9
+#define SLOT_QBIAS 9
+#define SLOT_KBIAS 10
+#define SLOT_VBIAS 11
+#define BLOCK_TENSORS 12
 
 #pragma pack(push, 1)
 typedef struct {

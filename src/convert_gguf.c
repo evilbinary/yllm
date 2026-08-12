@@ -87,10 +87,23 @@ typedef struct {
     float* scores;
     uint32_t n_scores;
     uint32_t cap_scores;
+    char** merges;
+    uint32_t n_merges;
+    uint32_t cap_merges;
     char* chat_template;
     int add_bos;
     int eos_id;
 } GgufMeta;
+
+static void gg_merges_grow(GgufMeta* g, uint64_t need)
+{
+    if (need <= g->cap_merges) return;
+    uint32_t cap = g->cap_merges ? g->cap_merges : 1024;
+    while (cap < need) cap *= 2;
+    g->merges = (char**)realloc(g->merges, (size_t)cap * sizeof(char*));
+    if (!g->merges) exit(1);
+    g->cap_merges = cap;
+}
 
 static void gg_tokens_grow(GgufMeta* g, uint64_t need)
 {
@@ -112,8 +125,16 @@ static void gg_scores_grow(GgufMeta* g, uint64_t need)
     g->cap_scores = cap;
 }
 
+/* KV key 去掉 "<arch>." 前缀后与公共名比较(如 llama.block_count / qwen2.block_count) */
+static const char* gk_suffix(const char* key)
+{
+    const char* p = strchr(key, '.');
+    return p ? p + 1 : key;
+}
+
 static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
 {
+    const char* k = gk_suffix(key);
     switch (type) {
     case GVT_U8:
     case GVT_I8:
@@ -128,11 +149,13 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
     case GVT_I32:
     case GVT_F32: {
         uint32_t v = gb_u32(b);
-        if (!strcmp(key, "llama.block_count")) g->n_blocks = v;
-        else if (!strcmp(key, "llama.embedding_length")) g->hidden = v;
-        else if (!strcmp(key, "llama.attention.head_count")) g->heads = v;
-        else if (!strcmp(key, "llama.attention.head_count_kv")) g->kv_heads = v;
-        else if (!strcmp(key, "llama.context_length")) g->context_len = v;
+        if (!strcmp(k, "block_count")) g->n_blocks = v;
+        else if (!strcmp(k, "embedding_length")) g->hidden = v;
+        else if (!strcmp(k, "attention.head_count")) g->heads = v;
+        else if (!strcmp(k, "attention.head_count_kv")) g->kv_heads = v;
+        else if (!strcmp(k, "context_length")) g->context_len = v;
+        else if (!strcmp(k, "rope.freq_base")) { float f; memcpy(&f, &v, 4); g->freq_base = f; }
+        else if (!strcmp(k, "attention.layer_norm_rms_epsilon")) { float f; memcpy(&f, &v, 4); g->rms_eps = f; }
         else if (!strcmp(key, "general.alignment")) g->alignment = v;
         else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
         else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
@@ -141,19 +164,19 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
     case GVT_U64:
     case GVT_I64: {
         uint64_t v = gb_u64(b);
-        if (!strcmp(key, "llama.block_count")) g->n_blocks = (uint32_t)v;
-        else if (!strcmp(key, "llama.embedding_length")) g->hidden = (uint32_t)v;
-        else if (!strcmp(key, "llama.attention.head_count")) g->heads = (uint32_t)v;
-        else if (!strcmp(key, "llama.attention.head_count_kv")) g->kv_heads = (uint32_t)v;
-        else if (!strcmp(key, "llama.context_length")) g->context_len = (uint32_t)v;
+        if (!strcmp(k, "block_count")) g->n_blocks = (uint32_t)v;
+        else if (!strcmp(k, "embedding_length")) g->hidden = (uint32_t)v;
+        else if (!strcmp(k, "attention.head_count")) g->heads = (uint32_t)v;
+        else if (!strcmp(k, "attention.head_count_kv")) g->kv_heads = (uint32_t)v;
+        else if (!strcmp(k, "context_length")) g->context_len = (uint32_t)v;
         else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
         else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
         break;
     }
     case GVT_F64: {
         double v = gb_f64(b);
-        if (!strcmp(key, "llama.rope.freq_base")) g->freq_base = (float)v;
-        else if (!strcmp(key, "llama.attention.layer_norm_rms_epsilon")) g->rms_eps = (float)v;
+        if (!strcmp(k, "rope.freq_base")) g->freq_base = (float)v;
+        else if (!strcmp(k, "attention.layer_norm_rms_epsilon")) g->rms_eps = (float)v;
         break;
     }
     case GVT_STR: {
@@ -176,8 +199,10 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         uint64_t n = gb_u64(b);
         int is_tokens = !strcmp(key, "tokenizer.ggml.tokens");
         int is_scores = !strcmp(key, "tokenizer.ggml.scores");
+        int is_merges = !strcmp(key, "tokenizer.ggml.merges");
         if (is_tokens) gg_tokens_grow(g, (uint64_t)g->n_tokens + n);
         if (is_scores) gg_scores_grow(g, (uint64_t)g->n_scores + n);
+        if (is_merges) gg_merges_grow(g, (uint64_t)g->n_merges + n);
         uint64_t i;
         for (i = 0; i < n && !b->err; i++) {
             if (is_tokens && at == GVT_STR) {
@@ -189,6 +214,10 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
                 float f;
                 memcpy(&f, &v, 4);
                 g->scores[g->n_scores++] = f;
+            } else if (is_merges && at == GVT_STR) {
+                char* s = gb_str(b);
+                if (!s) break;
+                g->merges[g->n_merges++] = s;
             } else {
                 switch (at) {
                 case GVT_U8: case GVT_I8: case GVT_BOOL: gb_skip(b, 1); break;
@@ -325,6 +354,34 @@ enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4 };
 
 static int gg_slot_for(const char* name, int* layer)
 {
+    /* qwen2 风格命名: model.embed_tokens / model.layers.{i}.self_attn.{q,k,v,o}_proj
+       / model.layers.{i}.mlp.{gate,up,down}_proj / model.norm / lm_head */
+    if (strcmp(name, "model.embed_tokens.weight") == 0) { *layer = 0; return SP_EMBED; }
+    if (strcmp(name, "model.norm.weight") == 0) { *layer = 0; return SP_FINALNORM; }
+    if (strcmp(name, "lm_head.weight") == 0) { *layer = 0; return SP_OUTPUT; }
+    if (strncmp(name, "model.layers.", 13) == 0) {
+        const char* p = name + 13;
+        int n = 0;
+        while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
+        if (*p != '.') return -1;
+        p++;
+        static const struct { const char* suf; int slot; } tab[] = {
+            { "input_layernorm.weight", SLOT_NORM1 },
+            { "self_attn.q_proj.weight", SLOT_Q },
+            { "self_attn.k_proj.weight", SLOT_K },
+            { "self_attn.v_proj.weight", SLOT_V },
+            { "self_attn.o_proj.weight", SLOT_O },
+            { "post_attention_layernorm.weight", SLOT_NORM2 },
+            { "mlp.gate_proj.weight", SLOT_GATE },
+            { "mlp.up_proj.weight", SLOT_UP },
+            { "mlp.down_proj.weight", SLOT_DOWN },
+        };
+        size_t i;
+        for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
+            if (strcmp(p, tab[i].suf) == 0) { *layer = n; return tab[i].slot; }
+        }
+        return -1;
+    }
     if (strcmp(name, "token_embd.weight") == 0) { *layer = 0; return SP_EMBED; }
     if (strcmp(name, "output_norm.weight") == 0) { *layer = 0; return SP_FINALNORM; }
     if (strcmp(name, "output.weight") == 0) { *layer = 0; return SP_OUTPUT; }
@@ -344,6 +401,9 @@ static int gg_slot_for(const char* name, int* layer)
             { "ffn_gate.weight", SLOT_GATE },
             { "ffn_up.weight", SLOT_UP },
             { "ffn_down.weight", SLOT_DOWN },
+            { "attn_q.bias", SLOT_QBIAS },
+            { "attn_k.bias", SLOT_KBIAS },
+            { "attn_v.bias", SLOT_VBIAS },
         };
         size_t i;
         for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
@@ -422,14 +482,15 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         snprintf(err, errlen, "bad gguf kv section");
         return -1;
     }
-    if (!g.arch || strcmp(g.arch, "llama") != 0) {
-        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' supported)", g.arch ? g.arch : "?");
+    if (!g.arch || (strcmp(g.arch, "llama") != 0 && strcmp(g.arch, "qwen2") != 0)) {
+        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' and 'qwen2' supported)", g.arch ? g.arch : "?");
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
         free(g.arch); free(data);
         return -1;
     }
+    int is_qwen = g.arch && strcmp(g.arch, "qwen2") == 0;
     free(g.arch);
     if (g.n_blocks == 0 || g.hidden == 0 || g.heads == 0) {
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
@@ -563,7 +624,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         if (slot == SP_EMBED) { items[n].layer = 0; items[n].slot = 0; }
         else if (slot == SP_FINALNORM) { items[n].layer = g.n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
-        else if (slot >= SLOT_NORM1 && slot <= SLOT_DOWN) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
+        else if (slot >= SLOT_NORM1 && slot <= SLOT_VBIAS) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else continue;
         const GGTensor* t = &list.t[i];
         items[n].dtype = type_map[t->gtype];
@@ -581,10 +642,11 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     {
         int p2;
         int missing = 0;
-        static const int all[BLOCK_TENSORS] = { SLOT_NORM1, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_NORM2, SLOT_GATE, SLOT_UP, SLOT_DOWN };
+        /* 只校验 9 个必需权重 slot(bias 可选) */
+        static const int all[9] = { SLOT_NORM1, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_NORM2, SLOT_GATE, SLOT_UP, SLOT_DOWN };
         for (i = 1; i <= g.n_blocks && !missing; i++) {
             int s2;
-            for (s2 = 0; s2 < BLOCK_TENSORS; s2++) {
+            for (s2 = 0; s2 < 9; s2++) {
                 int found = 0;
                 for (p2 = 0; p2 < n; p2++) {
                     if (items[p2].layer == i && items[p2].slot == (uint32_t)all[s2]) { found = 1; break; }
@@ -604,7 +666,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, YLLM_MAGIC, 8);
     h.version = YLLM_VERSION;
-    h.arch = ARCH_LLAMA;
+    h.arch = is_qwen ? ARCH_QWEN : ARCH_LLAMA;
     h.n_blocks = g.n_blocks;
     h.hidden = g.hidden;
     h.n_heads = g.heads;
@@ -660,6 +722,19 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                 fprintf(vf, "#SCORES#\n%u\n", g.n_scores);
                 for (i = 0; i < g.n_scores; i++) {
                     fprintf(vf, "%.9g\n", (double)g.scores[i]);
+                }
+            }
+            if (g.n_merges > 0) {
+                fprintf(vf, "#MERGES#\n%u\n", g.n_merges);
+                for (i = 0; i < g.n_merges; i++) {
+                    const char* s = g.merges[i];
+                    for (; *s; s++) {
+                        if (*s == '\n') fputs("\\n", vf);
+                        else if (*s == '\r') fputs("\\r", vf);
+                        else if (*s == '\\') fputs("\\\\", vf);
+                        else fputc(*s, vf);
+                    }
+                    fputc('\n', vf);
                 }
             }
             fprintf(vf, "#CHAT#\n");
