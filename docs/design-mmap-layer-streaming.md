@@ -421,3 +421,7 @@ def generate(req):
         out = ctx.step_decode()          # 内部: 自适应跳过全部预取/回收
     return ctx.result
 ```
+
+## 11. 参考
+
+ggml-org/ggml/master/docs/gguf.md

@@ -7,11 +7,33 @@ static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m)
 {
     if (j < 4) {
         *d = q[j] & 63;
-        *m = q[j + 8] & 63;
+        *m = q[j + 4] & 63;
     } else {
-        *d = (q[j + 4] >> 6) | ((q[j] >> 4) << 2);
-        *m = (q[j + 12] >> 6) | ((q[j + 8] >> 4) << 2);
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
+}
+
+static void q4k_block(float* y, const uint8_t* blk, uint32_t stride)
+{
+    float d = f16_to_f32(((const uint16_t*)blk)[0]);
+    float min = f16_to_f32(((const uint16_t*)blk)[1]);
+    const uint8_t* qs = blk + 16;
+    uint32_t g;
+    for (g = 0; g < 8; g++) {
+        uint8_t sc, m;
+        gsm_k4((int)g, blk + 4, &sc, &m);
+        float d1 = d * (float)sc;
+        float m1 = min * (float)m;
+        const uint8_t* q = qs + (g >> 1) * 32;
+        uint32_t e;
+        for (e = 0; e < 32; e++) {
+            uint8_t nib = q[e];
+            nib = (g & 1) ? (nib >> 4) : (nib & 0xF);
+            y[(size_t)g * 32 + e] = d1 * (float)nib - m1;
+        }
+    }
+    (void)stride;
 }
 
 static float q6k_val(const uint8_t* blk, uint32_t e)
@@ -26,7 +48,7 @@ static float q6k_val(const uint8_t* blk, uint32_t e)
     uint32_t bits = ((quad & 2) ? (ql >> 4) : (ql & 0xF)) | (((qh >> (quad * 2)) & 3) << 4);
     int8_t q = (int8_t)bits - 32;
     int8_t s = ((const int8_t*)(blk + 192))[half * 8 + quad * 2 + (ll >> 4)];
-    return d * ((float)s + 32.0f) * (float)q;
+    return d * (float)s * (float)q;
 }
 
 static const int8_t kvalues_iq4nl[16] = {
@@ -80,25 +102,7 @@ void embed_q4k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
     const uint8_t* r = w + (size_t)row * nb * 144;
     uint32_t b;
     for (b = 0; b < nb; b++) {
-        const uint8_t* blk = r + (size_t)b * 144;
-        float d = f16_to_f32(((const uint16_t*)blk)[0]);
-        float min = f16_to_f32(((const uint16_t*)blk)[1]);
-        float d1[8], m1[8];
-        uint32_t g;
-        for (g = 0; g < 8; g++) {
-            uint8_t sc, m;
-            gsm_k4((int)g, blk + 4, &sc, &m);
-            d1[g] = d * (float)sc;
-            m1[g] = min * (float)m;
-        }
-        for (g = 0; g < 8; g++) {
-            uint32_t e;
-            for (e = 0; e < 32; e++) {
-                uint8_t nib = blk[16 + g * 16 + (e >> 1)];
-                nib = (e & 1) ? (nib >> 4) : (nib & 0xF);
-                y[b * 256 + g * 32 + e] = d1[g] * nib - m1[g];
-            }
-        }
+        q4k_block(y + (size_t)b * 256, r + (size_t)b * 144, 0);
     }
 }
 
@@ -193,20 +197,19 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             const float* xb = x + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[0]);
             float min = f16_to_f32(((const uint16_t*)blk)[1]);
-            float d1[8], m1[8];
+            const uint8_t* qs = blk + 16;
             uint32_t g;
             for (g = 0; g < 8; g++) {
                 uint8_t sc, m;
                 gsm_k4((int)g, blk + 4, &sc, &m);
-                d1[g] = d * (float)sc;
-                m1[g] = min * (float)m;
-            }
-            for (g = 0; g < 8; g++) {
+                float d1 = d * (float)sc;
+                float m1 = min * (float)m;
+                const uint8_t* q = qs + (g >> 1) * 32;
                 uint32_t e;
                 for (e = 0; e < 32; e++) {
-                    uint8_t nib = blk[16 + g * 16 + (e >> 1)];
-                    nib = (e & 1) ? (nib >> 4) : (nib & 0xF);
-                    acc += xb[g * 32 + e] * (d1[g] * nib - m1[g]);
+                    uint8_t nib = q[e];
+                    nib = (g & 1) ? (nib >> 4) : (nib & 0xF);
+                    acc += xb[(size_t)g * 32 + e] * (d1 * (float)nib - m1);
                 }
             }
         }

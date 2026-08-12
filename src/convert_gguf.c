@@ -7,13 +7,25 @@ typedef struct {
     const uint8_t* p;
     const uint8_t* end;
     int err;
+    int be; /* big-endian (gguf v3 files may be BE; detected from version field) */
 } GB;
+
+static uint32_t yb_bswap32(uint32_t v)
+{
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+}
+
+static uint64_t yb_bswap64(uint64_t v)
+{
+    return ((uint64_t)yb_bswap32((uint32_t)v) << 32) | yb_bswap32((uint32_t)(v >> 32));
+}
 
 static uint32_t gb_u32(GB* b)
 {
     uint32_t v;
     if (b->p + 4 > b->end) { b->err = 1; return 0; }
     memcpy(&v, b->p, 4);
+    if (b->be) v = yb_bswap32(v);
     b->p += 4;
     return v;
 }
@@ -23,6 +35,7 @@ static uint64_t gb_u64(GB* b)
     uint64_t v;
     if (b->p + 8 > b->end) { b->err = 1; return 0; }
     memcpy(&v, b->p, 8);
+    if (b->be) v = yb_bswap64(v);
     b->p += 8;
     return v;
 }
@@ -67,6 +80,7 @@ typedef struct {
     float freq_base;
     float rms_eps;
     uint32_t context_len;
+    uint32_t alignment;
     char** tokens;
     uint32_t n_tokens;
     uint32_t cap_tokens;
@@ -103,6 +117,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(key, "llama.attention.head_count")) g->heads = v;
         else if (!strcmp(key, "llama.attention.head_count_kv")) g->kv_heads = v;
         else if (!strcmp(key, "llama.context_length")) g->context_len = v;
+        else if (!strcmp(key, "general.alignment")) g->alignment = v;
         break;
     }
     case GVT_U64:
@@ -323,6 +338,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     b.p = data;
     b.end = data + fsize;
     b.err = 0;
+    b.be = 0;
     if (fsize < 8 || memcmp(b.p, "GGUF", 4) != 0) {
         free(data);
         snprintf(err, errlen, "not a gguf file");
@@ -330,13 +346,27 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     }
     b.p += 4;
     uint32_t ver = gb_u32(&b);
-    if (ver != 2 && ver != 3) {
+    if ((ver & 0xFFFF) == 0) {
+        /* gguf v3 supports big-endian files; the version field read with the
+           wrong byte order has all zero low 16 bits, use that to detect BE */
+        b.be = 1;
+        ver = gb_u32(&b);
+    }
+    if (ver < 1 || ver > 3) {
         free(data);
-        snprintf(err, errlen, "unsupported gguf version %u (need 2 or 3)", ver);
+        snprintf(err, errlen, "unsupported gguf version %u (need 1, 2 or 3)", ver);
         return -1;
     }
-    uint64_t n_tensors = gb_u64(&b);
-    uint64_t n_kv = gb_u64(&b);
+    uint64_t n_tensors, n_kv;
+    if (ver == 1) {
+        /* v1: counts and string lengths are uint32 */
+        n_tensors = gb_u32(&b);
+        n_kv = gb_u32(&b);
+    } else {
+        /* v2+: counts are uint64 */
+        n_tensors = gb_u64(&b);
+        n_kv = gb_u64(&b);
+    }
 
     GgufMeta g;
     memset(&g, 0, sizeof(g));
@@ -395,7 +425,17 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
     uint64_t meta_end = (uint64_t)(b.p - data);
-    uint64_t data_start = align_up(meta_end, 32);
+    if (g.alignment && (g.alignment < 8 || (g.alignment & (g.alignment - 1)) != 0)) {
+        for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
+        free(list.t);
+        free(data);
+        snprintf(err, errlen, "bad general.alignment %u (must be >=8 and a power of two)", g.alignment);
+        return -1;
+    }
+    /* v1 has no data alignment; v2/v3 pad the data section to general.alignment
+       (default 32) so tensors can be memory-mapped */
+    uint32_t alignment = g.alignment ? g.alignment : 32;
+    uint64_t data_start = ver == 1 ? meta_end : align_up(meta_end, alignment);
     if (data_start > fsize) {
         for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
         free(list.t);
@@ -403,6 +443,8 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         snprintf(err, errlen, "gguf data section out of range");
         return -1;
     }
+    printf("gguf: version %u%s alignment=%u data_start=%llu\n", ver,
+           b.be ? " (big-endian)" : "", alignment, (unsigned long long)data_start);
 
     uint8_t type_map[256];
     gg_probe_layout(&list, data, data_start, fsize, type_map);
