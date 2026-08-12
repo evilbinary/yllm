@@ -22,7 +22,7 @@ static int g_pass = 0;
 } while (0)
 
 /* ---- golden reference data (from llama.cpp/gguf dequantize) ---- */
-#include "../build/ref_data.h"
+#include "ref_data.h"
 
 /* ---- f16_to_f32 regression tests ---- *
  * Fixed bugs:
