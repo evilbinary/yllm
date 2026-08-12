@@ -45,15 +45,18 @@ else ifeq ($(UNAME_S),Darwin)
     EXE      :=
     PLATDEF  := -D_DARWIN_C_SOURCE
     PLATLIBS := -lm -pthread
+    OMPFLAG  :=
 else
     EXE      :=
     PLATDEF  := -D_DEFAULT_SOURCE
     PLATLIBS := -lm -pthread
+    # Linux 默认启用 OpenMP 多核加速(可用 make OMPFLAG= 关闭)
+    OMPFLAG  := -fopenmp
 endif
 LIBS += $(PLATLIBS)
 
 # ---- 标量版本(默认) ----
-CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF)
+CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:src/%.c=$(OBJDIR)/%.o)
@@ -134,6 +137,29 @@ test-avx2: $(TEST_BIN_AVX)
 	@echo "=== test_engine (avx2) ==="
 	./$(OBJDIR_AVX2)/test_engine.exe
 
+# ---- 集成: 转换模型 + 运行 chat/gen ----
+MODEL_GGUF  ?= tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+MODEL_LLF   ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+MODEL_VOCAB ?= test/tinyllama.vocab.txt
+CHAT_PROMPT ?= "Once upon a time"
+CHAT_TOKENS ?= 32
+
+$(MODEL_LLF): $(MODEL_GGUF) $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(MODEL_GGUF) --out $(MODEL_LLF) --vocab $(MODEL_VOCAB) --seq 2048
+
+chat: $(BIN) $(MODEL_LLF)
+	$(BIN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+gen: $(BIN) $(MODEL_LLF)
+	$(BIN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
+	$(BIN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
+	$(BIN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
@@ -143,4 +169,4 @@ $(OBJDIR_AVX2):
 clean:
 	rm -rf build
 
-.PHONY: all avx2 clean test test-avx2
+.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2

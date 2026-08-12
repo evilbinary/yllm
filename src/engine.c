@@ -134,7 +134,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->hb = (float*)ycalloc(hidden, 4 * 9);
     e->hb2 = (float*)ycalloc(hidden, 4 * 9);
     e->ffn = (float*)ycalloc(hidden, 4 * 9);
-    e->att = (float*)ymalloc((size_t)e->max_seq * 4);
+    e->att = (float*)ymalloc((size_t)e->max_seq * m->h.n_heads * 4);
     e->logits = (float*)ymalloc((size_t)vocab * 4);
 
     Worker* w = (Worker*)ycalloc(1, sizeof(Worker));
@@ -227,23 +227,25 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
 
     float* att = e->att;
     float inv_d = 1.0f / sqrtf((float)h->head_dim);
+    #pragma omp parallel for schedule(static)
     for (hh = 0; hh < h->n_heads; hh++) {
+        float* att_h = att + (size_t)hh * e->max_seq;
         uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
         const float* qh = q + (size_t)hh * h->head_dim;
-        uint32_t s;
+        uint32_t s, jj;
         for (s = 0; s <= pos; s++) {
             const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
             float acc = 0.0f;
-            for (j = 0; j < h->head_dim; j++) acc += qh[j] * f16_to_f32(kh[j]);
-            att[s] = acc * inv_d;
+            for (jj = 0; jj < h->head_dim; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
+            att_h[s] = acc * inv_d;
         }
-        softmax(att, pos + 1);
+        softmax(att_h, pos + 1);
         float* out = att_out + (size_t)hh * h->head_dim;
         memset(out, 0, (size_t)h->head_dim * 4);
         for (s = 0; s <= pos; s++) {
             const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-            float a = att[s];
-            for (j = 0; j < h->head_dim; j++) out[j] += a * f16_to_f32(vh[j]);
+            float a = att_h[s];
+            for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
         }
     }
     memcpy(x2, att_out, (size_t)hidden * 4);

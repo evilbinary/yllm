@@ -93,6 +93,7 @@ static void matmul_f32(float* y, const float* x, const uint8_t* w, uint32_t out,
 {
     const float* wp = (const float*)w;
     uint32_t oo;
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         float acc = 0.0f;
         uint32_t ii;
@@ -105,6 +106,7 @@ static void matmul_f16(float* y, const float* x, const uint8_t* w, uint32_t out,
 {
     uint32_t oo;
     const uint16_t* wp = (const uint16_t*)w;
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         float acc = 0.0f;
         uint32_t ii;
@@ -162,6 +164,7 @@ void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     uint32_t rowb = nb * 144;
     float tmp[256];
     uint32_t oo;
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -192,6 +195,7 @@ void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint3
 {
     const float* wp = (const float*)w;
     uint32_t oo;
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         float acc = 0.0f;
         uint32_t ii;
@@ -206,8 +210,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t rowb = nb * 144;
     uint32_t oo;
 #ifdef __AVX2__
-#ifdef _OPENMP
-#endif
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -276,6 +279,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         y[oo] = acc;
     }
 #else
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -312,8 +316,7 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t rowb = nb * 210;
     uint32_t oo;
 #ifdef __AVX2__
-#ifdef _OPENMP
-#endif
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -375,6 +378,7 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         y[oo] = acc;
     }
 #else
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
@@ -417,6 +421,7 @@ void matmul_f16_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint3
 {
     uint32_t oo;
     const uint16_t* wp = (const uint16_t*)w;
+    #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         float acc = 0.0f;
         uint32_t ii;
