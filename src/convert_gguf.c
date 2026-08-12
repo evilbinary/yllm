@@ -87,6 +87,9 @@ typedef struct {
     float* scores;
     uint32_t n_scores;
     uint32_t cap_scores;
+    char* chat_template;
+    int add_bos;
+    int eos_id;
 } GgufMeta;
 
 static void gg_tokens_grow(GgufMeta* g, uint64_t need)
@@ -131,6 +134,8 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(key, "llama.attention.head_count_kv")) g->kv_heads = v;
         else if (!strcmp(key, "llama.context_length")) g->context_len = v;
         else if (!strcmp(key, "general.alignment")) g->alignment = v;
+        else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
+        else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
         break;
     }
     case GVT_U64:
@@ -141,6 +146,8 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(key, "llama.attention.head_count")) g->heads = (uint32_t)v;
         else if (!strcmp(key, "llama.attention.head_count_kv")) g->kv_heads = (uint32_t)v;
         else if (!strcmp(key, "llama.context_length")) g->context_len = (uint32_t)v;
+        else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
+        else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
         break;
     }
     case GVT_F64: {
@@ -155,6 +162,9 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
             if (!strcmp(key, "general.architecture")) {
                 free(g->arch);
                 g->arch = s;
+            } else if (!strcmp(key, "tokenizer.chat_template")) {
+                free(g->chat_template);
+                g->chat_template = s;
             } else {
                 free(s);
             }
@@ -406,6 +416,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
+        free(g.chat_template);
         free(data);
         snprintf(err, errlen, "bad gguf kv section");
         return -1;
@@ -423,6 +434,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
+        free(g.chat_template);
         free(data);
         snprintf(err, errlen, "missing model dims in metadata");
         return -1;
@@ -432,6 +444,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
+        free(g.chat_template);
         free(data);
         snprintf(err, errlen, "hidden %u not divisible by heads %u", g.hidden, g.heads);
         return -1;
@@ -440,6 +453,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
+        free(g.chat_template);
         free(data);
         snprintf(err, errlen, "hidden %u not divisible by 256 (required for K-quants)", g.hidden);
         return -1;
@@ -637,8 +651,23 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                     fprintf(vf, "%.9g\n", (double)g.scores[i]);
                 }
             }
+            fprintf(vf, "#CHAT#\n");
+            fprintf(vf, "add_bos=%d\n", g.add_bos);
+            fprintf(vf, "eos_id=%d\n", g.eos_id);
+            fprintf(vf, "template=");
+            if (g.chat_template) {
+                const char* s = g.chat_template;
+                for (; *s; s++) {
+                    if (*s == '\n') fputs("\\n", vf);
+                    else if (*s == '\r') fputs("\\r", vf);
+                    else if (*s == '\\') fputs("\\\\", vf);
+                    else fputc(*s, vf);
+                }
+            }
+            fputc('\n', vf);
             fclose(vf);
-            printf("vocab written: %s (%u pieces, %u scores)\n", vocab_out, g.n_tokens, g.n_scores);
+            printf("vocab written: %s (%u pieces, %u scores, add_bos=%d)\n",
+                   vocab_out, g.n_tokens, g.n_scores, g.add_bos);
         } else {
             snprintf(err, errlen, "cannot write %s", vocab_out);
             rc = -1;
@@ -647,6 +676,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
     free(g.tokens);
     free(g.scores);
+    free(g.chat_template);
     for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
     free(list.t);
     free(items);

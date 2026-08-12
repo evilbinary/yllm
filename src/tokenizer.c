@@ -190,6 +190,25 @@ static int parse_text(const char* path, Vocab* v)
             }
         }
     }
+
+    /* optional #CHAT# section: add_bos, eos_id, template */
+    if (fgets(line, sizeof(line), f)) {
+        size_t l = strlen(line);
+        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+        if (strcmp(line, "#CHAT#") == 0) {
+            while (fgets(line, sizeof(line), f)) {
+                size_t l2 = strlen(line);
+                while (l2 > 0 && (line[l2 - 1] == '\n' || line[l2 - 1] == '\r')) line[--l2] = 0;
+                if (strncmp(line, "add_bos=", 8) == 0) {
+                    v->add_bos = atoi(line + 8);
+                } else if (strncmp(line, "eos_id=", 7) == 0) {
+                    v->eos = atoi(line + 7);
+                } else if (strncmp(line, "template=", 9) == 0) {
+                    v->chat_template = unescape_piece(line + 9);
+                }
+            }
+        }
+    }
     fclose(f);
     return 0;
 }
@@ -268,6 +287,7 @@ void vocab_free(Vocab* v)
     free(v->order);
     free(v->sorted);
     free(v->scores);
+    free(v->chat_template);
     memset(v, 0, sizeof(*v));
 }
 
@@ -440,4 +460,226 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max)
     }
     out[o] = 0;
     return o;
+}
+
+int vocab_has_template(Vocab* v)
+{
+    return v->chat_template && v->chat_template[0] != 0;
+}
+
+/* ---- simplified jinja2 chat-template renderer ----
+ *
+ * Supports the message-loop subset used by llama/qwen family templates:
+ *
+ *   {% for message in messages %}
+ *   {% if message['role'] == 'user' %}
+ *   {{ '<|user|>\n' + message['content'] + eos_token }}
+ *   {% elif message['role'] == 'system' %} ...
+ *   {% elif message['role'] == 'assistant' %} ...
+ *   {% endif %}
+ *   {% if loop.last and add_generation_prompt %}
+ *   {{ '<|assistant|>' }}
+ *   {% endif %}
+ *   {% endfor %}
+ *
+ * Expressions evaluated: string literals ('...'), message['role'],
+ * message['content'], eos_token, bos_token, + concatenation, \n escapes.
+ */
+
+typedef struct {
+    const char* role;
+    const char* content;
+} ChatMsg;
+
+/* evaluate a {{ ... }} expression into out, returns length */
+static int chat_eval_expr(const char* e, const ChatMsg* msg, int is_last, int add_gen,
+                          int eos_id, int bos_id, const Vocab* v, char* out, int max)
+{
+    int o = 0;
+    const char* p = e;
+    const char* eos_tok = eos_id >= 0 && eos_id < v->n ? v->pieces[eos_id] : "";
+    const char* bos_tok = bos_id >= 0 && bos_id < v->n ? v->pieces[bos_id] : "";
+    while (*p && o < max - 1) {
+        if (*p == '\'') {
+            /* string literal */
+            p++;
+            while (*p && *p != '\'') {
+                if (*p == '\\' && p[1] == 'n') { out[o++] = '\n'; p += 2; }
+                else if (*p == '\\' && p[1] == 't') { out[o++] = '\t'; p += 2; }
+                else out[o++] = *p++;
+            }
+            if (*p == '\'') p++;
+        } else if (strncmp(p, "message['role']", 15) == 0) {
+            const char* r = msg ? msg->role : "";
+            while (*r && o < max - 1) out[o++] = *r++;
+            p += 15;
+        } else if (strncmp(p, "message['content']", 18) == 0) {
+            const char* c = msg ? msg->content : "";
+            while (*c && o < max - 1) out[o++] = *c++;
+            p += 18;
+        } else if (strncmp(p, "eos_token", 9) == 0) {
+            const char* s = eos_tok;
+            while (*s && o < max - 1) out[o++] = *s++;
+            p += 9;
+        } else if (strncmp(p, "bos_token", 9) == 0) {
+            const char* s = bos_tok;
+            while (*s && o < max - 1) out[o++] = *s++;
+            p += 9;
+        } else if (strncmp(p, "loop.last", 9) == 0) {
+            (void)is_last; (void)add_gen;
+            p += 9;
+        } else if (*p == '+') {
+            p++;
+        } else {
+            p++;
+        }
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* returns 1 if the condition is true */
+static int chat_eval_cond(const char* e, const ChatMsg* msg)
+{
+    /* patterns: message['role'] == 'user' / 'system' / 'assistant' */
+    const char* role = msg ? msg->role : "";
+    const char* p = strstr(e, "message['role']");
+    if (!p) return 0;
+    const char* q = strstr(p, "'");
+    if (!q) return 0;
+    const char* r = strchr(q + 1, '\'');
+    if (!r) return 0;
+    size_t rl = (size_t)(r - q - 1);
+    if (rl == strlen(role) && strncmp(q + 1, role, rl) == 0) return 1;
+    return 0;
+}
+
+static int chat_append_ids(Vocab* v, const char* text, uint32_t* ids, int max, int* n)
+{
+    uint32_t tmp[4096];
+    int ntmp = vocab_encode(v, text, tmp, 4096);
+    int i;
+    for (i = 0; i < ntmp && *n < max; i++) ids[(*n)++] = tmp[i];
+    return 0;
+}
+
+int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos)
+{
+    if (!vocab_has_template(v)) return -1;
+
+    /* single-turn messages: [user] (+ optional generation prompt from template) */
+    ChatMsg msgs[2];
+    int n_msgs = 0;
+    msgs[n_msgs].role = "user";
+    msgs[n_msgs].content = user_msg;
+    n_msgs++;
+
+    int n_out = 0;
+    if (add_bos && v->bos >= 0 && n_out < max) ids[n_out++] = (uint32_t)v->bos;
+
+    size_t len = strlen(v->chat_template);
+    char* t = (char*)ymalloc(len + 1);
+    memcpy(t, v->chat_template, len + 1);
+
+    /* parse template into statements */
+    enum { ST_FOR, ST_IF, ST_ELIF, ST_ENDIF, ST_END_FOR, ST_EXPR, ST_IF_LAST, ST_NONE };
+    typedef struct {
+        int kind;
+        char cond[512];   /* for ST_IF/ST_ELIF: the condition expr */
+        char expr[2048];  /* for ST_EXPR: the expression */
+    } TStmt;
+    TStmt stmts[128];
+    int n_stmts = 0;
+
+    char* save = NULL;
+    char* line = strtok_r(t, "\n", &save);
+    while (line && n_stmts < 128) {
+        char* ls = line;
+        while (*ls == ' ' || *ls == '\t') ls++;
+        char* le = ls + strlen(ls);
+        while (le > ls && (le[-1] == ' ' || le[-1] == '\t')) *--le = 0;
+
+        if (strncmp(ls, "{% for", 6) == 0) {
+            stmts[n_stmts].kind = ST_FOR;
+            n_stmts++;
+        } else if (strncmp(ls, "{% if loop.last", 15) == 0) {
+            stmts[n_stmts].kind = ST_IF_LAST;
+            n_stmts++;
+        } else if (strncmp(ls, "{% if", 5) == 0) {
+            stmts[n_stmts].kind = ST_IF;
+            char* c0 = ls + 5;
+            char* c1 = strstr(c0, "%}");
+            if (c1) { *c1 = 0; snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", c0); }
+            n_stmts++;
+        } else if (strncmp(ls, "{% elif", 7) == 0) {
+            stmts[n_stmts].kind = ST_ELIF;
+            char* c0 = ls + 7;
+            char* c1 = strstr(c0, "%}");
+            if (c1) { *c1 = 0; snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", c0); }
+            n_stmts++;
+        } else if (strncmp(ls, "{% endif %}", 11) == 0) {
+            stmts[n_stmts].kind = ST_ENDIF;
+            n_stmts++;
+        } else if (strncmp(ls, "{% endfor %}", 12) == 0) {
+            stmts[n_stmts].kind = ST_END_FOR;
+            n_stmts++;
+        } else if (strncmp(ls, "{{", 2) == 0) {
+            stmts[n_stmts].kind = ST_EXPR;
+            size_t el = strlen(ls);
+            if (el > 4 && ls[el - 2] == '}' && ls[el - 1] == '}') {
+                memcpy(stmts[n_stmts].expr, ls + 2, el - 4);
+                stmts[n_stmts].expr[el - 4] = 0;
+            } else {
+                stmts[n_stmts].expr[0] = 0;
+            }
+            n_stmts++;
+        } else if (ls[0] != 0) {
+            /* bare text line -> treat as literal expression */
+            stmts[n_stmts].kind = ST_EXPR;
+            snprintf(stmts[n_stmts].expr, sizeof(stmts[n_stmts].expr), "'%s'", ls);
+            n_stmts++;
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    free(t);
+
+    /* execute statements, iterating messages */
+    char out[4096];
+    int mi;
+    for (mi = 0; mi < n_msgs; mi++) {
+        int is_last = (mi == n_msgs - 1);
+        int in_if = 0;      /* 0 = no branch, 1 = active branch, 2 = skipped branch */
+        int si;
+        for (si = 0; si < n_stmts && n_out < max; si++) {
+            TStmt* st = &stmts[si];
+            switch (st->kind) {
+            case ST_FOR:
+                break;
+            case ST_IF:
+                in_if = chat_eval_cond(st->cond, &msgs[mi]) ? 1 : 2;
+                break;
+            case ST_ELIF:
+                if (in_if == 2 && chat_eval_cond(st->cond, &msgs[mi])) in_if = 1;
+                break;
+            case ST_ENDIF:
+                in_if = 0;
+                break;
+            case ST_IF_LAST:
+                in_if = is_last ? 1 : 2;
+                break;
+            case ST_END_FOR:
+                break;
+            case ST_EXPR:
+                if (in_if != 2) {
+                    chat_eval_expr(st->expr, &msgs[mi], is_last, 1, v->eos, v->bos, v, out, sizeof(out));
+                    chat_append_ids(v, out, ids, max, &n_out);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        if (!is_last) continue;
+    }
+    return n_out;
 }

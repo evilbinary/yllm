@@ -29,6 +29,8 @@ typedef struct {
     int* sorted;      /* indices into pieces, dictionary order (for BPE lookup) */
     float* scores;    /* tokenizer.ggml.scores, per-piece BPE priority */
     uint32_t n_scores;
+    char* chat_template; /* jinja2 chat template from gguf */
+    int add_bos;      /* tokenizer.ggml.add_bos_token */
 } Vocab;
 
 /* ---- 平台层 ---- */
@@ -72,6 +74,9 @@ void vocab_free(Vocab* v);
 int vocab_encode(Vocab* v, const char* text, uint32_t* ids, int max);
 int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max);
 int vocab_id(Vocab* v, const char* piece);
+/* chat template: render a single-turn user message, returns number of ids */
+int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos);
+int vocab_has_template(Vocab* v);
 
 /* ---- 引擎 ---- */
 typedef struct {
@@ -95,7 +100,7 @@ void engine_free(Engine* e);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out);
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
-                    float temp, float top_p, uint64_t seed,
+                    float temp, float top_p, uint64_t seed, int eos_stop,
                     void (*on_token)(uint32_t id, void* ctx), void* ctx, char* err, size_t errlen);
 uint64_t engine_resident(const Engine* e);
 

@@ -364,7 +364,7 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
 }
 
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
-                    float temp, float top_p, uint64_t seed,
+                    float temp, float top_p, uint64_t seed, int eos_stop,
                     void (*on_token)(uint32_t id, void* ctx), void* ctx, char* err, size_t errlen)
 {
     uint64_t rng = ysrand(seed);
@@ -383,6 +383,7 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         uint32_t nxt;
         if (engine_sample(e, e->ws.model.h.vocab, temp, top_p, &rng, &nxt) != 0) return -1;
         if (on_token) on_token(nxt, ctx);
+        if (eos_stop >= 0 && (int)nxt == eos_stop) break;
         engine_forward(e, nxt, pos);
         pos++;
     }

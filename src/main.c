@@ -164,7 +164,7 @@ static int cmd_gen(int argc, char** argv)
     uint64_t t0 = ynow_ms();
     int rc = 0;
     if (nprompt > 0) {
-        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, on_token_cb, &v, err, sizeof(err));
+        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
     printf("\n\n");
@@ -180,15 +180,83 @@ static int cmd_gen(int argc, char** argv)
     return rc == 0 ? 0 : 1;
 }
 
+static int cmd_chat(int argc, char** argv)
+{
+    Arg a[16];
+    int n = parse_args(argc, argv, 2, a, 16);
+    const char* m = opt(a, n, "model", NULL);
+    const char* vocab = opt(a, n, "vocab", "vocab.txt");
+    const char* prompt = opt(a, n, "prompt", NULL);
+    int ntokens = atoi(opt(a, n, "tokens", "128"));
+    int budget_mb = atoi(opt(a, n, "budget-mb", "0"));
+    int depth = atoi(opt(a, n, "depth", "2"));
+    float temp = (float)atof(opt(a, n, "temp", "0.8"));
+    float top_p = (float)atof(opt(a, n, "top-p", "0.9"));
+    uint64_t seed = (uint64_t)strtoull(opt(a, n, "seed", "42"), NULL, 10);
+
+    if (!m) {
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
+        return 1;
+    }
+
+    Vocab v;
+    if (vocab_load(vocab, &v) != 0) {
+        fprintf(stderr, "cannot load vocab: %s\n", vocab);
+        return 1;
+    }
+
+    Engine e;
+    char err[1024];
+    uint64_t budget = (uint64_t)budget_mb * 1024 * 1024;
+    if (engine_init(&e, m, budget, depth, err, sizeof(err)) != 0) {
+        fprintf(stderr, "engine init failed: %s\n", err);
+        vocab_free(&v);
+        return 1;
+    }
+
+    uint32_t* ids = (uint32_t*)ymalloc((size_t)ntokens + 8192);
+    uint32_t sz = (uint32_t)(ntokens + 8192);
+    int nprompt;
+    if (prompt && vocab_has_template(&v)) {
+        nprompt = vocab_chat_ids(&v, prompt, ids, (int)sz, v.add_bos);
+        if (nprompt <= 0) {
+            fprintf(stderr, "chat template render failed, falling back to plain encode\n");
+            nprompt = vocab_encode(&v, prompt, ids, (int)sz);
+        }
+    } else {
+        nprompt = vocab_encode(&v, prompt ? prompt : "Hello", ids, (int)sz);
+    }
+    printf("chat prompt tokens: %d (bos=%d)\n", nprompt, v.bos);
+    printf("\n");
+    uint64_t t0 = ynow_ms();
+    int rc = 0;
+    if (nprompt > 0) {
+        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, err, sizeof(err));
+    }
+    uint64_t ms = ynow_ms() - t0;
+    printf("\n\n");
+    printf("generated up to %d tokens in %.2f s\n", ntokens, (double)ms / 1000.0);
+    if (ms > 0) printf("throughput: %.2f tok/s\n", (double)ntokens * 1000.0 / (double)ms);
+    printf("resident estimate: %.2f MB (budget: %s)\n",
+           (double)engine_resident(&e) / 1048576.0,
+           budget_mb > 0 ? "limited" : "unlimited");
+    if (rc != 0) fprintf(stderr, "chat failed: %s\n", err);
+    engine_free(&e);
+    vocab_free(&v);
+    free(ids);
+    return rc == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: yllm <convert|check|gen> [options]\n");
+        fprintf(stderr, "usage: yllm <convert|check|gen|chat> [options]\n");
         return 1;
     }
     if (strcmp(argv[1], "convert") == 0) return cmd_convert(argc, argv);
     if (strcmp(argv[1], "check") == 0) return cmd_check(argc, argv);
     if (strcmp(argv[1], "gen") == 0) return cmd_gen(argc, argv);
+    if (strcmp(argv[1], "chat") == 0) return cmd_chat(argc, argv);
     fprintf(stderr, "unknown command: %s\n", argv[1]);
     return 1;
 }
