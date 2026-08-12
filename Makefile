@@ -1,3 +1,14 @@
+# yllm 构建 (Linux / macOS / Windows/MinGW)
+#
+#   make            标量版本
+#   make avx2       x86_64 上的 AVX2 版本(其他架构退化为标量)
+#   make test       运行测试
+#   make clean
+#
+# Windows 下请在 MSYS2 / MinGW 环境执行本 Makefile;
+# 若使用 MSVC, 请改用 CMake:
+#   cmake -S . -B build-msvc && cmake --build build-msvc --config Release
+
 CC         ?= cc
 LDFLAGS    ?=
 LIBS       :=
@@ -5,23 +16,57 @@ LIBS       :=
 SRC      := src/platform.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c src/main.c
 TEST_ENGINE_CORE := src/platform.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c
 
-UNAME_S := $(shell uname -s 2>/dev/null || echo Windows)
-ifneq ($(filter Linux Darwin,$(UNAME_S)),)
-    LIBS += -lm -pthread
+# ---- OS 检测 (Windows: MSYS2/MinGW 的 uname 会带 MINGW/MSYS, 也归为 Windows) ----
+ifneq ($(OS),Windows_NT)
+UNAME_S := $(shell uname -s 2>/dev/null)
+else
+UNAME_S := Windows
+endif
+ifneq ($(findstring MINGW,$(UNAME_S)),)
+UNAME_S := Windows
+endif
+ifneq ($(findstring MSYS,$(UNAME_S)),)
+UNAME_S := Windows
 endif
 
-# ---- 标量版本(默认,无 SIMD) ----
-CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra
+# ---- 架构检测 (AVX2 仅 x86_64) ----
+ifneq ($(OS),Windows_NT)
+ARCH := $(shell uname -m 2>/dev/null)
+else
+ARCH := x86_64
+endif
+
+# ---- 平台相关: 可执行后缀 / feature macros / 链接库 ----
+ifeq ($(UNAME_S),Windows)
+    EXE      := .exe
+    PLATDEF  :=
+    PLATLIBS := -lm
+else ifeq ($(UNAME_S),Darwin)
+    EXE      :=
+    PLATDEF  := -D_DARWIN_C_SOURCE
+    PLATLIBS := -lm -pthread
+else
+    EXE      :=
+    PLATDEF  := -D_DEFAULT_SOURCE
+    PLATLIBS := -lm -pthread
+endif
+LIBS += $(PLATLIBS)
+
+# ---- 标量版本(默认) ----
+CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF)
 OBJDIR        := build
-BIN           := build/yllm
+BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:src/%.c=$(OBJDIR)/%.o)
 
-# ---- AVX2 版本(加 -mavx2 -mfma) ----
-CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
+# ---- AVX2 版本(仅 x86_64; 其余架构退化为标量, 保持 target 可用) ----
+CFLAGS_AVX2   := $(CFLAGS_BASE)
 LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
-BIN_AVX2      := build/avx2/yllm
+BIN_AVX2      := build/avx2/yllm$(EXE)
 OBJ_AVX2      := $(SRC:src/%.c=$(OBJDIR_AVX2)/%.o)
+ifeq ($(ARCH),x86_64)
+CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
+endif
 
 all: $(BIN)
 
