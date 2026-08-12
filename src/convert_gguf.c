@@ -252,8 +252,10 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
                     for (i = 0; i < (size_t)l->n; i++) { if (l->t[i].gtype == a) { t0 = &l->t[i]; break; } }
                     if (t0) {
                         uint16_t u16;
-                        memcpy(&u16, dptr + data_start + t0->offset, 2);
+                        memcpy(&u16, dptr + data_start + t0->offset + 2, 2);
                         float dmin = f16_to_f32(u16);
+                        printf("probe: type %u first=%s offset=%llu dmin=%g\n",
+                            (unsigned)a, t0->name, (unsigned long long)t0->offset, (double)dmin);
                         if (dmin < -0.5f || dmin > 0.5f) map[a] = DT_IQ4XS;
                     }
                 }
@@ -404,6 +406,15 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
 
     uint8_t type_map[256];
     gg_probe_layout(&list, data, data_start, fsize, type_map);
+    {
+        static const char* dn[8] = { "f16", "f32", "bf16", "q4_k", "q6_k", "iq4_xs" };
+        int a;
+        for (a = 0; a < 256; a++) {
+            int has = 0;
+            for (i = 0; i < (uint64_t)list.n; i++) if (list.t[i].gtype == (uint32_t)a) { has = 1; break; }
+            if (has) printf("probe: gguf type %d -> %s\n", a, type_map[a] < 6 ? dn[type_map[a]] : "?");
+        }
+    }
     {
         /* compute nbytes and drop unsupported tensors */
         GGList keep;
