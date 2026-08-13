@@ -60,15 +60,21 @@ static int spawn_proc(const char* cmdline)
 }
 
 /* 拉起一个 rank(段 r, 模型 m) */
-/* 每个模型独立端口区间: 模型 mi 的 rank 端口基址 = rank_port_base + mi*16 */
-#define MODEL_PORT_STRIDE 16
+/* 动态步长: 所有模型里最大的 ranks; rank-N 端口 = base + N(连续, 无魔数上限) */
+static int model_stride(const Supervisor* s)
+{
+    int stride = 1, mi;
+    for (mi = 0; mi < s->n_models && mi < CFG_MAX_MODELS; mi++)
+        if (s->models[mi].ranks > stride) stride = s->models[mi].ranks;
+    return stride;
+}
 static uint16_t model_rank_base(const Supervisor* s, int mi)
 {
-    return (uint16_t)(s->rank_port_base + mi * MODEL_PORT_STRIDE);
+    return (uint16_t)(s->rank_port_base + mi * model_stride(s));
 }
 static uint16_t model_server_port(const Supervisor* s, int mi)
 {
-    return (uint16_t)(s->server_port_base + mi * MODEL_PORT_STRIDE);
+    return (uint16_t)(s->server_port_base + mi * model_stride(s));
 }
 
 static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
@@ -81,7 +87,7 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, rport, s->sv_host, s->port,
-             mi * 32 + r, mc->name, r);
+             mi * model_stride(s) + r, mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
     return spawn_proc(cmd);
 }
@@ -124,7 +130,8 @@ static void heal_dead(Supervisor* s)
             ylog_warn("supervisor: rank %s DEAD, respawn", n->node.node_id);
             if (s->auto_heal) {
                 int idx = atoi(n->node.node_id + strlen("rank-"));
-                supervisor_spawn_rank(s, idx / 32, idx % 32);
+                int st = model_stride(s);
+                supervisor_spawn_rank(s, idx / st, idx % st);
             }
         }
     }

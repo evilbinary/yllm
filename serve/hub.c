@@ -110,10 +110,10 @@ int cmd_hub(ServeConfig* cfg)
         snprintf(s->node.model, sizeof(s->node.model), "%s",
                  mc->name[0] ? mc->name : (cfg->model_name[0] ? cfg->model_name : "default"));
         s->node.state = NODE_STATE_READY;
-        s->port = (uint16_t)(cfg->server_port + mi * 16);
+        s->port = (uint16_t)(cfg->server_port + mi * cfg_model_stride(cfg));
         snprintf(s->node.addr, sizeof(s->node.addr), "127.0.0.1:%d", s->port);
         /* leader = 该模型 rank0 (rank_port_base + mi*16) */
-        int lbase = cfg->rank_port_base + mi * 16;
+        int lbase = cfg->rank_port_base + mi * cfg_model_stride(cfg);
         snprintf(s->leader_host, sizeof(s->leader_host), "%s", sv_host);
         s->leader_port = (uint16_t)lbase;
         snprintf(s->node.sv_host, sizeof(s->node.sv_host), "127.0.0.1");

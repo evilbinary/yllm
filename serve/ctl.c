@@ -48,7 +48,12 @@ static int ctl_target_port(ServeConfig* cfg, const char* target)
     if (strcmp(target, "rt") == 0 || strcmp(target, "router") == 0) return cfg->router_port;
     if ((target[0] == 'r' || target[0] == 's') && target[1] >= '0' && target[1] <= '9') {
         int idx = atoi(target + 1);
-        return target[0] == 'r' ? cfg->rank_port_base + idx : cfg->server_port + idx;
+        if (target[0] == 'r') {
+            /* rank-N: 全局连续编号, 端口 = base + N */
+            return cfg->rank_port_base + idx;
+        }
+        /* server-N: 端口 = server_port + N*步长 */
+        return cfg->server_port + idx * cfg_model_stride(cfg);
     }
     if (strncmp(target, "server", 6) == 0) {
         int idx = atoi(target + 6);
@@ -127,19 +132,32 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
             snprintf(cmd, sizeof(cmd), "\"%s\" router --config \"%s\"", cfg->bin, cfgpath);
         } else if (target[0] == 's' || strncmp(target, "server", 6) == 0) {
             int idx = target[0] == 's' ? atoi(target + 1) : atoi(target + 6);
+            /* server-N: 模型 idx, 端口 = server_port + N*步长, leader = 该模型 rank0 */
+            const char* mname = idx < cfg->n_models && cfg->models[idx].name[0]
+                                ? cfg->models[idx].name : cfg->model_name;
             snprintf(cmd, sizeof(cmd),
                      "\"%s\" server --id server-%d --model-name \"%s\" "
-                     "--leader %s:%d --supervisor %s:%d --port %d --log %s/server-%d.log",
-                     cfg->bin, idx, cfg->model_name[0] ? cfg->model_name : "default",
-                     cfg->sv_host, cfg->rank_port_base, cfg->sv_host, cfg->sv_port,
-                     cfg->server_port + idx, logdir, idx);
+                     "--leader %s:%d --supervisor %s:%d --port %d --log %s/%s-server-%d.log",
+                     cfg->bin, idx, mname[0] ? mname : "default",
+                     cfg->sv_host, cfg->rank_port_base + idx * cfg_model_stride(cfg),
+                     cfg->sv_host, cfg->sv_port,
+                     cfg->server_port + idx * cfg_model_stride(cfg), logdir, mname, idx);
         } else if (target[0] == 'r' || strncmp(target, "rank", 4) == 0) {
             int idx = target[0] == 'r' ? atoi(target + 1) : atoi(target + 4);
+            int st = cfg_model_stride(cfg);
+            int mi = idx / st;
+            int rr = idx % st;
+            const char* model = mi < cfg->n_models && cfg->models[mi].model[0]
+                                ? cfg->models[mi].model : cfg->model;
+            const char* vocab = mi < cfg->n_models && cfg->models[mi].vocab[0]
+                                ? cfg->models[mi].vocab : cfg->vocab;
+            const char* mname = mi < cfg->n_models && cfg->models[mi].name[0]
+                                ? cfg->models[mi].name : "default";
             snprintf(cmd, sizeof(cmd),
                      "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %d "
-                     "--supervisor %s:%d --id rank-%d --log %s/rank-%d.log",
-                     cfg->bin, cfg->model, cfg->vocab, cfg->rank_port_base + idx,
-                     cfg->sv_host, cfg->sv_port, idx, logdir, idx);
+                     "--supervisor %s:%d --id rank-%d --log %s/%s-rank-%d.log",
+                     cfg->bin, model, vocab, cfg->rank_port_base + idx,
+                     cfg->sv_host, cfg->sv_port, idx, logdir, mname, rr);
         } else {
             fprintf(stderr, "ctl start: 未知目标 '%s'(支持 hub / sv / rt / s<N> / r<N>)\n", target);
             return 1;

@@ -306,6 +306,15 @@ static inline void config_apply_role(ServeConfig* c, const char* role)
 }
 
 /* 统一加载: 默认值 → --config yaml → 命令行散参 */
+/* 多模型端口/ID 步长 = 所有模型里最大的 ranks(避免端口重叠; 无 16/32 魔数限制) */
+static inline int cfg_model_stride(const ServeConfig* c)
+{
+    int stride = 1, mi;
+    for (mi = 0; mi < c->n_models && mi < CFG_MAX_MODELS; mi++)
+        if (c->models[mi].ranks > stride) stride = c->models[mi].ranks;
+    return stride;
+}
+
 static inline void config_load(ServeConfig* c, int argc, char** argv, int start)
 {
     config_defaults(c);
