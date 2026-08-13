@@ -274,6 +274,7 @@ int cmd_rank(ServeConfig* cfg)
     snprintf(r.node.type, sizeof(r.node.type), "rank");
     snprintf(r.node.model, sizeof(r.node.model), "%s", cfg->model);
     r.node.state = NODE_STATE_READY;
+    snprintf(r.node.addr, sizeof(r.node.addr), "%s:%u", cfg->sv_host, cfg->rank_port_base);
     if (cfg->sv_host[0]) {
         snprintf(r.node.sv_host, sizeof(r.node.sv_host), "%s", cfg->sv_host);
         r.node.sv_port = (uint16_t)cfg->sv_port;

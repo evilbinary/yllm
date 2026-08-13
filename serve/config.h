@@ -243,12 +243,19 @@ static inline void config_load(ServeConfig* c, int argc, char** argv, int start)
     }
     if (argc > 1 && argv[1]) snprintf(c->role, sizeof(c->role), "%s", argv[1]);
     int i;
+    const char* cfg_path = NULL;
     for (i = start; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
-            config_load_yaml(c, argv[i + 1]);
+            cfg_path = argv[i + 1];
             break;
         }
     }
+    /* 未指定 --config 时默认 serve.yaml(存在才加载) */
+    if (!cfg_path) {
+        FILE* t = fopen("serve.yaml", "r");
+        if (t) { fclose(t); cfg_path = "serve.yaml"; }
+    }
+    if (cfg_path) config_load_yaml(c, cfg_path);
     config_load_args(c, argc, argv, start);
 }
 

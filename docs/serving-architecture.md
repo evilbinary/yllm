@@ -1,5 +1,7 @@
 # yllm 常驻推理服务架构设计(router / server / 公用 rank 池 / supervisor)
 
+> 命令速查见 [serve-cli.md](serve-cli.md)(启动/查看/管理/分发)
+
 版本:v0.3 ｜ 状态:设计 ｜ 目标:模型权重常驻,进程活等请求,调度层只做毫秒级路由决策
 
 ## 0. 结论摘要
