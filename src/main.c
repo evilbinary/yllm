@@ -139,6 +139,7 @@ static int cmd_gen(int argc, char** argv)
     int rank = atoi(opt(a, n, "rank", "0"));
     int ranks = atoi(opt(a, n, "ranks", "1"));
     int port_base = atoi(opt(a, n, "port-base", "8900"));
+    int dist_fp16 = atoi(opt(a, n, "dist-fp16", "0"));
 
     if (!m) {
         fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
@@ -164,15 +165,27 @@ static int cmd_gen(int argc, char** argv)
         vocab_free(&v);
         return 1;
     }
-    /* 分布式分片: 按层区间切 */
+    /* 分布式分片: 按字节均衡切层(末 rank 含 norm+head, 故少分块) */
     if (ranks > 1) {
         uint32_t blocks = e.ws.model.h.n_blocks;
         if ((uint32_t)ranks > blocks) { fprintf(stderr, "ranks %d > blocks %u\n", ranks, blocks); return 1; }
-        uint32_t bp = blocks / (uint32_t)ranks;
-        uint32_t begin = (uint32_t)rank * bp + 1;   /* 层 1 = 第一个 block */
-        uint32_t end = (uint32_t)(rank + 1) * bp + 1;
-        if (rank == 0) begin = 0;                   /* rank0 含 embed */
-        if (rank == ranks - 1) end = e.ws.model.n_layers; /* 末 rank 含 norm+head */
+        uint32_t b;
+        uint64_t total = 0;
+        for (b = 1; b <= blocks; b++) total += e.ws.model.dir[b].size;
+        uint64_t per = total / (uint32_t)ranks;
+        uint32_t bs[64]; /* 每个 rank 的起始 block */
+        bs[0] = 1;
+        uint64_t acc = 0;
+        int r = 1;
+        for (b = 1; b <= blocks && r < ranks; b++) {
+            acc += e.ws.model.dir[b].size;
+            if (acc >= per * (uint64_t)r) { bs[r] = b + 1; r++; }
+        }
+        while (r < ranks) { bs[r] = blocks + 1; r++; }
+        if (bs[ranks - 1] > blocks + 1) bs[ranks - 1] = blocks + 1;
+        uint32_t begin = bs[rank];
+        uint32_t end = rank + 1 < ranks ? bs[rank + 1] : e.ws.model.n_layers;
+        if (rank == 0) begin = 0; /* rank0 含 embed */
         engine_set_layers(&e, begin, end);
     }
 
@@ -198,36 +211,41 @@ static int cmd_gen(int argc, char** argv)
         }
         uint32_t hidden = e.ws.model.h.hidden;
         uint32_t vocab_sz = e.ws.model.h.vocab;
+        enum { TOPK = 1024 };
         float* xbuf = (float*)ymalloc((size_t)hidden * 4);
-        float* logbuf = (float*)ymalloc((size_t)vocab_sz * 4);
+        uint32_t* k_ids = (uint32_t*)ymalloc((size_t)TOPK * 4);
+
         uint64_t rng = ysrand(seed);
         int ngen = 0;
 
         if (rank == 0) {
-            /* master: embed + 自己块段, 采样由收到的 logits 决定 */
+            /* master: embed + 自己块段, 采样由收到的 top-k logits 决定 */
             uint32_t pos = 0;
             int i;
             for (i = 0; i < nprompt; i++) {
                 engine_forward_range(&e, ids[i], 1, pos, xbuf, NULL);
-                dist_send_x(&dist, pos, xbuf, hidden);
+                dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
                 pos++;
             }
-            /* 丢弃 prompt 阶段多余的 logits(末 rank 对每个 X 帧都回 logits,
-               采样第一个生成 token 需要最后那个 prompt token 的 logits) */
+            float lse = 0.0f;
+            /* 丢弃 prompt 阶段多余的 top-k(末 rank 对每个 X 帧都回 logits) */
             for (i = 0; i < nprompt - 1; i++) {
-                if (dist_recv(&dist, NULL, NULL, 0, logbuf, vocab_sz) != 2) { rc = -1; break; }
+                if (dist_recv_logits(&dist, k_ids, e.logits, vocab_sz, &lse) <= 0) { rc = -1; break; }
             }
             for (i = 0; i < ntokens && rc == 0; i++) {
                 if (pos >= e.max_seq) break;
-                int t = dist_recv(&dist, NULL, NULL, 0, logbuf, vocab_sz);
-                if (t != 2) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed (type %d)", t); break; }
-                memcpy(e.logits, logbuf, (size_t)vocab_sz * 4);
+                int k = dist_recv_logits(&dist, k_ids, e.logits, vocab_sz, &lse);
+                if (k <= 0) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed"); break; }
                 uint32_t nxt;
                 if (engine_sample(&e, vocab_sz, temp, top_p, &rng, &nxt) != 0) { rc = -1; break; }
+                if (getenv("YLLM_DISTDBG")) {
+                    fprintf(stderr, "R0 sampled k=%d id=%u [%s] logit=%.2f\n", k, nxt,
+                            v.pieces[nxt], e.logits[nxt]);
+                }
                 on_token_cb(nxt, &v);
                 if (nxt == (uint32_t)v.eos) break;
                 engine_forward_range(&e, nxt, 1, pos, xbuf, NULL);
-                dist_send_x(&dist, pos, xbuf, hidden);
+                dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
                 pos++;
                 ngen++;
             }
@@ -237,10 +255,10 @@ static int cmd_gen(int argc, char** argv)
                    (double)(ynow_ms() - t0) / 1000.0,
                    (double)ngen * 1000.0 / (double)(ynow_ms() - t0 > 0 ? ynow_ms() - t0 : 1));
         } else {
-            /* 中段/末段 rank: 收激活 → 算自己块段 → 转发/出 logits */
+            /* 中段/末段 rank: 收激活 → 算自己块段 → 转发/出 top-k logits */
             uint32_t pos;
             int t;
-            while ((t = dist_recv(&dist, &pos, xbuf, hidden, NULL, 0)) >= 0) {
+            while ((t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
                 if (t == 3) { /* DONE: 向后转发并退出 */
                     dist_send_done(&dist);
                     break;
@@ -248,16 +266,17 @@ static int cmd_gen(int argc, char** argv)
                 if (t != 1) break;
                 memcpy(e.x, xbuf, (size_t)hidden * 4); /* 输入激活入引擎缓冲 */
                 if (rank == ranks - 1) {
-                    engine_forward_range(&e, 0, 0, pos, NULL, logbuf);
-                    if (dist_send_logits(&dist, logbuf, vocab_sz) != 0) { rc = -1; break; }
+                    engine_forward_range(&e, 0, 0, pos, NULL, e.logits);
+                    if (dist_send_logits(&dist, e.logits, vocab_sz, TOPK) != 0) { rc = -1; break; }
                 } else {
                     engine_forward_range(&e, 0, 0, pos, xbuf, NULL);
-                    if (dist_send_x(&dist, pos, xbuf, hidden) != 0) { rc = -1; break; }
+                    if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
                 }
             }
         }
         free(xbuf);
-        free(logbuf);
+        free(k_ids);
+
         dist_close(&dist);
         engine_free(&e);
         vocab_free(&v);
@@ -266,6 +285,22 @@ static int cmd_gen(int argc, char** argv)
     }
 
     if (nprompt >= 0) {
+        if (getenv("YLLM_DISTDBG")) {
+            /* 手动逐 token 采样, 打印 rng 值(与 engine_generate 等价) */
+            uint64_t rng2 = ysrand(seed);
+            uint32_t pos = 0;
+            int i2;
+            for (i2 = 0; i2 < nprompt; i2++) { engine_forward(&e, ids[i2], pos); pos++; }
+            for (i2 = 0; i2 < ntokens && rc == 0; i2++) {
+                uint32_t nxt;
+                if (engine_sample(&e, e.ws.model.h.vocab, temp, top_p, &rng2, &nxt) != 0) { rc = -1; break; }
+                fprintf(stderr, "SINGLE pos%u id=%u [%s]\n", pos, nxt, v.pieces[nxt]);
+                if (nxt == (uint32_t)v.eos) break;
+                engine_forward(&e, nxt, pos);
+                pos++;
+            }
+            goto done_gen;
+        }
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
@@ -281,6 +316,7 @@ static int cmd_gen(int argc, char** argv)
            (double)engine_resident(&e) / 1048576.0,
            budget_mb > 0 ? "limited" : "unlimited");
     if (rc != 0) fprintf(stderr, "generate failed: %s\n", err);
+done_gen:;
     engine_free(&e);
     vocab_free(&v);
     free(ids);
