@@ -203,6 +203,100 @@ chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
 gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+# ---- 常驻推理服务(serve 层) ----
+# 变量: MODEL_LLF / MODEL_VOCAB(模型)
+#       SERVE_PORT(hub 心跳口, 默认 9500) ROUTER_PORT(客户端口, 默认 9400)
+#       SERVER_PORT(转发口, 默认 9420) RANK_PORT(rank 推理口, 默认 9410)
+#       SERVER_MODEL(模型名, 默认 tinyllama) SERVER_LEADER(rank 地址, 默认 127.0.0.1:9410)
+#       SUPERVISOR_ADDR(rank 心跳目标, 默认 127.0.0.1:9500)
+# 用法:
+#   make serve            # hub + rank 本地启动(合并模式, 最小部署 2 进程)
+#   make serve-avx2       # 同上, 用 avx2 版本
+#   make serve-stop       # 停掉 serve 相关进程
+# 分开模式(各自独立进程):
+#   make supervisor / make router / make server / make rank
+
+SERVE_PORT      ?= 9500
+ROUTER_PORT     ?= 9400
+SERVER_PORT     ?= 9420
+RANK_PORT       ?= 9410
+SERVER_MODEL    ?= tinyllama
+SERVER_LEADER   ?= 127.0.0.1:$(RANK_PORT)
+SUPERVISOR_ADDR ?= 127.0.0.1:$(SERVE_PORT)
+SERVE_LOGDIR    ?= logs
+
+serve: $(BIN) $(MODEL_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@echo "== hub (sv=$(SERVE_PORT) rt=$(ROUTER_PORT) srv=$(SERVER_PORT)) =="
+	@nohup $(BIN) hub --port $(SERVE_PORT) --router-port $(ROUTER_PORT) \
+	  --server-port $(SERVER_PORT) --server-model $(SERVER_MODEL) \
+	  --server-leader $(SERVER_LEADER) --log $(SERVE_LOGDIR)/hub.log \
+	  > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "== rank (port=$(RANK_PORT)) =="
+	@nohup $(BIN) rank --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) \
+	  --port $(RANK_PORT) --supervisor $(SUPERVISOR_ADDR) --id rank-r0 \
+	  --log $(SERVE_LOGDIR)/rank.log > $(SERVE_LOGDIR)/rank.out 2>&1 &
+	@echo "serve started: hub($(SERVE_PORT)/$(ROUTER_PORT)/$(SERVER_PORT)) + rank($(RANK_PORT))"
+	@echo "test: $(BIN) router --send \"$(SERVER_MODEL) 8 hello world\""
+
+serve-avx2: $(BIN_AVX2) $(MODEL_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@echo "== hub (avx2) =="
+	@nohup $(BIN_AVX2) hub --port $(SERVE_PORT) --router-port $(ROUTER_PORT) \
+	  --server-port $(SERVER_PORT) --server-model $(SERVER_MODEL) \
+	  --server-leader $(SERVER_LEADER) --log $(SERVE_LOGDIR)/hub.log \
+	  > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "== rank (avx2) =="
+	@nohup $(BIN_AVX2) rank --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) \
+	  --port $(RANK_PORT) --supervisor $(SUPERVISOR_ADDR) --id rank-r0 \
+	  --log $(SERVE_LOGDIR)/rank.log > $(SERVE_LOGDIR)/rank.out 2>&1 &
+	@echo "serve started (avx2): hub + rank"
+
+# 分开模式(独立进程)
+supervisor: $(BIN)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN) supervisor --port $(SERVE_PORT) --router 127.0.0.1:$(ROUTER_PORT) \
+	  --log $(SERVE_LOGDIR)/supervisor.log > $(SERVE_LOGDIR)/supervisor.out 2>&1 &
+	@echo "supervisor started on $(SERVE_PORT)"
+
+router: $(BIN)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN) router --port $(ROUTER_PORT) --supervisor 127.0.0.1:$(SERVE_PORT) \
+	  --log $(SERVE_LOGDIR)/router.log > $(SERVE_LOGDIR)/router.out 2>&1 &
+	@echo "router started on $(ROUTER_PORT)"
+
+server: $(BIN)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN) server --id server-a --model $(SERVER_MODEL) \
+	  --leader $(SERVER_LEADER) --supervisor 127.0.0.1:$(SERVE_PORT) \
+	  --port $(SERVER_PORT) --log $(SERVE_LOGDIR)/server.log \
+	  > $(SERVE_LOGDIR)/server.out 2>&1 &
+	@echo "server started on $(SERVER_PORT) (leader=$(SERVER_LEADER))"
+
+rank: $(BIN) $(MODEL_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN) rank --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) \
+	  --port $(RANK_PORT) --supervisor $(SUPERVISOR_ADDR) --id rank-r0 \
+	  --log $(SERVE_LOGDIR)/rank.log > $(SERVE_LOGDIR)/rank.out 2>&1 &
+	@echo "rank started on $(RANK_PORT) (heartbeat → $(SUPERVISOR_ADDR))"
+
+# 客户端: 经 router 发请求(prompt 不含引号, 空格用 %20 或直接传)
+SERVE_PROMPT ?= Once upon a time
+infer:
+	$(BIN) router --port $(ROUTER_PORT) --send "$(SERVER_MODEL) $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+serve-stop:
+ifeq ($(UNAME_S),Windows)
+	@taskkill //F //IM yllm.exe 2>/dev/null; echo "serve processes stopped"
+else
+	@-pkill -f "yllm hub" 2>/dev/null; \
+	pkill -f "yllm rank" 2>/dev/null; \
+	pkill -f "yllm supervisor" 2>/dev/null; \
+	pkill -f "yllm router" 2>/dev/null; \
+	pkill -f "yllm server" 2>/dev/null; \
+	echo "serve processes stopped"
+endif
+
 # ---- 模型文件 dump 工具(LLF / GGUF / Safetensors) ----
 DUMP_BIN := $(OBJDIR)/llfdump
 
@@ -289,4 +383,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop
+.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 supervisor router server rank infer serve-stop

@@ -226,6 +226,7 @@ static void handle_client_infer(int fd, Router* r, const char* args)
 /* 客户端模式: --send "<model> <max_tokens> <prompt>" */
 static int run_client(Router* r, const char* send)
 {
+    sock_init();
     char model[128];
     int max_tokens = 0;
     const char* prompt = send;
@@ -233,7 +234,16 @@ static int run_client(Router* r, const char* send)
         fprintf(stderr, "usage: yllm router --send \"<model> <max_tokens> <prompt>\"\n");
         return 1;
     }
-    while (*prompt && *prompt != ' ' && *prompt != '\n') prompt++;
+    /* 跳过 model 和 max_tokens 两个 token, 剩余为 prompt */
+    prompt = send;
+    int skip = 0;
+    while (*prompt) {
+        while (*prompt == ' ') prompt++;
+        if (!*prompt) break;
+        while (*prompt && *prompt != ' ') prompt++;
+        skip++;
+        if (skip >= 2) break;
+    }
     while (*prompt == ' ') prompt++;
 
     int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
