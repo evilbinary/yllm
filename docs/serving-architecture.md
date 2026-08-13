@@ -572,18 +572,137 @@ yllm/
 ### 3.6.3 帧协议分类
 
 - `inference/dist.c` 内部:rank 间激活帧(X/LOGITS/DONE),推理执行的一部分;
-- `serve/protocol.h`:服务层帧(PING/STAT/INFER/DRAIN/REGISTER/HEARTBEAT/SCALE),rank/server/router 共用。
+- `serve/protocol.h`:服务层帧(PING/STAT/INFER/DRAIN/HEARTBEAT/SERVER_ADD/DEL/UPDATE/QUERY_SERVERS),rank/server/router/supervisor 共用。
+
+## 3.7 服务层统一抽象(Node + 帧协议)
+
+### 3.7.1 统一节点结构(serve/node.h)
+
+所有进程(rank/server/router/supervisor)都是"一个 Node",共享同一套身份/心跳/状态语义,只是 type 不同:
+
+```c
+/* node.h — 所有节点共用的身份/心跳/状态结构 */
+typedef struct {
+    char node_id[128];   /* 全局唯一: rank-r0 / server-a / router-0 / supervisor-0 */
+    char type[16];       /* rank | server | router | supervisor */
+    char model[128];     /* 关联模型(rank/server 有; router/supervisor 可为空) */
+    char addr[128];      /* 自身服务地址 ip:port(供上级调用) */
+    int state;           /* 0=loading, 1=ready, 2=dead(统一三态) */
+    int inflight;        /* 当前处理请求数(rank: 推理中; server: 转发中) */
+    double kv_mb;        /* KV/内存占用(rank: 引擎; server: 组内汇总) */
+    uint64_t last_hb;    /* 上次心跳时间(监控用) */
+    char sv_host[128];   /* 心跳目标(supervisor) */
+    uint16_t sv_port;
+    int sv_enabled;
+} Node;
+
+/* 通用函数 */
+void node_heartbeat(Node* n);                    /* 周期调用, 发给 supervisor */
+int  node_parse_heartbeat(const char* args, Node* out);  /* supervisor/router 解析 */
+int  node_is_dead(Node* n, uint64_t now, int timeout);   /* 判死 */
+```
+
+### 3.7.2 统一帧协议(serve/frame.h)
+
+所有节点间通信走统一的"帧"编解码,替代各文件分散的字符串拼接/解析:
+
+```
+┌────────────────────────────────────┐
+│ 应用层: Node/HEARTBEAT/INFER/...   │
+├────────────────────────────────────┤
+│ 帧层(抽象): frame.h                │
+│   frame_send / frame_recv          │
+│   frame_send_payload / recv_payload│
+│   frame_get(key=value 解析)         │
+├────────────────────────────────────┤
+│ 传输层: sock.h(connect/send_n/...) │
+└────────────────────────────────────┘
+```
+
+```c
+/* frame.h — 统一帧(文本命令行 + 可选二进制 payload) */
+typedef struct {
+    char cmd[256];     /* HEARTBEAT / INFER / SERVER_ADD ... */
+    char args[1024];   /* 参数串: "server-a inflight=2 kv=380" */
+} Frame;
+
+int frame_send(int fd, const char* cmd, const char* args);
+int frame_recv(int fd, Frame* f);
+int frame_send_payload(int fd, const char* cmd, const void* payload, size_t n);
+int frame_recv_payload(int fd, char** payload, size_t* n);
+const char* frame_get(Frame* f, const char* key);
+```
+
+### 3.7.3 心跳语义(数据面 vs 生命周期面)
+
+**所有心跳发给 supervisor,supervisor 汇总后驱动 router;router 注册表增删完全由 supervisor 通知,router 也可主动查询。**
+
+```
+┌──────────────────────────────────────────────┐
+│ supervisor(汇总表: 机器/rank/server/router)   │
+│   ▲ 心跳(数据面)              │ 通知(生命周期面) │
+│   │                          ▼               │
+│ rank/server/router ──────▶ router(路由决策)   │
+└──────────────────────────────────────────────┘
+
+① 心跳(数据面, 都发 supervisor):
+   rank ──HEARTBEAT──▶ supervisor
+   server ──HEARTBEAT──▶ supervisor
+   router ──HEARTBEAT──▶ supervisor
+② 注册表增删(生命周期面, supervisor 通知 router):
+   supervisor ──SERVER_ADD/DEL──▶ router
+③ 路由数据(二选一或并存):
+   方式A(推送): supervisor ──SERVER_UPDATE inflight/kv──▶ router
+   方式B(拉取): router ──QUERY_SERVERS──▶ supervisor ──▶ 快照
+```
+
+| 帧 | 方向 | 内容 |
+|---|---|---|
+| `HEARTBEAT <node-id> type=<...> state=... inflight=<n> kv_mb=<f> addr=<ip:port>` | rank/server/router → supervisor | 统一上报 |
+| `SERVER_ADD <server-id> model=<name> leader=<ip:port>` | supervisor → router | 注册 |
+| `SERVER_DEL <server-id>` | supervisor → router | 注销 |
+| `SERVER_UPDATE <server-id> inflight=<n> kv_mb=<f>` | supervisor → router | 状态推送(方式A) |
+| `QUERY_SERVERS` | router → supervisor | 主动查询(方式B) |
+
+### 3.7.4 职责边界(修正)
+
+- **server 不再直接 REGISTER 到 router**:注册表增删由 supervisor 通知 router(生命周期面);
+- **server 心跳只发 supervisor**:不再广播 router(数据面统一归 supervisor 汇总);
+- **router 只消费**:收 supervisor 的 ADD/DEL/UPDATE + 主动 QUERY_SERVERS,做路由决策,不感知 server 生命周期;
+- **判死/重拉永远归 supervisor**:心跳停 = 死,supervisor 重拉。
+
+### 3.7.5 serve 目录结构
+
+```
+serve/
+├── protocol.h      # 命令常量(PING/HEARTBEAT/INFER/SERVER_ADD/... 语义定义)
+├── frame.h         # 帧编解码(统一收发, 新抽象)
+├── node.h          # Node 统一结构(身份/心跳/状态, 新抽象)
+├── sock.h          # 传输层(connect/send_n/recv_n, 已有)
+├── rank.c          # yllm rank(常驻推理单元, 走 frame+node+sock)
+├── server.c        # yllm server(业务逻辑组, 走 frame+node+sock)
+├── router.c        # yllm router(调度层, 走 frame+node+sock)
+└── supervisor.c    # yllm supervisor(P3: 收全部心跳 + 汇总 + 驱动 router)
+```
+
+依赖单向:`*.c → frame.h → sock.h`,心跳解析用 `node.h`。
 
 ## 4. 代码改造点
 
 | 位置                     | 改动                                                                                |
 | ---------------------- | --------------------------------------------------------------------------------- |
-| `src/main.c`           | 新增 `cmd_rank` / `cmd_server` / `cmd_router`(复用 gen 的 engine/vocab 初始化),把生成拆成可复用函数 |
-| `src/engine.c`         | 抽 `engine_generate(...)`(prompt→tokens→流式 cb),`cmd_gen` 与 `rank` 共用               |
-| `src/dist.c`           | `dist_gen` 增加"循环服务"入口或拆分连接建立/推理;常驻复用 dist 连接                                      |
-| `src/dist_worker.c`    | 文件服务 `--serve` + sync 逻辑迁往 `cmd_supervisor`;其余迁往 `cmd_rank/server/router`         |
-| `src/router_http.c`(新) | OpenAI 兼容 HTTP 层(JSON/SSE 解析与组装)                                                  |
-| `Makefile`             | 加 `rank`/`server`/`router` 目标与示例编排                                                |
+| `main.c`               | 新增 `cmd_rank` / `cmd_server` / `cmd_router`(复用 gen 的 engine/vocab 初始化),把生成拆成可复用函数 |
+| `inference/engine.c`   | `engine_generate(...)`(prompt→tokens→流式 cb),`cmd_gen` 与 `rank` 共用(已抽取)          |
+| `inference/dist.c`     | `dist_gen` 增加"循环服务"入口或拆分连接建立/推理;常驻复用 dist 连接                                      |
+| `serve/sock.h`(已有)    | 传输层:connect / send_n / recv_n / recv_line                                              |
+| `serve/frame.h`(新)     | 统一帧编解码:frame_send / frame_recv / payload / frame_get                                  |
+| `serve/node.h`(新)      | 统一节点结构:Node 身份/心跳/状态 + node_heartbeat / node_parse / node_is_dead                  |
+| `serve/rank.c`         | 改走 frame+node;心跳发 supervisor;INFER 流式 T 帧用 frame_send_payload                     |
+| `serve/server.c`       | 去掉 REGISTER 广播;心跳只发 supervisor;收 router 转发请求                                    |
+| `serve/router.c`       | 去掉收 server 广播;改收 supervisor 的 SERVER_ADD/DEL/UPDATE + QUERY_SERVERS               |
+| `serve/supervisor.c`(P3) | 收全部心跳 + 汇总表 + 驱动 router(ADD/DEL/UPDATE) + 拉起/自愈/更新                          |
+| `serve/router_http.c`(P3) | OpenAI 兼容 HTTP 层(JSON/SSE 解析与组装)                                                |
+| `Makefile`             | 加 `rank`/`server`/`router`/`supervisor` 目标与示例编排                                      |
 
 请求级拆分(单 rank 与多 rank 统一):
 
@@ -648,10 +767,14 @@ make serve-roll NEW_MODEL=test/v2.llf   # 起新模型 server→就绪→摘旧�
 
 ## 7. 里程碑
 
-- **P1 最小闭环**:`yllm rank` 常驻(单机单 rank)+ PING/STAT/INFER/DRAIN 帧协议 + 单机直连推理。
-  验证:进程启动一次,连续 N 个 INFER 请求不冷启动,结果入日志。跨机多 rank 复用 dist 握手。
-- **P2 路由**:`yllm server` 独立进程(租用 rank 组、会话亲和)+ `yllm router` 多实例
-  (server 注册表、心跳、模型过滤/least-inflight/kv-aware/prefix-affinity)。
-- **P3 生命周期 + OpenAI 面**:supervisor(滚动更新/自愈/扩缩容/机器 agent)+
+- **P1 最小闭环(✅ 完成)**:`yllm rank` 常驻(单机单 rank)+ PING/STAT/INFER/DRAIN 帧协议 + 单机直连推理。
+  已验证:进程启动一次,连续 N 个 INFER 请求不冷启动,结果入日志。目录重组(inference/+serve/),engine_generate 抽取。
+- **P2 路由(进行中)**:统一服务层抽象(§3.7:frame.h + node.h),`yllm server`(租用 rank 组、
+  心跳发 supervisor)、`yllm router`(收 supervisor 的 SERVER_ADD/DEL/UPDATE + QUERY_SERVERS、
+  模型过滤/least-inflight/kv-aware)、最小 `supervisor` 骨架(收全部心跳 + 汇总 + 驱动 router)。
+- **P3 生命周期 + OpenAI 面**:supervisor 完整版(滚动更新/自愈/扩缩容/机器 agent)+
   router OpenAI 兼容 HTTP(`/v1/chat/completions` + SSE)。
+
+> 设计变更(本轮):心跳统一发 supervisor(数据面),router 注册表增删由 supervisor 通知(生命周期面),
+> server 不再直接 REGISTER 到 router;统一 Node 结构 + 统一帧协议(frame.h)。
 

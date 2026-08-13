@@ -47,13 +47,40 @@
  * server 启动时广播到所有 router(注册业务组) */
 #define PROTO_REGISTER "REGISTER"
 
-/* HEARTBEAT <server-id> inflight=<n> kv_mb=<f>\n → OK\n
- * 周期性广播(每 2s), router 据此维护注册表状态 */
+/* ---- 统一心跳(所有常驻进程共用, 数据面: 活着就报) ----
+ *
+ * HEARTBEAT <node-id> type=<rank|server|router|supervisor> state=<loading|ready>
+ *            inflight=<n> kv_mb=<f> model=<name>\n → OK\n
+ *
+ * 发送方(数据面): 每个进程周期上报(默认 2s)。
+ * 接收方(监控面): supervisor 收全部; router 收 type=server; server 收 type=rank。
+ * 判死: 接收方超时未收 → 标记 DEAD → 通知 supervisor 重拉(生命周期面, 永远归 supervisor)。
+ */
 #define PROTO_HEARTBEAT "HEARTBEAT"
 
 /* SCALE <server-id> need_groups=<n>\n → OK\n
  * server 向 supervisor 请求扩/缩容(增加/减少 rank 组) */
 #define PROTO_SCALE "SCALE"
+
+/* ---- server 帧(supervisor → router, 生命周期面: 注册表增删/状态推送) ---- */
+
+/* SERVER_ADD <server-id> model=<name> leader=<ip:port>\n → OK\n
+ * supervisor 通知 router: 新 server 就绪, 加入候选表 */
+#define PROTO_SERVER_ADD "SERVER_ADD"
+
+/* SERVER_DEL <server-id>\n → OK\n
+ * supervisor 通知 router: server 已死/下线, 剔除 */
+#define PROTO_SERVER_DEL "SERVER_DEL"
+
+/* SERVER_UPDATE <server-id> inflight=<n> kv_mb=<f>\n → OK\n
+ * supervisor 推送 server 运行状态(路由决策用, 方式A) */
+#define PROTO_SERVER_UPDATE "SERVER_UPDATE"
+
+/* QUERY_SERVERS\n → SERVER_INFO ... QUERY_DONE\n
+ * router 主动查询 supervisor 的 server 快照(方式B) */
+#define PROTO_QUERY_SERVERS "QUERY_SERVERS"
+#define PROTO_SERVER_INFO "SERVER_INFO"
+#define PROTO_QUERY_DONE "QUERY_DONE"
 
 /* ---- 流式 token 帧(server → router 透传, rank → server) ---- */
 

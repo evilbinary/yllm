@@ -12,6 +12,9 @@
  * 多 rank 流水线(dist_split_layers + dist 收发)在 P2 接入。
  */
 #include "protocol.h"
+#include "frame.h"
+#include "node.h"
+#include "sock.h"
 #include "../inference/yllm.h"
 #include "../inference/log.h"
 #include <stdio.h>
@@ -45,6 +48,8 @@ typedef struct {
     float top_p;
     uint64_t seed;
     uint64_t uptime_s;
+    /* 统一节点身份(心跳发 supervisor, 生命周期归 supervisor) */
+    Node node;
 } Rank;
 
 /* ---- socket 辅助(与 dist_worker 同款) ---- */
@@ -214,28 +219,29 @@ static int handle_frame(int fd, Rank* r, char* line)
 static int run_rank(int port, Rank* r)
 {
     ws_init_rank();
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    int srv = sock_listen((uint16_t)port, 8);
     if (srv < 0) return 1;
-    int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(srv); return 1; }
-    if (listen(srv, 8) != 0) { close(srv); return 1; }
     ylog_info("rank: ready on port %u (model loaded, 常驻等待请求)", port);
 
+    uint64_t last_hb = 0;
     for (;;) {
-        int fd = (int)accept(srv, NULL, NULL);
-        if (fd < 0) continue;
-        char line[RANK_MAX_LINE];
-        int n = recv_line_rank(fd, line, sizeof(line));
-        if (n < 0) { close(fd); continue; }
-        int rc = handle_frame(fd, r, line);
-        close(fd);
-        if (rc == 2) break;
+        int fd = sock_accept_with_timeout(srv, 500);
+        if (fd >= 0) {
+            char line[RANK_MAX_LINE];
+            int n = recv_line_rank(fd, line, sizeof(line));
+            if (n >= 0) {
+                int rc = handle_frame(fd, r, line);
+                if (rc == 2) { close(fd); break; }
+            }
+            close(fd);
+        }
+        /* 周期心跳 → supervisor(数据面: 活着就报, 判死/重拉归 supervisor) */
+        uint64_t now = (uint64_t)time(NULL);
+        if (r->node.sv_enabled && now - last_hb >= 2) {
+            last_hb = now;
+            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
+            node_heartbeat(&r->node);
+        }
     }
     close(srv);
     return 0;
@@ -267,6 +273,8 @@ int cmd_rank(int argc, char** argv)
     }
     const char* model = opt_r(a, n, "model", NULL);
     const char* vocab_path = opt_r(a, n, "vocab", "vocab.txt");
+    const char* node_id = opt_r(a, n, "id", NULL);
+    const char* sv_addr = opt_r(a, n, "supervisor", NULL);
     int port = atoi(opt_r(a, n, "port", "9410"));
     int budget_mb = atoi(opt_r(a, n, "budget-mb", "0"));
     int depth = atoi(opt_r(a, n, "depth", "2"));
@@ -276,6 +284,7 @@ int cmd_rank(int argc, char** argv)
 
     if (!model) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "
+                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
         return 1;
     }
@@ -286,6 +295,22 @@ int cmd_rank(int argc, char** argv)
     r.top_p = top_p;
     r.seed = seed;
     r.uptime_s = (uint64_t)time(NULL);
+    if (node_id) snprintf(r.node.node_id, sizeof(r.node.node_id), "%s", node_id);
+    else snprintf(r.node.node_id, sizeof(r.node.node_id), "rank-%s", model);
+    snprintf(r.node.type, sizeof(r.node.type), "rank");
+    snprintf(r.node.model, sizeof(r.node.model), "%s", model);
+    r.node.state = NODE_STATE_READY;
+    if (sv_addr) {
+        const char* colon = strchr(sv_addr, ':');
+        if (colon) {
+            size_t hlen = (size_t)(colon - sv_addr);
+            if (hlen >= sizeof(r.node.sv_host)) hlen = sizeof(r.node.sv_host) - 1;
+            memcpy(r.node.sv_host, sv_addr, hlen);
+            r.node.sv_host[hlen] = '\0';
+            r.node.sv_port = (uint16_t)atoi(colon + 1);
+            r.node.sv_enabled = 1;
+        }
+    }
 
     if (vocab_load(vocab_path, &r.vocab) != 0) {
         ylog_error("rank: cannot load vocab: %s", vocab_path);
