@@ -291,6 +291,7 @@ static int cmd_gen(int argc, char** argv)
         free(xbuf);
         free(k_ids);
 
+        dist.elapsed_ms = (double)(ynow_ms() - t0);
         if (dist_stats || getenv("YLLM_DISTDBG")) dist_print_stats(&dist, "dist");
         dist_close(&dist);
         engine_free(&e);

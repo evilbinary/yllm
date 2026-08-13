@@ -284,4 +284,9 @@ void dist_print_stats(Dist* d, const char* tag)
             tag, d->rank,
             sec_send > 0 ? mb_sent / sec_send : 0.0,
             sec_recv > 0 ? mb_recv / sec_recv : 0.0);
+    if (d->elapsed_ms > 0) {
+        double sec_el = d->elapsed_ms / 1000.0;
+        fprintf(stderr, "[%s] rank %d          avg throughput: send %.2f MB/s recv %.2f MB/s (total %.2f s)\n",
+                tag, d->rank, mb_sent / sec_el, mb_recv / sec_el, sec_el);
+    }
 }
