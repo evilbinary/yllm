@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #endif
 
@@ -115,6 +116,9 @@ static inline int sock_connect(const char* host, uint16_t port, int retries)
     for (attempt = 0; attempt < retries; attempt++) {
         int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return -1;
+#ifndef _WIN32
+        fcntl(fd, F_SETFD, FD_CLOEXEC); /* fork+exec 时不泄漏 fd 给子进程 */
+#endif
         if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
@@ -148,6 +152,9 @@ static inline int sock_listen(uint16_t port, int backlog)
 {
     int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) return -1;
+#ifndef _WIN32
+    fcntl(srv, F_SETFD, FD_CLOEXEC); /* fork+exec 时不泄漏 fd 给子进程 */
+#endif
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
     struct sockaddr_in addr;

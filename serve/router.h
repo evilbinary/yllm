@@ -20,6 +20,7 @@ typedef struct {
 typedef struct {
     RtServer servers[RT_MAX_SERVERS];
     int n_servers;
+    volatile int quit;     /* 收到 QUIT 后退出主循环 */
     uint16_t port;
     int rr_counter;
     const char* strategy;

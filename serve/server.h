@@ -10,6 +10,7 @@ typedef struct {
     uint16_t leader_port;
     uint16_t port;         /* server 自身监听端口(router 转发入口) */
     uint64_t start_s;
+    volatile int quit;     /* 收到 QUIT/DRAIN 后退出主循环 */
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */

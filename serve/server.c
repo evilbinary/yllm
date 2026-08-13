@@ -71,9 +71,9 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         s->node.inflight++;
         forward_infer(fd, s, args);
         s->node.inflight--;
-    } else if (strcmp(cmd, PROTO_DRAIN) == 0) {
+    } else if (strcmp(cmd, PROTO_DRAIN) == 0 || strcmp(cmd, PROTO_QUIT) == 0) {
         frame_send(fd, "OK", NULL);
-        /* P2: 立即退出 */
+        s->quit = 1;
     } else {
         frame_send(fd, "ERR", "unknown cmd");
     }

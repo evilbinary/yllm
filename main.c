@@ -2,6 +2,9 @@
 #include "inference/dist.h"
 #include "inference/log.h"
 #include "serve/rank.h"
+#include "serve/status.h"
+#include "serve/ctl.h"
+#include "serve/sync.h"
 #include "serve/server.h"
 #include "serve/router.h"
 #include "serve/supervisor.h"
@@ -329,14 +332,15 @@ static int cmd_chat(int argc, char** argv)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank|server|router|supervisor|hub> [options]\n");
+        fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank|server|router|supervisor|hub|ctl|sync> [options]\n");
         return 1;
     }
     /* serve 角色统一走 ServeConfig(解析一次, 分发) */
     ServeConfig cfg;
     int is_serve = strcmp(argv[1], "rank") == 0 || strcmp(argv[1], "server") == 0 ||
                    strcmp(argv[1], "router") == 0 || strcmp(argv[1], "supervisor") == 0 ||
-                   strcmp(argv[1], "hub") == 0;
+                   strcmp(argv[1], "hub") == 0 ||
+                   strcmp(argv[1], "ctl") == 0;
     if (is_serve) {
         config_load(&cfg, argc, argv, 2);
         ylog_open(cfg.log_file);
@@ -353,7 +357,8 @@ int main(int argc, char** argv)
         else if (strcmp(argv[1], "server") == 0) rc = cmd_server(&cfg);
         else if (strcmp(argv[1], "router") == 0) rc = cmd_router(&cfg);
         else if (strcmp(argv[1], "supervisor") == 0) rc = cmd_supervisor(&cfg);
-        else rc = cmd_hub(&cfg);
+        else if (strcmp(argv[1], "hub") == 0) rc = cmd_hub(&cfg);
+        else rc = cmd_ctl(&cfg, argc, argv);
         ylog_close();
         return rc;
     }
@@ -379,7 +384,8 @@ int main(int argc, char** argv)
     ylog_info("yllm start: %s", log_path ? log_path : "(console only)");
 
     int rc;
-    if (strcmp(argv[1], "convert") == 0) rc = cmd_convert(argc, argv);
+    if (strcmp(argv[1], "sync") == 0) rc = cmd_sync(argc, argv);
+    else if (strcmp(argv[1], "convert") == 0) rc = cmd_convert(argc, argv);
     else if (strcmp(argv[1], "check") == 0) rc = cmd_check(argc, argv);
     else if (strcmp(argv[1], "gen") == 0) rc = cmd_gen(argc, argv);
     else if (strcmp(argv[1], "chat") == 0) rc = cmd_chat(argc, argv);

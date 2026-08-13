@@ -59,7 +59,7 @@ LIBS += $(PLATLIBS)
 CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
-OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o
+OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o $(OBJDIR)/status.o $(OBJDIR)/ctl.o $(OBJDIR)/sync.o
 OBJ           := $(sort $(OBJ))
 
 # ---- AVX2 版本(仅 x86_64; 其余架构退化为标量, 保持 target 可用) ----
@@ -67,7 +67,7 @@ CFLAGS_AVX2   := $(CFLAGS_BASE)
 LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
 BIN_AVX2      := build/avx2/yllm$(EXE)
-OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o $(OBJDIR_AVX2)/server.o $(OBJDIR_AVX2)/router.o $(OBJDIR_AVX2)/supervisor.o $(OBJDIR_AVX2)/hub.o $(OBJDIR_AVX2)/router_http.o
+OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o $(OBJDIR_AVX2)/server.o $(OBJDIR_AVX2)/router.o $(OBJDIR_AVX2)/supervisor.o $(OBJDIR_AVX2)/hub.o $(OBJDIR_AVX2)/router_http.o $(OBJDIR_AVX2)/status.o $(OBJDIR_AVX2)/ctl.o $(OBJDIR_AVX2)/sync.o
 OBJ_AVX2      := $(sort $(OBJ_AVX2))
 ifeq ($(ARCH),x86_64)
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
@@ -104,6 +104,14 @@ $(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h s
 $(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
+$(OBJDIR)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+
+$(OBJDIR)/ctl.o: serve/ctl.c serve/ctl.h serve/protocol.h serve/frame.h serve/sock.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/sync.o: serve/sync.c serve/sync.h serve/frame.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+
 $(OBJDIR)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
@@ -126,6 +134,14 @@ $(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/superviso
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+
+$(OBJDIR_AVX2)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+
+$(OBJDIR_AVX2)/ctl.o: serve/ctl.c serve/ctl.h serve/protocol.h serve/frame.h serve/sock.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/sync.o: serve/sync.c serve/sync.h serve/frame.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
@@ -267,8 +283,46 @@ rank: $(BIN) $(MODEL_LLF)
 # SERVER_MODEL 需匹配 serve.yaml 的 model-name
 SERVER_MODEL ?= tinyllama
 SERVE_PROMPT ?= Once upon a time
-infer:
+# 支持 `make infer hello world` 把多余参数当 prompt
+ifneq ($(filter-out infer,$(MAKECMDGOALS)),)
+SERVE_PROMPT := $(filter-out infer,$(MAKECMDGOALS))
+endif
+status: $(BIN)
+	$(BIN) ctl --config $(SERVE_CONFIG) status
+
+# 管理命令: make ctl <target> <cmd> [need]  (目标用短别名, 避免与 make 目标名冲突)
+#   r0=rank-0  s0=server-0  sv=supervisor  rt=router
+#   例: make ctl status              # 完整状态查看
+#       make ctl r0 PING / r0 STAT / r0 DRAIN / r0 QUIT
+#       make ctl sv SCALE 2          # 扩一组 rank
+#       make ctl sv QUERY_SERVERS
+#       make ctl s0 DRAIN            # server 优雅下线
+CTL_GOALS := $(filter-out ctl,$(MAKECMDGOALS))
+CTL_T0 := $(word 1,$(CTL_GOALS))
+CTL_TGT := $(if $(filter r0,$(CTL_T0)),rank-0,$(if $(filter s0,$(CTL_T0)),server-0,$(if $(filter sv,$(CTL_T0)),supervisor,$(if $(filter rt,$(CTL_T0)),router,$(CTL_T0)))))
+ifeq ($(words $(CTL_GOALS)),1)
+CTL_ARGS := --cmd $(CTL_GOALS)
+else ifeq ($(words $(CTL_GOALS)),3)
+CTL_ARGS := --target $(CTL_TGT) --cmd $(word 2,$(CTL_GOALS)) --need-groups $(word 3,$(CTL_GOALS))
+else
+CTL_ARGS := --target $(CTL_TGT) --cmd $(word 2,$(CTL_GOALS))
+endif
+ctl: $(BIN)
+	$(BIN) ctl --config $(SERVE_CONFIG) $(CTL_ARGS)
+
+# 文件分发: 接收端 make sync-serve PORT=9600; 发送端 make sync-push FILE=... TO=host:9600 DEST=...
+sync-serve: $(BIN)
+	$(BIN) sync --serve --port $(SYNC_PORT) --dir $(SYNC_DIR)
+
+sync-push: $(BIN)
+	$(BIN) sync --push $(SYNC_FILE) --to $(SYNC_TO) --dest $(SYNC_DEST)
+
+infer: $(BIN)
 	$(BIN) router --config $(SERVE_CONFIG) --send "$(SERVER_MODEL) $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+# 捕获 `make infer <prompt...>` 的多余目标词, 避免 "没有规则" 报错
+%:
+	@:
 
 serve-stop:
 ifeq ($(UNAME_S),Windows)
@@ -368,4 +422,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer serve-stop
+.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop

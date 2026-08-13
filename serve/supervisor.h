@@ -30,6 +30,7 @@ typedef struct {
     uint16_t server_port_base;/* server 端口基址 */
     char sv_host[128];      /* supervisor 自身地址(rank/server 心跳目标) */
     int auto_heal;          /* 自愈开关 */
+    volatile int quit;      /* 收到 QUIT 后退出主循环 */
     int no_spawn_server;    /* hub 合并模式: server 由本进程线程承担, 不 fork */
 } Supervisor;
 

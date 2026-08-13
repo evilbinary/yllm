@@ -197,13 +197,20 @@ static void handle_query_servers(Supervisor* s, int fd)
     int i;
     for (i = 0; i < s->n_nodes; i++) {
         Node* n = &s->nodes[i].node;
-        if (strcmp(n->type, "server") != 0) continue;
         char args[512];
-        snprintf(args, sizeof(args), "%s model=%s leader=%s state=%s inflight=%d kv_mb=%.1f",
-                 n->node_id, n->model, n->addr,
+        snprintf(args, sizeof(args), "%s type=%s model=%s leader=%s state=%s inflight=%d kv_mb=%.1f",
+                 n->node_id, n->type, n->model, n->addr,
                  n->state == NODE_STATE_READY ? "ready" :
                  n->state == NODE_STATE_DEAD ? "dead" : "loading",
                  n->inflight, n->kv_mb);
+        frame_send(fd, "SERVER_INFO", args);
+    }
+    /* router 节点(注册表, 无心跳, 固定 READY) */
+    for (i = 0; i < s->n_routers; i++) {
+        Node* rn = &s->routers[i];
+        char args[256];
+        snprintf(args, sizeof(args), "%s type=%s state=ready addr=%s",
+                 rn->node_id, rn->type, rn->addr);
         frame_send(fd, "SERVER_INFO", args);
     }
     frame_send(fd, "QUERY_DONE", NULL);
@@ -214,6 +221,10 @@ static void handle_frame(Supervisor* s, int fd, const char* cmd, const char* arg
     if (strcmp(cmd, "HEARTBEAT") == 0) handle_heartbeat(s, fd, args);
     else if (strcmp(cmd, "QUERY_SERVERS") == 0) handle_query_servers(s, fd);
     else if (strcmp(cmd, PROTO_SCALE) == 0) { handle_scale(s, args); frame_send(fd, "OK", NULL); }
+    else if (strcmp(cmd, PROTO_QUIT) == 0 || strcmp(cmd, PROTO_DRAIN) == 0) {
+        frame_send(fd, "OK", NULL);
+        s->quit = 1;
+    }
     else frame_send(fd, "ERR", "unknown cmd");
 }
 
@@ -257,6 +268,7 @@ int supervisor_run(Supervisor* s)
             last_check = now;
             heal_dead(s);
         }
+        if (s->quit) break;
     }
     close(srv);
     return 0;

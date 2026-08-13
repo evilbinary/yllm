@@ -346,11 +346,15 @@ int router_run(Router* r, const char* sv_host, uint16_t sv_port)
                     handle_server_del(r, f.args);
                 else if (strcmp(f.cmd, PROTO_SERVER_UPDATE) == 0)
                     handle_server_update(r, f.args);
-                else
+                else if (strcmp(f.cmd, PROTO_QUIT) == 0) {
+                    frame_send(fd, "OK", NULL);
+                    r->quit = 1;
+                } else
                     frame_send(fd, "ERR", "unknown cmd");
             }
             close(fd);
         }
+        if (r->quit) break;
         uint64_t now = (uint64_t)time(NULL);
         if (now - last_hb >= 2) {
             last_hb = now;
