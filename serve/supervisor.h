@@ -2,6 +2,7 @@
 #define YLLM_SERVE_SUPERVISOR_H
 
 #include "node.h"
+#include "config.h"
 
 #define SV_MAX_NODES 256
 #define SV_MAX_ROUTERS 16
@@ -23,6 +24,7 @@ typedef struct {
     char bin[512];          /* yllm 二进制路径 */
     char model[512];        /* 模型 llf 路径 */
     char vocab[512];        /* vocab 路径 */
+    char model_name[128];   /* server 注册的模型名 */
     int ranks;              /* 每 server 的 rank 段数 */
     uint16_t rank_port_base;  /* rank 端口基址 */
     uint16_t server_port_base;/* server 端口基址 */
@@ -31,7 +33,7 @@ typedef struct {
 } Supervisor;
 
 /* yllm supervisor: 管理节点(收全部心跳 + 汇总 + 驱动 router) */
-int cmd_supervisor(int argc, char** argv);
+int cmd_supervisor(ServeConfig* cfg);
 int supervisor_run(Supervisor* s);
 
 #endif

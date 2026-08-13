@@ -109,69 +109,41 @@ int server_run(Server* s)
     return 0;
 }
 
-typedef struct { const char* key; const char* val; } ArgS;
-
-static const char* opt_s(ArgS* args, int n, const char* key, const char* def)
+int cmd_server(ServeConfig* cfg)
 {
-    int i;
-    for (i = 0; i < n; i++)
-        if (strcmp(args[i].key, key) == 0) return args[i].val;
-    return def;
-}
-
-int cmd_server(int argc, char** argv)
-{
-    ArgS a[24];
-    int n = 0;
-    int i;
-    for (i = 2; i + 1 < argc && n < 24; i += 2) {
-        if (argv[i][0] != '-') break;
-        a[n].key = argv[i];
-        while (*a[n].key == '-') a[n].key++;
-        a[n].val = argv[i + 1];
-        n++;
-    }
-    const char* id = opt_s(a, n, "id", NULL);
-    const char* model = opt_s(a, n, "model", NULL);
-    const char* leader = opt_s(a, n, "leader", NULL);
-    const char* sv_addr = opt_s(a, n, "supervisor", NULL);
-    int port = atoi(opt_s(a, n, "port", "9420"));
-
-    if (!id || !model || !leader || !sv_addr) {
-        fprintf(stderr, "usage: yllm server --id <name> --model <name> --leader <ip:port> "
+    if (!cfg->model_name[0] || !cfg->leader[0]) {
+        fprintf(stderr, "usage: yllm server --id <name> --model-name <name> --leader <ip:port> "
                         "--supervisor <ip:port> [--port N]\n");
         return 1;
     }
 
     Server s;
     memset(&s, 0, sizeof(s));
-    snprintf(s.node.node_id, sizeof(s.node.node_id), "%s", id);
+    if (cfg->node_id[0] && strcmp(cfg->node_id, "node-0") != 0)
+        snprintf(s.node.node_id, sizeof(s.node.node_id), "%s", cfg->node_id);
+    else
+        snprintf(s.node.node_id, sizeof(s.node.node_id), "server-0");
     snprintf(s.node.type, sizeof(s.node.type), "server");
-    snprintf(s.node.model, sizeof(s.node.model), "%s", model);
+    snprintf(s.node.model, sizeof(s.node.model), "%s", cfg->model_name);
     s.node.state = NODE_STATE_READY;
-    s.port = (uint16_t)port;
+    s.port = (uint16_t)cfg->server_port;
     s.start_s = (uint64_t)time(NULL);
 
     /* 解析 leader ip:port */
-    char* colon = strchr(leader, ':');
-    if (!colon) { fprintf(stderr, "bad leader addr: %s\n", leader); return 1; }
-    size_t hlen = (size_t)(colon - leader);
+    const char* colon = strchr(cfg->leader, ':');
+    if (!colon) { fprintf(stderr, "bad leader addr: %s\n", cfg->leader); return 1; }
+    size_t hlen = (size_t)(colon - cfg->leader);
     if (hlen >= sizeof(s.leader_host)) hlen = sizeof(s.leader_host) - 1;
-    memcpy(s.leader_host, leader, hlen);
+    memcpy(s.leader_host, cfg->leader, hlen);
     s.leader_host[hlen] = '\0';
     s.leader_port = (uint16_t)atoi(colon + 1);
 
     /* 自身 addr(上报 supervisor 用): ip:port */
-    snprintf(s.node.addr, sizeof(s.node.addr), "127.0.0.1:%u", s.port);
+    snprintf(s.node.addr, sizeof(s.node.addr), "%s:%u", cfg->sv_host, s.port);
 
     /* supervisor 地址 */
-    colon = strchr(sv_addr, ':');
-    if (!colon) { fprintf(stderr, "bad supervisor addr: %s\n", sv_addr); return 1; }
-    hlen = (size_t)(colon - sv_addr);
-    if (hlen >= sizeof(s.node.sv_host)) hlen = sizeof(s.node.sv_host) - 1;
-    memcpy(s.node.sv_host, sv_addr, hlen);
-    s.node.sv_host[hlen] = '\0';
-    s.node.sv_port = (uint16_t)atoi(colon + 1);
+    snprintf(s.node.sv_host, sizeof(s.node.sv_host), "%s", cfg->sv_host);
+    s.node.sv_port = (uint16_t)cfg->sv_port;
     s.node.sv_enabled = 1;
 
     return server_run(&s);

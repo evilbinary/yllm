@@ -18,15 +18,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-typedef struct { const char* key; const char* val; } ArgC;
-
-static const char* opt_c(ArgC* args, int n, const char* key, const char* def)
-{
-    int i;
-    for (i = 0; i < n; i++)
-        if (strcmp(args[i].key, key) == 0) return args[i].val;
-    return def;
-}
 
 /* 线程包装: 跑 supervisor 主循环 */
 typedef struct { Supervisor* s; } HubCtxSv;
@@ -60,71 +51,51 @@ static void srv_thread(void* arg)
     ylog_info("hub: srv_thread exit");
 }
 
-int cmd_hub(int argc, char** argv)
+int cmd_hub(ServeConfig* cfg)
 {
-    ArgC a[32];
-    int n = 0;
-    int i;
-    for (i = 2; i + 1 < argc && n < 32; i += 2) {
-        if (argv[i][0] != '-') break;
-        a[n].key = argv[i];
-        while (*a[n].key == '-') a[n].key++;
-        a[n].val = argv[i + 1];
-        n++;
-    }
-    const char* sv_port_s = opt_c(a, n, "port", "9500");
-    const char* rt_port_s = opt_c(a, n, "router-port", "9400");
-    const char* srv_port_s = opt_c(a, n, "server-port", "9420");
-    const char* srv_id = opt_c(a, n, "server-id", "server-a");
-    const char* srv_model = opt_c(a, n, "server-model", NULL);
-    const char* srv_leader = opt_c(a, n, "server-leader", NULL);
-    const char* strategy = opt_c(a, n, "strategy", "least");
-    const char* http_port_s = opt_c(a, n, "http-port", NULL);
-
-    if (!srv_model || !srv_leader) {
-        fprintf(stderr, "usage: yllm hub --port <sv> --router-port <rt> --server-port <srv> "
-                        "--server-model <name> --server-leader <ip:port> [--server-id id] "
-                        "[--strategy s] [--http-port N]\n");
+    if (!cfg->model_name[0] || !cfg->leader[0]) {
+        fprintf(stderr, "usage: yllm hub --server-model <name> --server-leader <ip:port> "
+                        "[--port sv] [--router-port rt] [--server-port srv] [--http-port N]\n");
         return 1;
     }
 
     /* supervisor */
     Supervisor sv;
     memset(&sv, 0, sizeof(sv));
-    sv.port = (uint16_t)atoi(sv_port_s);
+    sv.port = (uint16_t)cfg->sv_port;
     /* router 地址(loopback, 走网络通知, 逻辑不变) */
     Node* rn = &sv.routers[sv.n_routers++];
     memset(rn, 0, sizeof(*rn));
     snprintf(rn->node_id, sizeof(rn->node_id), "router-0");
     snprintf(rn->type, sizeof(rn->type), "router");
-    snprintf(rn->addr, sizeof(rn->addr), "127.0.0.1:%s", rt_port_s);
+    snprintf(rn->addr, sizeof(rn->addr), "127.0.0.1:%d", cfg->router_port);
 
     /* router */
     Router rt;
     memset(&rt, 0, sizeof(rt));
-    rt.port = (uint16_t)atoi(rt_port_s);
-    rt.strategy = strategy;
+    rt.port = (uint16_t)cfg->router_port;
+    rt.strategy = cfg->strategy;
     snprintf(rt.node.node_id, sizeof(rt.node.node_id), "router-0");
     snprintf(rt.node.type, sizeof(rt.node.type), "router");
     rt.node.state = NODE_STATE_READY;
     char sv_host[128] = "127.0.0.1";
-    uint16_t sv_port = (uint16_t)atoi(sv_port_s);
+    uint16_t sv_port = (uint16_t)cfg->sv_port;
 
     /* server */
     Server srv;
     memset(&srv, 0, sizeof(srv));
-    snprintf(srv.node.node_id, sizeof(srv.node.node_id), "%s", srv_id);
+    snprintf(srv.node.node_id, sizeof(srv.node.node_id), "server-0");
     snprintf(srv.node.type, sizeof(srv.node.type), "server");
-    snprintf(srv.node.model, sizeof(srv.node.model), "%s", srv_model);
+    snprintf(srv.node.model, sizeof(srv.node.model), "%s", cfg->model_name);
     srv.node.state = NODE_STATE_READY;
-    srv.port = (uint16_t)atoi(srv_port_s);
-    snprintf(srv.node.addr, sizeof(srv.node.addr), "127.0.0.1:%s", srv_port_s);
+    srv.port = (uint16_t)cfg->server_port;
+    snprintf(srv.node.addr, sizeof(srv.node.addr), "127.0.0.1:%d", cfg->server_port);
     /* leader rank 地址 */
-    const char* colon = strchr(srv_leader, ':');
-    if (!colon) { fprintf(stderr, "bad leader addr: %s\n", srv_leader); return 1; }
-    size_t hlen = (size_t)(colon - srv_leader);
+    const char* colon = strchr(cfg->leader, ':');
+    if (!colon) { fprintf(stderr, "bad leader addr: %s\n", cfg->leader); return 1; }
+    size_t hlen = (size_t)(colon - cfg->leader);
     if (hlen >= sizeof(srv.leader_host)) hlen = sizeof(srv.leader_host) - 1;
-    memcpy(srv.leader_host, srv_leader, hlen);
+    memcpy(srv.leader_host, cfg->leader, hlen);
     srv.leader_host[hlen] = '\0';
     srv.leader_port = (uint16_t)atoi(colon + 1);
     /* server 心跳发本进程 supervisor(loopback) */
@@ -132,16 +103,16 @@ int cmd_hub(int argc, char** argv)
     srv.node.sv_port = sv_port;
     srv.node.sv_enabled = 1;
 
-    ylog_info("control: merged mode (sv=%u rt=%u srv=%u leader=%s:%u)",
+    ylog_info("hub: merged mode (sv=%u rt=%u srv=%u leader=%s:%u)",
               sv.port, rt.port, srv.port, srv.leader_host, srv.leader_port);
 
     void* t1 = NULL, *t2 = NULL, *t3 = NULL;
     HubCtxSv c1; c1.s = &sv;
     HubCtxRt c2; c2.r = &rt; snprintf(c2.sv_host, sizeof(c2.sv_host), "%s", sv_host); c2.sv_port = sv_port;
     HubCtxSrv c3; c3.s = &srv;
-    if (http_port_s) {
+    if (cfg->http_port > 0) {
         extern int router_http_start(Router* r, uint16_t http_port);
-        router_http_start(&rt, (uint16_t)atoi(http_port_s));
+        router_http_start(&rt, (uint16_t)cfg->http_port);
     }
     ythread_create(&t1, sv_thread, &c1);
     ythread_create(&t2, rt_thread, &c2);

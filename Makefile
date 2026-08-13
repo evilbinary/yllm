@@ -89,16 +89,16 @@ $(OBJDIR)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.
 $(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR)
@@ -113,16 +113,16 @@ $(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/con
 $(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
@@ -210,86 +210,55 @@ gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 # ---- 常驻推理服务(serve 层) ----
-# 变量: MODEL_LLF / MODEL_VOCAB(模型)
-#       SERVE_PORT(hub 心跳口, 默认 9500) ROUTER_PORT(客户端口, 默认 9400)
-#       SERVER_PORT(转发口, 默认 9420) RANK_PORT(rank 推理口, 默认 9410)
-#       SERVER_MODEL(模型名, 默认 tinyllama) SERVER_LEADER(rank 地址, 默认 127.0.0.1:9410)
-#       SUPERVISOR_ADDR(rank 心跳目标, 默认 127.0.0.1:9500)
+# 统一配置: serve.yaml(所有角色共用)
 # 用法:
-#   make serve            # hub + rank 本地启动(合并模式, 最小部署 2 进程)
-#   make serve-avx2       # 同上, 用 avx2 版本
+#   make serve            # supervisor --config serve.yaml 一键拉起 rank+server
+#   make serve-avx2       # 同上, avx2 版本
 #   make serve-stop       # 停掉 serve 相关进程
-# 分开模式(各自独立进程):
+#   make infer            # 客户端经 router 发请求
+# 分开模式(各自独立进程, 同一份 config):
 #   make supervisor / make router / make server / make rank
 
-SERVE_PORT      ?= 9500
-ROUTER_PORT     ?= 9400
-SERVER_PORT     ?= 9420
-RANK_PORT       ?= 9410
-SERVER_MODEL    ?= tinyllama
-SERVER_LEADER   ?= 127.0.0.1:$(RANK_PORT)
-SUPERVISOR_ADDR ?= 127.0.0.1:$(SERVE_PORT)
-SERVE_LOGDIR    ?= logs
+SERVE_CONFIG ?= serve.yaml
+SERVE_LOGDIR ?= logs
 
 serve: $(BIN) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@echo "== hub (sv=$(SERVE_PORT) rt=$(ROUTER_PORT) srv=$(SERVER_PORT)) =="
-	@nohup $(BIN) hub --port $(SERVE_PORT) --router-port $(ROUTER_PORT) \
-	  --server-port $(SERVER_PORT) --server-model $(SERVER_MODEL) \
-	  --server-leader $(SERVER_LEADER) --log $(SERVE_LOGDIR)/hub.log \
-	  > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "== rank (port=$(RANK_PORT)) =="
-	@nohup $(BIN) rank --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) \
-	  --port $(RANK_PORT) --supervisor $(SUPERVISOR_ADDR) --id rank-r0 \
-	  --log $(SERVE_LOGDIR)/rank.log > $(SERVE_LOGDIR)/rank.out 2>&1 &
-	@echo "serve started: hub($(SERVE_PORT)/$(ROUTER_PORT)/$(SERVER_PORT)) + rank($(RANK_PORT))"
-	@echo "test: $(BIN) router --send \"$(SERVER_MODEL) 8 hello world\""
+	@echo "== supervisor --config $(SERVE_CONFIG) =="
+	@nohup $(BIN) supervisor --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/serve.out 2>&1 &
+	@echo "serve started (supervisor auto-spawns rank+server)"
 
 serve-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@echo "== hub (avx2) =="
-	@nohup $(BIN_AVX2) hub --port $(SERVE_PORT) --router-port $(ROUTER_PORT) \
-	  --server-port $(SERVER_PORT) --server-model $(SERVER_MODEL) \
-	  --server-leader $(SERVER_LEADER) --log $(SERVE_LOGDIR)/hub.log \
-	  > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "== rank (avx2) =="
-	@nohup $(BIN_AVX2) rank --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) \
-	  --port $(RANK_PORT) --supervisor $(SUPERVISOR_ADDR) --id rank-r0 \
-	  --log $(SERVE_LOGDIR)/rank.log > $(SERVE_LOGDIR)/rank.out 2>&1 &
-	@echo "serve started (avx2): hub + rank"
+	@echo "== supervisor --config $(SERVE_CONFIG) (avx2) =="
+	@nohup $(BIN_AVX2) supervisor --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/serve.out 2>&1 &
+	@echo "serve started (avx2)"
 
-# 分开模式(独立进程)
+# 分开模式(独立进程, 同一份 config)
 supervisor: $(BIN)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN) supervisor --port $(SERVE_PORT) --router 127.0.0.1:$(ROUTER_PORT) \
-	  --log $(SERVE_LOGDIR)/supervisor.log > $(SERVE_LOGDIR)/supervisor.out 2>&1 &
-	@echo "supervisor started on $(SERVE_PORT)"
+	@nohup $(BIN) supervisor --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/supervisor.out 2>&1 &
+	@echo "supervisor started (--config $(SERVE_CONFIG))"
 
 router: $(BIN)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN) router --port $(ROUTER_PORT) --supervisor 127.0.0.1:$(SERVE_PORT) \
-	  --log $(SERVE_LOGDIR)/router.log > $(SERVE_LOGDIR)/router.out 2>&1 &
-	@echo "router started on $(ROUTER_PORT)"
+	@nohup $(BIN) router --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/router.out 2>&1 &
+	@echo "router started (--config $(SERVE_CONFIG))"
 
 server: $(BIN)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN) server --id server-a --model $(SERVER_MODEL) \
-	  --leader $(SERVER_LEADER) --supervisor 127.0.0.1:$(SERVE_PORT) \
-	  --port $(SERVER_PORT) --log $(SERVE_LOGDIR)/server.log \
-	  > $(SERVE_LOGDIR)/server.out 2>&1 &
-	@echo "server started on $(SERVER_PORT) (leader=$(SERVER_LEADER))"
+	@nohup $(BIN) server --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/server.out 2>&1 &
+	@echo "server started (--config $(SERVE_CONFIG))"
 
 rank: $(BIN) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN) rank --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) \
-	  --port $(RANK_PORT) --supervisor $(SUPERVISOR_ADDR) --id rank-r0 \
-	  --log $(SERVE_LOGDIR)/rank.log > $(SERVE_LOGDIR)/rank.out 2>&1 &
-	@echo "rank started on $(RANK_PORT) (heartbeat → $(SUPERVISOR_ADDR))"
+	@nohup $(BIN) rank --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/rank.out 2>&1 &
+	@echo "rank started (--config $(SERVE_CONFIG))"
 
-# 客户端: 经 router 发请求(prompt 不含引号, 空格用 %20 或直接传)
+# 客户端: 经 router 发请求(prompt 不含引号)
 SERVE_PROMPT ?= Once upon a time
 infer:
-	$(BIN) router --port $(ROUTER_PORT) --send "$(SERVER_MODEL) $(CHAT_TOKENS) $(SERVE_PROMPT)"
+	$(BIN) router --config $(SERVE_CONFIG) --send "$(SERVER_MODEL) $(CHAT_TOKENS) $(SERVE_PROMPT)"
 
 serve-stop:
 ifeq ($(UNAME_S),Windows)

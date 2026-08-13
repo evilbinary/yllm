@@ -1,0 +1,34 @@
+# yllm serve 统一配置
+# 用法:
+#   yllm supervisor --config serve.yaml      # supervisor 一键拉起 rank+server(+router/http)
+#   yllm rank    --config serve.yaml --rank-port-base 9410   # 单独起 rank(散参可覆盖)
+#   yllm server  --config serve.yaml --leader 127.0.0.1:9410
+#   yllm router  --config serve.yaml --http-port 8000
+#   yllm hub     --config serve.yaml                         # 合并模式(三合一进程)
+
+# 日志
+log: logs/serve.log
+log-level: info
+
+# 模型
+model: test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+vocab: test/tinyllama.vocab.txt
+model-name: tinyllama
+bin: ./build/avx2/yllm
+
+# 端口
+sv-port: 9500          # supervisor 心跳口
+router-port: 9400      # router 客户端口
+server-port: 9420      # server 转发口
+rank-port-base: 9410   # rank 推理口基址
+http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
+
+# 拓扑
+sv-host: 127.0.0.1     # supervisor 地址(rank/server 心跳目标)
+router-addrs: 127.0.0.1:9400   # supervisor 通知的 router 列表
+ranks: 1               # 每 server 的 rank 段数
+servers: 1             # server 副本数
+
+# 行为
+auto-heal: 1           # 自愈: 检测 DEAD 自动重拉
+strategy: least        # 路由策略: least | round-robin

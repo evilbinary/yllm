@@ -6,6 +6,7 @@
 #include "serve/router.h"
 #include "serve/supervisor.h"
 #include "serve/hub.h"
+#include "serve/config.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -331,7 +332,33 @@ int main(int argc, char** argv)
         fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank|server|router|supervisor|hub> [options]\n");
         return 1;
     }
-    /* 全局日志: --log <file> [--log-level debug|info|warn|error] [--no-console] */
+    /* serve 角色统一走 ServeConfig(解析一次, 分发) */
+    ServeConfig cfg;
+    int is_serve = strcmp(argv[1], "rank") == 0 || strcmp(argv[1], "server") == 0 ||
+                   strcmp(argv[1], "router") == 0 || strcmp(argv[1], "supervisor") == 0 ||
+                   strcmp(argv[1], "hub") == 0;
+    if (is_serve) {
+        config_load(&cfg, argc, argv, 2);
+        ylog_open(cfg.log_file);
+        if (cfg.no_console) ylog_set_console(0);
+        if (cfg.log_level[0]) {
+            if (strcmp(cfg.log_level, "debug") == 0) ylog_set_level(YLOG_DEBUG);
+            else if (strcmp(cfg.log_level, "warn") == 0) ylog_set_level(YLOG_WARN);
+            else if (strcmp(cfg.log_level, "error") == 0) ylog_set_level(YLOG_ERROR);
+            else ylog_set_level(YLOG_INFO);
+        }
+        ylog_info("yllm start: %s", cfg.log_file);
+        int rc;
+        if (strcmp(argv[1], "rank") == 0) rc = cmd_rank(&cfg);
+        else if (strcmp(argv[1], "server") == 0) rc = cmd_server(&cfg);
+        else if (strcmp(argv[1], "router") == 0) rc = cmd_router(&cfg);
+        else if (strcmp(argv[1], "supervisor") == 0) rc = cmd_supervisor(&cfg);
+        else rc = cmd_hub(&cfg);
+        ylog_close();
+        return rc;
+    }
+
+    /* 传统命令(convert/check/gen/chat): 原样 */
     const char* log_path = NULL;
     const char* log_level = NULL;
     int no_console = 0;
@@ -356,11 +383,6 @@ int main(int argc, char** argv)
     else if (strcmp(argv[1], "check") == 0) rc = cmd_check(argc, argv);
     else if (strcmp(argv[1], "gen") == 0) rc = cmd_gen(argc, argv);
     else if (strcmp(argv[1], "chat") == 0) rc = cmd_chat(argc, argv);
-    else if (strcmp(argv[1], "rank") == 0) rc = cmd_rank(argc, argv);
-    else if (strcmp(argv[1], "server") == 0) rc = cmd_server(argc, argv);
-    else if (strcmp(argv[1], "router") == 0) rc = cmd_router(argc, argv);
-    else if (strcmp(argv[1], "supervisor") == 0) rc = cmd_supervisor(argc, argv);
-    else if (strcmp(argv[1], "hub") == 0) rc = cmd_hub(argc, argv);
     else {
         fprintf(stderr, "unknown command: %s\n", argv[1]);
         rc = 1;

@@ -79,7 +79,7 @@ static int supervisor_spawn_server(Supervisor* s, int idx, const char* model_nam
     uint16_t sport = (uint16_t)(s->server_port_base + idx);
     uint16_t lport = (uint16_t)(s->rank_port_base);   /* leader = rank0 */
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" server --id server-%d --model \"%s\" --leader %s:%u "
+             "\"%s\" server --id server-%d --model-name \"%s\" --leader %s:%u "
              "--supervisor %s:%u --port %u --log logs/server-%d.log",
              s->bin, idx, model_name, s->sv_host, lport, s->sv_host, s->port,
              sport, idx);
@@ -217,12 +217,28 @@ static void handle_frame(Supervisor* s, int fd, const char* cmd, const char* arg
     else frame_send(fd, "ERR", "unknown cmd");
 }
 
+/* 启动引导: 按配置自动拉起 ranks 个 rank + 1 个 server(无需手动启动) */
+static void supervisor_bootstrap(Supervisor* s)
+{
+    if (!s->model[0] || !s->bin[0]) {
+        ylog_info("supervisor: no model/bin configured, skip bootstrap (manual spawn only)");
+        return;
+    }
+    int r;
+    for (r = 0; r < s->ranks; r++)
+        supervisor_spawn_rank(s, r);
+    supervisor_spawn_server(s, 0, s->model_name[0] ? s->model_name : "default");
+    ylog_info("supervisor: bootstrap done (%d rank(s) + 1 server)", s->ranks);
+}
+
 int supervisor_run(Supervisor* s)
 {
     sock_init();
     int srv = sock_listen(s->port, 16);
     if (srv < 0) return 1;
     ylog_info("supervisor: listening on port %u", s->port);
+
+    supervisor_bootstrap(s);
 
     uint64_t last_check = 0;
     for (;;) {
@@ -244,55 +260,24 @@ int supervisor_run(Supervisor* s)
     return 0;
 }
 
-typedef struct { const char* key; const char* val; } ArgSV;
-
-static const char* opt_sv(ArgSV* args, int n, const char* key, const char* def)
+int cmd_supervisor(ServeConfig* cfg)
 {
-    int i;
-    for (i = 0; i < n; i++)
-        if (strcmp(args[i].key, key) == 0) return args[i].val;
-    return def;
-}
-
-int cmd_supervisor(int argc, char** argv)
-{
-    ArgSV a[24];
-    int n = 0;
-    int i;
-    for (i = 2; i + 1 < argc && n < 24; i += 2) {
-        if (argv[i][0] != '-') break;
-        a[n].key = argv[i];
-        while (*a[n].key == '-') a[n].key++;
-        a[n].val = argv[i + 1];
-        n++;
-    }
-    const char* routers = opt_sv(a, n, "router", NULL);
-    const char* bin = opt_sv(a, n, "bin", NULL);
-    const char* model = opt_sv(a, n, "model", NULL);
-    const char* vocab = opt_sv(a, n, "vocab", "vocab.txt");
-    const char* sv_addr = opt_sv(a, n, "addr", "127.0.0.1");
-    int port = atoi(opt_sv(a, n, "port", "9500"));
-    int ranks = atoi(opt_sv(a, n, "ranks", "1"));
-    int rank_pb = atoi(opt_sv(a, n, "rank-port-base", "9410"));
-    int srv_pb = atoi(opt_sv(a, n, "server-port-base", "9420"));
-    int auto_heal = atoi(opt_sv(a, n, "auto-heal", "0"));
-
     Supervisor s;
     memset(&s, 0, sizeof(s));
-    s.port = (uint16_t)port;
-    s.ranks = ranks > 0 ? ranks : 1;
-    s.rank_port_base = (uint16_t)rank_pb;
-    s.server_port_base = (uint16_t)srv_pb;
-    s.auto_heal = auto_heal;
-    snprintf(s.sv_host, sizeof(s.sv_host), "%s", sv_addr);
-    if (bin) snprintf(s.bin, sizeof(s.bin), "%s", bin);
-    else snprintf(s.bin, sizeof(s.bin), "%s", "./build/avx2/yllm");
-    if (model) snprintf(s.model, sizeof(s.model), "%s", model);
-    if (vocab) snprintf(s.vocab, sizeof(s.vocab), "%s", vocab);
+    s.port = (uint16_t)cfg->sv_port;
+    s.ranks = cfg->ranks > 0 ? cfg->ranks : 1;
+    s.rank_port_base = (uint16_t)cfg->rank_port_base;
+    s.server_port_base = (uint16_t)cfg->server_port;
+    s.auto_heal = cfg->auto_heal;
+    snprintf(s.sv_host, sizeof(s.sv_host), "%s", cfg->sv_host);
+    snprintf(s.bin, sizeof(s.bin), "%s", cfg->bin);
+    if (cfg->model[0]) snprintf(s.model, sizeof(s.model), "%s", cfg->model);
+    if (cfg->vocab[0]) snprintf(s.vocab, sizeof(s.vocab), "%s", cfg->vocab);
+    if (cfg->model_name[0]) snprintf(s.model_name, sizeof(s.model_name), "%s", cfg->model_name);
 
-    if (routers) {
+    if (cfg->router_addrs[0]) {
         char tmp[2048];
-        snprintf(tmp, sizeof(tmp), "%s", routers);
+        snprintf(tmp, sizeof(tmp), "%s", cfg->router_addrs);
         char* tok = strtok(tmp, ",");
         while (tok != NULL && s.n_routers < SV_MAX_ROUTERS) {
             Node* rn = &s.routers[s.n_routers++];

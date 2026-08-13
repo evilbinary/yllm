@@ -2,6 +2,7 @@
 #define YLLM_SERVE_SERVER_H
 
 #include "node.h"
+#include "config.h"
 
 typedef struct {
     Node node;             /* 统一节点身份(type=server) */
@@ -12,7 +13,7 @@ typedef struct {
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */
-int cmd_server(int argc, char** argv);
+int cmd_server(ServeConfig* cfg);
 int server_run(Server* s);
 
 #endif

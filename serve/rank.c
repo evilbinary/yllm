@@ -247,78 +247,46 @@ static int run_rank(int port, Rank* r)
     return 0;
 }
 
-/* ---- 参数解析(与 main.c 同款) ---- */
+/* ---- 参数解析: 统一走 config(main.c 解析) ---- */
 
-typedef struct { const char* key; const char* val; } ArgR;
+#include "config.h"
 
-static const char* opt_r(ArgR* args, int n, const char* key, const char* def)
+int cmd_rank(ServeConfig* cfg)
 {
-    int i;
-    for (i = 0; i < n; i++)
-        if (strcmp(args[i].key, key) == 0) return args[i].val;
-    return def;
-}
-
-int cmd_rank(int argc, char** argv)
-{
-    ArgR a[24];
-    int n = 0;
-    int i;
-    for (i = 2; i + 1 < argc && n < 24; i += 2) {
-        if (argv[i][0] != '-') break;
-        a[n].key = argv[i];
-        while (*a[n].key == '-') a[n].key++;
-        a[n].val = argv[i + 1];
-        n++;
-    }
-    const char* model = opt_r(a, n, "model", NULL);
-    const char* vocab_path = opt_r(a, n, "vocab", "vocab.txt");
-    const char* node_id = opt_r(a, n, "id", NULL);
-    const char* sv_addr = opt_r(a, n, "supervisor", NULL);
-    int port = atoi(opt_r(a, n, "port", "9410"));
-    int budget_mb = atoi(opt_r(a, n, "budget-mb", "0"));
-    int depth = atoi(opt_r(a, n, "depth", "2"));
-    float temp = (float)atof(opt_r(a, n, "temp", "1.0"));
-    float top_p = (float)atof(opt_r(a, n, "top-p", "0.9"));
-    uint64_t seed = (uint64_t)strtoull(opt_r(a, n, "seed", "42"), NULL, 10);
-
-    if (!model) {
+    if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "
                         "[--supervisor <ip:port>] [--id <name>] "
-                        "[--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
+                        "[--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N] "
+                        "[--config <yaml>]\n");
         return 1;
     }
 
     Rank r;
     memset(&r, 0, sizeof(r));
-    r.temp = temp;
-    r.top_p = top_p;
-    r.seed = seed;
+    r.temp = cfg->temp;
+    r.top_p = cfg->top_p;
+    r.seed = cfg->seed;
     r.uptime_s = (uint64_t)time(NULL);
-    if (node_id) snprintf(r.node.node_id, sizeof(r.node.node_id), "%s", node_id);
-    else snprintf(r.node.node_id, sizeof(r.node.node_id), "rank-%s", model);
+    if (cfg->node_id[0] && strcmp(cfg->node_id, "node-0") != 0)
+        snprintf(r.node.node_id, sizeof(r.node.node_id), "%s", cfg->node_id);
+    else
+        snprintf(r.node.node_id, sizeof(r.node.node_id), "rank-%s", cfg->model);
     snprintf(r.node.type, sizeof(r.node.type), "rank");
-    snprintf(r.node.model, sizeof(r.node.model), "%s", model);
+    snprintf(r.node.model, sizeof(r.node.model), "%s", cfg->model);
     r.node.state = NODE_STATE_READY;
-    if (sv_addr) {
-        const char* colon = strchr(sv_addr, ':');
-        if (colon) {
-            size_t hlen = (size_t)(colon - sv_addr);
-            if (hlen >= sizeof(r.node.sv_host)) hlen = sizeof(r.node.sv_host) - 1;
-            memcpy(r.node.sv_host, sv_addr, hlen);
-            r.node.sv_host[hlen] = '\0';
-            r.node.sv_port = (uint16_t)atoi(colon + 1);
-            r.node.sv_enabled = 1;
-        }
+    if (cfg->sv_host[0]) {
+        snprintf(r.node.sv_host, sizeof(r.node.sv_host), "%s", cfg->sv_host);
+        r.node.sv_port = (uint16_t)cfg->sv_port;
+        r.node.sv_enabled = 1;
     }
 
-    if (vocab_load(vocab_path, &r.vocab) != 0) {
-        ylog_error("rank: cannot load vocab: %s", vocab_path);
+    if (vocab_load(cfg->vocab, &r.vocab) != 0) {
+        ylog_error("rank: cannot load vocab: %s", cfg->vocab);
         return 1;
     }
     char err[1024];
-    uint64_t budget = (uint64_t)budget_mb * 1024 * 1024;
-    if (engine_init(&r.engine, model, budget, depth, err, sizeof(err)) != 0) {
+    uint64_t budget = (uint64_t)cfg->budget_mb * 1024 * 1024;
+    if (engine_init(&r.engine, cfg->model, budget, cfg->depth, err, sizeof(err)) != 0) {
         ylog_error("rank: engine init failed: %s", err);
         vocab_free(&r.vocab);
         return 1;
@@ -326,7 +294,7 @@ int cmd_rank(int argc, char** argv)
     r.ids = (uint32_t*)ymalloc(4096);
     r.ids_cap = 4096;
 
-    int rc = run_rank(port, &r);
+    int rc = run_rank(cfg->rank_port_base, &r);
 
     free(r.ids);
     engine_free(&r.engine);

@@ -1,7 +1,9 @@
-#ifndef YLLM_SERVE_CONTROL_H
-#define YLLM_SERVE_CONTROL_H
+#ifndef YLLM_SERVE_HUB_H
+#define YLLM_SERVE_HUB_H
 
-/* yllm control: 合并模式(supervisor+router+server 同一进程不同线程) */
-int cmd_hub(int argc, char** argv);
+#include "config.h"
+
+/* yllm hub: 合并模式(supervisor+router+server 同一进程不同线程) */
+int cmd_hub(ServeConfig* cfg);
 
 #endif

@@ -2,6 +2,7 @@
 #define YLLM_SERVE_ROUTER_H
 
 #include "node.h"
+#include "config.h"
 
 #define RT_MAX_SERVERS 64
 
@@ -26,7 +27,7 @@ typedef struct {
 } Router;
 
 /* yllm router: 调度层(server 注册表 + 路由决策 + 请求转发) */
-int cmd_router(int argc, char** argv);
+int cmd_router(ServeConfig* cfg);
 int router_run(Router* r, const char* sv_host, uint16_t sv_port);
 
 /* 通用 INFER 转发(HTTP 层等复用): 路由到 server → 转发 → 逐 token 回调 */

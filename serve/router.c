@@ -366,61 +366,29 @@ int router_run(Router* r, const char* sv_host, uint16_t sv_port)
     return 0;
 }
 
-typedef struct { const char* key; const char* val; } ArgR;
-
-static const char* opt_r(ArgR* args, int n, const char* key, const char* def)
+int cmd_router(ServeConfig* cfg)
 {
-    int i;
-    for (i = 0; i < n; i++)
-        if (strcmp(args[i].key, key) == 0) return args[i].val;
-    return def;
-}
-
-int cmd_router(int argc, char** argv)
-{
-    ArgR a[24];
-    int n = 0;
-    int i;
-    for (i = 2; i + 1 < argc && n < 24; i += 2) {
-        if (argv[i][0] != '-') break;
-        a[n].key = argv[i];
-        while (*a[n].key == '-') a[n].key++;
-        a[n].val = argv[i + 1];
-        n++;
-    }
-    const char* send = opt_r(a, n, "send", NULL);
-    const char* sv_addr = opt_r(a, n, "supervisor", NULL);
-    const char* http_port_s = opt_r(a, n, "http-port", NULL);
-    int port = atoi(opt_r(a, n, "port", "9400"));
-    const char* strategy = opt_r(a, n, "strategy", "least");
-
     Router r;
     memset(&r, 0, sizeof(r));
-    r.port = (uint16_t)port;
-    r.strategy = strategy;
-    snprintf(r.node.node_id, sizeof(r.node.node_id), "router-0");
+    r.port = (uint16_t)cfg->router_port;
+    r.strategy = cfg->strategy;
+    snprintf(r.node.node_id, sizeof(r.node.node_id), "%s", cfg->node_id);
     snprintf(r.node.type, sizeof(r.node.type), "router");
     r.node.state = NODE_STATE_READY;
 
     char sv_host[128] = "";
     uint16_t sv_port = 0;
-    if (sv_addr) {
-        const char* colon = strchr(sv_addr, ':');
-        if (colon) {
-            size_t hlen = (size_t)(colon - sv_addr);
-            if (hlen >= sizeof(sv_host)) hlen = sizeof(sv_host) - 1;
-            memcpy(sv_host, sv_addr, hlen);
-            sv_host[hlen] = '\0';
-            sv_port = (uint16_t)atoi(colon + 1);
-            snprintf(r.node.sv_host, sizeof(r.node.sv_host), "%s", sv_host);
-            r.node.sv_port = sv_port;
-            r.node.sv_enabled = 1;
-        }
+    if (cfg->sv_host[0]) {
+        snprintf(sv_host, sizeof(sv_host), "%s", cfg->sv_host);
+        sv_port = (uint16_t)cfg->sv_port;
+        snprintf(r.node.sv_host, sizeof(r.node.sv_host), "%s", cfg->sv_host);
+        r.node.sv_port = sv_port;
+        r.node.sv_enabled = 1;
     }
 
-    if (send) return run_client(&r, send);
+    if (cfg->send[0]) return run_client(&r, cfg->send);
     /* OpenAI 兼容 HTTP(可选) */
-    if (http_port_s)
-        router_http_start(&r, (uint16_t)atoi(http_port_s));
+    if (cfg->http_port > 0)
+        router_http_start(&r, (uint16_t)cfg->http_port);
     return router_run(&r, sv_host, sv_port);
 }
