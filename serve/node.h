@@ -34,11 +34,12 @@ typedef struct {
 static inline int node_hb_args(const Node* n, char* out, size_t outsz)
 {
     return snprintf(out, outsz,
-                    "%s type=%s state=%s inflight=%d kv_mb=%.1f%s%s",
+                    "%s type=%s state=%s inflight=%d kv_mb=%.1f%s%s%s%s",
                     n->node_id, n->type,
                     n->state == NODE_STATE_READY ? "ready" :
                     n->state == NODE_STATE_DEAD ? "dead" : "loading",
                     n->inflight, n->kv_mb,
+                    n->addr[0] ? " addr=" : "", n->addr[0] ? n->addr : "",
                     n->model[0] ? " model=" : "",
                     n->model[0] ? n->model : "");
 }
@@ -68,17 +69,17 @@ static inline void node_parse_hb(const char* args, Node* out)
     if (idlen >= sizeof(out->node_id)) idlen = sizeof(out->node_id) - 1;
     memcpy(out->node_id, args, idlen);
     out->node_id[idlen] = '\0';
-    const char* v;
-    if ((v = frame_get(&f, "type")) != NULL) snprintf(out->type, sizeof(out->type), "%s", v);
-    if ((v = frame_get(&f, "model")) != NULL) snprintf(out->model, sizeof(out->model), "%s", v);
-    if ((v = frame_get(&f, "addr")) != NULL)  snprintf(out->addr, sizeof(out->addr), "%s", v);
-    if ((v = frame_get(&f, "state")) != NULL) {
+    char v[256];
+    if (frame_get(&f, "type", v, sizeof(v)) == 0) snprintf(out->type, sizeof(out->type), "%s", v);
+    if (frame_get(&f, "model", v, sizeof(v)) == 0) snprintf(out->model, sizeof(out->model), "%s", v);
+    if (frame_get(&f, "addr", v, sizeof(v)) == 0)  snprintf(out->addr, sizeof(out->addr), "%s", v);
+    if (frame_get(&f, "state", v, sizeof(v)) == 0) {
         if (strcmp(v, "ready") == 0) out->state = NODE_STATE_READY;
         else if (strcmp(v, "dead") == 0) out->state = NODE_STATE_DEAD;
         else out->state = NODE_STATE_LOADING;
     }
-    if ((v = frame_get(&f, "inflight")) != NULL) out->inflight = atoi(v);
-    if ((v = frame_get(&f, "kv_mb")) != NULL) out->kv_mb = atof(v);
+    if (frame_get(&f, "inflight", v, sizeof(v)) == 0) out->inflight = atoi(v);
+    if (frame_get(&f, "kv_mb", v, sizeof(v)) == 0) out->kv_mb = atof(v);
     out->last_hb = (uint64_t)time(NULL);
 }
 

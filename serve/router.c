@@ -68,15 +68,14 @@ static void handle_server_add(Router* r, const char* args)
         memset(s, 0, sizeof(*s));
         snprintf(s->id, sizeof(s->id), "%s", id);
     }
-    const char* m = frame_get(&f, "model");
-    const char* l = frame_get(&f, "leader");
-    if (m) snprintf(s->model, sizeof(s->model), "%s", m);
-    if (l) {
-        const char* colon = strchr(l, ':');
+    char vb[256];
+    if (frame_get(&f, "model", vb, sizeof(vb)) == 0) snprintf(s->model, sizeof(s->model), "%s", vb);
+    if (frame_get(&f, "leader", vb, sizeof(vb)) == 0) {
+        const char* colon = strchr(vb, ':');
         if (colon) {
-            size_t hlen = (size_t)(colon - l);
+            size_t hlen = (size_t)(colon - vb);
             if (hlen >= sizeof(s->leader_host)) hlen = sizeof(s->leader_host) - 1;
-            memcpy(s->leader_host, l, hlen);
+            memcpy(s->leader_host, vb, hlen);
             s->leader_host[hlen] = '\0';
             s->leader_port = (uint16_t)atoi(colon + 1);
         }
@@ -137,22 +136,23 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
                     Frame ff;
                     snprintf(ff.cmd, sizeof(ff.cmd), "X");
                     snprintf(ff.args, sizeof(ff.args), "%s", f.args);
-                    const char* st = frame_get(&ff, "state");
-                    const char* l = frame_get(&ff, "leader");
-                    const char* m = frame_get(&ff, "model");
-                    if (st && strcmp(st, "ready") == 0) s->state = NODE_STATE_READY;
-                    else if (st && strcmp(st, "dead") == 0) s->state = NODE_STATE_DEAD;
-                    if (l) {
-                        const char* colon = strchr(l, ':');
+                    char vb[256];
+                    if (frame_get(&ff, "state", vb, sizeof(vb)) == 0) {
+                        if (strcmp(vb, "ready") == 0) s->state = NODE_STATE_READY;
+                        else if (strcmp(vb, "dead") == 0) s->state = NODE_STATE_DEAD;
+                    }
+                    if (frame_get(&ff, "leader", vb, sizeof(vb)) == 0) {
+                        const char* colon = strchr(vb, ':');
                         if (colon) {
-                            size_t hlen = (size_t)(colon - l);
+                            size_t hlen = (size_t)(colon - vb);
                             if (hlen >= sizeof(s->leader_host)) hlen = sizeof(s->leader_host) - 1;
-                            memcpy(s->leader_host, l, hlen);
+                            memcpy(s->leader_host, vb, hlen);
                             s->leader_host[hlen] = '\0';
                             s->leader_port = (uint16_t)atoi(colon + 1);
                         }
                     }
-                    if (m) snprintf(s->model, sizeof(s->model), "%s", m);
+                    if (frame_get(&ff, "model", vb, sizeof(vb)) == 0)
+                        snprintf(s->model, sizeof(s->model), "%s", vb);
                 }
             }
         }

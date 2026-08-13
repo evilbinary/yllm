@@ -89,16 +89,16 @@ $(OBJDIR)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.
 $(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
+$(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h | $(OBJDIR_AVX2)
@@ -107,16 +107,16 @@ $(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/con
 $(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----

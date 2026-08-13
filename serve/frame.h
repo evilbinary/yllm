@@ -80,19 +80,26 @@ static inline int frame_recv_payload(int fd, void* buf, size_t n)
     return 0;
 }
 
-/* 解析 "key=value" 参数: 返回 value 指针(指向 args 内)或 NULL */
-static inline const char* frame_get(const Frame* f, const char* key)
+/* 解析 "key=value" 参数: 复制 value 到 out(截断到空格/结尾), 返回 0 或 -1 */
+static inline int frame_get(const Frame* f, const char* key, char* out, size_t outsz)
 {
     size_t klen = strlen(key);
     const char* p = f->args;
     while (*p) {
         while (*p == ' ') p++;
         if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
-            return p + klen + 1;
+            const char* v = p + klen + 1;
+            size_t vlen = 0;
+            while (v[vlen] && v[vlen] != ' ') vlen++;
+            if (vlen >= outsz) vlen = outsz - 1;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return 0;
         }
         while (*p && *p != ' ') p++;
     }
-    return NULL;
+    out[0] = '\0';
+    return -1;
 }
 
 /* 取 payload 长度(args 末尾的裸数字, 如 "INFER 20 15" 的 15) */

@@ -177,7 +177,7 @@ static int handle_infer(int fd, Rank* r, char* args)
         r->ids_cap = (uint32_t)nbytes + 8192;
     }
     if (xrecv_rank(fd, r->ids, (size_t)nbytes) != 0) return -1;
-    r->ids[nbytes] = '\0';
+    ((char*)r->ids)[nbytes] = '\0';
     char* prompt = (char*)r->ids;
 
     int nprompt = vocab_encode(&r->vocab, prompt, r->ids, (int)r->ids_cap - 4096);
