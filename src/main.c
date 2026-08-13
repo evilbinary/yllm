@@ -141,6 +141,7 @@ static int cmd_gen(int argc, char** argv)
     int ranks = atoi(opt(a, n, "ranks", "1"));
     int port_base = atoi(opt(a, n, "port-base", "8900"));
     int dist_fp16 = atoi(opt(a, n, "dist-fp16", "0"));
+    const char* dist_addrs = opt(a, n, "dist-addrs", NULL);
 
     if (!m) {
         fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
@@ -188,7 +189,7 @@ static int cmd_gen(int argc, char** argv)
     if (ranks > 1) {
         /* 分布式层流水线各 rank 均执行 dist_gen */
         rc = dist_gen(&e, &v, ids, nprompt, ntokens, temp, top_p, seed,
-                      rank, ranks, port_base, dist_fp16, t0, on_token_cb, &v);
+                      rank, ranks, port_base, dist_addrs, dist_fp16, t0, on_token_cb, &v);
         engine_free(&e);
         vocab_free(&v);
         free(ids);

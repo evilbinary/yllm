@@ -15,7 +15,8 @@
  *
  * 轻量文本协议, 一条命令一行, 回复一行("ok" 或 "err <msg>"):
  *   ping                        探测存活
- *   run RANK RANKS PB TOKENS MODEL VOCAB PROMPT... 拉起 gen 子进程 (prompt 为行尾剩余部分)
+ *   run RANK RANKS PB TOKENS MODEL VOCAB ADDRS PROMPT... 拉起 gen 子进程
+ *                                (ADDRS 为逗号分隔节点IP列表, 与 RANKS 等长; prompt 为行尾剩余部分)
  *   sync HOST PORT REL DEST     从 HOST:PORT 拉 REL(相对 serve root) 到本地 DEST,
  *                               已有且 size+mtime 一致则跳过
  *   stop                        终止本 worker 曾启动的全部子进程
@@ -80,23 +81,29 @@ static int child_kill(int pid)
 #endif
 }
 
-/* 后台拉起 `bin gen --rank R ...`, 输出追加写入 logdir/rank<R>.log */
+/* 后台拉起 `bin gen --rank R ...`, 日志由 yllm 自身 --log 写入 logdir/rank<R>.log */
 static int spawn_gen(const char* bin, const char* logdir,
                      int rank, int ranks, int port_base, int tokens,
-                     const char* model, const char* vocab, const char* prompt)
+                     const char* model, const char* vocab, const char* addrs,
+                     const char* prompt)
 {
     char log[1024];
     snprintf(log, sizeof(log), "%s/rank%d.log", logdir, rank);
+    const char* addr_opt = (addrs && addrs[0]) ? "--dist-addrs " : "";
+    const char* addr_val = (addrs && addrs[0]) ? addrs : "";
 #ifdef _WIN32
     char cmd[8192];
     snprintf(cmd, sizeof(cmd),
-             "cmd.exe /c \"\"%s\" gen --model \"%s\" --vocab \"%s\" --tokens %d --prompt \"%s\" --rank %d --ranks %d --port-base %d >> \"%s\" 2>&1\"",
-             bin, model, vocab, tokens, prompt, rank, ranks, port_base, log);
+             "\"%s\" gen --model \"%s\" --vocab \"%s\" --tokens %d --prompt \"%s\" --rank %d --ranks %d --port-base %d %s\"%s\" --log \"%s\"",
+             bin, model, vocab, tokens, prompt, rank, ranks, port_base, addr_opt, addr_val, log);
+    DBG("spawn cmd: %s", cmd);
+    /* 直接 CreateProcess 执行 yllm, 日志由 yllm 自身写 --log 文件。
+     * stdout/stderr 不重定向(生成 token 走 stdout 无所谓, 后台无终端), */
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si)); memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
     if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        fprintf(stderr, "worker: CreateProcess fail\n");
+        fprintf(stderr, "worker: CreateProcess fail (%lu)\n", GetLastError());
         return -1;
     }
     CloseHandle(pi.hThread);
@@ -109,8 +116,8 @@ static int spawn_gen(const char* bin, const char* logdir,
         setsid();
         char cmd[8192];
         snprintf(cmd, sizeof(cmd),
-                 "\"%s\" gen --model \"%s\" --vocab \"%s\" --tokens %d --prompt \"%s\" --rank %d --ranks %d --port-base %d >> \"%s\" 2>&1",
-                 bin, model, vocab, tokens, prompt, rank, ranks, port_base, log);
+                 "\"%s\" gen --model \"%s\" --vocab \"%s\" --tokens %d --prompt \"%s\" --rank %d --ranks %d --port-base %d %s\"%s\" --log \"%s\" > /dev/null 2>&1",
+                 bin, model, vocab, tokens, prompt, rank, ranks, port_base, addr_opt, addr_val, log);
         execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
         _exit(127);
     }
@@ -395,23 +402,23 @@ static void handle_line(char* line, const char* bin, const char* logdir,
     }
     if (strncmp(cmd, "run", 3) == 0 && (cmd[3] == ' ')) {
         char* p = cmd + 4;
-        char* tok[7];
+        char* tok[8];
         int i;
-        for (i = 0; i < 6; i++) {
+        for (i = 0; i < 7; i++) {
             tok[i] = strtok(p, " ");
             if (!tok[i]) break;
             p = NULL;
         }
-        /* prompt = 第6个字段之后的行尾剩余部分(可含空格) */
-        if (i >= 6) {
+        /* prompt = 第7个字段(rank ranks port_base tokens model vocab addrs)之后的行尾剩余部分 */
+        if (i >= 7) {
             char* rest = strtok(NULL, "");
-            if (tok[0] && tok[1] && tok[2] && tok[3] && tok[4] && tok[5] && rest) {
+            if (tok[0] && tok[1] && tok[2] && tok[3] && tok[4] && tok[5] && tok[6] && rest) {
                 int rank = atoi(tok[0]);
                 int ranks = atoi(tok[1]);
                 int port_base = atoi(tok[2]);
                 int tokens = atoi(tok[3]);
                 if (spawn_gen(bin, logdir, rank, ranks, port_base, tokens,
-                              tok[4], tok[5], rest) == 0)
+                              tok[4], tok[5], tok[6], rest) == 0)
                     snprintf(out, outsz, "ok spawned rank %d", rank);
                 else
                     snprintf(out, outsz, "err spawn");

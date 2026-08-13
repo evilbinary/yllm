@@ -32,7 +32,7 @@ typedef struct {
 
 void dist_print_stats(Dist* d, const char* tag);
 
-int dist_init(Dist* d, int rank, int ranks, uint16_t port_base);
+int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs);
 int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16);
 int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16);
 int dist_send_logits(Dist* d, const float* logits, uint32_t vocab, uint32_t topk);
@@ -40,11 +40,11 @@ int dist_recv_logits(Dist* d, uint32_t* ids, float* logits, uint32_t topk, float
 int dist_send_done(Dist* d);
 void dist_close(Dist* d);
 
-/* 分布式层流水线推理: 各 rank 均执行, 按 rank 分 master / middle / last。
- * emit 为生成 token 的输出回调(跑在 rank0)。 */
+/* 跨机分布式: 传 addrs(逗号分隔节点 IP, 长度=ranks, 第 i 个是 rank i 的地址)可为空,
+ * 为空时用 127.0.0.1 退化为单机多进程测试。 */
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
              int ntokens, float temp, float top_p, uint64_t seed,
-             int rank, int ranks, int port_base, int dist_fp16,
+             int rank, int ranks, int port_base, const char* addrs, int dist_fp16,
              uint64_t t0, dist_token_cb emit, void* ctx);
 
 /* 按字节均衡切层(末 rank 含 norm+head, 故少分块), 并设置本 rank 的层范围。

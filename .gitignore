@@ -61,3 +61,4 @@ tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 qwen2.5-1.5b-instruct-q4_k_m.gguf
 tmp/
 logs/
+*.gguf

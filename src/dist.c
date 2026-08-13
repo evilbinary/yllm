@@ -43,22 +43,33 @@ static int sock_listen(uint16_t port)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
     if (listen(fd, 8) != 0) { close(fd); return -1; }
     return fd;
 }
 
-static int sock_connect(uint16_t port)
+static int sock_connect(uint16_t port, const char* ip)
 {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (ip && ip[0]) {
+#ifdef _WIN32
+        if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
+            addr.sin_addr.S_un.S_addr = inet_addr(ip);
+#else
+        if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
+            addr.sin_addr.s_addr = inet_addr(ip);
+#endif
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
     addr.sin_port = htons(port);
     int attempt;
-    for (attempt = 0; attempt < 50; attempt++) {
+    /* 跨机场景对端可能仍在加载模型/尚未 listen, 重试 500 次 ×200ms = 100s */
+    for (attempt = 0; attempt < 500; attempt++) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return -1;
         if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
@@ -98,7 +109,8 @@ static int xio(Dist* d, int fd, const void* buf, size_t n, int is_send)
         p += sent;
         n -= sent;
 #else
-        ssize_t r = (ssize_t)send(fd, p, n, 0);
+        ssize_t r = is_send ? (ssize_t)send(fd, p, n, 0)
+                            : (ssize_t)recv(fd, p, n, 0);
         if (r <= 0) goto err_fail;
         p += r;
         n -= (size_t)r;
@@ -122,8 +134,9 @@ static int xrecv(Dist* d, int fd, void* buf, size_t n)
     return xio(d, fd, buf, n, 0);
 }
 
-/* 建立连接: 所有进程先 bind+listen, 再按拓扑 connect */
-int dist_init(Dist* d, int rank, int ranks, uint16_t port_base)
+/* 建立连接: 所有进程先 bind+listen(INADDR_ANY), 再按拓扑 connect。
+ * addrs: 每 rank 节点 IP 数组(长度 ranks); NULL 时用 loopback。 */
+int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs)
 {
 #ifdef _WIN32
     WSADATA wsa;
@@ -139,7 +152,8 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base)
     if (listen_fd < 0) { fprintf(stderr, "dist: rank %d cannot listen on port %u\n", rank, port_base + rank); return -1; }
 
     if (rank < ranks - 1) {
-        d->down_fd = sock_connect((uint16_t)(port_base + (uint16_t)(rank + 1)));
+        const char* ip = addrs ? addrs[rank + 1] : NULL;
+        d->down_fd = sock_connect((uint16_t)(port_base + (uint16_t)(rank + 1)), ip);
         if (d->down_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect to %u\n", rank, port_base + rank + 1); return -1; }
     }
     if (rank == 0) {
@@ -147,7 +161,8 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base)
     } else {
         d->up_fd = (int)accept(listen_fd, NULL, NULL);
         if (rank == ranks - 1) {
-            d->log_fd = sock_connect(port_base);
+            const char* ip = addrs ? addrs[0] : NULL;
+            d->log_fd = sock_connect(port_base, ip);
             if (d->log_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect back to rank 0\n", rank); return -1; }
         }
     }
@@ -290,15 +305,33 @@ void dist_print_stats(Dist* d, const char* tag)
     }
 }
 
-/* 分布式层流水线推理 */
+/* 分布式层流水线推理: 各 rank 均执行, 按 rank 分 master / middle / last。
+ * addrs: 每 rank 节点 IP(逗号分隔, 长度=ranks); NULL 退化为 loopback。
+ * emit 为生成 token 的输出回调(跑在 rank0)。 */
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
              int ntokens, float temp, float top_p, uint64_t seed,
-             int rank, int ranks, int port_base, int dist_fp16,
+             int rank, int ranks, int port_base, const char* addrs, int dist_fp16,
              uint64_t t0, dist_token_cb emit, void* ctx)
 {
     Dist dist;
     char err[256];
-    if (dist_init(&dist, rank, ranks, (uint16_t)port_base) != 0) {
+    const char* addr_list[64];
+    const char* const* addr_arr = NULL;
+    if (addrs && addrs[0] && ranks <= 64) {
+        char tmp[1024];
+        snprintf(tmp, sizeof(tmp), "%s", addrs);
+        char* tok = strtok(tmp, ",");
+        int i = 0;
+        static char nodes[64][128];
+        while (tok && i < ranks) {
+            snprintf(nodes[i], sizeof(nodes[i]), "%s", tok);
+            addr_list[i] = nodes[i];
+            tok = strtok(NULL, ",");
+            i++;
+        }
+        if (i == ranks) addr_arr = addr_list;
+    }
+    if (dist_init(&dist, rank, ranks, (uint16_t)port_base, addr_arr) != 0) {
         ylog_error("dist init failed");
         return 1;
     }
