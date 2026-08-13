@@ -349,6 +349,15 @@ int router_run(Router* r, const char* sv_host, uint16_t sv_port)
                 else if (strcmp(f.cmd, PROTO_QUIT) == 0) {
                     frame_send(fd, "OK", NULL);
                     r->quit = 1;
+                } else if (strcmp(f.cmd, PROTO_PING) == 0) {
+                    frame_send(fd, "OK", "READY");
+                } else if (strcmp(f.cmd, PROTO_STAT) == 0) {
+                    int total = 0, i2;
+                    for (i2 = 0; i2 < r->n_servers; i2++) total += r->servers[i2].inflight;
+                    char st[256];
+                    snprintf(st, sizeof(st), "servers=%d inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=0",
+                             r->n_servers, total);
+                    frame_send(fd, "OK", st);
                 } else
                     frame_send(fd, "ERR", "unknown cmd");
             }

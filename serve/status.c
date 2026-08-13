@@ -90,18 +90,24 @@ static void query_supervisor(ServeConfig* cfg)
     if (!found) printf("  (无 server 节点)\n");
 }
 
+static void query_role(const char* label, int port)
+{
+    int fd = sock_connect("127.0.0.1", (uint16_t)port, 2);
+    if (fd < 0) { printf("  %s: 不可达\n", label); return; }
+    frame_send(fd, PROTO_STAT, NULL);
+    Frame f;
+    if (frame_recv(fd, &f) >= 0)
+        printf("  %s: %s %s\n", label, f.cmd, f.args);
+    close(fd);
+}
+
 static void query_ranks(ServeConfig* cfg)
 {
-    printf("== rank 状态 (端口基址 %d) ==\n", cfg->rank_port_base);
     int r;
     for (r = 0; r < (cfg->ranks > 0 ? cfg->ranks : 1); r++) {
-        int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->rank_port_base + r), 2);
-        if (fd < 0) { printf("  rank-%d: 不可达\n", r); continue; }
-        frame_send(fd, PROTO_STAT, NULL);
-        Frame f;
-        if (frame_recv(fd, &f) >= 0)
-            printf("  rank-%d: %s %s\n", r, f.cmd, f.args);
-        close(fd);
+        char label[32];
+        snprintf(label, sizeof(label), "rank-%d", r);
+        query_role(label, cfg->rank_port_base + r);
     }
 }
 
@@ -111,6 +117,11 @@ int cmd_status(ServeConfig* cfg)
     printf("\n");
     query_supervisor(cfg);
     printf("\n");
+    printf("== rank 状态 (端口基址 %d) ==\n", cfg->rank_port_base);
     query_ranks(cfg);
+    printf("\n== server 状态 ==\n");
+    query_role("server-0", cfg->server_port);
+    printf("\n== router 状态 ==\n");
+    query_role("router-0", cfg->router_port);
     return 0;
 }

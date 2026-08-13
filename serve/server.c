@@ -71,6 +71,14 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         s->node.inflight++;
         forward_infer(fd, s, args);
         s->node.inflight--;
+    } else if (strcmp(cmd, PROTO_PING) == 0) {
+        frame_send(fd, "OK", "READY");
+    } else if (strcmp(cmd, PROTO_STAT) == 0) {
+        uint64_t uptime = s->start_s ? (uint64_t)(time(NULL) - (time_t)s->start_s) : 0;
+        char st[256];
+        snprintf(st, sizeof(st), "inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=%llu",
+                 s->node.inflight, (unsigned long long)uptime);
+        frame_send(fd, "OK", st);
     } else if (strcmp(cmd, PROTO_DRAIN) == 0 || strcmp(cmd, PROTO_QUIT) == 0) {
         frame_send(fd, "OK", NULL);
         s->quit = 1;
