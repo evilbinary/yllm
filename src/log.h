@@ -20,6 +20,8 @@ int  ylog_get_level(void);
 /* 1 = 控制台回显(默认开), 0 = 仅写文件 */
 void ylog_set_console(int on);
 void ylog_log(int level, const char* fmt, ...);
+/* 原始输出(无时间戳/级别), 追加到日志文件与 stderr, 用于流式 token 文本 */
+void ylog_raw(const char* fmt, ...);
 void ylog_close(void);
 
 #define ylog_debug(...) ylog_log(YLOG_DEBUG, __VA_ARGS__)

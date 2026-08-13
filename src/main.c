@@ -40,6 +40,7 @@ static void on_token_cb(uint32_t id, void* ctx)
     vocab_decode(v, &id, 1, tmp, sizeof(tmp));
     fputs(tmp, stdout);
     fflush(stdout);
+    ylog_raw("%s", tmp);
 }
 
 static int cmd_convert(int argc, char** argv)

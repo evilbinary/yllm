@@ -101,6 +101,21 @@ void ylog_log(int level, const char* fmt, ...)
     ymutex_unlock(g_mu);
 }
 
+void ylog_raw(const char* fmt, ...)
+{
+    char buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    log_ensure_mu();
+    ymutex_lock(g_mu);
+    if (g_fp) { fputs(buf, g_fp); fflush(g_fp); }
+    if (g_console || !g_fp) { fputs(buf, stderr); fflush(stderr); }
+    ymutex_unlock(g_mu);
+}
+
 void ylog_close(void)
 {
     if (g_mu) ymutex_lock(g_mu);
