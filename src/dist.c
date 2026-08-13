@@ -317,6 +317,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         /* master: embed + 自己块段, 采样由收到的 top-k logits 决定 */
         uint32_t pos = 0;
         int i;
+        int pend = 0;
         for (i = 0; i < nprompt; i++) {
             engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
             dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
@@ -331,6 +332,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (pos >= e->max_seq) break;
             int k = dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse);
             if (k <= 0) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed"); break; }
+            pend = 0;
             uint32_t nxt;
             if (engine_sample(e, vocab_sz, temp, top_p, &rng, &nxt) != 0) { rc = -1; break; }
             if (getenv("YLLM_DISTDBG")) {
@@ -343,11 +345,19 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
             pos++;
             ngen++;
+            pend = 1;
             if (dist_stats && (ngen % STATS_EVERY) == 0) {
                 char tag[48];
                 snprintf(tag, sizeof(tag), "dist@tok%d", ngen);
                 dist_print_stats(&dist, tag);
             }
+        }
+        /* 若最后一个 X 帧刚发出、其 logits 响应尚未读走则冲刷掉,
+         * 避免 last rank 的 send 打到已关闭 socket。eos/错误退出时 pend=0 则不占。 */
+        if (pend) {
+            float* flush = (float*)ymalloc((size_t)vocab_sz * 4);
+            (void)dist_recv_logits(&dist, NULL, flush, vocab_sz, NULL);
+            free(flush);
         }
         dist_send_done(&dist);
         ylog_info("decode:  %d tokens in %.2f s (%.1f tok/s)", ngen,
