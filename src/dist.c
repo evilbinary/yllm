@@ -8,6 +8,7 @@
  */
 #include "dist.h"
 #include "yllm.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -274,19 +275,16 @@ void dist_print_stats(Dist* d, const char* tag)
     double mb_recv = (double)d->bytes_recv / (1024.0 * 1024.0);
     double sec_send = (double)d->nanos_wait_send / 1e9;
     double sec_recv = (double)d->nanos_wait_recv / 1e9;
-    fprintf(stderr, "[%s] rank %d/%d  X frames: sent=%llu recv=%llu | logits frames: sent=%llu recv=%llu\n",
+    ylog_info("[%s] rank %d/%d X frames: sent=%llu recv=%llu | logits frames: sent=%llu recv=%llu | bytes: sent=%.2f MB recv=%.2f MB | block: send %.1f ms recv %.1f ms | bw: send %.1f MB/s recv %.1f MB/s",
             tag, d->rank, d->ranks,
             (unsigned long long)d->n_x_sent, (unsigned long long)d->n_x_recv,
-            (unsigned long long)d->n_log_sent, (unsigned long long)d->n_log_recv);
-    fprintf(stderr, "[%s] rank %d          bytes: sent=%.2f MB recv=%.2f MB | block: send %.1f ms recv %.1f ms\n",
-            tag, d->rank, mb_sent, mb_recv, sec_send * 1000.0, sec_recv * 1000.0);
-    fprintf(stderr, "[%s] rank %d          bandwidth: send %.1f MB/s recv %.1f MB/s\n",
-            tag, d->rank,
+            (unsigned long long)d->n_log_sent, (unsigned long long)d->n_log_recv,
+            mb_sent, mb_recv, sec_send * 1000.0, sec_recv * 1000.0,
             sec_send > 0 ? mb_sent / sec_send : 0.0,
             sec_recv > 0 ? mb_recv / sec_recv : 0.0);
     if (d->elapsed_ms > 0) {
         double sec_el = d->elapsed_ms / 1000.0;
-        fprintf(stderr, "[%s] rank %d          avg throughput: send %.2f MB/s recv %.2f MB/s (total %.2f s)\n",
+        ylog_info("[%s] rank %d avg throughput: send %.2f MB/s recv %.2f MB/s (total %.2f s)",
                 tag, d->rank, mb_sent / sec_el, mb_recv / sec_el, sec_el);
     }
 }

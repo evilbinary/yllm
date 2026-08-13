@@ -1,5 +1,6 @@
 #include "yllm.h"
 #include "dist.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -60,7 +61,7 @@ static int cmd_convert(int argc, char** argv)
 
     if (gguf && out) {
         if (convert_model("gguf", gguf, out, vocab_out, seq, err, sizeof(err)) != 0) {
-            fprintf(stderr, "convert failed: %s\n", err);
+            ylog_error("convert failed: %s", err);
             return 1;
         }
         printf("converted %s -> %s (max_seq %u)\n", gguf, out, seq);
@@ -69,7 +70,7 @@ static int cmd_convert(int argc, char** argv)
     }
     if (in && out) {
         if (convert_model("safetensors", in, out, vocab_out, seq, err, sizeof(err)) != 0) {
-            fprintf(stderr, "convert failed: %s\n", err);
+            ylog_error("convert failed: %s", err);
             return 1;
         }
         printf("converted %s -> %s (dtype fp16, max_seq %u)\n", in, out, seq);
@@ -78,14 +79,14 @@ static int cmd_convert(int argc, char** argv)
     }
     if (out) {
         if (convert_dummy(out, blocks, hidden, heads, kv_heads, vocab, seq, seed, err, sizeof(err)) != 0) {
-            fprintf(stderr, "convert failed: %s\n", err);
+            ylog_error("convert failed: %s", err);
             return 1;
         }
         printf("dummy model written: %s (blocks=%u hidden=%u heads=%u kv=%u vocab=%u seq=%u)\n",
                out, blocks, hidden, heads, kv_heads, vocab, seq);
         if (vocab_out) {
             if (dummy_vocab(vocab_out, vocab, err, sizeof(err)) != 0) {
-                fprintf(stderr, "vocab failed: %s\n", err);
+                ylog_error("vocab failed: %s", err);
                 return 1;
             }
             printf("vocab written: %s\n", vocab_out);
@@ -94,7 +95,7 @@ static int cmd_convert(int argc, char** argv)
     }
     if (vocab_out && !in) {
         if (dummy_vocab(vocab_out, vocab, err, sizeof(err)) != 0) {
-            fprintf(stderr, "vocab failed: %s\n", err);
+            ylog_error("vocab failed: %s", err);
             return 1;
         }
         printf("vocab written: %s\n", vocab_out);
@@ -117,7 +118,7 @@ static int cmd_check(int argc, char** argv)
     }
     char err[1024];
     if (llf_check(m, err, sizeof(err)) != 0) {
-        fprintf(stderr, "check failed: %s\n", err);
+        ylog_error("check failed: %s", err);
         return 1;
     }
     return 0;
@@ -257,8 +258,7 @@ static int cmd_gen(int argc, char** argv)
                 }
             }
             dist_send_done(&dist);
-            printf("\n\n");
-            printf("decode:  %d tokens in %.2f s (%.1f tok/s)\n", ngen,
+            ylog_info("decode:  %d tokens in %.2f s (%.1f tok/s)", ngen,
                    (double)(ynow_ms() - t0) / 1000.0,
                    (double)ngen * 1000.0 / (double)(ynow_ms() - t0 > 0 ? ynow_ms() - t0 : 1));
         } else {
@@ -320,18 +320,17 @@ static int cmd_gen(int argc, char** argv)
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
-    printf("\n\n");
-    printf("prefill: %u tokens in %.2f s (%.1f tok/s)\n", tim.n_prefill,
-           (double)tim.prefill_ms / 1000.0,
-           tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
-    printf("decode:  %u tokens in %.2f s (%.1f tok/s)\n", tim.n_decode,
-           (double)tim.decode_ms / 1000.0,
-           tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
-    printf("total:   %.2f s\n", (double)ms / 1000.0);
-    printf("resident estimate: %.2f MB (budget: %s)\n",
-           (double)engine_resident(&e) / 1048576.0,
-           budget_mb > 0 ? "limited" : "unlimited");
-    if (rc != 0) fprintf(stderr, "generate failed: %s\n", err);
+    ylog_info("prefill: %u tokens in %.2f s (%.1f tok/s)", tim.n_prefill,
+            (double)tim.prefill_ms / 1000.0,
+            tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
+    ylog_info("decode:  %u tokens in %.2f s (%.1f tok/s)", tim.n_decode,
+            (double)tim.decode_ms / 1000.0,
+            tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
+    ylog_info("total:   %.2f s", (double)ms / 1000.0);
+    ylog_info("resident estimate: %.2f MB (budget: %s)",
+            (double)engine_resident(&e) / 1048576.0,
+            budget_mb > 0 ? "limited" : "unlimited");
+    if (rc != 0) ylog_error("generate failed: %s", err);
 done_gen:;
     engine_free(&e);
     vocab_free(&v);
@@ -398,8 +397,7 @@ static int cmd_chat(int argc, char** argv)
             nprompt++;
         }
     }
-    printf("chat prompt tokens: %d (bos=%d)\n", nprompt, v.bos);
-    printf("\n");
+    ylog_info("chat prompt tokens: %d (bos=%d)", nprompt, v.bos);
     uint64_t t0 = ynow_ms();
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));
@@ -408,18 +406,17 @@ static int cmd_chat(int argc, char** argv)
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
-    printf("\n\n");
-    printf("prefill: %u tokens in %.2f s (%.1f tok/s)\n", tim.n_prefill,
+    ylog_info("prefill: %u tokens in %.2f s (%.1f tok/s)", tim.n_prefill,
            (double)tim.prefill_ms / 1000.0,
            tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
-    printf("decode:  %u tokens in %.2f s (%.1f tok/s)\n", tim.n_decode,
+    ylog_info("decode:  %u tokens in %.2f s (%.1f tok/s)", tim.n_decode,
            (double)tim.decode_ms / 1000.0,
            tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
-    printf("total:   %.2f s\n", (double)ms / 1000.0);
-    printf("resident estimate: %.2f MB (budget: %s)\n",
+    ylog_info("total:   %.2f s", (double)ms / 1000.0);
+    ylog_info("resident estimate: %.2f MB (budget: %s)",
            (double)engine_resident(&e) / 1048576.0,
            budget_mb > 0 ? "limited" : "unlimited");
-    if (rc != 0) fprintf(stderr, "chat failed: %s\n", err);
+    if (rc != 0) ylog_error("chat failed: %s", err);
     engine_free(&e);
     vocab_free(&v);
     free(ids);
@@ -432,10 +429,35 @@ int main(int argc, char** argv)
         fprintf(stderr, "usage: yllm <convert|check|gen|chat> [options]\n");
         return 1;
     }
-    if (strcmp(argv[1], "convert") == 0) return cmd_convert(argc, argv);
-    if (strcmp(argv[1], "check") == 0) return cmd_check(argc, argv);
-    if (strcmp(argv[1], "gen") == 0) return cmd_gen(argc, argv);
-    if (strcmp(argv[1], "chat") == 0) return cmd_chat(argc, argv);
-    fprintf(stderr, "unknown command: %s\n", argv[1]);
-    return 1;
+    /* 全局日志: --log <file> [--log-level debug|info|warn|error] [--no-console] */
+    const char* log_path = NULL;
+    const char* log_level = NULL;
+    int no_console = 0;
+    int i;
+    for (i = 2; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--log") == 0) { log_path = argv[i + 1]; i++; }
+        else if (strcmp(argv[i], "--log-level") == 0) { log_level = argv[i + 1]; i++; }
+        else if (strcmp(argv[i], "--no-console") == 0) no_console = 1;
+    }
+    ylog_open(log_path);
+    if (no_console) ylog_set_console(0);
+    if (log_level) {
+        if (strcmp(log_level, "debug") == 0) ylog_set_level(YLOG_DEBUG);
+        else if (strcmp(log_level, "warn") == 0) ylog_set_level(YLOG_WARN);
+        else if (strcmp(log_level, "error") == 0) ylog_set_level(YLOG_ERROR);
+        else ylog_set_level(YLOG_INFO);
+    }
+    ylog_info("yllm start: %s", log_path ? log_path : "(console only)");
+
+    int rc;
+    if (strcmp(argv[1], "convert") == 0) rc = cmd_convert(argc, argv);
+    else if (strcmp(argv[1], "check") == 0) rc = cmd_check(argc, argv);
+    else if (strcmp(argv[1], "gen") == 0) rc = cmd_gen(argc, argv);
+    else if (strcmp(argv[1], "chat") == 0) rc = cmd_chat(argc, argv);
+    else {
+        fprintf(stderr, "unknown command: %s\n", argv[1]);
+        rc = 1;
+    }
+    ylog_close();
+    return rc;
 }

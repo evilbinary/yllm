@@ -13,8 +13,8 @@ CC         ?= cc
 LDFLAGS    ?=
 LIBS       :=
 
-SRC      := src/platform.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c src/dist.c src/main.c
-TEST_ENGINE_CORE := src/platform.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c
+SRC      := src/platform.c src/log.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c src/dist.c src/main.c
+TEST_ENGINE_CORE := src/platform.c src/log.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c
 
 # ---- OS 检测 (Windows: MSYS2/MinGW 的 uname 会带 MINGW/MSYS, 也归为 Windows) ----
 ifneq ($(OS),Windows_NT)
