@@ -1,7 +1,11 @@
 #ifndef YLLM_DIST_H
 #define YLLM_DIST_H
 
+#include "yllm.h"
 #include <stdint.h>
+
+/* 生成 token 输出回调(解码并打印到 stdout) */
+typedef void (*dist_token_cb)(uint32_t id, void* ctx);
 
 /* 层流水线分布式拓扑 */
 typedef struct {
@@ -35,5 +39,16 @@ int dist_send_logits(Dist* d, const float* logits, uint32_t vocab, uint32_t topk
 int dist_recv_logits(Dist* d, uint32_t* ids, float* logits, uint32_t topk, float* lse_out);
 int dist_send_done(Dist* d);
 void dist_close(Dist* d);
+
+/* 分布式层流水线推理: 各 rank 均执行, 按 rank 分 master / middle / last。
+ * emit 为生成 token 的输出回调(跑在 rank0)。 */
+int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
+             int ntokens, float temp, float top_p, uint64_t seed,
+             int rank, int ranks, int port_base, int dist_fp16,
+             uint64_t t0, dist_token_cb emit, void* ctx);
+
+/* 按字节均衡切层(末 rank 含 norm+head, 故少分块), 并设置本 rank 的层范围。
+ * 返回 0 成功, -1 失败(ranks > blocks)。 */
+int dist_split_layers(Engine* e, int rank, int ranks);
 
 #endif

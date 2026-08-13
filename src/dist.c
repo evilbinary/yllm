@@ -288,3 +288,134 @@ void dist_print_stats(Dist* d, const char* tag)
                 tag, d->rank, mb_sent / sec_el, mb_recv / sec_el, sec_el);
     }
 }
+
+/* 分布式层流水线推理 */
+int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
+             int ntokens, float temp, float top_p, uint64_t seed,
+             int rank, int ranks, int port_base, int dist_fp16,
+             uint64_t t0, dist_token_cb emit, void* ctx)
+{
+    Dist dist;
+    char err[256];
+    if (dist_init(&dist, rank, ranks, (uint16_t)port_base) != 0) {
+        ylog_error("dist init failed");
+        return 1;
+    }
+    uint32_t hidden = e->ws.model.h.hidden;
+    uint32_t vocab_sz = e->ws.model.h.vocab;
+    enum { TOPK = 1024 };
+    float* xbuf = (float*)ymalloc((size_t)hidden * 4);
+    uint32_t* k_ids = (uint32_t*)ymalloc((size_t)TOPK * 4);
+
+    uint64_t rng = ysrand(seed);
+    int ngen = 0;
+    int dist_stats = getenv("YLLM_DIST_STATS") != NULL;
+    const int STATS_EVERY = 8;
+    int rc = 0;
+
+    if (rank == 0) {
+        /* master: embed + 自己块段, 采样由收到的 top-k logits 决定 */
+        uint32_t pos = 0;
+        int i;
+        for (i = 0; i < nprompt; i++) {
+            engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
+            dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
+            pos++;
+        }
+        float lse = 0.0f;
+        /* 丢弃 prompt 阶段多余的 top-k(末 rank 对每个 X 帧都回 logits) */
+        for (i = 0; i < nprompt - 1; i++) {
+            if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; break; }
+        }
+        for (i = 0; i < ntokens && rc == 0; i++) {
+            if (pos >= e->max_seq) break;
+            int k = dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse);
+            if (k <= 0) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed"); break; }
+            uint32_t nxt;
+            if (engine_sample(e, vocab_sz, temp, top_p, &rng, &nxt) != 0) { rc = -1; break; }
+            if (getenv("YLLM_DISTDBG")) {
+                fprintf(stderr, "R0 sampled k=%d id=%u [%s] logit=%.2f\n", k, nxt,
+                        v->pieces[nxt], e->logits[nxt]);
+            }
+            if (emit) emit(nxt, ctx);
+            if (nxt == (uint32_t)v->eos) break;
+            engine_forward_range(e, nxt, 1, pos, xbuf, NULL);
+            dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
+            pos++;
+            ngen++;
+            if (dist_stats && (ngen % STATS_EVERY) == 0) {
+                char tag[48];
+                snprintf(tag, sizeof(tag), "dist@tok%d", ngen);
+                dist_print_stats(&dist, tag);
+            }
+        }
+        dist_send_done(&dist);
+        ylog_info("decode:  %d tokens in %.2f s (%.1f tok/s)", ngen,
+               (double)(ynow_ms() - t0) / 1000.0,
+               (double)ngen * 1000.0 / (double)(ynow_ms() - t0 > 0 ? ynow_ms() - t0 : 1));
+    } else {
+        /* 中段/末段 rank: 收激活 → 算自己块段 → 转发/出 top-k logits */
+        uint32_t pos;
+        int t;
+        int nf = 0;
+        while ((t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
+            if (t == 3) { /* DONE: 向后转发并退出 */
+                dist_send_done(&dist);
+                break;
+            }
+            if (t != 1) break;
+            nf++;
+            memcpy(e->x, xbuf, (size_t)hidden * 4); /* 输入激活入引擎缓冲 */
+            if (rank == ranks - 1) {
+                engine_forward_range(e, 0, 0, pos, NULL, e->logits);
+                if (dist_send_logits(&dist, e->logits, vocab_sz, TOPK) != 0) { rc = -1; break; }
+            } else {
+                engine_forward_range(e, 0, 0, pos, xbuf, NULL);
+                if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
+            }
+            if (dist_stats && (nf % STATS_EVERY) == 0) {
+                char tag[48];
+                snprintf(tag, sizeof(tag), "dist@X%d", nf);
+                dist_print_stats(&dist, tag);
+            }
+        }
+    }
+    free(xbuf);
+    free(k_ids);
+
+    dist.elapsed_ms = (double)(ynow_ms() - t0);
+    if (dist_stats || getenv("YLLM_DISTDBG")) dist_print_stats(&dist, "dist");
+    dist_close(&dist);
+    if (rc != 0) ylog_error("dist generate failed: %s", err);
+    return rc == 0 ? 0 : 1;
+}
+
+/* 按字节均衡切层: 各 rank 领一个块区间, 末 rank 略少分块(norm+head)。
+ * 写入 engine 的层范围供 dist_gen 各段使用。 */
+int dist_split_layers(Engine* e, int rank, int ranks)
+{
+    uint32_t blocks = e->ws.model.h.n_blocks;
+    if ((uint32_t)ranks > blocks) {
+        ylog_error("ranks %d > blocks %u", ranks, blocks);
+        return -1;
+    }
+    uint32_t b;
+    uint64_t total = 0;
+    for (b = 1; b <= blocks; b++) total += e->ws.model.dir[b].size;
+    uint64_t per = total / (uint32_t)ranks;
+    uint32_t bs[64]; /* 每个 rank 的起始 block */
+    bs[0] = 1;
+    uint64_t acc = 0;
+    int r = 1;
+    for (b = 1; b <= blocks && r < ranks; b++) {
+        acc += e->ws.model.dir[b].size;
+        if (acc >= per * (uint64_t)r) { bs[r] = b + 1; r++; }
+    }
+    while (r < ranks) { bs[r] = blocks + 1; r++; }
+    if (bs[ranks - 1] > blocks + 1) bs[ranks - 1] = blocks + 1;
+    uint32_t begin = bs[rank];
+    uint32_t end = rank + 1 < ranks ? bs[rank + 1] : e->ws.model.n_layers;
+    if (rank == 0) begin = 0; /* rank0 含 embed */
+    engine_set_layers(e, begin, end);
+    return 0;
+}
