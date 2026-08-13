@@ -217,6 +217,8 @@ static int cmd_gen(int argc, char** argv)
 
         uint64_t rng = ysrand(seed);
         int ngen = 0;
+        int dist_stats = getenv("YLLM_DIST_STATS") != NULL;
+        const int STATS_EVERY = 8;
 
         if (rank == 0) {
             /* master: embed + 自己块段, 采样由收到的 top-k logits 决定 */
@@ -248,6 +250,11 @@ static int cmd_gen(int argc, char** argv)
                 dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
                 pos++;
                 ngen++;
+                if (dist_stats && (ngen % STATS_EVERY) == 0) {
+                    char tag[48];
+                    snprintf(tag, sizeof(tag), "dist@tok%d", ngen);
+                    dist_print_stats(&dist, tag);
+                }
             }
             dist_send_done(&dist);
             printf("\n\n");
@@ -258,12 +265,14 @@ static int cmd_gen(int argc, char** argv)
             /* 中段/末段 rank: 收激活 → 算自己块段 → 转发/出 top-k logits */
             uint32_t pos;
             int t;
+            int nf = 0;
             while ((t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
                 if (t == 3) { /* DONE: 向后转发并退出 */
                     dist_send_done(&dist);
                     break;
                 }
                 if (t != 1) break;
+                nf++;
                 memcpy(e.x, xbuf, (size_t)hidden * 4); /* 输入激活入引擎缓冲 */
                 if (rank == ranks - 1) {
                     engine_forward_range(&e, 0, 0, pos, NULL, e.logits);
@@ -272,11 +281,17 @@ static int cmd_gen(int argc, char** argv)
                     engine_forward_range(&e, 0, 0, pos, xbuf, NULL);
                     if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
                 }
+                if (dist_stats && (nf % STATS_EVERY) == 0) {
+                    char tag[48];
+                    snprintf(tag, sizeof(tag), "dist@X%d", nf);
+                    dist_print_stats(&dist, tag);
+                }
             }
         }
         free(xbuf);
         free(k_ids);
 
+        if (dist_stats || getenv("YLLM_DISTDBG")) dist_print_stats(&dist, "dist");
         dist_close(&dist);
         engine_free(&e);
         vocab_free(&v);

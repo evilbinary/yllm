@@ -52,6 +52,20 @@ uint64_t ynow_ms(void)
 #endif
 }
 
+uint64_t ynow_ns(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart * 1000000000ull / f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+#endif
+}
+
 void ymsleep(uint32_t ms)
 {
 #ifdef _WIN32

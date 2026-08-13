@@ -50,6 +50,7 @@ void* ymalloc(size_t n);
 void* ycalloc(size_t n, size_t s);
 char* ystrdup(const char* s);
 uint64_t ynow_ms(void);
+uint64_t ynow_ns(void);
 void ymsleep(uint32_t ms);
 int ythread_create(void* t, void (*fn)(void*), void* arg);
 void ythread_join(void* t);

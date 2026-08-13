@@ -40,7 +40,7 @@ endif
 ifeq ($(UNAME_S),Windows)
     EXE      := .exe
     PLATDEF  :=
-    PLATLIBS := -lm
+    PLATLIBS := -lm -lws2_32
 else ifeq ($(UNAME_S),Darwin)
     EXE      :=
     PLATDEF  := -D_DARWIN_C_SOURCE
