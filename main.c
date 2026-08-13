@@ -1,6 +1,6 @@
-#include "yllm.h"
-#include "dist.h"
-#include "log.h"
+#include "inference/yllm.h"
+#include "inference/dist.h"
+#include "inference/log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

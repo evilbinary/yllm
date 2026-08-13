@@ -13,8 +13,8 @@ CC         ?= cc
 LDFLAGS    ?=
 LIBS       :=
 
-SRC      := src/platform.c src/log.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c src/dist.c src/main.c
-TEST_ENGINE_CORE := src/platform.c src/log.c src/llf.c src/convert.c src/convert_safetensors.c src/convert_gguf.c src/tokenizer.c src/matvec.c src/engine.c
+SRC      := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/dist.c
+TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c
 
 # ---- OS 检测 (Windows: MSYS2/MinGW 的 uname 会带 MINGW/MSYS, 也归为 Windows) ----
 ifneq ($(OS),Windows_NT)
@@ -59,14 +59,14 @@ LIBS += $(PLATLIBS)
 CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
-OBJ           := $(SRC:src/%.c=$(OBJDIR)/%.o)
+OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o
 
 # ---- AVX2 版本(仅 x86_64; 其余架构退化为标量, 保持 target 可用) ----
 CFLAGS_AVX2   := $(CFLAGS_BASE)
 LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
 BIN_AVX2      := build/avx2/yllm$(EXE)
-OBJ_AVX2      := $(SRC:src/%.c=$(OBJDIR_AVX2)/%.o)
+OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o
 ifeq ($(ARCH),x86_64)
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
 endif
@@ -81,38 +81,44 @@ $(BIN): $(OBJ)
 $(BIN_AVX2): $(OBJ_AVX2)
 	$(CC) $(CFLAGS_AVX2) -o $@ $(OBJ_AVX2) $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h src/dist.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -c -o $@ $<
+$(OBJDIR)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -c -o $@ $<
 
-$(OBJDIR_AVX2)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h src/dist.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -c -o $@ $<
+$(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -c -o $@ $<
+
+$(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
+
+$(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----
 TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c
 
-$(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h src/platform.c src/llf.c src/matvec.c | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -Itests -o $@ $< src/platform.c src/llf.c src/matvec.c $(LDFLAGS) $(LIBS)
+$(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/platform.c inference/llf.c inference/matvec.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Itests -o $@ $< inference/platform.c inference/llf.c inference/matvec.c $(LDFLAGS) $(LIBS)
 
-$(OBJDIR)/test_tokenizer.exe: tests/test_tokenizer.c src/platform.c src/llf.c src/tokenizer.c | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+$(OBJDIR)/test_tokenizer.exe: tests/test_tokenizer.c inference/platform.c inference/llf.c inference/tokenizer.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
 
-$(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h src/platform.c src/llf.c src/matvec.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -Itests -o $@ $< src/platform.c src/llf.c src/matvec.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/platform.c inference/llf.c inference/matvec.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Itests -o $@ $< inference/platform.c inference/llf.c inference/matvec.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c src/platform.c src/llf.c src/tokenizer.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c inference/platform.c inference/llf.c inference/tokenizer.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 TEST_BIN     := $(TEST_SRC:tests/%.c=$(OBJDIR)/%.exe)
 TEST_BIN_AVX := $(TEST_SRC:tests/%.c=$(OBJDIR_AVX2)/%.exe)
@@ -168,8 +174,8 @@ gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 # ---- 模型文件 dump 工具(LLF / GGUF / Safetensors) ----
 DUMP_BIN := $(OBJDIR)/llfdump
 
-$(DUMP_BIN): src/dump.c src/llf.c src/platform.c src/llf.h src/yllm.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $^ $(LDFLAGS) $(LIBS)
+$(DUMP_BIN): tools/dump.c inference/llf.c inference/platform.c inference/llf.h inference/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
 
 dump: $(DUMP_BIN)
 
@@ -210,11 +216,11 @@ DIST_SERVE_PORT ?= 9360
 DIST_MODEL  ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
 DIST_VOCAB  ?= test/tinyllama.vocab.txt
 
-$(DIST_WORKER): src/dist_worker.c src/log.c src/log.h src/platform.c src/yllm.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $< src/log.c src/platform.c $(LDFLAGS) $(LIBS)
+$(DIST_WORKER): serve/dist_worker.c serve/protocol.h inference/log.c inference/log.h inference/platform.c inference/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $< inference/log.c inference/platform.c $(LDFLAGS) $(LIBS)
 
-$(DIST_WORKER_AVX2): src/dist_worker.c src/log.c src/log.h src/platform.c src/yllm.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $< src/log.c src/platform.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(DIST_WORKER_AVX2): serve/dist_worker.c inference/log.c inference/log.h inference/platform.c inference/yllm.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $< inference/log.c inference/platform.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 dist-worker: $(DIST_WORKER)
 dist-worker-avx2: $(DIST_WORKER_AVX2)
