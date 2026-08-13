@@ -182,4 +182,73 @@ $(OBJDIR_AVX2):
 clean:
 	rm -rf build
 
-.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump
+# ---- 分布式远程测试(局域网多节点, worker 常驻) ----
+# 用法:
+#   make dist-serve  DIST_SERVE_PORT=9360                        # 管理节点起文件服务(大模型/日志中转)
+#   make dist-deploy NODES="192.168.1.10 192.168.1.11" USER=root  # 构建+SSH分发(不含大模型)+各节点起 worker
+#   make dist        NODES="192.168.1.10 192.168.1.11"            # 各节点 sync 拉模型(vocab 已随 rsync)+ 下发 run
+#   make dist-stop   NODES="192.168.1.10 192.168.1.11"            # 终止已下发进程
+# 变量: NODES(节点IP列表, 按 rank 顺序) USER(SSH 用户) DIST_PORT(worker 控制端口)
+#       DIST_DIR(远端工作目录) DIST_RANK_N(rank 数, 默认=节点数) DIST_PORT_BASE(推理数据端口基数)
+#       DIST_TOKENS DIST_PROMPT DIST_SEED
+#       DIST_SERVE_HOST DIST_SERVE_PORT(管理节点文件服务地址; 各节点 sync 用)
+# 文件分发: 模型 test/*.llf 不随 rsync 上传, 由各节点经 sync 从管理节点文件服务拉取(私有 TCP 帧)。
+DIST_WORKER := $(OBJDIR)/dist-worker
+DIST_WORKER_AVX2 := $(OBJDIR_AVX2)/dist-worker$(EXE)
+NODES      ?= 127.0.0.1 127.0.0.1
+USER       ?= $(USERNAME)
+DIST_PORT  ?= 9100
+DIST_DIR   ?= /tmp/yllm
+DIST_PORT_BASE ?= 8900
+DIST_TOKENS ?= 8
+DIST_PROMPT ?= "Once upon a time"
+DIST_SEED  ?= 42
+DIST_RANK_N ?= $(words $(NODES))
+DIST_SERVE_HOST ?= 127.0.0.1
+DIST_SERVE_PORT ?= 9360
+# 远端模型/vocab 路径(相对 DIST_DIR); 大模型经 sync 拉到同路径
+DIST_MODEL  ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+DIST_VOCAB  ?= test/tinyllama.vocab.txt
+
+$(DIST_WORKER): src/dist_worker.c src/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $< $(LDFLAGS) $(LIBS)
+
+$(DIST_WORKER_AVX2): src/dist_worker.c src/yllm.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $< $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+
+dist-worker: $(DIST_WORKER)
+dist-worker-avx2: $(DIST_WORKER_AVX2)
+
+# 管理节点起文件服务: 供各节点 sync 拉模型/日志
+dist-serve: $(DIST_WORKER_AVX2)
+	@set -e; echo "== serve on $(DIST_SERVE_PORT) =="; \
+	./$(DIST_WORKER_AVX2) --serve --root $(abspath .) --port $(DIST_SERVE_PORT) > logs/serve.log 2>&1 &
+
+# 上传源码(排除大模型/日志/build), 远端编译并启动 worker
+dist-deploy: $(DIST_WORKER) $(BIN) $(BIN_AVX2)
+	@set -e; for h in $(NODES); do \
+	  echo "== deploy to $$h =="; \
+	  ssh $(USER)@$$h "mkdir -p $(DIST_DIR)" || exit 1; \
+	  rsync -a --exclude build --exclude logs --exclude 'test/*.llf' ./ $(USER)@$$h:$(DIST_DIR)/ || exit 1; \
+	  ssh $(USER)@$$h "cd $(DIST_DIR) && make avx2 dist-worker" || exit 1; \
+	  ssh $(USER)@$$h "cd $(DIST_DIR) && nohup ./build/avx2/dist-worker --port $(DIST_PORT) --bin ./build/avx2/yllm --logdir logs > logs/worker.log 2>&1 &" || exit 1; \
+	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send ping" || exit 1; \
+	done; echo "dist-deploy OK"
+
+# 一键: 各节点 sync 拉模型(已有且 size+mtime 一致则跳过)后, 向各节点 worker 下发 run(rank 按 NODES 顺序)
+dist: dist-deploy
+	@set -e; r=0; for h in $(NODES); do \
+	  echo "== sync + rank $$r @ $$h =="; \
+	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send \"sync $(DIST_SERVE_HOST) $(DIST_SERVE_PORT) $(DIST_MODEL) $(DIST_MODEL)\"" || exit 1; \
+	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send \"run $$r $(DIST_RANK_N) $(DIST_PORT_BASE) $(DIST_TOKENS) $(DIST_MODEL) $(DIST_VOCAB) $(DIST_PROMPT)\"" || exit 1; \
+	  r=$$((r+1)); \
+	done; echo "dist dispatched (see rank*.log on each node)"
+
+# 终止各节点已下发的推理进程
+dist-stop:
+	@for h in $(NODES); do \
+	  echo "== stop $$h =="; \
+	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
+	done
+
+.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop
