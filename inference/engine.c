@@ -507,7 +507,7 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
 /* 返回 0 成功;-1 失败。timings 非空时填充 prefill/decode 分别的耗时与 token 数 */
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
-                    void (*on_token)(uint32_t id, void* ctx), void* ctx,
+                    int (*on_token)(uint32_t id, void* ctx), void* ctx,
                     EngineTimings* timings, char* err, size_t errlen)
 {
     uint64_t rng = ysrand(seed);
@@ -533,8 +533,8 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         if (pos >= e->max_seq) break;
         uint32_t nxt;
         if (engine_sample(e, e->ws.model.h.vocab, temp, top_p, &rng, &nxt) != 0) return -1;
-        if (on_token) on_token(nxt, ctx);
-        if (eos_stop >= 0 && (int)nxt == eos_stop) break;
+        if (eos_stop >= 0 && (int)nxt == eos_stop) break;   /* eos 不发给对端 */
+        if (on_token && on_token(nxt, ctx) != 0) break;     /* 回调可中止(如对端断开) */
         engine_forward(e, nxt, pos);
         pos++;
         ngen++;

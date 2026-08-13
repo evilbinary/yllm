@@ -80,6 +80,26 @@ static inline int frame_recv_payload(int fd, void* buf, size_t n)
     return 0;
 }
 
+/* 读取 "T <len>" 帧的 payload: line 为刚收到的帧头行。
+ * 若 payload 超过 line 缓冲则用堆(调用方必须 free), 否则直接写入 line。
+ * 成功返回 payload 指针并置 *plen, 失败返回 NULL。 */
+static inline char* frame_t_payload(int fd, char* line, size_t linesz, size_t* plen)
+{
+    long tlen = atol(line + 2);
+    if (tlen <= 0) return NULL;
+    *plen = (size_t)tlen;
+    if ((size_t)tlen < linesz) {
+        if (sock_recv_n(fd, line, (size_t)tlen) != 0) return NULL;
+        line[tlen] = '\0';
+        return line;
+    }
+    char* p = (char*)malloc((size_t)tlen + 1);
+    if (!p) return NULL;
+    if (sock_recv_n(fd, p, (size_t)tlen) != 0) { free(p); return NULL; }
+    p[tlen] = '\0';
+    return p;
+}
+
 /* 解析 "key=value" 参数: 复制 value 到 out(截断到空格/结尾), 返回 0 或 -1 */
 static inline int frame_get(const Frame* f, const char* key, char* out, size_t outsz)
 {

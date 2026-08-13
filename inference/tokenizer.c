@@ -162,6 +162,7 @@ static int parse_text(const char* path, Vocab* v)
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     int n = atoi(line);
     if (n <= 0 || n > 1000000) { fclose(f); return -1; }
+    memset(v, 0, sizeof(*v));   /* 全字段清零: 无 #SCORES#/#MERGES# 段时不得读未初始化内存 */
     v->pieces = (char**)ycalloc((size_t)n, sizeof(char*));
     v->n = 0;
     v->unk = -1;
@@ -404,7 +405,7 @@ static int vocab_encode_greedy(Vocab* v, const char* text, uint32_t* ids, int ma
         for (i = 0; i < v->n; i++) {
             const char* pc = v->pieces[i];
             size_t l = strlen(pc);
-            if (l == 0 || l > bestlen) continue;
+            if (l == 0 || l < bestlen) continue;
             if (strncmp(p, pc, l) == 0) { best = i; bestlen = l; }
         }
         if (best < 0) {
@@ -843,6 +844,7 @@ static int chat_eval_expr(const char* e, const ChatMsg* msg, int is_last, int ad
 static int chat_clause_true(const char* c, const ChatMsg* msg)
 {
     while (*c == ' ' || *c == '(' || *c == ')') c++;
+    if (strncmp(c, "True", 4) == 0) return 1;
     size_t l = strlen(c);
     if (strncmp(c, "add_generation_prompt", 21) == 0) return 1;
     if (strncmp(c, "loop.first", 10) == 0) return 1;      /* 单轮: 首条消息 */
@@ -955,6 +957,10 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
                     stmts[n_stmts].kind = ST_ELIF;
                     snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "%s", t2 + 4);
                     n_stmts++;
+                } else if (strncmp(t2, "else", 4) == 0) {
+                    stmts[n_stmts].kind = ST_ELIF;
+                    snprintf(stmts[n_stmts].cond, sizeof(stmts[n_stmts].cond), "True");
+                    n_stmts++;
                 } else if (strncmp(t2, "endif", 5) == 0) {
                     stmts[n_stmts].kind = ST_ENDIF;
                     n_stmts++;
@@ -997,9 +1003,9 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
     int mi;
     for (mi = 0; mi < n_msgs; mi++) {
         int is_last = (mi == n_msgs - 1);
-        /* in_if: 0 = outside any if, 1 = in if-chain but not yet matched,
-           2 = in if-chain and matched (expressions active) */
-        int in_if = 0;
+        /* if 栈: 每层 1 = 本链未匹配(跳过), 2 = 已匹配(渲染),
+         * 3 = 位于已跳过区域内的链(永久跳过, else/elif 不得复活) */
+        int stk[16], sp = 0;
         int si;
         for (si = 0; si < n_stmts && n_out < max; si++) {
             TStmt* st = &stmts[si];
@@ -1007,25 +1013,38 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
             case ST_FOR:
                 break;
             case ST_IF:
-                in_if = chat_eval_cond(st->cond, &msgs[mi]) ? 2 : 1;
+                if (sp > 0 && stk[sp - 1] == 1)
+                    stk[sp++] = 3;      /* 未匹配分支内的嵌套 if */
+                else if (sp > 0 && stk[sp - 1] == 3)
+                    stk[sp++] = 3;      /* 跳过区域内: 层层跳过 */
+                else
+                    stk[sp++] = chat_eval_cond(st->cond, &msgs[mi]) ? 2 : 1;
                 break;
             case ST_ELIF:
-                if (in_if == 2) {
-                    in_if = 1; /* this if-chain already matched; skip remaining elifs */
-                } else if (in_if == 1 && chat_eval_cond(st->cond, &msgs[mi])) {
-                    in_if = 2;
+                if (sp > 0) {
+                    if (stk[sp - 1] == 1) {
+                        stk[sp - 1] = chat_eval_cond(st->cond, &msgs[mi]) ? 2 : 1;
+                    } else if (stk[sp - 1] == 2) {
+                        stk[sp - 1] = 1; /* 本链已匹配, 跳过剩余 elif */
+                    }
+                    /* 3: 保持跳过 */
                 }
                 break;
             case ST_ENDIF:
-                in_if = 0;
+                if (sp > 0) sp--;
                 break;
             case ST_IF_LAST:
-                in_if = is_last ? 2 : 1;
+                if (sp > 0 && stk[sp - 1] == 1)
+                    stk[sp++] = 3;
+                else if (sp > 0 && stk[sp - 1] == 3)
+                    stk[sp++] = 3;
+                else
+                    stk[sp++] = is_last ? 2 : 1;
                 break;
             case ST_END_FOR:
                 break;
             case ST_EXPR:
-                if (in_if == 2) {
+                if (sp == 0 || stk[sp - 1] == 2) {
                     chat_eval_expr(st->expr, &msgs[mi], is_last, 1, v->eos, v->bos, v, out, sizeof(out));
                     chat_append_ids(v, out, ids, max, &n_out);
                 }

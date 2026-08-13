@@ -31,7 +31,7 @@ static int g_pass = 0;
  */
 int main(int argc, char** argv)
 {
-    const char* model_path = "test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf";
+    const char* model_path = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf";
     if (argc > 1) model_path = argv[1];
 
     Engine e;

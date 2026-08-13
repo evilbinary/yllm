@@ -88,6 +88,7 @@ int cmd_hub(ServeConfig* cfg)
     Router rt;
     memset(&rt, 0, sizeof(rt));
     rt.port = (uint16_t)cfg->router_port;
+    pthread_mutex_init(&rt.lock, NULL);
     rt.strategy = cfg->strategy;
     snprintf(rt.node.node_id, sizeof(rt.node.node_id), "router-0");
     snprintf(rt.node.type, sizeof(rt.node.type), "router");

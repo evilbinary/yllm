@@ -229,6 +229,7 @@ static void handle_models(int fd, Router* r)
     char json[2048] = "{\"object\":\"list\",\"data\":[";
     int first = 1;
     int i;
+    pthread_mutex_lock(&r->lock);
     for (i = 0; i < r->n_servers; i++) {
         if (r->servers[i].state != 1) continue;
         if (!first) strncat(json, ",", sizeof(json) - strlen(json) - 1);
@@ -238,6 +239,7 @@ static void handle_models(int fd, Router* r)
                  r->servers[i].model);
         strncat(json, one, sizeof(json) - strlen(json) - 1);
     }
+    pthread_mutex_unlock(&r->lock);
     strncat(json, "]}", sizeof(json) - strlen(json) - 1);
     HttpResponse rr;
     http_begin(&rr, fd, 200, "application/json");

@@ -116,6 +116,22 @@ void ylog_raw(const char* fmt, ...)
     ymutex_unlock(g_mu);
 }
 
+/* 流式 token 文本, 仅写日志文件(不写 stderr)。
+ * 用于 stdout 已输出 token 的进程(如 chat), 避免终端重复。 */
+void ylog_raw_log(const char* fmt, ...)
+{
+    char buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    log_ensure_mu();
+    ymutex_lock(g_mu);
+    if (g_fp) { fputs(buf, g_fp); fflush(g_fp); }
+    ymutex_unlock(g_mu);
+}
+
 void ylog_close(void)
 {
     if (g_mu) ymutex_lock(g_mu);

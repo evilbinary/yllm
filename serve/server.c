@@ -19,6 +19,8 @@
 #include "server.h"
 #include "../inference/log.h"
 #include <time.h>
+#include <pthread.h>
+#include <stdint.h>
 
 #define SRV_MAX_LINE 8192
 
@@ -54,12 +56,12 @@ static void forward_infer(int client_fd, Server* s, const char* args)
         if (n < 0) { sock_send_line(client_fd, "ERR server: leader disconnected"); break; }
         sock_send_line(client_fd, "%s", out);
         if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
-        if (strncmp(out, "T ", 2) == 0) {
-            long tlen = atol(out + 2);
-            if (tlen > 0 && tlen < (long)sizeof(out)) {
-                if (sock_recv_n(fd, out, (size_t)tlen) != 0) break;
-                sock_send_n(client_fd, out, (size_t)tlen);
-            }
+        else if (strncmp(out, "T ", 2) == 0) {
+            size_t tlen = 0;
+            char* payload = frame_t_payload(fd, out, sizeof(out), &tlen);
+            if (!payload) break;
+            sock_send_n(client_fd, payload, tlen);
+            if (payload != out) free(payload);
         }
     }
     close(fd);
@@ -87,9 +89,23 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
     }
 }
 
+/* 单连接处理(线程化: 长生成不阻塞该 server 的其他连接) */
+static Server* srv_conn_server;
+static void* srv_conn(void* arg)
+{
+    int fd = (int)(intptr_t)arg;
+    Server* s = srv_conn_server;
+    Frame f;
+    if (frame_recv(fd, &f) >= 0)
+        handle_frame(fd, s, f.cmd, f.args);
+    close(fd);
+    return NULL;
+}
+
 int server_run(Server* s)
 {
     sock_init();
+    srv_conn_server = s;
 
     int srv = sock_listen(s->port, 8);
     if (srv < 0) return 1;
@@ -101,10 +117,9 @@ int server_run(Server* s)
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
-            Frame f;
-            if (frame_recv(fd, &f) >= 0)
-                handle_frame(fd, s, f.cmd, f.args);
-            close(fd);
+            pthread_t t;
+            pthread_create(&t, NULL, srv_conn, (void*)(intptr_t)fd);
+            pthread_detach(t);
         }
         uint64_t now = (uint64_t)time(NULL);
         if (now - last_hb >= 2) {

@@ -127,7 +127,7 @@ void engine_set_layers(Engine* e, uint32_t begin, uint32_t end);
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out);
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
-                    void (*on_token)(uint32_t id, void* ctx), void* ctx,
+                    int (*on_token)(uint32_t id, void* ctx), void* ctx,
                     EngineTimings* timings, char* err, size_t errlen);
 uint64_t engine_resident(const Engine* e);
 

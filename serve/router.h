@@ -3,6 +3,7 @@
 
 #include "node.h"
 #include "config.h"
+#include <pthread.h>
 
 #define RT_MAX_SERVERS 64
 
@@ -20,6 +21,7 @@ typedef struct {
 typedef struct {
     RtServer servers[RT_MAX_SERVERS];
     int n_servers;
+    pthread_mutex_t lock;    /* 保护 servers[] 表(supervisor 通知线程 vs 请求线程) */
     volatile int quit;     /* 收到 QUIT 后退出主循环 */
     uint16_t port;
     int rr_counter;

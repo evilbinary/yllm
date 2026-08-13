@@ -17,6 +17,7 @@
 #include "router_http.h"
 #include "../inference/log.h"
 #include <time.h>
+#include <stdint.h>
 
 #define RT_MAX_LINE 8192
 
@@ -26,6 +27,12 @@ static RtServer* find_server(Router* r, const char* id)
     for (i = 0; i < r->n_servers; i++)
         if (strcmp(r->servers[i].id, id) == 0) return &r->servers[i];
     return NULL;
+}
+
+/* 加锁的 find(调用方必须已持有 lock) */
+static RtServer* find_server_locked(Router* r, const char* id)
+{
+    return find_server(r, id);
 }
 
 /* supervisor 通知: SERVER_ADD */
@@ -42,7 +49,8 @@ static void handle_server_add(Router* r, const char* args)
     memcpy(id, args, idlen);
     id[idlen] = '\0';
 
-    RtServer* s = find_server(r, id);
+    pthread_mutex_lock(&r->lock);
+    RtServer* s = find_server_locked(r, id);
     if (!s) {
         if (r->n_servers >= RT_MAX_SERVERS) return;
         s = &r->servers[r->n_servers++];
@@ -63,6 +71,7 @@ static void handle_server_add(Router* r, const char* args)
     }
     s->state = NODE_STATE_READY;
     s->last_update = (uint64_t)time(NULL);
+    pthread_mutex_unlock(&r->lock);
     ylog_info("router: SERVER_ADD %s model=%s leader=%s:%u", s->id, s->model,
               s->leader_host, s->leader_port);
 }
@@ -72,11 +81,13 @@ static void handle_server_del(Router* r, const char* args)
 {
     char id[128];
     if (sscanf(args, "%127s", id) != 1) return;
-    RtServer* s = find_server(r, id);
+    pthread_mutex_lock(&r->lock);
+    RtServer* s = find_server_locked(r, id);
     if (s) {
         s->state = NODE_STATE_DEAD;
         ylog_warn("router: SERVER_DEL %s", id);
     }
+    pthread_mutex_unlock(&r->lock);
 }
 
 /* supervisor 通知: SERVER_UPDATE */
@@ -86,12 +97,14 @@ static void handle_server_update(Router* r, const char* args)
     int inflight = 0;
     double kv = 0;
     if (sscanf(args, "%127s inflight=%d kv_mb=%lf", id, &inflight, &kv) >= 1) {
-        RtServer* s = find_server(r, id);
+        pthread_mutex_lock(&r->lock);
+        RtServer* s = find_server_locked(r, id);
         if (s) {
             s->inflight = inflight;
             s->kv_mb = kv;
             s->last_update = (uint64_t)time(NULL);
         }
+        pthread_mutex_unlock(&r->lock);
     }
 }
 
@@ -125,6 +138,7 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
                     snprintf(ff.cmd, sizeof(ff.cmd), "X");
                     snprintf(ff.args, sizeof(ff.args), "%s", f.args);
                     char vb[256];
+                    pthread_mutex_lock(&r->lock);
                     if (frame_get(&ff, "state", vb, sizeof(vb)) == 0) {
                         if (strcmp(vb, "ready") == 0) s->state = NODE_STATE_READY;
                         else if (strcmp(vb, "dead") == 0) s->state = NODE_STATE_DEAD;
@@ -141,6 +155,7 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
                     }
                     if (frame_get(&ff, "model", vb, sizeof(vb)) == 0)
                         snprintf(s->model, sizeof(s->model), "%s", vb);
+                    pthread_mutex_unlock(&r->lock);
                 }
             }
         }
@@ -153,9 +168,10 @@ static RtServer* pick_server(Router* r, const char* model)
 {
     int i;
     int n = 0;
+    pthread_mutex_lock(&r->lock);
     for (i = 0; i < r->n_servers; i++)
         if (r->servers[i].state == NODE_STATE_READY && strcmp(r->servers[i].model, model) == 0) n++;
-    if (n == 0) return NULL;
+    if (n == 0) { pthread_mutex_unlock(&r->lock); return NULL; }
 
     if (r->strategy && strcmp(r->strategy, "round-robin") == 0) {
         r->rr_counter = (r->rr_counter + 1) % n;
@@ -175,6 +191,7 @@ static RtServer* pick_server(Router* r, const char* model)
                 best = &r->servers[i];
         }
     }
+    pthread_mutex_unlock(&r->lock);
     return best;
 }
 
@@ -195,7 +212,9 @@ int router_infer(Router* r, const char* model, int max_tokens,
     sock_send_n(sfd, "\n", 1);
     if (plen > 0) sock_send_n(sfd, prompt, plen);
 
+    pthread_mutex_lock(&r->lock);
     s->inflight++;
+    pthread_mutex_unlock(&r->lock);
     char out[RT_MAX_LINE];
     int rc = 0;
     int done = 0;
@@ -204,14 +223,16 @@ int router_infer(Router* r, const char* model, int max_tokens,
         if (n < 0) { rc = -1; break; }
         if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
         else if (strncmp(out, "T ", 2) == 0) {
-            long tlen = atol(out + 2);
-            if (tlen > 0 && tlen < (long)sizeof(out)) {
-                if (sock_recv_n(sfd, out, (size_t)tlen) != 0) { rc = -1; break; }
-                if (on_token) on_token(out, (size_t)tlen, ctx);
-            }
+            size_t tlen = 0;
+            char* payload = frame_t_payload(sfd, out, sizeof(out), &tlen);
+            if (!payload) { rc = -1; break; }
+            if (on_token) on_token(payload, tlen, ctx);
+            if (payload != out) free(payload);
         }
     }
+    pthread_mutex_lock(&r->lock);
     s->inflight--;
+    pthread_mutex_unlock(&r->lock);
     close(sfd);
     return rc;
 }
@@ -247,7 +268,9 @@ static void handle_client_infer(int fd, Router* r, const char *args)
         sock_send_n(sfd, pb, (size_t)nbytes);
         free(pb);
     }
+    pthread_mutex_lock(&r->lock);
     s->inflight++;
+    pthread_mutex_unlock(&r->lock);
     /* 透传 T/DONE */
     char out[RT_MAX_LINE];
     int done = 0;
@@ -256,15 +279,17 @@ static void handle_client_infer(int fd, Router* r, const char *args)
         if (n < 0) { sock_send_line(fd, "ERR server disconnected"); break; }
         sock_send_line(fd, "%s", out);
         if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
-        if (strncmp(out, "T ", 2) == 0) {
-            long tlen = atol(out + 2);
-            if (tlen > 0 && tlen < (long)sizeof(out)) {
-                if (sock_recv_n(sfd, out, (size_t)tlen) != 0) break;
-                sock_send_n(fd, out, (size_t)tlen);
-            }
+        else if (strncmp(out, "T ", 2) == 0) {
+            size_t tlen = 0;
+            char* payload = frame_t_payload(sfd, out, sizeof(out), &tlen);
+            if (!payload) break;
+            sock_send_n(fd, payload, tlen);
+            if (payload != out) free(payload);
         }
     }
+    pthread_mutex_lock(&r->lock);
     s->inflight--;
+    pthread_mutex_unlock(&r->lock);
     close(sfd);
 }
 
@@ -331,44 +356,60 @@ static int run_client(Router* r, const char* send)
     return 0;
 }
 
+/* 单连接处理(线程化: 长生成不阻塞其他连接) */
+static Router* router_conn_router;  /* 简化线程参数传递 */
+
+static void* router_conn(void* arg)
+{
+    int fd = (int)(intptr_t)arg;
+    Router* r = router_conn_router;
+    Frame f;
+    if (frame_recv(fd, &f) >= 0) {
+        if (strcmp(f.cmd, PROTO_INFER) == 0)
+            handle_client_infer(fd, r, f.args);
+        else if (strcmp(f.cmd, PROTO_SERVER_ADD) == 0)
+            handle_server_add(r, f.args);
+        else if (strcmp(f.cmd, PROTO_SERVER_DEL) == 0)
+            handle_server_del(r, f.args);
+        else if (strcmp(f.cmd, PROTO_SERVER_UPDATE) == 0)
+            handle_server_update(r, f.args);
+        else if (strcmp(f.cmd, PROTO_QUIT) == 0) {
+            frame_send(fd, "OK", NULL);
+            r->quit = 1;
+        } else if (strcmp(f.cmd, PROTO_PING) == 0) {
+            frame_send(fd, "OK", "READY");
+        } else if (strcmp(f.cmd, PROTO_STAT) == 0) {
+            int total = 0, i2;
+            pthread_mutex_lock(&r->lock);
+            for (i2 = 0; i2 < r->n_servers; i2++) total += r->servers[i2].inflight;
+            pthread_mutex_unlock(&r->lock);
+            char st[256];
+            snprintf(st, sizeof(st), "servers=%d inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=0",
+                     r->n_servers, total);
+            frame_send(fd, "OK", st);
+        } else
+            frame_send(fd, "ERR", "unknown cmd");
+    }
+    close(fd);
+    return NULL;
+}
+
 int router_run(Router* r, const char* sv_host, uint16_t sv_port)
 {
     sock_init();
     int srv = sock_listen(r->port, 16);
     if (srv < 0) return 1;
     ylog_info("router: listening on port %u", r->port);
+    router_conn_router = r;
 
     uint64_t last_hb = 0;
     uint64_t last_query = 0;
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
-            Frame f;
-            if (frame_recv(fd, &f) >= 0) {
-                if (strcmp(f.cmd, PROTO_INFER) == 0)
-                    handle_client_infer(fd, r, f.args);
-                else if (strcmp(f.cmd, PROTO_SERVER_ADD) == 0)
-                    handle_server_add(r, f.args);
-                else if (strcmp(f.cmd, PROTO_SERVER_DEL) == 0)
-                    handle_server_del(r, f.args);
-                else if (strcmp(f.cmd, PROTO_SERVER_UPDATE) == 0)
-                    handle_server_update(r, f.args);
-                else if (strcmp(f.cmd, PROTO_QUIT) == 0) {
-                    frame_send(fd, "OK", NULL);
-                    r->quit = 1;
-                } else if (strcmp(f.cmd, PROTO_PING) == 0) {
-                    frame_send(fd, "OK", "READY");
-                } else if (strcmp(f.cmd, PROTO_STAT) == 0) {
-                    int total = 0, i2;
-                    for (i2 = 0; i2 < r->n_servers; i2++) total += r->servers[i2].inflight;
-                    char st[256];
-                    snprintf(st, sizeof(st), "servers=%d inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=0",
-                             r->n_servers, total);
-                    frame_send(fd, "OK", st);
-                } else
-                    frame_send(fd, "ERR", "unknown cmd");
-            }
-            close(fd);
+            pthread_t t;
+            pthread_create(&t, NULL, router_conn, (void*)(intptr_t)fd);
+            pthread_detach(t);
         }
         if (r->quit) break;
         uint64_t now = (uint64_t)time(NULL);
@@ -391,6 +432,7 @@ int cmd_router(ServeConfig* cfg)
     Router r;
     memset(&r, 0, sizeof(r));
     r.port = (uint16_t)cfg->router_port;
+    pthread_mutex_init(&r.lock, NULL);
     r.strategy = cfg->strategy;
     snprintf(r.node.node_id, sizeof(r.node.node_id), "%s", cfg->node_id);
     snprintf(r.node.type, sizeof(r.node.type), "router");

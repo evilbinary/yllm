@@ -22,6 +22,8 @@ void ylog_set_console(int on);
 void ylog_log(int level, const char* fmt, ...);
 /* 原始输出(无时间戳/级别), 追加到日志文件与 stderr, 用于流式 token 文本 */
 void ylog_raw(const char* fmt, ...);
+/* 流式 token 文本, 仅写日志文件(不写 stderr, 供 stdout 已输出 token 的进程用) */
+void ylog_raw_log(const char* fmt, ...);
 void ylog_close(void);
 
 #define ylog_debug(...) ylog_log(YLOG_DEBUG, __VA_ARGS__)

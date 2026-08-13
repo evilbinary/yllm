@@ -20,8 +20,8 @@ cd "$(dirname "$0")/.."   # 仓库根目录
 
 # ---- 配置(可按需覆盖) ----
 GGUF=${GGUF:-tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf}
-LLF=${LLF:-test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf}
-VOCAB=${VOCAB:-test/tinyllama.vocab.txt}
+LLF=${LLF:-models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf}
+VOCAB=${VOCAB:-models/tinyllama.vocab.txt}
 PROMPT=${PROMPT:-"Once upon a time"}
 NTOKENS=${NTOKENS:-64}
 THREADS=${THREADS:-"1 4 8 16"}

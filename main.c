@@ -42,14 +42,15 @@ static int parse_args(int argc, char** argv, int start, Arg* args, int maxn)
     return n;
 }
 
-static void on_token_cb(uint32_t id, void* ctx)
+static int on_token_cb(uint32_t id, void* ctx)
 {
     Vocab* v = (Vocab*)ctx;
     char tmp[65536];
     vocab_decode(v, &id, 1, tmp, sizeof(tmp));
     fputs(tmp, stdout);
     fflush(stdout);
-    ylog_raw("%s", tmp);
+    ylog_raw_log("%s", tmp);
+    return 0;
 }
 
 static int cmd_convert(int argc, char** argv)

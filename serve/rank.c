@@ -78,7 +78,8 @@ static int xrecv_rank(int fd, void* buf, size_t n)
     return 0;
 }
 
-static void xsend_rank(int fd, const void* buf, size_t n)
+/* 发送: 返回 -1 表示对端已断开(调用方应中止) */
+static int xsend_rank(int fd, const void* buf, size_t n)
 {
     const char* p = (const char*)buf;
     while (n > 0) {
@@ -87,10 +88,11 @@ static void xsend_rank(int fd, const void* buf, size_t n)
 #else
         ssize_t r = send(fd, p, n, 0);
 #endif
-        if (r <= 0) return;
+        if (r <= 0) return -1;
         p += (size_t)r;
         n -= (size_t)r;
     }
+    return 0;
 }
 
 /* 读一行到 max(不含换行), 返回长度或 -1 */
@@ -113,16 +115,16 @@ static int recv_line_rank(int fd, char* buf, size_t max)
     return (int)n;
 }
 
-/* 发送一行文本 */
-static void send_line(int fd, const char* fmt, ...)
+/* 发送一行文本; 返回 -1 表示对端断开 */
+static int send_line(int fd, const char* fmt, ...)
 {
     char buf[RANK_MAX_LINE];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    xsend_rank(fd, buf, strlen(buf));
-    xsend_rank(fd, "\n", 1);
+    if (xsend_rank(fd, buf, strlen(buf)) != 0) return -1;
+    return xsend_rank(fd, "\n", 1);
 }
 
 /* ---- 帧处理 ---- */
@@ -150,7 +152,8 @@ typedef struct {
     Vocab* vocab;
 } TokenCtx;
 
-static void on_token_rank(uint32_t id, void* ctx)
+/* 生成回调: 逐 token 流式回 T 帧; 返回非 0 中止生成(对端断开) */
+static int on_token_rank(uint32_t id, void* ctx)
 {
     TokenCtx* tc = (TokenCtx*)ctx;
     char tmp[65536];
@@ -158,9 +161,10 @@ static void on_token_rank(uint32_t id, void* ctx)
     size_t len = strlen(tmp);
     char hdr[64];
     int hn = snprintf(hdr, sizeof(hdr), "T %zu\n", len);
-    xsend_rank(tc->fd, hdr, (size_t)hn);
-    xsend_rank(tc->fd, tmp, len);
-    ylog_raw("%s", tmp);
+    if (xsend_rank(tc->fd, hdr, (size_t)hn) != 0) return -1;
+    if (xsend_rank(tc->fd, tmp, len) != 0) return -1;
+    ylog_raw_log("%s", tmp);
+    return 0;
 }
 
 static int handle_infer(int fd, Rank* r, char* args)
@@ -180,7 +184,11 @@ static int handle_infer(int fd, Rank* r, char* args)
     ((char*)r->ids)[nbytes] = '\0';
     char* prompt = (char*)r->ids;
 
-    int nprompt = vocab_encode(&r->vocab, prompt, r->ids, (int)r->ids_cap - 4096);
+    int nprompt;
+    if (vocab_has_template(&r->vocab))
+        nprompt = vocab_chat_ids(&r->vocab, prompt, r->ids, (int)r->ids_cap - 4096, r->vocab.add_bos);
+    else
+        nprompt = vocab_encode(&r->vocab, prompt, r->ids, (int)r->ids_cap - 4096);
     if (nprompt < 0) { send_line(fd, "ERR encode failed"); return 0; }
 
     EngineTimings tim;
@@ -192,7 +200,7 @@ static int handle_infer(int fd, Rank* r, char* args)
     tc.fd = fd;
     tc.vocab = &r->vocab;
     int rc = engine_generate(&r->engine, r->ids, nprompt, max_tokens,
-                             r->temp, r->top_p, r->seed, 1,
+                             r->temp, r->top_p, r->seed, r->vocab.eos,
                              on_token_rank, &tc, &tim, err, sizeof(err));
     uint64_t ms = ynow_ms() - t0;
     if (rc != 0) {
