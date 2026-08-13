@@ -49,6 +49,7 @@ static inline const char* json_parse(const char* p, JsonVal* v)
                 p++;
                 while (*p && *p != '"') { if (*p == '\\') p++; p++; }
                 if (*p == '"') p++;
+                continue;   /* 字符串后不 p++, 避免吞掉紧随的 ']' '}' 分隔符 */
             }
             p++;
         }
@@ -63,6 +64,7 @@ static inline const char* json_parse(const char* p, JsonVal* v)
                 p++;
                 while (*p && *p != '"') { if (*p == '\\') p++; p++; }
                 if (*p == '"') p++;
+                continue;   /* 同上: 字符串后直接回到分支判断 */
             }
             p++;
         }

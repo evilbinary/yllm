@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <pthread.h>
 
 #define HTTP_MAX_BODY (1 << 20)
 
@@ -300,6 +302,16 @@ static void handle_conn(int fd, Router* r)
     close(fd);
 }
 
+/* HTTP 连接处理(每连接一线程: 长生成不阻塞其他连接) */
+static Router* http_conn_router;
+static void* http_conn(void* arg)
+{
+    int fd = (int)(intptr_t)arg;
+    Router* r = http_conn_router;
+    handle_conn(fd, r);
+    return NULL;
+}
+
 static void http_thread(void* arg)
 {
     HttpCtx* c = (HttpCtx*)arg;
@@ -307,10 +319,13 @@ static void http_thread(void* arg)
     int srv = sock_listen(c->port, 16);
     if (srv < 0) { ylog_error("http: cannot listen on %u", c->port); return; }
     ylog_info("http: OpenAI-compatible listening on port %u", c->port);
+    http_conn_router = c->router;
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
-            handle_conn(fd, c->router);
+            pthread_t t;
+            pthread_create(&t, NULL, http_conn, (void*)(intptr_t)fd);
+            pthread_detach(t);
         }
     }
     close(srv);

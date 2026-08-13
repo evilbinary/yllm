@@ -104,6 +104,20 @@ static void* srv_conn(void* arg)
     return NULL;
 }
 
+/* 独立心跳线程: 长请求转发期间 accept 循环被占用, 心跳不能停 */
+static void srv_hb_thread(void* arg)
+{
+    Server* s = (Server*)arg;
+    struct timespec ts;
+    ts.tv_sec = 2;
+    ts.tv_nsec = 0;
+    while (!s->quit) {
+        nanosleep(&ts, NULL);
+        s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
+        node_heartbeat(&s->node);
+    }
+}
+
 int server_run(Server* s)
 {
     sock_init();
@@ -115,7 +129,8 @@ int server_run(Server* s)
               s->node.node_id, s->port, s->leader_host, s->leader_port,
               s->node.sv_host, s->node.sv_port);
 
-    uint64_t last_hb = 0;
+    void* hb = NULL;
+    if (s->node.sv_enabled) ythread_create(&hb, srv_hb_thread, s);
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
@@ -123,12 +138,7 @@ int server_run(Server* s)
             pthread_create(&t, NULL, srv_conn, (void*)(intptr_t)fd);
             pthread_detach(t);
         }
-        uint64_t now = (uint64_t)time(NULL);
-        if (now - last_hb >= 2) {
-            last_hb = now;
-            s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
-            node_heartbeat(&s->node);
-        }
+        if (s->quit) break;
     }
     close(srv);
     return 0;

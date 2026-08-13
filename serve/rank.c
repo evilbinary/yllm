@@ -22,6 +22,8 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -42,14 +44,14 @@
 typedef struct {
     Engine engine;
     Vocab vocab;
-    uint32_t* ids;
-    uint32_t ids_cap;
     float temp;
     float top_p;
     uint64_t seed;
     uint64_t uptime_s;
     /* 统一节点身份(心跳发 supervisor, 生命周期归 supervisor) */
     Node node;
+    pthread_mutex_t engine_lock;   /* 引擎单实例: INFER 互斥, PING/STAT 不阻塞 */
+    volatile int quit;   /* QUIT 后主循环退出, 心跳线程一并退出 */
 } Rank;
 
 /* ---- socket 辅助(与 dist_worker 同款) ---- */
@@ -175,21 +177,21 @@ static int handle_infer(int fd, Rank* r, char* args)
         send_line(fd, "ERR bad INFER args");
         return 0;
     }
-    if ((size_t)nbytes >= (size_t)r->ids_cap - 4096) {
-        free(r->ids);
-        r->ids = (uint32_t*)ymalloc((size_t)nbytes + 8192);
-        r->ids_cap = (uint32_t)nbytes + 8192;
-    }
-    if (xrecv_rank(fd, r->ids, (size_t)nbytes) != 0) return -1;
-    ((char*)r->ids)[nbytes] = '\0';
-    char* prompt = (char*)r->ids;
+    /* 每请求独立缓冲(线程化后不可共享 r->ids) */
+    char* pb = (char*)ymalloc((size_t)nbytes + 8192);
+    if (!pb) { send_line(fd, "ERR oom"); return 0; }
+    if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); return -1; }
+    pb[nbytes] = '\0';
 
+    uint32_t* ids = (uint32_t*)ymalloc((size_t)nbytes + 8192 + 4096);
+    if (!ids) { free(pb); send_line(fd, "ERR oom"); return 0; }
     int nprompt;
     if (vocab_has_template(&r->vocab))
-        nprompt = vocab_chat_ids(&r->vocab, prompt, r->ids, (int)r->ids_cap - 4096, r->vocab.add_bos);
+        nprompt = vocab_chat_ids(&r->vocab, pb, ids, (int)nbytes + 8192, r->vocab.add_bos);
     else
-        nprompt = vocab_encode(&r->vocab, prompt, r->ids, (int)r->ids_cap - 4096);
-    if (nprompt < 0) { send_line(fd, "ERR encode failed"); return 0; }
+        nprompt = vocab_encode(&r->vocab, pb, ids, (int)nbytes + 8192);
+    free(pb);
+    if (nprompt < 0) { free(ids); send_line(fd, "ERR encode failed"); return 0; }
 
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));
@@ -199,9 +201,13 @@ static int handle_infer(int fd, Rank* r, char* args)
     TokenCtx tc;
     tc.fd = fd;
     tc.vocab = &r->vocab;
-    int rc = engine_generate(&r->engine, r->ids, nprompt, max_tokens,
+    /* 引擎单实例: 串行执行推理; 并发 INFER 在此排队, PING/STAT 无需等锁 */
+    pthread_mutex_lock(&r->engine_lock);
+    int rc = engine_generate(&r->engine, ids, nprompt, max_tokens,
                              r->temp, r->top_p, r->seed, r->vocab.eos,
                              on_token_rank, &tc, &tim, err, sizeof(err));
+    pthread_mutex_unlock(&r->engine_lock);
+    free(ids);
     uint64_t ms = ynow_ms() - t0;
     if (rc != 0) {
         send_line(fd, "ERR generate: %s", err);
@@ -216,13 +222,45 @@ static int handle_frame(int fd, Rank* r, char* line)
     if (strcmp(line, PROTO_PING) == 0) return handle_ping(fd, r);
     if (strcmp(line, PROTO_STAT) == 0) return handle_stat(fd, r);
     if (strncmp(line, PROTO_INFER " ", 6) == 0) return handle_infer(fd, r, line + 6);
-    if (strcmp(line, PROTO_DRAIN) == 0) { send_line(fd, "OK"); return 2; }
-    if (strcmp(line, PROTO_QUIT) == 0) { send_line(fd, "OK"); return 2; }
+    if (strcmp(line, PROTO_DRAIN) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
+    if (strcmp(line, PROTO_QUIT) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
     send_line(fd, "ERR unknown cmd");
     return 0;
 }
 
 /* ---- 主服务循环 ---- */
+
+static Rank* rank_conn_rank;
+
+/* 每连接一线程的处理入口 */
+static void* rank_conn(void* arg)
+{
+    int fd = (int)(intptr_t)arg;
+    Rank* r = rank_conn_rank;
+    char line[RANK_MAX_LINE];
+    int n = recv_line_rank(fd, line, sizeof(line));
+    if (n >= 0) {
+        handle_frame(fd, r, line);
+    }
+    close(fd);
+    return NULL;
+}
+
+/* 独立心跳线程: 生成长达数分钟也不被 supervisor 误判 DEAD */
+static void rank_hb_thread(void* arg)
+{
+    Rank* r = (Rank*)arg;
+    struct timespec ts;
+    ts.tv_sec = 2;
+    ts.tv_nsec = 0;
+    while (!r->quit) {
+        nanosleep(&ts, NULL);
+        if (r->node.sv_enabled) {
+            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
+            node_heartbeat(&r->node);
+        }
+    }
+}
 
 static int run_rank(int port, Rank* r)
 {
@@ -231,26 +269,23 @@ static int run_rank(int port, Rank* r)
     if (srv < 0) return 1;
     ylog_info("rank: ready on port %u (model loaded, 常驻等待请求)", port);
 
-    uint64_t last_hb = 0;
+    void* hb = NULL;
+    if (r->node.sv_enabled) ythread_create(&hb, rank_hb_thread, r);
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
-            char line[RANK_MAX_LINE];
-            int n = recv_line_rank(fd, line, sizeof(line));
-            if (n >= 0) {
-                int rc = handle_frame(fd, r, line);
-                if (rc == 2) { close(fd); break; }
+            /* 每连接一线程: 长生成期间 PING/STAT 仍可即时响应,
+             * 并发 INFER 在 engine_lock 排队 */
+            pthread_t t;
+            if (pthread_create(&t, NULL, rank_conn, (void*)(intptr_t)fd) != 0) {
+                close(fd);
+            } else {
+                pthread_detach(t);
             }
-            close(fd);
         }
-        /* 周期心跳 → supervisor(数据面: 活着就报, 判死/重拉归 supervisor) */
-        uint64_t now = (uint64_t)time(NULL);
-        if (r->node.sv_enabled && now - last_hb >= 2) {
-            last_hb = now;
-            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
-            node_heartbeat(&r->node);
-        }
+        if (r->quit) break;
     }
+    r->quit = 1;
     close(srv);
     return 0;
 }
@@ -300,12 +335,11 @@ int cmd_rank(ServeConfig* cfg)
         vocab_free(&r.vocab);
         return 1;
     }
-    r.ids = (uint32_t*)ymalloc(4096);
-    r.ids_cap = 4096;
+    pthread_mutex_init(&r.engine_lock, NULL);
+    rank_conn_rank = &r;
 
     int rc = run_rank(cfg->rank_port_base, &r);
 
-    free(r.ids);
     engine_free(&r.engine);
     vocab_free(&r.vocab);
     return rc;
