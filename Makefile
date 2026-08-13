@@ -59,14 +59,16 @@ LIBS += $(PLATLIBS)
 CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
-OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o
+OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o
+OBJ           := $(sort $(OBJ))
 
 # ---- AVX2 版本(仅 x86_64; 其余架构退化为标量, 保持 target 可用) ----
 CFLAGS_AVX2   := $(CFLAGS_BASE)
 LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
 BIN_AVX2      := build/avx2/yllm$(EXE)
-OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o
+OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o
+OBJ_AVX2      := $(sort $(OBJ_AVX2))
 ifeq ($(ARCH),x86_64)
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
 endif
@@ -84,14 +86,20 @@ $(BIN_AVX2): $(OBJ_AVX2)
 $(OBJDIR)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -c -o $@ $<
 
-$(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -c -o $@ $<
+$(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+
+$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h inference/yllm.h inference/log.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
 
-$(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
+$(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+
+$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----
 TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c

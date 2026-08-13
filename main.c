@@ -1,6 +1,7 @@
 #include "inference/yllm.h"
 #include "inference/dist.h"
 #include "inference/log.h"
+#include "serve/rank.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -323,7 +324,7 @@ static int cmd_chat(int argc, char** argv)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: yllm <convert|check|gen|chat> [options]\n");
+        fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank> [options]\n");
         return 1;
     }
     /* 全局日志: --log <file> [--log-level debug|info|warn|error] [--no-console] */
@@ -351,6 +352,7 @@ int main(int argc, char** argv)
     else if (strcmp(argv[1], "check") == 0) rc = cmd_check(argc, argv);
     else if (strcmp(argv[1], "gen") == 0) rc = cmd_gen(argc, argv);
     else if (strcmp(argv[1], "chat") == 0) rc = cmd_chat(argc, argv);
+    else if (strcmp(argv[1], "rank") == 0) rc = cmd_rank(argc, argv);
     else {
         fprintf(stderr, "unknown command: %s\n", argv[1]);
         rc = 1;
