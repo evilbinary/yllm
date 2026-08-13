@@ -5,6 +5,7 @@
 #include "serve/server.h"
 #include "serve/router.h"
 #include "serve/supervisor.h"
+#include "serve/hub.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -327,7 +328,7 @@ static int cmd_chat(int argc, char** argv)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank|server|router> [options]\n");
+        fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank|server|router|supervisor|hub> [options]\n");
         return 1;
     }
     /* 全局日志: --log <file> [--log-level debug|info|warn|error] [--no-console] */
@@ -359,6 +360,7 @@ int main(int argc, char** argv)
     else if (strcmp(argv[1], "server") == 0) rc = cmd_server(argc, argv);
     else if (strcmp(argv[1], "router") == 0) rc = cmd_router(argc, argv);
     else if (strcmp(argv[1], "supervisor") == 0) rc = cmd_supervisor(argc, argv);
+    else if (strcmp(argv[1], "hub") == 0) rc = cmd_hub(argc, argv);
     else {
         fprintf(stderr, "unknown command: %s\n", argv[1]);
         rc = 1;

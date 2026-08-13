@@ -16,18 +16,11 @@
 #include "frame.h"
 #include "node.h"
 #include "sock.h"
+#include "server.h"
 #include "../inference/log.h"
 #include <time.h>
 
 #define SRV_MAX_LINE 8192
-
-typedef struct {
-    Node node;             /* 统一节点身份(type=server) */
-    char leader_host[128];
-    uint16_t leader_port;
-    uint16_t port;         /* server 自身监听端口(router 转发入口) */
-    uint64_t start_s;
-} Server;
 
 /* INFER 转发: 连 leader rank → 发 INFER → 逐帧透传回客户端 */
 static void forward_infer(int client_fd, Server* s, const char* args)
@@ -86,7 +79,7 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
     }
 }
 
-static int run_server(Server* s)
+int server_run(Server* s)
 {
     sock_init();
 
@@ -181,5 +174,5 @@ int cmd_server(int argc, char** argv)
     s.node.sv_port = (uint16_t)atoi(colon + 1);
     s.node.sv_enabled = 1;
 
-    return run_server(&s);
+    return server_run(&s);
 }

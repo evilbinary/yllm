@@ -13,31 +13,11 @@
 #include "frame.h"
 #include "node.h"
 #include "sock.h"
+#include "router.h"
 #include "../inference/log.h"
 #include <time.h>
 
-#define RT_MAX_SERVERS 64
 #define RT_MAX_LINE 8192
-
-typedef struct {
-    char id[128];
-    char model[128];
-    char leader_host[128];
-    uint16_t leader_port;
-    int state;           /* NODE_STATE_* */
-    int inflight;
-    double kv_mb;
-    uint64_t last_update;
-} RtServer;
-
-typedef struct {
-    RtServer servers[RT_MAX_SERVERS];
-    int n_servers;
-    uint16_t port;
-    int rr_counter;
-    const char* strategy;
-    Node node;           /* 自身节点(type=router), 心跳发 supervisor */
-} Router;
 
 static RtServer* find_server(Router* r, const char* id)
 {
@@ -296,7 +276,7 @@ static int run_client(Router* r, const char* send)
     return 0;
 }
 
-static int run_router(Router* r, const char* sv_host, uint16_t sv_port)
+int router_run(Router* r, const char* sv_host, uint16_t sv_port)
 {
     sock_init();
     int srv = sock_listen(r->port, 16);
@@ -390,5 +370,5 @@ int cmd_router(int argc, char** argv)
     }
 
     if (send) return run_client(&r, send);
-    return run_router(&r, sv_host, sv_port);
+    return router_run(&r, sv_host, sv_port);
 }

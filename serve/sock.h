@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -165,7 +166,7 @@ static inline int sock_accept_with_timeout(int srv, int ms)
     tv.tv_usec = (ms % 1000) * 1000;
     fd_set rfds;
     FD_ZERO(&rfds);
-    FD_SET((SOCKET)srv, &rfds);
+    FD_SET(srv, &rfds);
     int sel = select(srv + 1, &rfds, NULL, NULL, &tv);
     if (sel <= 0) return sel == 0 ? -2 : -1;
     if (!FD_ISSET(srv, &rfds)) return -2;

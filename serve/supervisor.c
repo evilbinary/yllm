@@ -14,26 +14,9 @@
 #include "frame.h"
 #include "node.h"
 #include "sock.h"
+#include "supervisor.h"
 #include "../inference/log.h"
 #include <time.h>
-
-#define SV_MAX_NODES 256
-#define SV_MAX_ROUTERS 16
-#define SV_HB_TIMEOUT 10
-
-typedef struct {
-    Node node;
-    int router_notified;   /* 已通知 router(server ADD/DEL 去重) */
-} SvNode;
-
-typedef struct {
-    SvNode nodes[SV_MAX_NODES];
-    int n_nodes;
-    /* router 列表: 用统一 Node 抽象(type=router, addr="ip:port") */
-    Node routers[SV_MAX_ROUTERS];
-    int n_routers;
-    uint16_t port;
-} Supervisor;
 
 static SvNode* find_node(Supervisor* s, const char* id)
 {
@@ -130,7 +113,7 @@ static void handle_frame(Supervisor* s, int fd, const char* cmd, const char* arg
     else frame_send(fd, "ERR", "unknown cmd");
 }
 
-static int run_supervisor(Supervisor* s)
+int supervisor_run(Supervisor* s)
 {
     sock_init();
     int srv = sock_listen(s->port, 16);
@@ -210,5 +193,5 @@ int cmd_supervisor(int argc, char** argv)
         }
     }
 
-    return run_supervisor(&s);
+    return supervisor_run(&s);
 }
