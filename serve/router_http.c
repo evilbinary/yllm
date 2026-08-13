@@ -30,6 +30,7 @@ typedef struct {
     char* buf;
     size_t cap;
     size_t len;
+    int n_tokens;        /* 收集到的 token 数(usage 统计用) */
 } CollectCtx;
 
 /* 收集回调: token 拼进 buffer(转义 JSON 特殊字符) */
@@ -52,6 +53,7 @@ static void collect_on_token(const char* utf8, size_t len, void* ctx)
         }
     }
     cc->buf[cc->len] = '\0';
+    cc->n_tokens++;
 }
 
 /* SSE 回调: 逐 token 写 data 块 */
@@ -134,15 +136,26 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     if (stream) {
         HttpResponse rr;
         http_sse_begin(&rr, fd);
-        router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &rr);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &rr);
+        if (rc != 0)
+            http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
     } else {
         CollectCtx cc;
         cc.buf = collected;
         cc.cap = HTTP_MAX_BODY;
         cc.len = 0;
+        cc.n_tokens = 0;
         collected[0] = '\0';
-        router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+        if (rc != 0) {
+            HttpResponse rr;
+            http_begin(&rr, fd, 502, "application/json");
+            http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            free(prompt);
+            free(collected);
+            return;
+        }
         char* json = (char*)malloc(HTTP_MAX_BODY + 512);
         if (!json) { free(prompt); free(collected); return; }
         snprintf(json, HTTP_MAX_BODY + 512,
@@ -151,7 +164,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                  "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                  "\"finish_reason\":\"length\"}],"
                  "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-                 (long long)time(NULL), model, collected, (int)cc.len, (int)cc.len);
+                 (long long)time(NULL), model, collected, cc.n_tokens, cc.n_tokens);
         HttpResponse rr;
         http_begin(&rr, fd, 200, "application/json");
         http_reply(&rr, json);
@@ -198,15 +211,26 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
     if (stream) {
         HttpResponse rr;
         http_sse_begin(&rr, fd);
-        router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &rr);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &rr);
+        if (rc != 0)
+            http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
     } else {
         CollectCtx cc;
         cc.buf = collected;
         cc.cap = HTTP_MAX_BODY;
         cc.len = 0;
+        cc.n_tokens = 0;
         collected[0] = '\0';
-        router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+        if (rc != 0) {
+            HttpResponse rr;
+            http_begin(&rr, fd, 502, "application/json");
+            http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            free(prompt);
+            free(collected);
+            return;
+        }
         char* json = (char*)malloc(HTTP_MAX_BODY + 256);
         if (!json) { free(prompt); free(collected); return; }
         snprintf(json, HTTP_MAX_BODY + 256,

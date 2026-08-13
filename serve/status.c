@@ -115,10 +115,14 @@ static void query_role(const char* label, const char* addr)
     size_t hlen = (size_t)(colon - addr);
     int fd = sock_connect_host(addr, hlen, (uint16_t)atoi(colon + 1), 2);
     if (fd < 0) { printf("  %s: 不可达 (%s)\n", label, addr); return; }
+    /* 节点僵死(如 rank 被 STOP)时 3s 超时, 不阻塞整个 status */
+    sock_set_timeout(fd, 3);
     frame_send(fd, PROTO_STAT, NULL);
     Frame f;
     if (frame_recv(fd, &f) >= 0)
         printf("  %s: %s %s\n", label, f.cmd, f.args);
+    else
+        printf("  %s: 无响应(超时) (%s)\n", label, addr);
     close(fd);
 }
 

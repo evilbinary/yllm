@@ -16,6 +16,11 @@ typedef struct {
 typedef struct {
     SvNode nodes[SV_MAX_NODES];
     int n_nodes;
+    /* 已拉起进程记录(node_id → pid, 自愈重拉前先杀旧进程)。
+     * pid 为 spawn 的会话组长(sh -c 包装), kill(-pid) 连带 rank 子进程。 */
+    char spawn_ids[SV_MAX_NODES][128];
+    int spawn_pids[SV_MAX_NODES];
+    int n_spawns;
     /* router 列表: 用统一 Node 抽象(type=router, addr="ip:port") */
     Node routers[SV_MAX_ROUTERS];
     int n_routers;

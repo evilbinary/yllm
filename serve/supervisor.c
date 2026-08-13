@@ -17,6 +17,7 @@
 #include "supervisor.h"
 #include "../inference/log.h"
 #include <time.h>
+#include <signal.h>
 
 static SvNode* find_node(Supervisor* s, const char* id)
 {
@@ -77,6 +78,42 @@ static uint16_t model_server_port(const Supervisor* s, int mi)
     return (uint16_t)(s->server_port_base + mi * model_stride(s));
 }
 
+/* 记录已拉起进程(node_id -> pid) */
+static void spawn_record(Supervisor* s, const char* id, int pid)
+{
+    int i;
+    for (i = 0; i < s->n_spawns; i++) {
+        if (strcmp(s->spawn_ids[i], id) == 0) {
+            s->spawn_pids[i] = pid;
+            return;
+        }
+    }
+    if (s->n_spawns < SV_MAX_NODES) {
+        snprintf(s->spawn_ids[s->n_spawns], sizeof(s->spawn_ids[0]), "%s", id);
+        s->spawn_pids[s->n_spawns] = pid;
+        s->n_spawns++;
+    }
+}
+
+/* 杀掉已拉起的进程组(sh -c + rank 都在同一会话, kill(-pid) 全杀) */
+static void spawn_kill(Supervisor* s, const char* id)
+{
+    int i;
+    for (i = 0; i < s->n_spawns; i++) {
+        if (strcmp(s->spawn_ids[i], id) == 0) {
+            if (s->spawn_pids[i] > 0) {
+                ylog_warn("supervisor: kill stale process of %s (pid %d)", id, s->spawn_pids[i]);
+#ifndef _WIN32
+                kill(-s->spawn_pids[i], SIGKILL);
+                kill(s->spawn_pids[i], SIGKILL);
+#endif
+            }
+            s->spawn_pids[i] = 0;
+            return;
+        }
+    }
+}
+
 static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
 {
     if (mi >= s->n_models) return -1;
@@ -89,7 +126,13 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
              s->bin, mc->model, mc->vocab, rport, s->sv_host, s->port,
              mi * model_stride(s) + r, mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
-    return spawn_proc(cmd);
+    int pid = spawn_proc(cmd);
+    if (pid > 0) {
+        char id[128];
+        snprintf(id, sizeof(id), "rank-%d", mi * model_stride(s) + r);
+        spawn_record(s, id, pid);
+    }
+    return pid;
 }
 
 /* 拉起一个 server(业务组, leader 指向该模型 rank0) */
@@ -106,7 +149,13 @@ static int supervisor_spawn_server(Supervisor* s, int mi)
              s->bin, mi, mc->name, s->sv_host, lport, s->sv_host, s->port,
              sport, mc->name, mi);
     ylog_info("supervisor: spawn server %d (model %s) on port %u", mi, mc->name, sport);
-    return spawn_proc(cmd);
+    int pid = spawn_proc(cmd);
+    if (pid > 0) {
+        char id[128];
+        snprintf(id, sizeof(id), "server-%d", mi);
+        spawn_record(s, id, pid);
+    }
+    return pid;
 }
 
 /* 自愈: 心跳超时的 server/rank 自动重拉 */
@@ -122,6 +171,7 @@ static void heal_dead(Supervisor* s)
             ylog_warn("supervisor: server %s DEAD, respawn", n->node.node_id);
             sync_server_to_router(s, n);
             if (s->auto_heal) {
+                spawn_kill(s, n->node.node_id);
                 int idx = atoi(n->node.node_id + strlen("server-"));
                 supervisor_spawn_server(s, idx);
             }
@@ -129,6 +179,7 @@ static void heal_dead(Supervisor* s)
             n->node.state = NODE_STATE_DEAD;
             ylog_warn("supervisor: rank %s DEAD, respawn", n->node.node_id);
             if (s->auto_heal) {
+                spawn_kill(s, n->node.node_id);
                 int idx = atoi(n->node.node_id + strlen("rank-"));
                 int st = model_stride(s);
                 supervisor_spawn_rank(s, idx / st, idx % st);

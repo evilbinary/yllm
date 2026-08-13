@@ -33,6 +33,8 @@ static void forward_infer(int client_fd, Server* s, const char* args)
                        s->leader_host, s->leader_port);
         return;
     }
+    /* leader 无响应(如 rank 被 STOP/僵死) 60s 后报错, 不无限挂起 */
+    sock_set_timeout(fd, 60);
     Frame f;
     snprintf(f.cmd, sizeof(f.cmd), "%s", PROTO_INFER);
     snprintf(f.args, sizeof(f.args), "%s", args);

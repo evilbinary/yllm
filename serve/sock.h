@@ -98,6 +98,16 @@ static inline void sock_send_line(int fd, const char* fmt, ...)
     sock_send_n(fd, "\n", 1);
 }
 
+/* 连接后设置接收超时(秒); 超时后 recv/sock_recv_line 返回 -1 */
+static inline void sock_set_timeout(int fd, int sec)
+{
+    struct timeval tv;
+    tv.tv_sec = sec;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+}
+
 /* TCP 连接(带重试) */
 static inline int sock_connect(const char* host, uint16_t port, int retries)
 {
