@@ -83,14 +83,37 @@ static int xio(Dist* d, int fd, const void* buf, size_t n, int is_send)
     uint64_t t0 = ynow_ns();
     const char* p = (const char*)buf;
     while (n > 0) {
+#ifdef _WIN32
+        WSABUF wb;
+        wb.buf = (char*)p;
+        wb.len = (ULONG)(n > 0x7fffffff ? 0x7fffffff : n);
+        DWORD sent = 0;
+        DWORD flags = 0;
+        int wsa = is_send ? WSASend((SOCKET)fd, &wb, 1, &sent, flags, NULL, NULL)
+                          : WSARecv((SOCKET)fd, &wb, 1, &sent, &flags, NULL, NULL);
+        if (wsa != 0) goto err_fail;
+        if (sent == 0) goto err_fail;
+        p += sent;
+        n -= sent;
+#else
         ssize_t r = (ssize_t)send(fd, p, n, 0);
-        if (r <= 0) return -1;
+        if (r <= 0) goto err_fail;
         p += r;
         n -= (size_t)r;
+#endif
     }
     if (is_send) { d->bytes_sent += (uint64_t)(p - (const char*)buf); d->nanos_wait_send += ynow_ns() - t0; }
     else         { d->bytes_recv += (uint64_t)(p - (const char*)buf); d->nanos_wait_recv += ynow_ns() - t0; }
     return 0;
+err_fail:
+    if (getenv("YLLM_DISTDBG")) {
+#ifdef _WIN32
+        fprintf(stderr, "[distdbg] rank %d xio %s FAIL fd=%d n=%u WSAGetLastError=%d\n", d->rank, is_send ? "send" : "recv", fd, (unsigned)n, WSAGetLastError());
+#else
+        fprintf(stderr, "[distdbg] rank %d xio %s FAIL fd=%d n=%u errno=%d\n", d->rank, is_send ? "send" : "recv", fd, (unsigned)n, (int)errno);
+#endif
+    }
+    return -1;
 }
 static int xrecv(Dist* d, int fd, void* buf, size_t n)
 {

@@ -81,10 +81,10 @@ $(BIN): $(OBJ)
 $(BIN_AVX2): $(OBJ_AVX2)
 	$(CC) $(CFLAGS_AVX2) -o $@ $(OBJ_AVX2) $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h | $(OBJDIR)
+$(OBJDIR)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h src/dist.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -c -o $@ $<
 
-$(OBJDIR_AVX2)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/%.o: src/%.c src/yllm.h src/llf.h src/convert.h src/matvec.h src/dist.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----
