@@ -29,4 +29,9 @@ typedef struct {
 int cmd_router(int argc, char** argv);
 int router_run(Router* r, const char* sv_host, uint16_t sv_port);
 
+/* 通用 INFER 转发(HTTP 层等复用): 路由到 server → 转发 → 逐 token 回调 */
+int router_infer(Router* r, const char* model, int max_tokens,
+                 const char* prompt, size_t plen,
+                 void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx);
+
 #endif

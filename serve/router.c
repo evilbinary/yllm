@@ -14,6 +14,7 @@
 #include "node.h"
 #include "sock.h"
 #include "router.h"
+#include "router_http.h"
 #include "../inference/log.h"
 #include <time.h>
 
@@ -171,7 +172,44 @@ static RtServer* pick_server(Router* r, const char* model)
 }
 
 /* 客户端 INFER: 解析 <model> <max_tokens> <n_bytes>\n + prompt */
-static void handle_client_infer(int fd, Router* r, const char* args)
+/* 通用 INFER 转发: 路由到 server → 转发给 leader rank → 逐 token 回调。
+ * on_token(token utf8, ctx) 每生成一个 token 回调一次; 返回 0 成功, -1 失败 */
+int router_infer(Router* r, const char* model, int max_tokens,
+                 const char* prompt, size_t plen,
+                 void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx)
+{
+    RtServer* s = pick_server(r, model);
+    if (!s) { ylog_warn("router_infer: no ready server for %s", model); return -1; }
+    int sfd = sock_connect(s->leader_host, s->leader_port, 5);
+    if (sfd < 0) { ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
+    char line[RT_MAX_LINE];
+    snprintf(line, sizeof(line), "%s %d %zu", PROTO_INFER, max_tokens, plen);
+    sock_send_n(sfd, line, strlen(line));
+    sock_send_n(sfd, "\n", 1);
+    if (plen > 0) sock_send_n(sfd, prompt, plen);
+
+    s->inflight++;
+    char out[RT_MAX_LINE];
+    int rc = 0;
+    int done = 0;
+    while (!done) {
+        int n = sock_recv_line(sfd, out, sizeof(out));
+        if (n < 0) { rc = -1; break; }
+        if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
+        else if (strncmp(out, "T ", 2) == 0) {
+            long tlen = atol(out + 2);
+            if (tlen > 0 && tlen < (long)sizeof(out)) {
+                if (sock_recv_n(sfd, out, (size_t)tlen) != 0) { rc = -1; break; }
+                if (on_token) on_token(out, (size_t)tlen, ctx);
+            }
+        }
+    }
+    s->inflight--;
+    close(sfd);
+    return rc;
+}
+
+static void handle_client_infer(int fd, Router* r, const char *args)
 {
     char model[128];
     int max_tokens = 0;
@@ -352,6 +390,7 @@ int cmd_router(int argc, char** argv)
     }
     const char* send = opt_r(a, n, "send", NULL);
     const char* sv_addr = opt_r(a, n, "supervisor", NULL);
+    const char* http_port_s = opt_r(a, n, "http-port", NULL);
     int port = atoi(opt_r(a, n, "port", "9400"));
     const char* strategy = opt_r(a, n, "strategy", "least");
 
@@ -380,5 +419,8 @@ int cmd_router(int argc, char** argv)
     }
 
     if (send) return run_client(&r, send);
+    /* OpenAI 兼容 HTTP(可选) */
+    if (http_port_s)
+        router_http_start(&r, (uint16_t)atoi(http_port_s));
     return router_run(&r, sv_host, sv_port);
 }

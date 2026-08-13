@@ -79,10 +79,12 @@ int cmd_hub(int argc, char** argv)
     const char* srv_model = opt_c(a, n, "server-model", NULL);
     const char* srv_leader = opt_c(a, n, "server-leader", NULL);
     const char* strategy = opt_c(a, n, "strategy", "least");
+    const char* http_port_s = opt_c(a, n, "http-port", NULL);
 
     if (!srv_model || !srv_leader) {
         fprintf(stderr, "usage: yllm hub --port <sv> --router-port <rt> --server-port <srv> "
-                        "--server-model <name> --server-leader <ip:port> [--server-id id] [--strategy s]\n");
+                        "--server-model <name> --server-leader <ip:port> [--server-id id] "
+                        "[--strategy s] [--http-port N]\n");
         return 1;
     }
 
@@ -137,6 +139,10 @@ int cmd_hub(int argc, char** argv)
     HubCtxSv c1; c1.s = &sv;
     HubCtxRt c2; c2.r = &rt; snprintf(c2.sv_host, sizeof(c2.sv_host), "%s", sv_host); c2.sv_port = sv_port;
     HubCtxSrv c3; c3.s = &srv;
+    if (http_port_s) {
+        extern int router_http_start(Router* r, uint16_t http_port);
+        router_http_start(&rt, (uint16_t)atoi(http_port_s));
+    }
     ythread_create(&t1, sv_thread, &c1);
     ythread_create(&t2, rt_thread, &c2);
     ythread_create(&t3, srv_thread, &c3);

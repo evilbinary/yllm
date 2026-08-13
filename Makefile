@@ -59,7 +59,7 @@ LIBS += $(PLATLIBS)
 CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
-OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o
+OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o
 OBJ           := $(sort $(OBJ))
 
 # ---- AVX2 版本(仅 x86_64; 其余架构退化为标量, 保持 target 可用) ----
@@ -67,7 +67,7 @@ CFLAGS_AVX2   := $(CFLAGS_BASE)
 LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
 BIN_AVX2      := build/avx2/yllm$(EXE)
-OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o $(OBJDIR_AVX2)/server.o $(OBJDIR_AVX2)/router.o $(OBJDIR_AVX2)/supervisor.o $(OBJDIR_AVX2)/hub.o
+OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o $(OBJDIR_AVX2)/server.o $(OBJDIR_AVX2)/router.o $(OBJDIR_AVX2)/supervisor.o $(OBJDIR_AVX2)/hub.o $(OBJDIR_AVX2)/router_http.o
 OBJ_AVX2      := $(sort $(OBJ_AVX2))
 ifeq ($(ARCH),x86_64)
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
@@ -104,6 +104,9 @@ $(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h s
 $(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
 
+$(OBJDIR)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+
 $(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
 
@@ -123,6 +126,9 @@ $(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/superviso
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+
+$(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----

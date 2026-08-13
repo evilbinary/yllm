@@ -26,6 +26,109 @@ static SvNode* find_node(Supervisor* s, const char* id)
     return NULL;
 }
 
+static void sync_server_to_router(Supervisor* s, SvNode* n);   /* 前向声明 */
+
+/* ---- 拉起进程(生命周期面, 唯一 spawn 的地方) ---- */
+
+static int spawn_proc(const char* cmdline)
+{
+#ifdef _WIN32
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    if (!CreateProcessA(NULL, (char*)cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        ylog_error("supervisor: CreateProcess fail: %s", cmdline);
+        return -1;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)pi.dwProcessId;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setsid();
+        char* cmd = (char*)malloc(strlen(cmdline) + 1);
+        if (!cmd) _exit(127);
+        strcpy(cmd, cmdline);
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    return (int)pid;
+#endif
+}
+
+/* 拉起一个 rank(段 r, 模型 m) */
+static int supervisor_spawn_rank(Supervisor* s, int r)
+{
+    char cmd[4096];
+    uint16_t rport = (uint16_t)(s->rank_port_base + r);
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %u "
+             "--supervisor %s:%u --id rank-%d --log logs/rank-%d.log",
+             s->bin, s->model, s->vocab, rport, s->sv_host, s->port, r, r);
+    ylog_info("supervisor: spawn rank %d on port %u", r, rport);
+    return spawn_proc(cmd);
+}
+
+/* 拉起一个 server(业务组, leader 指向 rank 组) */
+static int supervisor_spawn_server(Supervisor* s, int idx, const char* model_name)
+{
+    char cmd[4096];
+    uint16_t sport = (uint16_t)(s->server_port_base + idx);
+    uint16_t lport = (uint16_t)(s->rank_port_base);   /* leader = rank0 */
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" server --id server-%d --model \"%s\" --leader %s:%u "
+             "--supervisor %s:%u --port %u --log logs/server-%d.log",
+             s->bin, idx, model_name, s->sv_host, lport, s->sv_host, s->port,
+             sport, idx);
+    ylog_info("supervisor: spawn server %d on port %u", idx, sport);
+    return spawn_proc(cmd);
+}
+
+/* 自愈: 心跳超时的 server/rank 自动重拉 */
+static void heal_dead(Supervisor* s)
+{
+    int i;
+    for (i = 0; i < s->n_nodes; i++) {
+        SvNode* n = &s->nodes[i];
+        if (n->node.state == NODE_STATE_DEAD) continue;
+        if (!node_is_dead(&n->node, SV_HB_TIMEOUT)) continue;
+        if (strcmp(n->node.type, "server") == 0) {
+            n->node.state = NODE_STATE_DEAD;
+            ylog_warn("supervisor: server %s DEAD, respawn", n->node.node_id);
+            sync_server_to_router(s, n);
+            if (s->auto_heal) {
+                int idx = atoi(n->node.node_id + strlen("server-"));
+                supervisor_spawn_server(s, idx, n->node.model[0] ? n->node.model : "default");
+            }
+        } else if (strcmp(n->node.type, "rank") == 0) {
+            n->node.state = NODE_STATE_DEAD;
+            ylog_warn("supervisor: rank %s DEAD, respawn", n->node.node_id);
+            if (s->auto_heal) {
+                int r = atoi(n->node.node_id + strlen("rank-"));
+                supervisor_spawn_rank(s, r);
+            }
+        }
+    }
+}
+
+/* SCALE: server 请求扩容(拉起新的 rank 段组) */
+static void handle_scale(Supervisor* s, const char* args)
+{
+    char id[128];
+    int need = 0;
+    if (sscanf(args, "%127s need_groups=%d", id, &need) != 2) return;
+    ylog_info("supervisor: SCALE %s need_groups=%d", id, need);
+    if (s->auto_heal) {
+        /* P3 简化: 拉起一组 rank(rank0..ranks-1) */
+        int r;
+        for (r = 0; r < s->ranks; r++)
+            supervisor_spawn_rank(s, r);
+    }
+}
+
 /* 向所有 router 发一帧(router 地址从统一 Node.addr 解析) */
 static void notify_routers(Supervisor* s, const char* cmd, const char* args)
 {
@@ -110,6 +213,7 @@ static void handle_frame(Supervisor* s, int fd, const char* cmd, const char* arg
 {
     if (strcmp(cmd, "HEARTBEAT") == 0) handle_heartbeat(s, fd, args);
     else if (strcmp(cmd, "QUERY_SERVERS") == 0) handle_query_servers(s, fd);
+    else if (strcmp(cmd, PROTO_SCALE) == 0) { handle_scale(s, args); frame_send(fd, "OK", NULL); }
     else frame_send(fd, "ERR", "unknown cmd");
 }
 
@@ -133,17 +237,7 @@ int supervisor_run(Supervisor* s)
         uint64_t now = (uint64_t)time(NULL);
         if (now - last_check >= 2) {
             last_check = now;
-            int i;
-            for (i = 0; i < s->n_nodes; i++) {
-                SvNode* n = &s->nodes[i];
-                if (n->node.state != NODE_STATE_DEAD &&
-                    strcmp(n->node.type, "server") == 0 &&
-                    node_is_dead(&n->node, SV_HB_TIMEOUT)) {
-                    n->node.state = NODE_STATE_DEAD;
-                    ylog_warn("supervisor: server %s DEAD", n->node.node_id);
-                    sync_server_to_router(s, n);
-                }
-            }
+            heal_dead(s);
         }
     }
     close(srv);
@@ -173,11 +267,28 @@ int cmd_supervisor(int argc, char** argv)
         n++;
     }
     const char* routers = opt_sv(a, n, "router", NULL);
+    const char* bin = opt_sv(a, n, "bin", NULL);
+    const char* model = opt_sv(a, n, "model", NULL);
+    const char* vocab = opt_sv(a, n, "vocab", "vocab.txt");
+    const char* sv_addr = opt_sv(a, n, "addr", "127.0.0.1");
     int port = atoi(opt_sv(a, n, "port", "9500"));
+    int ranks = atoi(opt_sv(a, n, "ranks", "1"));
+    int rank_pb = atoi(opt_sv(a, n, "rank-port-base", "9410"));
+    int srv_pb = atoi(opt_sv(a, n, "server-port-base", "9420"));
+    int auto_heal = atoi(opt_sv(a, n, "auto-heal", "0"));
 
     Supervisor s;
     memset(&s, 0, sizeof(s));
     s.port = (uint16_t)port;
+    s.ranks = ranks > 0 ? ranks : 1;
+    s.rank_port_base = (uint16_t)rank_pb;
+    s.server_port_base = (uint16_t)srv_pb;
+    s.auto_heal = auto_heal;
+    snprintf(s.sv_host, sizeof(s.sv_host), "%s", sv_addr);
+    if (bin) snprintf(s.bin, sizeof(s.bin), "%s", bin);
+    else snprintf(s.bin, sizeof(s.bin), "%s", "./build/avx2/yllm");
+    if (model) snprintf(s.model, sizeof(s.model), "%s", model);
+    if (vocab) snprintf(s.vocab, sizeof(s.vocab), "%s", vocab);
 
     if (routers) {
         char tmp[2048];
