@@ -20,12 +20,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #endif
 
 static inline void sock_init(void)
 {
-#ifdef _WIN32
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN); /* 对端关闭时不自杀, send 返回 EPIPE 由上层处理 */
+#else
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif

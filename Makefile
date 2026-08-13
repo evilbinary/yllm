@@ -183,8 +183,8 @@ test-avx2: $(TEST_BIN_AVX)
 
 # ---- 集成: 转换模型 + 运行 chat/gen ----
 MODEL_GGUF  ?= tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-MODEL_LLF   ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
-MODEL_VOCAB ?= test/tinyllama.vocab.txt
+MODEL_LLF   ?= models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+MODEL_VOCAB ?= models/tinyllama.vocab.txt
 CHAT_PROMPT ?= "Once upon a time"
 CHAT_TOKENS ?= 30
 
@@ -213,6 +213,7 @@ gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 # 统一配置: serve.yaml(所有角色共用)
 # 用法:
 #   make serve            # supervisor --config serve.yaml 一键拉起 rank+server
+#   make hub              # 合并模式: supervisor+router+server 同进程(推荐)
 #   make serve-avx2       # 同上, avx2 版本
 #   make serve-stop       # 停掉 serve 相关进程
 #   make infer            # 客户端经 router 发请求
@@ -233,6 +234,13 @@ serve-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	@echo "== supervisor --config $(SERVE_CONFIG) (avx2) =="
 	@nohup $(BIN_AVX2) supervisor --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/serve.out 2>&1 &
 	@echo "serve started (avx2)"
+
+# 合并模式: supervisor+router+server 同进程, 自动拉起 rank; 之后 make infer 即可
+hub: $(BIN_AVX2) $(MODEL_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@echo "== hub --config $(SERVE_CONFIG) (avx2, 三合一) =="
+	@nohup $(BIN_AVX2) hub --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (--config $(SERVE_CONFIG)); 用 make infer 发请求"
 
 # 分开模式(独立进程, 同一份 config)
 supervisor: $(BIN)
@@ -256,6 +264,8 @@ rank: $(BIN) $(MODEL_LLF)
 	@echo "rank started (--config $(SERVE_CONFIG))"
 
 # 客户端: 经 router 发请求(prompt 不含引号)
+# SERVER_MODEL 需匹配 serve.yaml 的 model-name
+SERVER_MODEL ?= tinyllama
 SERVE_PROMPT ?= Once upon a time
 infer:
 	$(BIN) router --config $(SERVE_CONFIG) --send "$(SERVER_MODEL) $(CHAT_TOKENS) $(SERVE_PROMPT)"
@@ -299,7 +309,7 @@ clean:
 #       DIST_DIR(远端工作目录) DIST_RANK_N(rank 数, 默认=节点数) DIST_PORT_BASE(推理数据端口基数)
 #       DIST_TOKENS DIST_PROMPT DIST_SEED
 #       DIST_SERVE_HOST DIST_SERVE_PORT(管理节点文件服务地址; 各节点 sync 用)
-# 文件分发: 模型 test/*.llf 不随 rsync 上传, 由各节点经 sync 从管理节点文件服务拉取(私有 TCP 帧)。
+# 文件分发: 模型 models/*.llf 不随 rsync 上传, 由各节点经 sync 从管理节点文件服务拉取(私有 TCP 帧)。
 DIST_WORKER := $(OBJDIR)/dist-worker
 DIST_WORKER_AVX2 := $(OBJDIR_AVX2)/dist-worker$(EXE)
 NODES      ?= 127.0.0.1 127.0.0.1
@@ -314,8 +324,8 @@ DIST_RANK_N ?= $(words $(NODES))
 DIST_SERVE_HOST ?= 127.0.0.1
 DIST_SERVE_PORT ?= 9360
 # 远端模型/vocab 路径(相对 DIST_DIR); 大模型经 sync 拉到同路径
-DIST_MODEL  ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
-DIST_VOCAB  ?= test/tinyllama.vocab.txt
+DIST_MODEL  ?= models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+DIST_VOCAB  ?= models/tinyllama.vocab.txt
 
 $(DIST_WORKER): serve/dist_worker.c serve/protocol.h inference/log.c inference/log.h inference/platform.c inference/yllm.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $< inference/log.c inference/platform.c $(LDFLAGS) $(LIBS)
@@ -336,7 +346,7 @@ dist-deploy: $(DIST_WORKER) $(BIN) $(BIN_AVX2)
 	@set -e; for h in $(NODES); do \
 	  echo "== deploy to $$h =="; \
 	  ssh $(USER)@$$h "mkdir -p $(DIST_DIR)" || exit 1; \
-	  rsync -a --exclude build --exclude logs --exclude 'test/*.llf' ./ $(USER)@$$h:$(DIST_DIR)/ || exit 1; \
+	  rsync -a --exclude build --exclude logs --exclude 'models/*.llf' ./ $(USER)@$$h:$(DIST_DIR)/ || exit 1; \
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && make avx2 dist-worker" || exit 1; \
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && nohup ./build/avx2/dist-worker --port $(DIST_PORT) --bin ./build/avx2/yllm --logdir logs > logs/worker.log 2>&1 &" || exit 1; \
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send ping" || exit 1; \
@@ -358,4 +368,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 supervisor router server rank infer serve-stop
+.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer serve-stop

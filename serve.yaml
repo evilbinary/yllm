@@ -11,8 +11,8 @@ log: logs/serve.log
 log-level: info
 
 # 模型
-model: test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
-vocab: test/tinyllama.vocab.txt
+model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+vocab: models/tinyllama.vocab.txt
 model-name: tinyllama
 bin: ./build/avx2/yllm
 
@@ -21,6 +21,7 @@ sv-port: 9500          # supervisor 心跳口
 router-port: 9400      # router 客户端口
 server-port: 9420      # server 转发口
 rank-port-base: 9410   # rank 推理口基址
+leader: 127.0.0.1:9410  # server 的 leader rank 地址(rank 0 端口; hub 模式必需)
 http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
 
 # 拓扑

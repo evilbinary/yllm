@@ -227,8 +227,10 @@ static void supervisor_bootstrap(Supervisor* s)
     int r;
     for (r = 0; r < s->ranks; r++)
         supervisor_spawn_rank(s, r);
-    supervisor_spawn_server(s, 0, s->model_name[0] ? s->model_name : "default");
-    ylog_info("supervisor: bootstrap done (%d rank(s) + 1 server)", s->ranks);
+    if (!s->no_spawn_server)
+        supervisor_spawn_server(s, 0, s->model_name[0] ? s->model_name : "default");
+    ylog_info("supervisor: bootstrap done (%d rank(s) + 1 server%s)", s->ranks,
+              s->no_spawn_server ? ", server in-process" : "");
 }
 
 int supervisor_run(Supervisor* s)

@@ -63,6 +63,16 @@ int cmd_hub(ServeConfig* cfg)
     Supervisor sv;
     memset(&sv, 0, sizeof(sv));
     sv.port = (uint16_t)cfg->sv_port;
+    sv.ranks = cfg->ranks > 0 ? cfg->ranks : 1;
+    sv.rank_port_base = (uint16_t)cfg->rank_port_base;
+    sv.server_port_base = (uint16_t)cfg->server_port;
+    sv.auto_heal = cfg->auto_heal;
+    sv.no_spawn_server = 1; /* hub 内已有 server 线程 */
+    snprintf(sv.sv_host, sizeof(sv.sv_host), "%s", cfg->sv_host);
+    snprintf(sv.bin, sizeof(sv.bin), "%s", cfg->bin);
+    if (cfg->model[0]) snprintf(sv.model, sizeof(sv.model), "%s", cfg->model);
+    if (cfg->vocab[0]) snprintf(sv.vocab, sizeof(sv.vocab), "%s", cfg->vocab);
+    if (cfg->model_name[0]) snprintf(sv.model_name, sizeof(sv.model_name), "%s", cfg->model_name);
     /* router 地址(loopback, 走网络通知, 逻辑不变) */
     Node* rn = &sv.routers[sv.n_routers++];
     memset(rn, 0, sizeof(*rn));
