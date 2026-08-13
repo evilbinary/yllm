@@ -210,11 +210,11 @@ DIST_SERVE_PORT ?= 9360
 DIST_MODEL  ?= test/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
 DIST_VOCAB  ?= test/tinyllama.vocab.txt
 
-$(DIST_WORKER): src/dist_worker.c src/yllm.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $< $(LDFLAGS) $(LIBS)
+$(DIST_WORKER): src/dist_worker.c src/log.c src/log.h src/platform.c src/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Isrc -o $@ $< src/log.c src/platform.c $(LDFLAGS) $(LIBS)
 
-$(DIST_WORKER_AVX2): src/dist_worker.c src/yllm.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $< $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(DIST_WORKER_AVX2): src/dist_worker.c src/log.c src/log.h src/platform.c src/yllm.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Isrc -o $@ $< src/log.c src/platform.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 dist-worker: $(DIST_WORKER)
 dist-worker-avx2: $(DIST_WORKER_AVX2)

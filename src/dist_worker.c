@@ -28,7 +28,10 @@
 #include <stdint.h>
 #include <time.h>
 #include <errno.h>
-#define DBG(fmt, ...) do { fprintf(stderr, fmt "\n", ##__VA_ARGS__); fflush(stderr); } while (0)
+#include "log.h"
+#define DBG(fmt, ...) ylog_debug(fmt, ##__VA_ARGS__)
+#define WLN(fmt, ...) ylog_info(fmt, ##__VA_ARGS__)
+#define WERR(fmt, ...) ylog_error(fmt, ##__VA_ARGS__)
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -103,7 +106,7 @@ static int spawn_gen(const char* bin, const char* logdir,
     memset(&si, 0, sizeof(si)); memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
     if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        fprintf(stderr, "worker: CreateProcess fail (%lu)\n", GetLastError());
+        WERR("worker: CreateProcess fail (%lu)", GetLastError());
         return -1;
     }
     CloseHandle(pi.hThread);
@@ -297,8 +300,7 @@ static int run_serve(uint16_t port, const char* root)
     addr.sin_port = htons(port);
     if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(srv); return 1; }
     if (listen(srv, 8) != 0) { close(srv); return 1; }
-    fprintf(stderr, "worker: serving root %s on port %u\n", root, port);
-    fflush(stderr);
+    WLN("worker: serving root %s on port %u", root, port);
     for (;;) {
         int fd = (int)accept(srv, NULL, NULL);
         if (fd < 0) continue;
@@ -447,8 +449,7 @@ static int run_server(uint16_t port, const char* bin, const char* logdir)
     addr.sin_port = htons(port);
     if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(srv); return 1; }
     if (listen(srv, 8) != 0) { close(srv); return 1; }
-    fprintf(stderr, "worker: listening on port %u (bin=%s logdir=%s)\n", port, bin, logdir);
-    fflush(stderr);
+    WLN("worker: listening on port %u (bin=%s logdir=%s)", port, bin, logdir);
 
 for (;;) {
         int fd = (int)accept(srv, NULL, NULL);
@@ -484,7 +485,7 @@ static int run_client(const char* host, uint16_t port, const char* send)
     ws_init();
 #endif
     int fd = tcp_connect(host, port);
-    if (fd < 0) { fprintf(stderr, "connect fail\n"); return 1; }
+    if (fd < 0) { WERR("connect fail"); return 1; }
     char line[MAX_LINE];
     snprintf(line, sizeof(line), "%s\n", send);
     xsend(fd, line, strlen(line));
@@ -508,6 +509,9 @@ int main(int argc, char** argv)
     const char* logdir = "./logs";
     const char* root = NULL;
     const char* send = NULL;
+    const char* log_path = NULL;
+    const char* log_level = NULL;
+    int no_console = 0;
     int serve_mode = 0;
     uint16_t port = 9100;
     int i;
@@ -519,12 +523,28 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--serve") == 0) serve_mode = 1;
         else if (strcmp(argv[i], "--root") == 0 && i + 1 < argc) root = argv[++i];
         else if (strcmp(argv[i], "--send") == 0 && i + 1 < argc) send = argv[++i];
-        else { fprintf(stderr, "usage: dist-worker [--host ip] [--port n] [--bin path] [--logdir dir] [--send cmd] | --serve [--root dir]\n"); return 1; }
+        else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) log_path = argv[++i];
+        else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) log_level = argv[++i];
+        else if (strcmp(argv[i], "--no-console") == 0) no_console = 1;
+        else { fprintf(stderr, "usage: dist-worker [--host ip] [--port n] [--bin path] [--logdir dir] [--log file] [--log-level lvl] [--no-console] [--send cmd] | --serve [--root dir]\n"); return 1; }
     }
+    ylog_open(log_path);
+    if (no_console) ylog_set_console(0);
+    if (log_level) {
+        if (strcmp(log_level, "debug") == 0) ylog_set_level(YLOG_DEBUG);
+        else if (strcmp(log_level, "warn") == 0) ylog_set_level(YLOG_WARN);
+        else if (strcmp(log_level, "error") == 0) ylog_set_level(YLOG_ERROR);
+        else ylog_set_level(YLOG_INFO);
+    }
+    int rc;
     if (serve_mode) {
         if (!root) root = ".";
-        return run_serve(port, root);
+        rc = run_serve(port, root);
+    } else if (send) {
+        rc = run_client(host, port, send);
+    } else {
+        rc = run_server(port, bin, logdir);
     }
-    if (send) return run_client(host, port, send);
-    return run_server(port, bin, logdir);
+    ylog_close();
+    return rc;
 }
