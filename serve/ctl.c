@@ -152,18 +152,26 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
         return 0;
     }
 
-    /* stop: 停止服务(所有 rank DRAIN, supervisor QUIT → hub 随之退出) */
+    /* stop: 停止服务(所有模型的所有 rank DRAIN, supervisor QUIT → hub 随之退出) */
     if (strcmp(cmd, "stop") == 0) {
-        int r;
-        for (r = 0; r < (cfg->ranks > 0 ? cfg->ranks : 1); r++) {
-            int rfd = sock_connect("127.0.0.1", (uint16_t)(cfg->rank_port_base + r), 2);
-            if (rfd >= 0) {
-                frame_send(rfd, PROTO_DRAIN, NULL);
-                Frame rf;
-                if (frame_recv(rfd, &rf) >= 0) printf("rank-%d: %s %s\n", r, rf.cmd, rf.args);
-                close(rfd);
-            } else {
-                printf("rank-%d: 不可达(已停止?)\n", r);
+        int nm = cfg->n_models > 0 ? cfg->n_models : 1;
+        int mi, r;
+        for (mi = 0; mi < nm; mi++) {
+            int ranks = mi < cfg->n_models && cfg->models[mi].ranks > 0
+                        ? cfg->models[mi].ranks : (cfg->ranks > 0 ? cfg->ranks : 1);
+            int base = cfg->rank_port_base + mi * 16;
+            for (r = 0; r < ranks; r++) {
+                char label[32];
+                snprintf(label, sizeof(label), "rank-%d", mi * 32 + r);
+                int rfd = sock_connect("127.0.0.1", (uint16_t)(base + r), 2);
+                if (rfd >= 0) {
+                    frame_send(rfd, PROTO_DRAIN, NULL);
+                    Frame rf;
+                    if (frame_recv(rfd, &rf) >= 0) printf("%s: %s %s\n", label, rf.cmd, rf.args);
+                    close(rfd);
+                } else {
+                    printf("%s: 不可达(已停止?)\n", label);
+                }
             }
         }
         int sfd = sock_connect("127.0.0.1", (uint16_t)cfg->sv_port, 2);

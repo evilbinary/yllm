@@ -140,3 +140,55 @@ make hub / make serve / make rank / make server / make router / make supervisor 
 make status / make infer [prompt...] / make ctl ... / make sync-serve / make sync-push
 make serve-stop                          # 杀进程(强停)
 ```
+
+## OpenAI 兼容 HTTP API(端口 8000)
+
+router 提供 OpenAI 风格 REST 接口,标准 OpenAI SDK/curl 可直接使用。
+模型名用 serve.yaml 的 `model-name`(例:`tinyllama`)。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/v1/models` | 已注册模型列表 |
+| POST | `/v1/chat/completions` | chat 补全(OpenAI messages 格式) |
+| POST | `/v1/completions` | 文本补全 |
+
+### curl 示例
+
+```sh
+# 模型列表
+curl http://127.0.0.1:8000/v1/models
+
+# chat 补全
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tinyllama","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":64}'
+
+# 文本补全
+curl -X POST http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tinyllama","prompt":"Once upon a time","max_tokens":64}'
+
+# 流式(SSE)
+curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tinyllama","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"stream":true}'
+```
+
+### 请求字段
+
+| 字段 | 说明 |
+|---|---|
+| `model` | 模型名(匹配 serve.yaml `model-name`) |
+| `messages`(chat) | `[{"role":"user","content":"..."}]` |
+| `prompt`(completions) | 提示文本 |
+| `max_tokens` | 最大生成 token(默认 32) |
+| `stream` | `true` 时 SSE 分块输出 |
+
+### 响应
+
+- 非流式: OpenAI 风格 `chat.completion` / `text_completion` JSON(含 `choices`、`usage`)
+- 流式: `data: {...}` SSE 块,`finish_reason` 结束
+
+> 请求经 router → server → rank 流水线处理;若节点未就绪会返回错误。

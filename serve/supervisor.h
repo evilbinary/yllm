@@ -32,6 +32,8 @@ typedef struct {
     int auto_heal;          /* 自愈开关 */
     volatile int quit;      /* 收到 QUIT 后退出主循环 */
     int no_spawn_server;    /* hub 合并模式: server 由本进程线程承担, 不 fork */
+    ModelCfg models[CFG_MAX_MODELS];  /* 多模型: 每个模型一组 rank + 一个 server */
+    int n_models;
 } Supervisor;
 
 /* yllm supervisor: 管理节点(收全部心跳 + 汇总 + 驱动 router) */

@@ -60,30 +60,46 @@ static int spawn_proc(const char* cmdline)
 }
 
 /* 拉起一个 rank(段 r, 模型 m) */
-static int supervisor_spawn_rank(Supervisor* s, int r)
+/* 每个模型独立端口区间: 模型 mi 的 rank 端口基址 = rank_port_base + mi*16 */
+#define MODEL_PORT_STRIDE 16
+static uint16_t model_rank_base(const Supervisor* s, int mi)
 {
+    return (uint16_t)(s->rank_port_base + mi * MODEL_PORT_STRIDE);
+}
+static uint16_t model_server_port(const Supervisor* s, int mi)
+{
+    return (uint16_t)(s->server_port_base + mi * MODEL_PORT_STRIDE);
+}
+
+static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
+{
+    if (mi >= s->n_models) return -1;
+    ModelCfg* mc = &s->models[mi];
     char cmd[4096];
-    uint16_t rport = (uint16_t)(s->rank_port_base + r);
+    uint16_t rport = (uint16_t)(model_rank_base(s, mi) + r);
     snprintf(cmd, sizeof(cmd),
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %u "
-             "--supervisor %s:%u --id rank-%d --log logs/rank-%d.log",
-             s->bin, s->model, s->vocab, rport, s->sv_host, s->port, r, r);
-    ylog_info("supervisor: spawn rank %d on port %u", r, rport);
+             "--supervisor %s:%u --id rank-%d --log logs/%s-rank-%d.log",
+             s->bin, mc->model, mc->vocab, rport, s->sv_host, s->port,
+             mi * 32 + r, mc->name, r);
+    ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
     return spawn_proc(cmd);
 }
 
-/* 拉起一个 server(业务组, leader 指向 rank 组) */
-static int supervisor_spawn_server(Supervisor* s, int idx, const char* model_name)
+/* 拉起一个 server(业务组, leader 指向该模型 rank0) */
+static int supervisor_spawn_server(Supervisor* s, int mi)
 {
+    if (mi >= s->n_models) return -1;
+    ModelCfg* mc = &s->models[mi];
     char cmd[4096];
-    uint16_t sport = (uint16_t)(s->server_port_base + idx);
-    uint16_t lport = (uint16_t)(s->rank_port_base);   /* leader = rank0 */
+    uint16_t sport = model_server_port(s, mi);
+    uint16_t lport = model_rank_base(s, mi);   /* leader = rank0 */
     snprintf(cmd, sizeof(cmd),
              "\"%s\" server --id server-%d --model-name \"%s\" --leader %s:%u "
-             "--supervisor %s:%u --port %u --log logs/server-%d.log",
-             s->bin, idx, model_name, s->sv_host, lport, s->sv_host, s->port,
-             sport, idx);
-    ylog_info("supervisor: spawn server %d on port %u", idx, sport);
+             "--supervisor %s:%u --port %u --log logs/%s-server-%d.log",
+             s->bin, mi, mc->name, s->sv_host, lport, s->sv_host, s->port,
+             sport, mc->name, mi);
+    ylog_info("supervisor: spawn server %d (model %s) on port %u", mi, mc->name, sport);
     return spawn_proc(cmd);
 }
 
@@ -101,14 +117,14 @@ static void heal_dead(Supervisor* s)
             sync_server_to_router(s, n);
             if (s->auto_heal) {
                 int idx = atoi(n->node.node_id + strlen("server-"));
-                supervisor_spawn_server(s, idx, n->node.model[0] ? n->node.model : "default");
+                supervisor_spawn_server(s, idx);
             }
         } else if (strcmp(n->node.type, "rank") == 0) {
             n->node.state = NODE_STATE_DEAD;
             ylog_warn("supervisor: rank %s DEAD, respawn", n->node.node_id);
             if (s->auto_heal) {
-                int r = atoi(n->node.node_id + strlen("rank-"));
-                supervisor_spawn_rank(s, r);
+                int idx = atoi(n->node.node_id + strlen("rank-"));
+                supervisor_spawn_rank(s, idx / 32, idx % 32);
             }
         }
     }
@@ -125,7 +141,7 @@ static void handle_scale(Supervisor* s, const char* args)
         /* P3 简化: 拉起一组 rank(rank0..ranks-1) */
         int r;
         for (r = 0; r < s->ranks; r++)
-            supervisor_spawn_rank(s, r);
+            supervisor_spawn_rank(s, 0, r);
     }
 }
 
@@ -235,12 +251,16 @@ static void supervisor_bootstrap(Supervisor* s)
         ylog_info("supervisor: no model/bin configured, skip bootstrap (manual spawn only)");
         return;
     }
-    int r;
-    for (r = 0; r < s->ranks; r++)
-        supervisor_spawn_rank(s, r);
-    if (!s->no_spawn_server)
-        supervisor_spawn_server(s, 0, s->model_name[0] ? s->model_name : "default");
-    ylog_info("supervisor: bootstrap done (%d rank(s) + 1 server%s)", s->ranks,
+    int mi, r;
+    for (mi = 0; mi < s->n_models; mi++) {
+        ModelCfg* mc = &s->models[mi];
+        int ranks = mc->ranks > 0 ? mc->ranks : 1;
+        for (r = 0; r < ranks; r++)
+            supervisor_spawn_rank(s, mi, r);
+        if (!s->no_spawn_server)
+            supervisor_spawn_server(s, mi);
+    }
+    ylog_info("supervisor: bootstrap done (%d model(s)%s)", s->n_models,
               s->no_spawn_server ? ", server in-process" : "");
 }
 
@@ -288,6 +308,11 @@ int cmd_supervisor(ServeConfig* cfg)
     if (cfg->model[0]) snprintf(s.model, sizeof(s.model), "%s", cfg->model);
     if (cfg->vocab[0]) snprintf(s.vocab, sizeof(s.vocab), "%s", cfg->vocab);
     if (cfg->model_name[0]) snprintf(s.model_name, sizeof(s.model_name), "%s", cfg->model_name);
+    s.n_models = cfg->n_models;
+    {
+        int mi;
+        for (mi = 0; mi < cfg->n_models && mi < CFG_MAX_MODELS; mi++) s.models[mi] = cfg->models[mi];
+    }
 
     if (cfg->router_addrs[0]) {
         char tmp[2048];

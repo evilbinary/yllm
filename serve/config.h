@@ -16,6 +16,14 @@
 
 #define CFG_STR_MAX 1024
 
+#define CFG_MAX_MODELS 8
+typedef struct {
+    char name[CFG_STR_MAX];   /* 模型注册名(router 路由用) */
+    char model[CFG_STR_MAX];  /* llf 路径 */
+    char vocab[CFG_STR_MAX];  /* vocab 路径 */
+    int  ranks;               /* 该模型的 rank 段数 */
+} ModelCfg;
+
 typedef struct {
     /* 身份/日志 */
     char node_id[CFG_STR_MAX];
@@ -24,11 +32,13 @@ typedef struct {
     char log_level[CFG_STR_MAX];
     int  no_console;
 
-    /* 模型 */
-    char model[CFG_STR_MAX];        /* llf 路径 */
+    /* 模型(单模型兼容: 顶层字段 = models[0]; 多模型用 models: 列表) */
+    char model[CFG_STR_MAX];        /* llf 路径(= models[0].model) */
     char vocab[CFG_STR_MAX];        /* vocab 路径 */
     char model_name[CFG_STR_MAX];   /* 注册名(router 路由用) */
     char bin[CFG_STR_MAX];          /* yllm 二进制路径 */
+    ModelCfg models[CFG_MAX_MODELS];
+    int n_models;
 
     /* 端口 */
     int sv_port;            /* supervisor 心跳口   9500 */
@@ -162,27 +172,89 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
 {
     FILE* f = fopen(path, "r");
     if (!f) return;
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        char* p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
-        char* colon = strchr(p, ':');
-        if (!colon) continue;
-        *colon = '\0';
-        char* key = p;
-        char* val = colon + 1;
-        while (*val == ' ' || *val == '\t') val++;
-        /* 去行尾 \r\n 和 # 注释 */
-        size_t vlen = strlen(val);
-        while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '\r')) val[--vlen] = '\0';
-        char* hash = strchr(val, '#');
-        if (hash) *hash = '\0';
-        vlen = strlen(val);
-        while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) val[--vlen] = '\0';
-        config_set(c, key, val);
-    }
+    char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
+    buf[n] = 0;
+
+    int in_models = 0;
+    char* save = NULL;
+    char* line = strtok_r(buf, "\n", &save);
+    while (line) {
+        char* p = line;
+        int indent = 0;
+        while (*p == ' ' || *p == '\t') { p++; indent++; }
+        if (*p == '#' || *p == '\r' || *p == '\0') { line = strtok_r(NULL, "\n", &save); continue; }
+        size_t l = strlen(p);
+        while (l > 0 && (p[l-1] == '\r' || p[l-1] == '\n')) p[--l] = 0;
+
+        if (in_models) {
+            if (indent == 0) {
+                /* 顶格: 退出 models 段, 该行按普通 key 处理 */
+                in_models = 0;
+            } else {
+                if (strncmp(p, "- ", 2) == 0) {
+                    p += 2;
+                    while (*p == ' ') p++;
+                    if (c->n_models < CFG_MAX_MODELS) c->n_models++;
+                }
+                if (c->n_models > 0) {
+                    char* colon = strchr(p, ':');
+                    if (colon) {
+                        *colon = 0;
+                        char* key = p;
+                        char* val = colon + 1;
+                        while (*val == ' ' || *val == '\t') val++;
+                        char* hash = strchr(val, '#');
+                        if (hash) *hash = 0;
+                        size_t vl = strlen(val);
+                        while (vl > 0 && (val[vl-1] == ' ' || val[vl-1] == '\t' || val[vl-1] == '\r')) val[--vl] = 0;
+                        ModelCfg* mc = &c->models[c->n_models - 1];
+                        if (strcmp(key, "name") == 0) snprintf(mc->name, sizeof(mc->name), "%s", val);
+                        else if (strcmp(key, "model") == 0) snprintf(mc->model, sizeof(mc->model), "%s", val);
+                        else if (strcmp(key, "vocab") == 0) snprintf(mc->vocab, sizeof(mc->vocab), "%s", val);
+                        else if (strcmp(key, "ranks") == 0) mc->ranks = atoi(val);
+                    }
+                }
+                line = strtok_r(NULL, "\n", &save);
+                continue;
+            }
+        }
+
+        /* 普通 key: value */
+        {
+            char* colon = strchr(p, ':');
+            if (!colon) { line = strtok_r(NULL, "\n", &save); continue; }
+            *colon = 0;
+            char* key = p;
+            char* val = colon + 1;
+            while (*val == ' ' || *val == '\t') val++;
+            char* hash = strchr(val, '#');
+            if (hash) *hash = 0;
+            size_t vl = strlen(val);
+            while (vl > 0 && (val[vl-1] == ' ' || val[vl-1] == '\t' || val[vl-1] == '\r')) val[--vl] = 0;
+            if (strcmp(key, "models") == 0) in_models = 1;
+            else config_set(c, key, val);
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+
+    /* 兼容: 无 models 列表时, 顶层单模型字段填入 models[0] */
+    if (c->n_models == 0 && c->model[0]) {
+        c->n_models = 1;
+        snprintf(c->models[0].name, sizeof(c->models[0].name), "%s",
+                 c->model_name[0] ? c->model_name : "default");
+        snprintf(c->models[0].model, sizeof(c->models[0].model), "%s", c->model);
+        snprintf(c->models[0].vocab, sizeof(c->models[0].vocab), "%s", c->vocab);
+        c->models[0].ranks = c->ranks > 0 ? c->ranks : 1;
+    }
+    /* 反向: models[0] 同步到顶层(rank/server 直接读顶层字段) */
+    if (c->n_models > 0) {
+        if (c->models[0].model[0]) snprintf(c->model, sizeof(c->model), "%s", c->models[0].model);
+        if (c->models[0].vocab[0]) snprintf(c->vocab, sizeof(c->vocab), "%s", c->models[0].vocab);
+        if (c->models[0].name[0]) snprintf(c->model_name, sizeof(c->model_name), "%s", c->models[0].name);
+        if (c->models[0].ranks > 0) c->ranks = c->models[0].ranks;
+    }
 }
 
 /* 命令行散参: --key value 或 --key=value, 覆盖到 config */

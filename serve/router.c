@@ -105,6 +105,13 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
     while (frame_recv(fd, &f) >= 0) {
         if (strcmp(f.cmd, PROTO_QUERY_DONE) == 0) break;
         if (strcmp(f.cmd, PROTO_SERVER_INFO) == 0) {
+            /* 只登记 server 节点(节点表含 rank/router, 需按 type 过滤) */
+            Frame ff0;
+            snprintf(ff0.cmd, sizeof(ff0.cmd), "X");
+            snprintf(ff0.args, sizeof(ff0.args), "%s", f.args);
+            char vb0[64];
+            if (frame_get(&ff0, "type", vb0, sizeof(vb0)) == 0 && strcmp(vb0, "server") != 0)
+                continue;
             char id[128];
             if (sscanf(f.args, "%127s", id) == 1) {
                 RtServer* s = find_server(r, id);
