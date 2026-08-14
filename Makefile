@@ -56,7 +56,9 @@ endif
 LIBS += $(PLATLIBS)
 
 # ---- 标量版本(默认) ----
-CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra $(PLATDEF) $(OMPFLAG)
+# 批量 prefill(编译期开关): 默认开启, 用 make BATCH_PREFILL=0 关闭
+BATCH_PREFILL ?= 1
+CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o $(OBJDIR)/status.o $(OBJDIR)/ctl.o $(OBJDIR)/sync.o
@@ -148,7 +150,7 @@ $(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/rout
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----
-TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c
+TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c tests/test_prefill_batch.c
 
 $(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/platform.c inference/llf.c inference/matvec.c | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Itests -o $@ $< inference/platform.c inference/llf.c inference/matvec.c $(LDFLAGS) $(LIBS)
@@ -174,6 +176,12 @@ $(OBJDIR_AVX2)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX
 $(OBJDIR_AVX2)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
+$(OBJDIR)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+
+$(OBJDIR_AVX2)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+
 TEST_BIN     := $(TEST_SRC:tests/%.c=$(OBJDIR)/%.exe)
 TEST_BIN_AVX := $(TEST_SRC:tests/%.c=$(OBJDIR_AVX2)/%.exe)
 
@@ -186,6 +194,8 @@ test: $(TEST_BIN)
 	./$(OBJDIR)/test_llf.exe
 	@echo "=== test_engine ==="
 	./$(OBJDIR)/test_engine.exe
+	@echo "=== test_prefill_batch ==="
+	./$(OBJDIR)/test_prefill_batch.exe
 
 test-avx2: $(TEST_BIN_AVX)
 	@echo "=== test_matvec (avx2) ==="
@@ -196,6 +206,8 @@ test-avx2: $(TEST_BIN_AVX)
 	./$(OBJDIR_AVX2)/test_llf.exe
 	@echo "=== test_engine (avx2) ==="
 	./$(OBJDIR_AVX2)/test_engine.exe
+	@echo "=== test_prefill_batch (avx2) ==="
+	./$(OBJDIR_AVX2)/test_prefill_batch.exe
 
 # ---- 集成: 转换模型 + 运行 chat/gen ----
 MODEL_GGUF  ?= tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf

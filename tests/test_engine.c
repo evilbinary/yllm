@@ -32,7 +32,9 @@ static int g_pass = 0;
 int main(int argc, char** argv)
 {
     const char* model_path = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf";
+    const char* vocab_path = "models/tinyllama.vocab.txt";
     if (argc > 1) model_path = argv[1];
+    if (argc > 2) vocab_path = argv[2];
 
     Engine e;
     char err[1024];
@@ -84,6 +86,9 @@ int main(int argc, char** argv)
     }
 
     engine_free(&e);
+
     printf("engine tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
+
+

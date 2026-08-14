@@ -106,6 +106,16 @@ typedef struct {
     float* ffn;
     float* att;
     float* logits;
+    /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
+    float* pb;      /* [PB_MAX × hidden]  输入/残差 */
+    float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */
+    float* pbq;     /* [PB_MAX × hidden]  query */
+    float* pbk;     /* [PB_MAX × kv_dim]  key */
+    float* pbv;     /* [PB_MAX × kv_dim]  value */
+    float* pbg;     /* [PB_MAX × inter]   gate */
+    float* pbu;     /* [PB_MAX × inter]   up */
+    float* pba;     /* [PB_MAX × n_heads × max_seq] 注意力分数 */
+    uint32_t pb_cap;    /* 当前分配的批容量 */
     uint64_t stat_reads;
     uint64_t stat_releases;
     uint64_t stat_faults;
@@ -125,6 +135,13 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
                          float* x_out, float* logits_out);
 void engine_set_layers(Engine* e, uint32_t begin, uint32_t end);
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out);
+/* 批量 matmul(批量 prefill): y[B×out] = x[B×in] · W^T */
+void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in,
+                  uint32_t dtype, uint32_t B);
+
+/* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
+int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos);
+
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
                     int (*on_token)(uint32_t id, void* ctx), void* ctx,

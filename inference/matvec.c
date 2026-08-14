@@ -158,6 +158,27 @@ void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps, 
     }
 }
 
+/* Q6_K 块反量化到 tmp[256](批量路径用, 无逐元素函数调用) */
+static void q6k_block(float* y, const uint8_t* blk)
+{
+    float d = f16_to_f32(((const uint16_t*)blk)[104]);
+    uint32_t half, e;
+    for (half = 0; half < 2; half++) {
+        const uint8_t* ql = blk + half * 64;
+        const uint8_t* qh = blk + 128 + half * 32;
+        const int8_t* sc = (const int8_t*)(blk + 192) + half * 8;
+        for (e = 0; e < 128; e++) {
+            uint32_t quad = e >> 5;
+            uint32_t ll = e & 31;
+            uint8_t qb = ql[(quad & 1) * 32 + ll];
+            uint8_t bits = (uint8_t)(((quad & 2) ? (qb >> 4) : (qb & 0xF)) | (((qh[ll] >> (quad * 2)) & 3) << 4));
+            int8_t q = (int8_t)bits - 32;
+            int8_t s = sc[quad * 2 + (ll >> 4)];
+            y[half * 128 + e] = d * (float)s * (float)q;
+        }
+    }
+}
+
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t nb = in / 256;
@@ -200,6 +221,19 @@ void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint3
         float acc = 0.0f;
         uint32_t ii;
         for (ii = 0; ii < in; ii++) acc += x[ii] * wp[(size_t)ii * out + oo];
+        y[oo] = acc;
+    }
+}
+
+void matmul_f16_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out)
+{
+    const uint16_t* wp = (const uint16_t*)w;
+    uint32_t oo;
+    #pragma omp parallel for schedule(static)
+    for (oo = 0; oo < out; oo++) {
+        float acc = 0.0f;
+        uint32_t ii;
+        for (ii = 0; ii < in; ii++) acc += x[ii] * f16_to_f32(wp[(size_t)ii * out + oo]);
         y[oo] = acc;
     }
 }
@@ -460,16 +494,67 @@ void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t i
     }
 }
 
-void matmul_f16_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out)
+/* ---- 批量 matmul(批量 prefill 用): y[B×out] = x[B×in] · W^T
+ * 每个输出行 oo: 同时算 B 个 token 的点积, 权重行只读一次(每 4 token 一组 SIMD)。 */
+/* ---- 批量 matmul(批量 prefill 用): y[B×out] = x[B×in] · W^T
+ * 每个 256 元素块只反量化一次(tmp[256]), 权重对整批 token 共享(内存带宽 ÷B)。
+ * Q4K/Q6K/IQ4XS 用各自的反量化; f32/f16 直接拷贝。AVX2 构建用 SIMD 点积,
+ * 基础构建用标量点积(编译器 -O2 自动向量化)。 */
+void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in,
+                  uint32_t dtype, uint32_t B)
 {
+    uint32_t nb = in / 256;
     uint32_t oo;
-    const uint16_t* wp = (const uint16_t*)w;
+    const uint32_t blk = (dtype == DT_Q6K) ? 210 : 144;
+    if (dtype == DT_F32 || dtype == DT_F16) {
+        /* f32/f16: 逐 token 点积 */
+        uint32_t g, i;
+        #pragma omp parallel for schedule(static)
+        for (oo = 0; oo < out; oo++) {
+            for (g = 0; g < B; g++) {
+                const float* xg = x + (size_t)g * in;
+                float acc = 0.0f;
+                if (dtype == DT_F32) {
+                    const float* wp = (const float*)w + (size_t)oo * in;
+                    for (i = 0; i < in; i++) acc += xg[i] * wp[i];
+                } else {
+                    const uint16_t* wp = (const uint16_t*)w + (size_t)oo * in;
+                    for (i = 0; i < in; i++) acc += xg[i] * f16_to_f32(wp[i]);
+                }
+                y[(size_t)g * out + oo] = acc;
+            }
+        }
+        return;
+    }
+    /* 量化 dtype(Q4K/Q6K/IQ4XS): 块反量化共享 + 批量点积 */
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
-        float acc = 0.0f;
-        uint32_t ii;
-        for (ii = 0; ii < in; ii++) acc += x[ii] * f16_to_f32(wp[(size_t)ii * out + oo]);
-        y[oo] = acc;
+        const uint8_t* row = w + (size_t)oo * nb * blk;
+        float* acc = (float*)malloc((size_t)B * 4);
+        float tmp[256];   /* 每线程独立, 避免共享数组踩踏 */
+        uint32_t b, g;
+        for (g = 0; g < B; g++) acc[g] = 0.0f;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* bp = row + (size_t)b * blk;
+            if (dtype == DT_Q4K) q4k_block(tmp, bp, 0);
+            else if (dtype == DT_Q6K) q6k_block(tmp, bp);
+            else iq4xs_block(tmp, bp, f16_to_f32(((const uint16_t*)bp)[0]));
+            for (g = 0; g < B; g++) {
+                const float* xg = x + (size_t)g * in + (size_t)b * 256;
+#ifdef __AVX2__
+                __m256 sv = _mm256_setzero_ps();
+                uint32_t i;
+                for (i = 0; i < 256; i += 8)
+                    sv = _mm256_fmadd_ps(_mm256_loadu_ps(tmp + i), _mm256_loadu_ps(xg + i), sv);
+                acc[g] += hsum_avx2(sv);
+#else
+                uint32_t i;
+                for (i = 0; i < 256; i++) acc[g] += tmp[i] * xg[i];
+#endif
+            }
+        }
+        for (g = 0; g < B; g++) y[(size_t)g * out + oo] = acc[g];
+        free(acc);
     }
 }
 

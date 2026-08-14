@@ -214,6 +214,20 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->ffn = (float*)ycalloc((size_t)2 * inter, 4);
     e->att = (float*)ymalloc((size_t)e->max_seq * m->h.n_heads * 4);
     e->logits = (float*)ymalloc((size_t)vocab * 4);
+    /* 批量 prefill 工作区 */
+    {
+        uint32_t PB_MAX = 64;
+        uint32_t kv_dim2 = m->h.n_kv_heads * m->h.head_dim;
+        e->pb_cap = PB_MAX;
+        e->pb  = (float*)ycalloc((size_t)PB_MAX * hidden, 4);
+        e->pb2 = (float*)ycalloc((size_t)PB_MAX * hidden, 4);
+        e->pbq = (float*)ycalloc((size_t)PB_MAX * hidden, 4);
+        e->pbk = (float*)ycalloc((size_t)PB_MAX * kv_dim2, 4);
+        e->pbv = (float*)ycalloc((size_t)PB_MAX * kv_dim2, 4);
+        e->pbg = (float*)ycalloc((size_t)PB_MAX * inter, 4);
+        e->pbu = (float*)ycalloc((size_t)PB_MAX * inter, 4);
+        e->pba = (float*)ymalloc((size_t)PB_MAX * m->h.n_heads * e->max_seq * 4);
+    }
 
     Worker* w = (Worker*)ycalloc(1, sizeof(Worker));
     w->ws = ws;
@@ -250,6 +264,9 @@ void engine_free(Engine* e)
     free(e->ffn);
     free(e->att);
     free(e->logits);
+    free(e->pb); free(e->pb2); free(e->pbq);
+    free(e->pbk); free(e->pbv); free(e->pbg); free(e->pbu);
+    free(e->pba);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
     if (e->ws.hot) free(e->ws.hot);
@@ -257,6 +274,210 @@ void engine_free(Engine* e)
     if (e->ws.layer_size) free(e->ws.layer_size);
     free(w);
     memset(e, 0, sizeof(*e));
+}
+
+/* 批量前向一层: 同时处理 B 个 token(pos 连续: pos_start..pos_start+B-1) */
+static int forward_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
+    uint32_t hidden = h->hidden;
+    uint32_t kv_dim = h->n_kv_heads * h->head_dim;
+    float eps, theta;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    memcpy(&theta, &h->rope_theta_bits, 4);
+    uint32_t hidx = m->base_idx[layer];
+    const LlfTensorMeta* mt = &m->metas[hidx];
+    uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
+    uint32_t b;
+
+    /* 1) norm + QKV(批量) */
+    for (b = 0; b < B; b++)
+        rmsnorm(e->pb2 + (size_t)b * hidden, e->pb + (size_t)b * hidden,
+                base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+    matmul_batch(e->pbq, e->pb2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype, B);
+    matmul_batch(e->pbk, e->pb2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype, B);
+    matmul_batch(e->pbv, e->pb2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype, B);
+
+    /* 2) bias + QK-norm */
+    if (mt[SLOT_QBIAS].size > 0) {
+        const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
+        for (b = 0; b < B; b++) {
+            float* q = e->pbq + (size_t)b * hidden;
+            uint32_t j;
+            for (j = 0; j < hidden; j++) q[j] += bq[j];
+        }
+    }
+    if (mt[SLOT_KBIAS].size > 0) {
+        const float* bk = (const float*)(base + mt[SLOT_KBIAS].offset);
+        for (b = 0; b < B; b++) {
+            float* k = e->pbk + (size_t)b * kv_dim;
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) k[j] += bk[j];
+        }
+    }
+    if (mt[SLOT_VBIAS].size > 0) {
+        const float* bv = (const float*)(base + mt[SLOT_VBIAS].offset);
+        for (b = 0; b < B; b++) {
+            float* v = e->pbv + (size_t)b * kv_dim;
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) v[j] += bv[j];
+        }
+    }
+    if (mt[SLOT_QNORM].size > 0 || mt[SLOT_KNORM].size > 0) {
+        for (b = 0; b < B; b++) {
+            float* q = e->pbq + (size_t)b * hidden;
+            float* k = e->pbk + (size_t)b * kv_dim;
+            uint32_t hh;
+            if (mt[SLOT_QNORM].size > 0)
+                for (hh = 0; hh < h->n_heads; hh++)
+                    rmsnorm(q + (size_t)hh * h->head_dim, q + (size_t)hh * h->head_dim,
+                            base + mt[SLOT_QNORM].offset, h->head_dim, eps, mt[SLOT_QNORM].dtype);
+            if (mt[SLOT_KNORM].size > 0)
+                for (hh = 0; hh < h->n_kv_heads; hh++)
+                    rmsnorm(k + (size_t)hh * h->head_dim, k + (size_t)hh * h->head_dim,
+                            base + mt[SLOT_KNORM].offset, h->head_dim, eps, mt[SLOT_KNORM].dtype);
+        }
+    }
+
+    /* 3) RoPE + KV 写入(每 token 独立 pos) */
+    for (b = 0; b < B; b++) {
+        uint32_t pos = pos_start + b;
+        float* q = e->pbq + (size_t)b * hidden;
+        float* k = e->pbk + (size_t)b * kv_dim;
+        uint32_t hh;
+        for (hh = 0; hh < h->n_heads; hh++) {
+            if (h->arch == ARCH_QWEN)
+                rope_inplace_qwen(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+            else
+                rope_inplace(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+        }
+        for (hh = 0; hh < h->n_kv_heads; hh++) {
+            if (h->arch == ARCH_QWEN)
+                rope_inplace_qwen(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+            else
+                rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
+        }
+        {
+            uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
+            uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
+            uint64_t kvp = (uint64_t)pos * kv_dim;
+            const float* kvk = e->pbk + (size_t)b * kv_dim;
+            const float* kvv = e->pbv + (size_t)b * kv_dim;
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) {
+                kcache[kvp + j] = f32_to_f16(kvk[j]);
+                vcache[kvp + j] = f32_to_f16(kvv[j]);
+            }
+        }
+    }
+
+    /* 4) 注意力: 每 token 因果关注 0..pos_b; 并行于 head */
+    {
+        uint32_t hh;
+        #pragma omp parallel for schedule(static)
+        for (hh = 0; hh < h->n_heads; hh++) {
+            uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
+            uint32_t bb;
+            for (bb = 0; bb < B; bb++) {
+                uint32_t pos = pos_start + bb;
+                const float* qh = e->pbq + (size_t)bb * hidden + (size_t)hh * h->head_dim;
+                float* att_h = e->pba + ((size_t)bb * h->n_heads + hh) * e->max_seq;
+                float inv_d = 1.0f / sqrtf((float)h->head_dim);
+                uint32_t s, jj;
+                for (s = 0; s <= pos; s++) {
+                    const uint16_t* kh = e->kv + (size_t)layer * e->max_seq * kv_dim
+                                         + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
+                    float acc = 0.0f;
+                    for (jj = 0; jj < h->head_dim; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
+                    att_h[s] = acc * inv_d;
+                }
+                softmax(att_h, pos + 1);
+                float* out = e->pb2 + (size_t)bb * hidden + (size_t)hh * h->head_dim;
+                memset(out, 0, (size_t)h->head_dim * 4);
+                for (s = 0; s <= pos; s++) {
+                    const uint16_t* vh = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim
+                                         + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
+                    float a = att_h[s];
+                    for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+                }
+            }
+        }
+    }
+
+    /* 5) o_proj + 残差, norm2, FFN */
+    matmul_batch(e->pbq, e->pb2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype, B);
+    for (b = 0; b < B; b++) {
+        float* xb = e->pb + (size_t)b * hidden;
+        float* ob = e->pbq + (size_t)b * hidden;
+        uint32_t j;
+        for (j = 0; j < hidden; j++) xb[j] += ob[j];
+        rmsnorm(e->pb2 + (size_t)b * hidden, xb, base + mt[SLOT_NORM2].offset,
+                hidden, eps, mt[SLOT_NORM2].dtype);
+    }
+    matmul_batch(e->pbg, e->pb2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype, B);
+    matmul_batch(e->pbu, e->pb2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype, B);
+    /* swiglu 输出必须是 [B × inter] 布局(down 的输入维度是 inter, 复用 pbg) */
+    for (b = 0; b < B; b++)
+        swiglu(e->pbg + (size_t)b * inter, e->pbg + (size_t)b * inter, e->pbu + (size_t)b * inter, inter);
+    matmul_batch(e->pbq, e->pbg, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype, B);
+    for (b = 0; b < B; b++) {
+        float* xb = e->pb + (size_t)b * hidden;
+        uint32_t j;
+        for (j = 0; j < hidden; j++) xb[j] += e->pbq[(size_t)b * hidden + j];
+    }
+    return 0;
+}
+
+/* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
+int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    uint32_t hidden = h->hidden;
+    uint32_t hidx0 = m->base_idx[0];
+    const LlfTensorMeta* tm = &m->metas[hidx0];
+    const uint8_t* base = (const uint8_t*)ws->map.base;
+    uint32_t B = e->pb_cap ? e->pb_cap : 16;
+    int off = 0;
+    while (off < n) {
+        uint32_t nb = (uint32_t)(n - off);
+        if (nb > B) nb = B;
+        /* embed 全部 batch token */
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* emb = base + m->dir[0].offset;
+            switch (tm->dtype) {
+            case DT_F32: embed_f32(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
+            case DT_Q4K: embed_q4k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
+            case DT_Q6K: embed_q6k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
+            case DT_IQ4XS: embed_iq4xs(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
+            default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
+            }
+        }
+        uint32_t i;
+        for (i = 1; i <= h->n_blocks; i++)
+            forward_block_batch(e, i, (uint32_t)(start_pos + off), nb);
+        /* 最后一层: final norm + output(只算最后 token) */
+        {
+            const LlfTensorMeta* fn = &m->metas[m->base_idx[h->n_blocks + 1]];
+            const LlfTensorMeta* out = &m->metas[m->base_idx[h->n_blocks + 2]];
+            float eps;
+            memcpy(&eps, &h->norm_eps_bits, 4);
+            if (off + (int)nb == n) {
+                float* xlast = e->pb + (size_t)(nb - 1) * hidden;
+                rmsnorm(e->x, xlast, base + m->dir[h->n_blocks + 1].offset + fn->offset,
+                        hidden, eps, fn->dtype);
+                matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
+                       h->vocab, hidden, out->dtype);
+            }
+        }
+        off += (int)nb;
+    }
+    return 0;
 }
 
 static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
@@ -529,6 +750,11 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
 }
 
 /* 返回 0 成功;-1 失败。timings 非空时填充 prefill/decode 分别的耗时与 token 数 */
+/* 批量 prefill: 默认开启; 编译期关闭用 -DYLLM_BATCH_PREFILL=0 */
+#ifndef YLLM_BATCH_PREFILL
+#define YLLM_BATCH_PREFILL 1
+#endif
+
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
                     int (*on_token)(uint32_t id, void* ctx), void* ctx,
@@ -539,6 +765,16 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
     int i;
     uint64_t t0 = 0, t1 = 0;
     if (timings) { memset(timings, 0, sizeof(*timings)); t0 = ynow_ms(); }
+#if YLLM_BATCH_PREFILL
+    if (nprompt > 0) {
+        if ((uint32_t)nprompt > e->max_seq) {
+            if (err) snprintf(err, errlen, "prompt too long");
+            return -1;
+        }
+        engine_forward_prefill(e, prompt, nprompt, 0);
+        pos = (uint32_t)nprompt;
+    }
+#else
     for (i = 0; i < nprompt; i++) {
         if (pos >= e->max_seq) {
             if (err) snprintf(err, errlen, "prompt too long");
@@ -547,6 +783,7 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         engine_forward(e, prompt[i], pos);
         pos++;
     }
+#endif
     if (timings) {
         timings->n_prefill = nprompt > 0 ? (uint32_t)nprompt : 0;
         t1 = ynow_ms();
