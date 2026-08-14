@@ -12,9 +12,11 @@
 #include "sock.h"
 #include "config.h"
 #include "status.h"
+#include "proclist.h"
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 #endif
 #include "../inference/log.h"
 #include <stdio.h>
@@ -66,6 +68,148 @@ static int ctl_target_port(ServeConfig* cfg, const char* target)
     return -1;
 }
 
+/* 强制清理残留的 yllm 服务进程(hub/supervisor/router/server/rank),
+ * 排除 ctl 自身与其他子命令(convert/chat/gen/dump 等)。
+ * 跨平台: Linux /proc 扫描, Windows Toolhelp + PEB 命令行(proclist.h) */
+static int kill_leftover_proc(int pid, const char* cmdline, void* ctx)
+{
+    const char* bin_hint = (const char*)ctx;
+    if (pid <= 0 || pid == getpid()) return 0;
+    if (!strstr(cmdline, "yllm")) return 0;
+    if (strstr(cmdline, " ctl") || strstr(cmdline, " chat") || strstr(cmdline, " convert") ||
+        strstr(cmdline, " gen ") || strstr(cmdline, " dump")) return 0;
+    if (!strstr(cmdline, " hub ") && !strstr(cmdline, " supervisor ") &&
+        !strstr(cmdline, " router ") && !strstr(cmdline, " server ") &&
+        !strstr(cmdline, " rank ")) return 0;
+    if (bin_hint && bin_hint[0] && !strstr(cmdline, bin_hint)) return 0;
+    printf("exit: force-kill pid %d (%s)\n", pid, cmdline);
+#ifdef _WIN32
+    {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
+        if (h) { TerminateProcess(h, 1); CloseHandle(h); }
+    }
+#else
+    kill(pid, SIGKILL);
+#endif
+    return 0;
+}
+
+static void kill_leftover_processes(const char* bin_hint)
+{
+    proclist_visit(kill_leftover_proc, (void*)bin_hint);
+}
+
+/* stop: 优雅停止服务(rank DRAIN + supervisor QUIT → hub 随之退出) */
+static int ctl_stop(ServeConfig* cfg)
+{
+    int nm = cfg->n_models > 0 ? cfg->n_models : 1;
+    int stride = cfg_model_stride(cfg);
+    int mi, r;
+    for (mi = 0; mi < nm; mi++) {
+        int ranks = mi < cfg->n_models && cfg->models[mi].ranks > 0
+                    ? cfg->models[mi].ranks : (cfg->ranks > 0 ? cfg->ranks : 1);
+        for (r = 0; r < ranks; r++) {
+            int idx = mi * stride + r;
+            char label[32];
+            snprintf(label, sizeof(label), "rank-%d", idx);
+            int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->rank_port_base + idx), 1);
+            if (fd >= 0) {
+                frame_send(fd, PROTO_DRAIN, NULL);
+                Frame f;
+                if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
+                sock_close(fd);
+            } else {
+                printf("%s: 不可达(已停止?)\n", label);
+            }
+        }
+    }
+    int sfd = sock_connect("127.0.0.1", (uint16_t)cfg->sv_port, 1);
+    if (sfd >= 0) {
+        frame_send(sfd, PROTO_QUIT, NULL);
+        Frame f;
+        if (frame_recv(sfd, &f) >= 0) printf("supervisor: %s %s\n", f.cmd, f.args);
+        sock_close(sfd);
+    } else {
+        printf("supervisor: 不可达(已停止?)\n");
+    }
+    return 0;
+}
+
+/* exit: 全退 — DRAIN 所有 rank/server, QUIT router/supervisor, 再兜底强杀残留 */
+static int ctl_exit(ServeConfig* cfg)
+{
+    int nm = cfg->n_models > 0 ? cfg->n_models : 1;
+    int stride = cfg_model_stride(cfg);
+    int mi, r;
+    /* 1) DRAIN 所有 rank(动态步长, 多模型) */
+    for (mi = 0; mi < nm; mi++) {
+        int ranks = mi < cfg->n_models && cfg->models[mi].ranks > 0
+                    ? cfg->models[mi].ranks : (cfg->ranks > 0 ? cfg->ranks : 1);
+        for (r = 0; r < ranks; r++) {
+            int idx = mi * stride + r;
+            char label[32];
+            snprintf(label, sizeof(label), "rank-%d", idx);
+            int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->rank_port_base + idx), 1);
+            if (fd >= 0) {
+                frame_send(fd, PROTO_DRAIN, NULL);
+                Frame f;
+                if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
+                sock_close(fd);
+            } else {
+                printf("%s: 不可达(已停止?)\n", label);
+            }
+        }
+    }
+    /* 2) DRAIN 所有 server */
+    for (mi = 0; mi < nm; mi++) {
+        char label[32];
+        snprintf(label, sizeof(label), "server-%d", mi);
+        int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->server_port + mi * stride), 1);
+        if (fd >= 0) {
+            frame_send(fd, PROTO_DRAIN, NULL);
+            Frame f;
+            if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
+            sock_close(fd);
+        } else {
+            printf("%s: 不可达(已停止?)\n", label);
+        }
+    }
+    /* 3) QUIT router / supervisor */
+    {
+        struct { const char* name; int port; } tops[2] = {
+            { "router", cfg->router_port },
+            { "supervisor", cfg->sv_port },
+        };
+        int t;
+        for (t = 0; t < 2; t++) {
+            int fd = sock_connect("127.0.0.1", (uint16_t)tops[t].port, 1);
+            if (fd >= 0) {
+                frame_send(fd, PROTO_QUIT, NULL);
+                Frame f;
+                if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", tops[t].name, f.cmd, f.args);
+                sock_close(fd);
+            } else {
+                printf("%s: 不可达(已停止?)\n", tops[t].name);
+            }
+        }
+    }
+    /* 4) 兜底强杀: 等 3s 让 DRAIN/QUIT 优雅退出(engine_free 释放模型需 1~2s),
+     *    残留的一并清理 */
+    {
+        struct timespec ts;
+        ts.tv_sec = 3;
+        ts.tv_nsec = 0;
+        nanosleep(&ts, NULL);
+        char bin_hint[128] = "";
+        if (cfg->bin[0]) {
+            const char* base = strrchr(cfg->bin, '/');
+            snprintf(bin_hint, sizeof(bin_hint), "%s", base ? base + 1 : cfg->bin);
+        }
+        kill_leftover_processes(bin_hint);
+    }
+    return 0;
+}
+
 /* 支持两种写法:
  *   yllm ctl --target rank-0 --cmd PING
  *   yllm ctl rank-0 PING      /   yllm ctl r0 PING   /   yllm ctl status
@@ -102,7 +246,7 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
     if (pos[2] && !(pos[0] && strcmp(pos[0], "start") == 0)) need_groups = atoi(pos[2]);
     if (!cmd) {
         fprintf(stderr, "usage: yllm ctl [--target <rank-0|r0|server|s0|router|rt|supervisor|sv>] "
-                        "--cmd <PING|STAT|DRAIN|QUIT|SCALE|QUERY_SERVERS|status|stop|start> [--need-groups N]\n");
+                        "--cmd <PING|STAT|DRAIN|QUIT|SCALE|QUERY_SERVERS|status|start|stop|exit> [--need-groups N]\n");
         fprintf(stderr, "   or: yllm ctl <target> <cmd> [need]   e.g. yllm ctl r0 PING / yllm ctl status\n");
         return 1;
     }
@@ -171,39 +315,9 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
         return 0;
     }
 
-    /* stop: 停止服务(所有模型的所有 rank DRAIN, supervisor QUIT → hub 随之退出) */
-    if (strcmp(cmd, "stop") == 0) {
-        int nm = cfg->n_models > 0 ? cfg->n_models : 1;
-        int mi, r;
-        for (mi = 0; mi < nm; mi++) {
-            int ranks = mi < cfg->n_models && cfg->models[mi].ranks > 0
-                        ? cfg->models[mi].ranks : (cfg->ranks > 0 ? cfg->ranks : 1);
-            int base = cfg->rank_port_base + mi * 16;
-            for (r = 0; r < ranks; r++) {
-                char label[32];
-                snprintf(label, sizeof(label), "rank-%d", mi * 32 + r);
-                int rfd = sock_connect("127.0.0.1", (uint16_t)(base + r), 2);
-                if (rfd >= 0) {
-                    frame_send(rfd, PROTO_DRAIN, NULL);
-                    Frame rf;
-                    if (frame_recv(rfd, &rf) >= 0) printf("%s: %s %s\n", label, rf.cmd, rf.args);
-                    sock_close(rfd);
-                } else {
-                    printf("%s: 不可达(已停止?)\n", label);
-                }
-            }
-        }
-        int sfd = sock_connect("127.0.0.1", (uint16_t)cfg->sv_port, 2);
-        if (sfd >= 0) {
-            frame_send(sfd, PROTO_QUIT, NULL);
-            Frame sf;
-            if (frame_recv(sfd, &sf) >= 0) printf("supervisor: %s %s\n", sf.cmd, sf.args);
-            sock_close(sfd);
-        } else {
-            printf("supervisor: 不可达(已停止?)\n");
-        }
-        return 0;
-    }
+    /* stop: 优雅停止(rank DRAIN + supervisor QUIT); exit: 全退(所有节点 + 强杀残留) */
+    if (strcmp(cmd, "stop") == 0) return ctl_stop(cfg);
+    if (strcmp(cmd, "exit") == 0) return ctl_exit(cfg);
 
     if (!target) target = "supervisor";
     int port = ctl_target_port(cfg, target);

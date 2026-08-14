@@ -143,7 +143,11 @@ int cmd_hub(ServeConfig* cfg)
     ythread_create(&t2, rt_thread, &c2);
     for (mi = 0; mi < cfg->n_models; mi++)
         ythread_create(&t3[mi], srv_thread, &c3[mi]);
+    /* supervisor 退出(ctl stop/exit 的 QUIT)→ 通知 router/server 线程一并退出 */
     ythread_join(&t1);
+    rt.quit = 1;
+    for (mi = 0; mi < cfg->n_models; mi++)
+        srv[mi].quit = 1;
     ythread_join(&t2);
     for (mi = 0; mi < cfg->n_models; mi++)
         ythread_join(&t3[mi]);
