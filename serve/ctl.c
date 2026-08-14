@@ -17,6 +17,21 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
+#else
+#include <windows.h>
+#include <process.h>
+#define getpid() _getpid()
+static void ysleep_ms(int ms) { Sleep((DWORD)ms); }
+#endif
+#ifndef _WIN32
+static void ysleep_ms(int ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
 #endif
 #include "../inference/log.h"
 #include <stdio.h>
@@ -195,18 +210,13 @@ static int ctl_exit(ServeConfig* cfg)
     }
     /* 4) 兜底强杀: 等 3s 让 DRAIN/QUIT 优雅退出(engine_free 释放模型需 1~2s),
      *    残留的一并清理 */
-    {
-        struct timespec ts;
-        ts.tv_sec = 3;
-        ts.tv_nsec = 0;
-        nanosleep(&ts, NULL);
-        char bin_hint[128] = "";
-        if (cfg->bin[0]) {
-            const char* base = strrchr(cfg->bin, '/');
-            snprintf(bin_hint, sizeof(bin_hint), "%s", base ? base + 1 : cfg->bin);
-        }
-        kill_leftover_processes(bin_hint);
+    ysleep_ms(3000);
+    char bin_hint[128] = "";
+    if (cfg->bin[0]) {
+        const char* base = strrchr(cfg->bin, '/');
+        snprintf(bin_hint, sizeof(bin_hint), "%s", base ? base + 1 : cfg->bin);
     }
+    kill_leftover_processes(bin_hint);
     return 0;
 }
 
