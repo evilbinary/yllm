@@ -321,6 +321,8 @@ int cmd_rank(ServeConfig* cfg)
         return 1;
     }
 
+    sock_init(); /* sock_local_ip(取本机 IP)依赖 winsock, 必须先初始化 */
+
     Rank r;
     memset(&r, 0, sizeof(r));
     r.temp = cfg->temp;
