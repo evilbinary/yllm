@@ -106,6 +106,7 @@ int cmd_hub(ServeConfig* cfg)
         ModelCfg* mc = &cfg->models[mi];
         Server* s = &srv[mi];
         memset(s, 0, sizeof(*s));
+        s->start_s = (uint64_t)time(NULL);
         snprintf(s->node.node_id, sizeof(s->node.node_id), "server-%d", mi);
         snprintf(s->node.type, sizeof(s->node.type), "server");
         snprintf(s->node.model, sizeof(s->node.model), "%s",

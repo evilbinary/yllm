@@ -17,6 +17,17 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* ---- 协议版本(节点间通信握手用) ----
+ * 版本不匹配的节点拒绝通信, 避免新旧混跑解析错乱。
+ * 改动帧格式/语义时递增此号。 */
+#define PROTO_VERSION 1
+#define PROTO_VERSION_STR "yllm-proto-1"
+
+/* HELLO <version> <node_id> <type>\n → HELLO_OK <version>\n | ERR version mismatch\n
+ * 连接建立后的第一条帧, 双方交换版本与身份。 */
+#define PROTO_HELLO "HELLO"
+#define PROTO_HELLO_OK "HELLO_OK"
+
 /* ---- rank 帧(server / supervisor → rank) ---- */
 
 /* PING\n → OK READY\n | OK LOADING\n | ERR <msg>

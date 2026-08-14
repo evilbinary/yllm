@@ -216,13 +216,13 @@ static int handle_infer(int fd, Rank* r, char* args)
     return 0;
 }
 
-static int handle_frame(int fd, Rank* r, char* line)
+static int handle_frame(int fd, Rank* r, const Frame* f)
 {
-    if (strcmp(line, PROTO_PING) == 0) return handle_ping(fd, r);
-    if (strcmp(line, PROTO_STAT) == 0) return handle_stat(fd, r);
-    if (strncmp(line, PROTO_INFER " ", 6) == 0) return handle_infer(fd, r, line + 6);
-    if (strcmp(line, PROTO_DRAIN) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
-    if (strcmp(line, PROTO_QUIT) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
+    if (strcmp(f->cmd, PROTO_PING) == 0) return handle_ping(fd, r);
+    if (strcmp(f->cmd, PROTO_STAT) == 0) return handle_stat(fd, r);
+    if (strcmp(f->cmd, PROTO_INFER) == 0) return handle_infer(fd, r, (char*)f->args);
+    if (strcmp(f->cmd, PROTO_DRAIN) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
+    if (strcmp(f->cmd, PROTO_QUIT) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
     send_line(fd, "ERR unknown cmd");
     return 0;
 }
@@ -236,10 +236,9 @@ static void* rank_conn(void* arg)
 {
     int fd = (int)(intptr_t)arg;
     Rank* r = rank_conn_rank;
-    char line[RANK_MAX_LINE];
-    int n = recv_line_rank(fd, line, sizeof(line));
-    if (n >= 0) {
-        handle_frame(fd, r, line);
+    Frame f;
+    if (frame_recv(fd, &f) >= 0) {
+        handle_frame(fd, r, &f);
     }
     sock_close(fd);
     return NULL;

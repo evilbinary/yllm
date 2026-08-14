@@ -206,11 +206,9 @@ int router_infer(Router* r, const char* model, int max_tokens,
     if (!s) { ylog_warn("router_infer: no ready server for %s", model); return -1; }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) { ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
-    char line[RT_MAX_LINE];
-    snprintf(line, sizeof(line), "%s %d %zu", PROTO_INFER, max_tokens, plen);
-    sock_send_n(sfd, line, strlen(line));
-    sock_send_n(sfd, "\n", 1);
-    if (plen > 0) sock_send_n(sfd, prompt, plen);
+    char args[128];
+    snprintf(args, sizeof(args), "%d %zu", max_tokens, plen);
+    frame_send_payload(sfd, PROTO_INFER, args, prompt, plen);
 
     pthread_mutex_lock(&r->lock);
     s->inflight++;
@@ -257,16 +255,16 @@ static void handle_client_infer(int fd, Router* r, const char *args)
         return;
     }
     /* 转发 INFER 头 + prompt */
-    char line[RT_MAX_LINE];
-    snprintf(line, sizeof(line), "%s %d %ld", PROTO_INFER, max_tokens, nbytes);
-    sock_send_n(sfd, line, strlen(line));
-    sock_send_n(sfd, "\n", 1);
+    char infer_args[128];
+    snprintf(infer_args, sizeof(infer_args), "%d %ld", max_tokens, nbytes);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
         if (!pb) { sock_close(sfd); sock_send_line(fd, "ERR oom"); return; }
         if (sock_recv_n(fd, pb, (size_t)nbytes) != 0) { free(pb); sock_close(sfd); return; }
-        sock_send_n(sfd, pb, (size_t)nbytes);
+        frame_send_payload(sfd, PROTO_INFER, infer_args, pb, (size_t)nbytes);
         free(pb);
+    } else {
+        frame_send_payload(sfd, PROTO_INFER, infer_args, NULL, 0);
     }
     pthread_mutex_lock(&r->lock);
     s->inflight++;
@@ -329,11 +327,9 @@ static int run_client(Router* r, const char* send)
         return 1;
     }
     size_t plen = strlen(prompt);
-    char line[RT_MAX_LINE];
-    snprintf(line, sizeof(line), "%s %s %d %zu", PROTO_INFER, model, max_tokens, plen);
-    sock_send_n(fd, line, strlen(line));
-    sock_send_n(fd, "\n", 1);
-    sock_send_n(fd, prompt, plen);
+    char args[128];
+    snprintf(args, sizeof(args), "%s %d %zu", model, max_tokens, plen);
+    frame_send_payload(fd, PROTO_INFER, args, prompt, plen);
     /* 读响应: T 帧打印 token 内容 */
     char out[RT_MAX_LINE];
     int done = 0;
