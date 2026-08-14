@@ -16,6 +16,7 @@
 #include "node.h"
 #include "sock.h"
 #include "../inference/yllm.h"
+#include "../inference/dist.h"
 #include "../inference/log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,7 +52,15 @@ typedef struct {
     Node node;
     pthread_mutex_t engine_lock;   /* 引擎单实例: INFER 互斥, PING/STAT 不阻塞 */
     volatile int quit;   /* QUIT 后主循环退出, 心跳线程一并退出 */
+    /* 组内协作(多段流水线) */
+    int dist_rank;       /* 段号 0..ranks-1 */
+    int dist_ranks;      /* 总段数(1 = 单机, 不走协作) */
+    uint16_t pipe_base;  /* 协作口基址 = rank_port_base + RANK_PIPE_OFFSET */
+    char addrs_csv[1024];/* 组内各段节点 IP(逗号分隔, 段号顺序) */
+    int dist_fp16;
 } Rank;
+
+#define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
 
 /* ---- socket 辅助(与 dist_worker 同款) ---- */
 
@@ -166,12 +175,14 @@ static int handle_stat(int fd, Rank* r)
 typedef struct {
     int fd;
     Vocab* vocab;
+    int n_tokens;
 } TokenCtx;
 
 /* 生成回调: 逐 token 流式回 T 帧; 返回非 0 中止生成(对端断开) */
 static int on_token_rank(uint32_t id, void* ctx)
 {
     TokenCtx* tc = (TokenCtx*)ctx;
+    tc->n_tokens++;
     char tmp[65536];
     vocab_decode(tc->vocab, &id, 1, tmp, sizeof(tmp));
     size_t len = strlen(tmp);
@@ -190,6 +201,17 @@ static int handle_infer(int fd, Rank* r, char* args)
     if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
         send_line(fd, "ERR bad INFER args");
         return 0;
+    }
+    /* 组内 rank 信息随请求携带(server 从 sv 租用获得): 按数据办事 */
+    {
+        const char* seg = proto_get(args, "seg");
+        const char* segs = proto_get(args, "segs");
+        const char* peers = proto_get(args, "peers");
+        if (segs && atoi(segs) > 1) {
+            r->dist_ranks = atoi(segs);
+            if (seg) r->dist_rank = atoi(seg);
+            if (peers) snprintf(r->addrs_csv, sizeof(r->addrs_csv), "%s", peers);
+        }
     }
     /* 每请求独立缓冲(线程化后不可共享 r->ids) */
     char* pb = (char*)ymalloc((size_t)nbytes + 8192);
@@ -215,21 +237,34 @@ static int handle_infer(int fd, Rank* r, char* args)
     TokenCtx tc;
     tc.fd = fd;
     tc.vocab = &r->vocab;
+    tc.n_tokens = 0;
     /* 引擎单实例: 串行执行推理; 并发 INFER 在此排队, PING/STAT 无需等锁 */
     pthread_mutex_lock(&r->engine_lock);
-    int rc = engine_generate(&r->engine, ids, nprompt, max_tokens,
+    int rc;
+    if (r->dist_ranks > 1) {
+        /* 多段流水线: rank0 为 master, 与组内兄弟协作(兄弟段在各自进程等激活) */
+        rc = dist_gen(&r->engine, &r->vocab, ids, nprompt, max_tokens,
+                      r->temp, r->top_p, r->seed,
+                      r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
+                      t0, on_token_rank, &tc);
+    } else {
+        rc = engine_generate(&r->engine, ids, nprompt, max_tokens,
                              r->temp, r->top_p, r->seed, r->vocab.eos,
                              on_token_rank, &tc, &tim, err, sizeof(err));
+    }
     ylog_info("rank: generate rc=%d (%d tokens, %llu ms)",
-              rc, tim.n_decode, (unsigned long long)(ynow_ms() - t0));
+              rc, tc.n_tokens, (unsigned long long)(ynow_ms() - t0));
     pthread_mutex_unlock(&r->engine_lock);
     free(ids);
     uint64_t ms = ynow_ms() - t0;
     if (rc != 0) {
-        send_line(fd, "ERR generate: %s", err);
+        if (r->dist_ranks > 1)
+            send_line(fd, "ERR generate: dist pipeline failed");
+        else
+            send_line(fd, "ERR generate: %s", err);
         return 0;
     }
-    send_line(fd, "DONE %u %d %llu", tim.n_decode, 0, (unsigned long long)ms);
+    send_line(fd, "DONE %u %d %llu", tc.n_tokens, 0, (unsigned long long)ms);
     return 0;
 }
 
@@ -244,25 +279,7 @@ static int handle_frame(int fd, Rank* r, const Frame* f)
     return 0;
 }
 
-/* ---- 主服务循环 ---- */
-
-static Rank* rank_conn_rank;
-
-/* 每连接一线程的处理入口 */
-static void* rank_conn(void* arg)
-{
-    int fd = (int)(intptr_t)arg;
-    Rank* r = rank_conn_rank;
-    Frame f;
-    ylog_info("rank: conn accepted fd=%d", fd);
-    int frc = frame_recv(fd, &f);
-    if (frc >= 0) {
-        handle_frame(fd, r, &f);
-    }
-    ylog_info("rank: closing conn fd=%d", fd);
-    sock_close(fd);
-    return NULL;
-}
+/* ---- 主循环 ---- */
 
 /* 独立心跳线程: 生成长达数分钟也不被 supervisor 误判 DEAD */
 static void rank_hb_thread(void* arg)
@@ -277,33 +294,46 @@ static void rank_hb_thread(void* arg)
     }
 }
 
+/* 主循环: worker 段(rank>0) = dist 等激活循环(不监听 serve 口, server 只连 rank0);
+ * rank0 = 监听 serve 口, 串行处理连接(推理是一个过程, 不并发)。
+ * 进程内仅主线程 + 心跳线程。 */
 static int run_rank(int port, Rank* r)
 {
     ws_init_rank();
-    int srv = sock_listen((uint16_t)port, 8);
-    if (srv < 0) return 1;
-    ylog_info("rank: ready on port %u (model loaded, 常驻等待请求)", port);
-
     void* hb = NULL;
     if (r->node.sv_enabled) ythread_create(&hb, rank_hb_thread, r);
-    for (;;) {
-        int fd = sock_accept_with_timeout(srv, 500);
-        if (fd >= 0) {
-            ylog_info("rank: accept fd=%d", fd);
-            /* 每连接一线程: 长生成期间 PING/STAT 仍可即时响应,
-             * 并发 INFER 在 engine_lock 排队 */
-            pthread_t t;
-            if (pthread_create(&t, NULL, rank_conn, (void*)(intptr_t)fd) != 0) {
-                ylog_error("rank: pthread_create FAILED, closing fd=%d", fd);
-                sock_close(fd);
-            } else {
-                pthread_detach(t);
+
+    if (r->dist_rank > 0 && r->dist_ranks > 1) {
+        while (!r->quit) {
+            int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
+                              r->temp, r->top_p, r->seed,
+                              r->dist_rank, r->dist_ranks, r->pipe_base, NULL, r->dist_fp16,
+                              ynow_ms(), NULL, NULL);
+            if (r->quit) break;
+            if (rc != 0) {
+                ylog_warn("rank: pipeline round failed (rc=%d), retry", rc);
+                sock_sleep_ms(1000);
             }
         }
-        if (r->quit) break;
+    } else {
+        int srv = sock_listen((uint16_t)port, 8);
+        if (srv < 0) { r->quit = 1; if (hb) ythread_join(&hb); return 1; }
+        ylog_info("rank: ready on port %u (model loaded, 常驻等待请求)", port);
+        while (!r->quit) {
+            int fd = sock_accept_with_timeout(srv, 500);
+            if (fd >= 0) {
+                ylog_info("rank: accept fd=%d", fd);
+                Frame f;
+                if (frame_recv(fd, &f) >= 0)
+                    handle_frame(fd, r, &f);
+                ylog_info("rank: closing conn fd=%d", fd);
+                sock_close(fd);
+            }
+        }
+        sock_close(srv);
     }
     r->quit = 1;
-    sock_close(srv);
+    if (hb) ythread_join(&hb);
     return 0;
 }
 
@@ -359,8 +389,24 @@ int cmd_rank(ServeConfig* cfg)
         vocab_free(&r.vocab);
         return 1;
     }
+
+    /* 多段协作: 协作口基址 = serve 基准(自己的 --port - 段号) + 偏移, 全组统一;
+     * 成员地址: worker 段来自命令(--peers, sv 自动下发); rank0 以 INFER 数据为准(启动时的兜底) */
+    r.dist_rank = cfg->rank_idx;
+    r.dist_ranks = cfg->ranks > 1 ? cfg->ranks : 1;
+    r.pipe_base = (uint16_t)(cfg->rank_port_base - r.dist_rank + RANK_PIPE_OFFSET);
+    if (cfg->peers[0])
+        snprintf(r.addrs_csv, sizeof(r.addrs_csv), "%s", cfg->peers);
+    if (r.dist_ranks > 1) {
+        if (dist_split_layers(&r.engine, r.dist_rank, r.dist_ranks) != 0) {
+            ylog_error("rank: dist_split_layers failed (seg %d/%d)", r.dist_rank, r.dist_ranks);
+            engine_free(&r.engine);
+            vocab_free(&r.vocab);
+            return 1;
+        }
+    }
+
     pthread_mutex_init(&r.engine_lock, NULL);
-    rank_conn_rank = &r;
 
     int rc = run_rank(cfg->rank_port_base, &r);
 

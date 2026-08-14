@@ -3,7 +3,7 @@
 #   yllm hub --config serve.yaml                # 合并模式(推荐): 每模型一组 rank + server 线程
 #   yllm supervisor --config serve.yaml         # 分开模式 supervisor
 #   yllm ctl start / yllm ctl stop / yllm ctl status
-# 多模型: models 列表, 每个模型独立一组 rank(端口 rank-port-base + mi*16)和一个 server(server-port + mi*16)
+# 多模型: models 列表, 每个模型独立一组 rank(端口 rank-port-base + mi*stride)和一个 server(server-port + mi*stride)
 
 # 日志
 log: logs/serve.log
@@ -11,7 +11,7 @@ log-level: info
 
 bin: ./build/avx2/yllm
 
-# 端口(模型 mi 的 rank 基址 = rank-port-base + mi*16, server 端口 = server-port + mi*16)
+# 端口(模型 mi 的 rank 基址 = rank-port-base + mi*stride, server 端口 = server-port + mi*stride)
 sv-port: 9500          # supervisor 心跳口
 router-port: 9400      # router 客户端口
 server-port: 9420      # 模型0 server 端口
@@ -28,12 +28,17 @@ auto-heal: 1           # 自愈: 检测 DEAD 自动重拉
 strategy: least        # 路由策略: least | round-robin
 
 # ---- 多模型 ----
+# 每个模型独立一组 rank + 一个 server。
+# ranks: 该模型启动的 rank 推理进程数(>=1 由 supervisor/hub 自动拉起)。
+#        ranks: 0 = 该模型 rank 由外部机器承担(分布式部署), 本机不拉起。
+# 端口: 模型 mi 的 rank r 端口 = rank-port-base + mi*stride + r,
+#        server 端口 = server-port + mi*stride, 其中 stride = 所有模型 ranks 的最大值。
 models:
   - name: tinyllama
     model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
     vocab: models/tinyllama.vocab.txt
-    ranks: 1
+    ranks: 1             # 本模型 rank 进程数(0 = 外部部署)
   - name: qwen2.5
     model: models/qwen2.5-1.5b.llf
     vocab: models/qwen2.5.vocab.txt
-    ranks: 1
+    ranks: 1             # 本模型 rank 进程数(0 = 外部部署)

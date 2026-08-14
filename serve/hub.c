@@ -121,6 +121,9 @@ int cmd_hub(ServeConfig* cfg)
         snprintf(s->node.sv_host, sizeof(s->node.sv_host), "127.0.0.1");
         s->node.sv_port = sv_port;
         s->node.sv_enabled = 1;
+        snprintf(s->lease_strategy, sizeof(s->lease_strategy), "%s",
+                 cfg->lease_strategy[0] ? cfg->lease_strategy : "request");
+        s->lease_duration = cfg->lease_duration;
         c3[mi].s = s;
         ylog_info("hub: server-%d model=%s port=%d leader=%s:%d",
                   mi, s->node.model, s->port, s->leader_host, s->leader_port);

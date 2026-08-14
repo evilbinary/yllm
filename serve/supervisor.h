@@ -11,6 +11,8 @@
 typedef struct {
     Node node;
     int router_notified;   /* 已通知 router(server ADD/DEL 去重) */
+    char leased_by[128];   /* 被哪个 server 租用(空 = 空闲) */
+    uint64_t lease_expire; /* timed 策略到期时间戳(0 = permanent/未租) */
 } SvNode;
 
 typedef struct {

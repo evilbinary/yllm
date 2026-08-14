@@ -151,18 +151,12 @@ static inline int frame_get(const Frame* f, const char* key, char* out, size_t o
     return -1;
 }
 
-/* 取 payload 长度(args 末尾的裸数字, 如 "INFER v=1 20 15" 的 15) */
+/* 取 payload 长度(INFER args 的第二个数字, 如 "30 5 seg=0 segs=2 peers=..." 的 5) */
 static inline long frame_payload_len(const Frame* f)
 {
-    const char* p = f->args;
-    const char* last = NULL;
-    while (*p) {
-        while (*p == ' ') p++;
-        const char* tok = p;
-        while (*p && *p != ' ') p++;
-        if (p > tok) last = tok;
-    }
-    return last ? atol(last) : 0;
+    int a = 0, b = 0;
+    if (sscanf(f->args, "%d %d", &a, &b) >= 2) return b;
+    return 0;
 }
 
 #endif /* YLLM_SERVE_FRAME_H */

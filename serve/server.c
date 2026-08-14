@@ -38,7 +38,10 @@ static void forward_infer(int client_fd, Server* s, const char* args)
     sock_set_timeout(fd, 60);
     Frame f;
     snprintf(f.cmd, sizeof(f.cmd), "%s", PROTO_INFER);
-    snprintf(f.args, sizeof(f.args), "%s", args);
+    /* 组内 rank 信息随请求捎给 rank0(它按数据组织协作) */
+    snprintf(f.args, sizeof(f.args), "%s seg=0 segs=%d peers=%s",
+             args, s->lease_ranks > 0 ? s->lease_ranks : 1,
+             s->lease_peers[0] ? s->lease_peers : "127.0.0.1");
     frame_send(fd, f.cmd, f.args);
 
     /* 读 prompt 长度, 透传 prompt bytes */
@@ -81,11 +84,74 @@ static void forward_infer(int client_fd, Server* s, const char* args)
     sock_close(fd);
 }
 
+/* 向 sv 租用该模型一组 rank(标记忙), 成功填 leader_host/port */
+static int server_lease(Server* s)
+{
+    char args[512];
+    snprintf(args, sizeof(args), "%s model=%s", s->node.node_id,
+             s->resolve_model[0] ? s->resolve_model : s->node.model);
+    if (strcmp(s->lease_strategy, "permanent") == 0) {
+        strncat(args, " permanent", sizeof(args) - strlen(args) - 1);
+    } else if (strcmp(s->lease_strategy, "timed") == 0 && s->lease_duration > 0) {
+        char d[64];
+        snprintf(d, sizeof(d), " duration=%d", s->lease_duration);
+        strncat(args, d, sizeof(args) - strlen(args) - 1);
+    }
+    int fd = sock_connect(s->node.sv_host, s->node.sv_port, 3);
+    if (fd < 0) { ylog_warn("[dbg-lease] connect sv fail %s:%u", s->node.sv_host, s->node.sv_port); return -1; }
+    sock_set_timeout(fd, 5);
+    frame_send(fd, PROTO_LEASE, args);
+    Frame f;
+    int rc = -1;
+    int frc = frame_recv(fd, &f);
+    ylog_warn("[dbg-lease] recv rc=%d cmd=%s args=%s", frc, frc >= 0 ? f.cmd : "-", frc >= 0 ? f.args : "-");
+    if (frc >= 0 && strcmp(f.cmd, "OK") == 0) {
+        const char* leader = proto_get(f.args, "leader");
+        if (leader) {
+            const char* colon = strchr(leader, ':');
+            if (colon) {
+                size_t hlen = (size_t)(colon - leader);
+                if (hlen >= sizeof(s->leader_host)) hlen = sizeof(s->leader_host) - 1;
+                memcpy(s->leader_host, leader, hlen);
+                s->leader_host[hlen] = '\0';
+                s->leader_port = (uint16_t)atoi(colon + 1);
+                rc = 0;
+            }
+        }
+        s->lease_ranks = atoi(proto_get(f.args, "ranks") ? proto_get(f.args, "ranks") : "1");
+        const char* peers = proto_get(f.args, "peers");
+        if (peers) snprintf(s->lease_peers, sizeof(s->lease_peers), "%s", peers);
+        else s->lease_peers[0] = '\0';
+    }
+    sock_close(fd);
+    return rc;
+}
+
+/* 释放租用(rank 回池) */
+static void server_release(Server* s)
+{
+    int fd = sock_connect(s->node.sv_host, s->node.sv_port, 3);
+    if (fd < 0) return;
+    sock_set_timeout(fd, 5);
+    frame_send(fd, PROTO_RELEASE, s->node.node_id);
+    Frame f;
+    (void)frame_recv(fd, &f);
+    sock_close(fd);
+}
+
 static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
 {
     if (strcmp(cmd, PROTO_INFER) == 0) {
         s->node.inflight++;
-        forward_infer(fd, s, args);
+        int request_lease = strcmp(s->lease_strategy, "request") == 0;
+        int ok = 1;
+        if (request_lease && server_lease(s) != 0) {
+            ylog_warn("server: lease failed (no free rank), reject");
+            sock_send_line(fd, "ERR server: no rank leased");
+            ok = 0;
+        }
+        if (ok) forward_infer(fd, s, args);
+        if (request_lease) server_release(s);
         s->node.inflight--;
     } else if (strcmp(cmd, PROTO_PING) == 0) {
         frame_send(fd, "OK", "READY");
@@ -134,18 +200,16 @@ int server_run(Server* s)
 {
     sock_init();
 
-    /* leader 未指定(分布式自动发现): 向 supervisor 查询该模型 rank, 等心跳就绪重试 */
-    if (!s->leader_host[0]) {
-        const char* qmodel = s->resolve_model[0] ? s->resolve_model : s->node.model;
+    /* leader 未指定: 按租用策略 —— timed/permanent 启动时租一次;
+     * request 策略不预租(每次推理时 LEASE/RELEASE) */
+    if (!s->leader_host[0] && strcmp(s->lease_strategy, "request") != 0) {
         int tries;
         for (tries = 0; tries < 90; tries++) {
-            if (server_resolve_leader(s, s->node.sv_host, s->node.sv_port, qmodel) == 0)
-                break;
+            if (server_lease(s) == 0) break;
             sock_sleep_ms(1000);
         }
         if (!s->leader_host[0]) {
-            ylog_error("server: leader auto-discovery failed (no ready rank for %s)",
-                       s->node.model);
+            ylog_error("server: lease failed (no ready rank for %s)", s->node.model);
             return 1;
         }
     }
@@ -241,7 +305,12 @@ int cmd_server(ServeConfig* cfg)
     if (cfg->model[0])
         snprintf(s.resolve_model, sizeof(s.resolve_model), "%s", cfg->model);
 
-    /* 解析 leader ip:port; 未配置 → 向 supervisor 查询该模型 rank 自动发现 */
+    /* 租用策略(默认 request: 每次推理 LEASE/RELEASE) */
+    snprintf(s.lease_strategy, sizeof(s.lease_strategy), "%s",
+             cfg->lease_strategy[0] ? cfg->lease_strategy : "request");
+    s.lease_duration = cfg->lease_duration;
+
+    /* 解析 leader ip:port; 未配置 → 走租用(LEASE), request 策略每次推理时租 */
     if (cfg->leader[0]) {
         const char* colon = strchr(cfg->leader, ':');
         if (!colon) { fprintf(stderr, "bad leader addr: %s\n", cfg->leader); return 1; }
@@ -250,12 +319,6 @@ int cmd_server(ServeConfig* cfg)
         memcpy(s.leader_host, cfg->leader, hlen);
         s.leader_host[hlen] = '\0';
         s.leader_port = (uint16_t)atoi(colon + 1);
-    } else {
-        if (server_resolve_leader(&s, cfg->sv_host, (uint16_t)cfg->sv_port, cfg->model) != 0) {
-            fprintf(stderr, "server: no ready rank for model %s (supervisor %s:%d)\n",
-                    cfg->model, cfg->sv_host, cfg->sv_port);
-            return 1;
-        }
     }
 
     /* 自身 addr(上报 supervisor 用): ip:port */

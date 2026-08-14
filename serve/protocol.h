@@ -38,8 +38,11 @@
  * 状态上报(供 server 路由决策: 忙闲 / KV 占用) */
 #define PROTO_STAT "STAT"
 
-/* INFER <max_tokens> <n_bytes>\n<prompt bytes>
+/* INFER <max_tokens> <n_bytes> seg=<r> segs=<n> peers=<ip1,ip2,...>\n<prompt bytes>
  * 生成请求: max_tokens 上限, n_bytes = prompt 的 UTF-8 字节数。
+ * seg/segs/peers 为组内 rank 信息(由 server 从 supervisor 租用时获得, 随请求捎给 rank0):
+ *   seg 段号(rank0=0), segs 总段数, peers 各段节点 IP(逗号分隔, 段号顺序)。
+ * rank0 收到后按该数据组织组内协作; worker 段不接收 INFER。
  * 响应: 逐 token 流式回 T <len>\n<token utf8 bytes>...,
  *       结束回 DONE <gen_tokens> <eos=0|1> <ms>\n
  * 错误回 ERR <msg> */
@@ -98,6 +101,18 @@
  * 跨机器分布式: rank 心跳上报自身 IP, server 无需配置 leader) */
 #define PROTO_QUERY_RANKS "QUERY_RANKS"
 #define PROTO_RANK_INFO "RANK_INFO"
+
+/* LEASE <server-id> model=<name> [duration=<s>|permanent]\n
+ * → OK LEASED ranks=<n> leader=<ip:port> peers=<ip1,ip2,...>\n | ERR no-rank\n
+ * server 向 supervisor 租用该模型一组空闲 rank(标记忙, 防其他 server 使用)。
+ * peers = 组内各段节点 IP(段号顺序, server 随 INFER 捎给 rank0 组织协作)。
+ * 不带 duration = 请求级(request 策略, 推理完即 RELEASE);
+ * duration=<s> = 定时租用(timed, 到期自动回池); permanent = 永久(直到 RELEASE 或 server 死)。 */
+#define PROTO_LEASE "LEASE"
+
+/* RELEASE <server-id>\n → OK\n
+ * server 释放租用的 rank 组, supervisor 同步更新为空闲。 */
+#define PROTO_RELEASE "RELEASE"
 
 /* ---- 流式 token 帧(server → router 透传, rank → server) ---- */
 

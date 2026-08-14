@@ -152,6 +152,10 @@ rank/server/router 的二进制与模型由 supervisor 先分发(sync)到目标�
 3. `dist_init` 与组内兄弟 rank 建立常驻 TCP(流水线握手一次,不复用后销毁);
 4. 监听推理端口,进入事件循环。
 
+> 注:`--port-base` 为 rank 组内协作流水线端口基址,由 `rank-port-base` 自动派生
+> (协作口 = `rank-port-base + RANK_PIPE_OFFSET + r`,固定偏移 100,默认 9510 起),
+> 段 i 的协作口 = 基址 + i;与服务端口(9410 + i)分离,避免冲突,无需单独配置。
+
 **请求阶段(循环,层段权重常驻)**
 
 - 收帧 → `vocab_encode`(仅 rank0)→ 本地算自己层段 → 经 dist 与组内兄弟协作 → 流式写回 token → 回完成统计;返回后不退出。
@@ -281,18 +285,28 @@ server ──流式回──▶ router ──▶ 用户
 
 **server 帧(router ↔ server,私有 TCP)**
 
-| 命令                                                     | 请求                                                           | 响应                   |
-| ------------------------------------------------------ | ------------------------------------------------------------ | -------------------- |
-| `REGISTER`                                             | `REGISTER server-a model=tinyllama leader=ip:port ranks=n\n` | `OK\n`(广播到所有 router) |
-| `HEARTBEAT`                                            | `HEARTBEAT inflight=2 kv_mb=380\n`                           | `OK\n`(每 2s 广播)      |
-| `INFER <session_id> <max_tokens> <n_bytes>\n` + prompt | 流式 `T` ... `DONE`                                            | 生成请求                 |
-| `SCALE`                                                | `SCALE server-a need_groups=3\n`                              | `OK\n`(supervisor 处理后通知) |
-| `DRAIN`                                                | `DRAIN\n`                                                    | `OK\n` 后退出(滚动更新/缩容)  |
+| 命令                                                         | 请求                                                           | 响应                       |
+| ---------------------------------------------------------- | ------------------------------------------------------------ | ------------------------ |
+| `REGISTER`                                                 | `REGISTER server-a model=tinyllama leader=ip:port ranks=n\n` | `OK\n`(广播到所有 router)     |
+| `HEARTBEAT`                                                | `HEARTBEAT inflight=2 kv_mb=380\n`                           | `OK\n`(每 2s 广播)          |
+| `INFER <session_id> <max_tokens> <n_bytes>\n` + prompt     | 流式 `T` ... `DONE`                                            | 生成请求                     |
+| `SCALE`                                                    | `SCALE server-a need_groups=3\n`                             | `OK\n`(supervisor 处理后通知) |
+| `DRAIN`                                                    | `DRAIN\n`                                                    | `OK\n` 后退出(滚动更新/缩容)      |
+| `LEASE <server-id> model=<name> [duration=<s>\|permanent]` | `OK LEASED ranks=<n> leader=<ip:port>\n` / `ERR no-rank\n`   | 租用该模型一组空闲 rank(标记忙)      |
+| `RELEASE <server-id>`                                      | `OK\n`                                                       | 释放租用的 rank 组             |
+
+**server 租用策略(两种,`lease-strategy`** **配置)**
+
+| 策略            | 说明                                                | 行为                                               |
+| ------------- | ------------------------------------------------- | ------------------------------------------------ |
+| `request`(默认) | 用完即释放:每次推理前 `LEASE` 拿 leader → 推理 → 完成后 `RELEASE` | rank 只在本请求期间被标记忙, 请求间完全空闲, 其他 server 可随时租用       |
+| `timed`       | 定时租用:一次 `LEASE duration=<s>` 租一段时间, 到期自动释放(可续租)   | 长会话/高并发场景避免每请求往返; 到期后 rank 回池                    |
+| `permanent`   | 永久租用:直到 server 显式 `RELEASE`(或 server 死亡租约超时回收)    | 独占一组 rank, 适合长期稳定服务; server 退出/挂掉由 supervisor 回收 |
 
 **server 伪代码流程**
 
 ```
-yllm server (业务组, 常驻进程, 从 rank 池租用一组或多组 rank)
+释放租用的 rank 组yllm server (业务组, 常驻进程, 从 rank 池租用一组或多组 rank)
 ────────── 初始化 ──────────
   REGISTER 到所有 router: (id, model, leader_addr, ranks)
   lease = supervisor 分配的 rank 组(可多组, 每组 rank0..rankN)
@@ -441,14 +455,28 @@ every 2s:
 yllm supervisor (管理节点, 常驻进程, 唯一 spawn/kill 进程的一方)
 ────────── 状态 ──────────
 machines:   {ip → 核数/内存/已部署进程}
-rank_pool:  {rank_id → 机器/模型段/状态/被谁租用}   # rank 池权威
+rank_pool:  {rank_id → 机器/模型段/状态/被谁租用/租约到期}   # rank 池权威
 processes:  {type → pid, state}                    # 全部进程
-leases:     {server_id → rank 组}
+leases:     {server_id → rank 组 + 策略(request|timed|permanent) + 到期时间}
 
 ────────── 主循环(事件驱动) ──────────
 loop:
   evt = recv_event()
   switch:
+    LEASE(server, model, duration|permanent):   # server 租用一组 rank
+      candidates = [r in rank_pool
+                    if r.model == model and r.state == READY and r.leased_by == null]
+      if candidates 为空: reply ERR no-rank
+      把 candidates 全部标记 leased_by=server
+      按策略登记租约(request: 推理后即释; timed: 记录到期时间; permanent: 常驻)
+      reply OK LEASED ranks=<n> leader=<candidates 的 rank0 地址>
+
+    RELEASE(server):                            # server 释放租用
+      该 server 全部 rank 标记 leased_by=null → 回池
+      reply OK
+
+    租约到期检查(timed 策略):到期 → 自动释放回池(server 可续租)
+
     SCALE(server, 期望组数):
       if 机器清单有资源:
         for i in 需要的 rank 段数:
@@ -486,11 +514,11 @@ every 3s:
 
 **策略:先整组重建,保证正确**(P1/P2 阶段 dist 仅启动时握手、无运行时重连)。
 
-| 挂的位置 | 影响 | 当前策略(整组重建) | 后续优化(需 dist 支持运行时重连) |
-|---|---|---|---|
-| rank0 挂 | 入口+采样点没了,整条流水线无法起步 | 整组重建(唯一选择) | 整组重建(不可省) |
-| 中间 rank 挂(如 rank1) | 流水线在中间断,rank0 发激活失败,下游空等 | 整组重建 | 只替换该 rank,重连握手 |
-| 末 rank 挂 | 收不到 logits,rank0 无法采样 | 整组重建 | 只替换末 rank |
+| 挂的位置               | 影响                       | 当前策略(整组重建) | 后续优化(需 dist 支持运行时重连) |
+| ------------------ | ------------------------ | ---------- | -------------------- |
+| rank0 挂            | 入口+采样点没了,整条流水线无法起步       | 整组重建(唯一选择) | 整组重建(不可省)            |
+| 中间 rank 挂(如 rank1) | 流水线在中间断,rank0 发激活失败,下游空等 | 整组重建       | 只替换该 rank,重连握手       |
+| 末 rank 挂           | 收不到 logits,rank0 无法采样    | 整组重建       | 只替换末 rank            |
 
 **整组重建流程(supervisor)**
 
@@ -506,11 +534,13 @@ every 3s:
 ```
 
 **为什么先整组重建**
+
 - 当前 `dist` 只在启动时 `dist_init` 握手一次,无"邻居断开→等待→重新握手"的运行时重连;
 - 只替换单 rank 需要:新 rank 与邻居重新握手 + 流水线重新对齐 + 各 rank KV 重填,复杂度高;
-- 整组重建逻辑与 SCALE/MODEL_UPDATE 复用同一套"租组→拉起→READY→通知"流程,简单可靠。
+- 整组重建逻辑与 SCALE/MODEL\_UPDATE 复用同一套"租组→拉起→READY→通知"流程,简单可靠。
 
 **后续优化(可选,非 P1/P2)**
+
 - 给 `dist` 加运行时重连:邻居检测 dist 连接断开 → 上报 → supervisor 从池租同模型同段 rank 替换 → 重新握手;
 - 收益:中间/末 rank 挂时只损失一个层段的 KV(整组重建丢全部 KV),其余 rank 保留。
 
@@ -574,7 +604,7 @@ yllm/
 ### 3.6.3 帧协议分类
 
 - `inference/dist.c` 内部:rank 间激活帧(X/LOGITS/DONE),推理执行的一部分;
-- `serve/protocol.h`:服务层帧(PING/STAT/INFER/DRAIN/HEARTBEAT/SERVER_ADD/DEL/UPDATE/QUERY_SERVERS),rank/server/router/supervisor 共用。
+- `serve/protocol.h`:服务层帧(PING/STAT/INFER/DRAIN/HEARTBEAT/SERVER\_ADD/DEL/UPDATE/QUERY\_SERVERS),rank/server/router/supervisor 共用。
 
 ## 3.7 服务层统一抽象(Node + 帧协议)
 
@@ -658,19 +688,21 @@ const char* frame_get(Frame* f, const char* key);
    方式B(拉取): router ──QUERY_SERVERS──▶ supervisor ──▶ 快照
 ```
 
-| 帧 | 方向 | 内容 |
-|---|---|---|
-| `HEARTBEAT <node-id> type=<...> state=... inflight=<n> kv_mb=<f> addr=<ip:port>` | rank/server/router → supervisor | 统一上报 |
-| `SERVER_ADD <server-id> model=<name> leader=<ip:port>` | supervisor → router | 注册 |
-| `SERVER_DEL <server-id>` | supervisor → router | 注销 |
-| `SERVER_UPDATE <server-id> inflight=<n> kv_mb=<f>` | supervisor → router | 状态推送(方式A) |
-| `QUERY_SERVERS` | router → supervisor | 主动查询(方式B) |
+| 帧                                                                                | 方向                              | 内容             |
+| -------------------------------------------------------------------------------- | ------------------------------- | -------------- |
+| `HEARTBEAT <node-id> type=<...> state=... inflight=<n> kv_mb=<f> addr=<ip:port>` | rank/server/router → supervisor | 统一上报           |
+| `SERVER_ADD <server-id> model=<name> leader=<ip:port>`                           | supervisor → router             | 注册             |
+| `SERVER_DEL <server-id>`                                                         | supervisor → router             | 注销             |
+| `SERVER_UPDATE <server-id> inflight=<n> kv_mb=<f>`                               | supervisor → router             | 状态推送(方式A)      |
+| `QUERY_SERVERS`                                                                  | router → supervisor             | 主动查询(方式B)      |
+| `LEASE <server-id> model=<name> [duration=<s>\|permanent]`                       | server → supervisor             | 租用 rank 组(标记忙) |
+| `RELEASE <server-id>`                                                            | server → supervisor             | 释放租用(rank 回池)  |
 
 ### 3.7.4 职责边界(修正)
 
 - **server 不再直接 REGISTER 到 router**:注册表增删由 supervisor 通知 router(生命周期面);
 - **server 心跳只发 supervisor**:不再广播 router(数据面统一归 supervisor 汇总);
-- **router 只消费**:收 supervisor 的 ADD/DEL/UPDATE + 主动 QUERY_SERVERS,做路由决策,不感知 server 生命周期;
+- **router 只消费**:收 supervisor 的 ADD/DEL/UPDATE + 主动 QUERY\_SERVERS,做路由决策,不感知 server 生命周期;
 - **判死/重拉永远归 supervisor**:心跳停 = 死,supervisor 重拉。
 
 ### 3.7.5 serve 目录结构
@@ -691,20 +723,20 @@ serve/
 
 ## 4. 代码改造点
 
-| 位置                     | 改动                                                                                |
-| ---------------------- | --------------------------------------------------------------------------------- |
-| `main.c`               | 新增 `cmd_rank` / `cmd_server` / `cmd_router`(复用 gen 的 engine/vocab 初始化),把生成拆成可复用函数 |
-| `inference/engine.c`   | `engine_generate(...)`(prompt→tokens→流式 cb),`cmd_gen` 与 `rank` 共用(已抽取)          |
-| `inference/dist.c`     | `dist_gen` 增加"循环服务"入口或拆分连接建立/推理;常驻复用 dist 连接                                      |
-| `serve/sock.h`(已有)    | 传输层:connect / send_n / recv_n / recv_line                                              |
-| `serve/frame.h`(新)     | 统一帧编解码:frame_send / frame_recv / payload / frame_get                                  |
-| `serve/node.h`(新)      | 统一节点结构:Node 身份/心跳/状态 + node_heartbeat / node_parse / node_is_dead                  |
-| `serve/rank.c`         | 改走 frame+node;心跳发 supervisor;INFER 流式 T 帧用 frame_send_payload                     |
-| `serve/server.c`       | 去掉 REGISTER 广播;心跳只发 supervisor;收 router 转发请求                                    |
-| `serve/router.c`       | 去掉收 server 广播;改收 supervisor 的 SERVER_ADD/DEL/UPDATE + QUERY_SERVERS               |
-| `serve/supervisor.c`(P3) | 收全部心跳 + 汇总表 + 驱动 router(ADD/DEL/UPDATE) + 拉起/自愈/更新                          |
-| `serve/router_http.c`(P3) | OpenAI 兼容 HTTP 层(JSON/SSE 解析与组装)                                                |
-| `Makefile`             | 加 `rank`/`server`/`router`/`supervisor` 目标与示例编排                                      |
+| 位置                        | 改动                                                                                |
+| ------------------------- | --------------------------------------------------------------------------------- |
+| `main.c`                  | 新增 `cmd_rank` / `cmd_server` / `cmd_router`(复用 gen 的 engine/vocab 初始化),把生成拆成可复用函数 |
+| `inference/engine.c`      | `engine_generate(...)`(prompt→tokens→流式 cb),`cmd_gen` 与 `rank` 共用(已抽取)            |
+| `inference/dist.c`        | `dist_gen` 增加"循环服务"入口或拆分连接建立/推理;常驻复用 dist 连接                                      |
+| `serve/sock.h`(已有)        | 传输层:connect / send\_n / recv\_n / recv\_line                                      |
+| `serve/frame.h`(新)        | 统一帧编解码:frame\_send / frame\_recv / payload / frame\_get                           |
+| `serve/node.h`(新)         | 统一节点结构:Node 身份/心跳/状态 + node\_heartbeat / node\_parse / node\_is\_dead             |
+| `serve/rank.c`            | 改走 frame+node;心跳发 supervisor;INFER 流式 T 帧用 frame\_send\_payload                   |
+| `serve/server.c`          | 去掉 REGISTER 广播;心跳只发 supervisor;收 router 转发请求                                      |
+| `serve/router.c`          | 去掉收 server 广播;改收 supervisor 的 SERVER\_ADD/DEL/UPDATE + QUERY\_SERVERS             |
+| `serve/supervisor.c`(P3)  | 收全部心跳 + 汇总表 + 驱动 router(ADD/DEL/UPDATE) + 拉起/自愈/更新                                |
+| `serve/router_http.c`(P3) | OpenAI 兼容 HTTP 层(JSON/SSE 解析与组装)                                                  |
+| `Makefile`                | 加 `rank`/`server`/`router`/`supervisor` 目标与示例编排                                   |
 
 请求级拆分(单 rank 与多 rank 统一):
 
@@ -723,21 +755,24 @@ int engine_generate(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
 # supervisor 先把模型/二进制 sync 到各机器, 再拉起 rank/server/router
 
 # 机器1(公用 rank 池: qwen3 段 rank + tinyllama 段 rank)
-yllm rank --model /models/qwen3.llf --rank 0 --ranks 2 --port-base 9410 \
+#   --port-base 为 rank 组内协作流水线口 = rank-port-base + 固定偏移(100), 段 i = 基址 + i
+yllm rank --model /models/qwen3.llf --rank 0 --ranks 2 --port-base 9510 \
     --dist-addrs 192.168.1.161,192.168.0.23 --log logs/q3-r0.log
-yllm rank --model /models/tinyllama.llf --rank 0 --ranks 1 --port-base 9420 \
+yllm rank --model /models/tinyllama.llf --rank 0 --ranks 1 --port-base 9510 \
     --log logs/t-r0.log
 # 机器2
-yllm rank --model /models/qwen3.llf --rank 1 --ranks 2 --port-base 9410 \
+yllm rank --model /models/qwen3.llf --rank 1 --ranks 2 --port-base 9510 \
     --dist-addrs 192.168.1.161,192.168.0.23 --log logs/q3-r1.log
 
 # 业务逻辑组(supervisor 拉起, 注册到所有 router)
+#   租用策略 lease-strategy: request(用完即释放) | timed(duration 秒) | permanent(常驻)
 yllm server --id server-q1 --model qwen3 --ranks 2 \
     --rank-pool 192.168.1.161:9410,192.168.0.23:9411 \
-    --router 127.0.0.1:9400,127.0.0.1:9401 --port 9421 --log logs/server-q1.log
+    --router 127.0.0.1:9400,127.0.0.1:9401 --port 9421 --log logs/server-q1.log \
+    --lease-strategy timed --lease-duration 3600
 yllm server --id server-t1 --model tinyllama --ranks 1 \
     --rank-pool 192.168.1.161:9420 --router 127.0.0.1:9400,127.0.0.1:9401 \
-    --port 9422 --log logs/server-t1.log
+    --port 9422 --log logs/server-t1.log --lease-strategy request
 
 # 调度层: 多实例
 yllm router --port 9400 --config servers.yaml --log logs/router0.log
@@ -770,10 +805,16 @@ make serve-roll NEW_MODEL=test/v2.llf   # 起新模型 server→就绪→摘旧�
 ## 7. 里程碑
 
 - **P1 最小闭环(✅ 完成)**:`yllm rank` 常驻(单机单 rank)+ PING/STAT/INFER/DRAIN 帧协议 + 单机直连推理。
-  已验证:进程启动一次,连续 N 个 INFER 请求不冷启动,结果入日志。目录重组(inference/+serve/),engine_generate 抽取。
+  已验证:进程启动一次,连续 N 个 INFER 请求不冷启动,结果入日志。目录重组(inference/+serve/),engine\_generate 抽取。
 - **P2 路由(进行中)**:统一服务层抽象(§3.7:frame.h + node.h),`yllm server`(租用 rank 组、
-  心跳发 supervisor)、`yllm router`(收 supervisor 的 SERVER_ADD/DEL/UPDATE + QUERY_SERVERS、
+  心跳发 supervisor)、`yllm router`(收 supervisor 的 SERVER\_ADD/DEL/UPDATE + QUERY\_SERVERS、
   模型过滤/least-inflight/kv-aware)、最小 `supervisor` 骨架(收全部心跳 + 汇总 + 驱动 router)。
+  - rank 多段接入:rank 解析 `--rank/--ranks/--port-base/--dist-addrs`,`dist_split_layers` 切层,
+    rank0 收 INFER 走组内流水线协作(dist\_gen),rank>0 常驻等激活(组内协作, serve 层无 dist 概念,
+    角色仅 router/server/rank/supervisor);
+  - **rank 租用(LEASE/RELEASE)**:server 向 supervisor 租用一组 rank(标记忙, 防其他 server 使用),
+    支持三种策略:request(用完即释放)/ timed(定时租用, 到期自动释放)/ permanent(永久租用);
+    推理完成释放后 supervisor 同步更新 rank 使用情况。
 - **P3 生命周期 + OpenAI 面**:supervisor 完整版(滚动更新/自愈/扩缩容/机器 agent)+
   router OpenAI 兼容 HTTP(`/v1/chat/completions` + SSE)。
 

@@ -21,7 +21,9 @@ typedef struct {
     char name[CFG_STR_MAX];   /* 模型注册名(router 路由用) */
     char model[CFG_STR_MAX];  /* llf 路径 */
     char vocab[CFG_STR_MAX];  /* vocab 路径 */
-    int  ranks;               /* 该模型的 rank 段数 */
+    char peers[CFG_STR_MAX];  /* 组内各段节点 IP(逗号分隔, 段号顺序; worker 段 spawn 时下发) */
+    int  ranks;               /* 该模型的 rank 段数(总) */
+    int  local;               /* 本机拉起的段数(默认 = ranks; 0 = 全部外部; 1 = 只 rank0 本地) */
 } ModelCfg;
 
 typedef struct {
@@ -58,6 +60,14 @@ typedef struct {
     int  auto_heal;
     char strategy[CFG_STR_MAX];
 
+    /* 租用(server) */
+    char lease_strategy[CFG_STR_MAX];   /* request(用完即释放) | timed | permanent */
+    int  lease_duration;                /* timed 策略的租期(秒) */
+
+    /* rank 协作(多段) */
+    int  rank_idx;                      /* --rank 段号(0..ranks-1) */
+    char peers[CFG_STR_MAX];            /* 组内各段节点 IP(逗号分隔; worker 段命令行下发) */
+
     /* 推理参数(rank 用) */
     float temp;
     float top_p;
@@ -81,6 +91,7 @@ static inline void config_defaults(ServeConfig* c)
     snprintf(c->bin, sizeof(c->bin), "%s", "./build/avx2/yllm");
     snprintf(c->sv_host, sizeof(c->sv_host), "%s", "127.0.0.1");
     snprintf(c->strategy, sizeof(c->strategy), "%s", "least");
+    snprintf(c->lease_strategy, sizeof(c->lease_strategy), "%s", "request");
     c->sv_port = 9500;
     c->router_port = 9400;
     c->server_port = 9420;
@@ -149,6 +160,14 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->auto_heal = atoi(val);
     } else if (strcmp(key, "strategy") == 0) {
         snprintf(c->strategy, sizeof(c->strategy), "%s", val);
+    } else if (strcmp(key, "lease-strategy") == 0) {
+        snprintf(c->lease_strategy, sizeof(c->lease_strategy), "%s", val);
+    } else if (strcmp(key, "lease-duration") == 0) {
+        c->lease_duration = atoi(val);
+    } else if (strcmp(key, "rank") == 0) {
+        c->rank_idx = atoi(val);
+    } else if (strcmp(key, "peers") == 0) {
+        snprintf(c->peers, sizeof(c->peers), "%s", val);
     } else if (strcmp(key, "temp") == 0) {
         c->temp = (float)atof(val);
     } else if (strcmp(key, "top-p") == 0) {
@@ -214,6 +233,7 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
                         else if (strcmp(key, "model") == 0) snprintf(mc->model, sizeof(mc->model), "%s", val);
                         else if (strcmp(key, "vocab") == 0) snprintf(mc->vocab, sizeof(mc->vocab), "%s", val);
                         else if (strcmp(key, "ranks") == 0) mc->ranks = atoi(val);
+                        else if (strcmp(key, "local") == 0) mc->local = atoi(val);
                     }
                 }
                 line = strtok_r(NULL, "\n", &save);

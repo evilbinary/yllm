@@ -6,12 +6,16 @@
 
 typedef struct {
     Node node;             /* 统一节点身份(type=server) */
-    char leader_host[128];
+    char leader_host[128]; /* 租用的 leader rank(rank0) 地址 */
     uint16_t leader_port;
     uint16_t port;         /* server 自身监听端口(router 转发入口) */
     uint64_t start_s;
     volatile int quit;     /* 收到 QUIT/DRAIN 后退出主循环 */
-    char resolve_model[128]; /* 自动发现查询用的模型(llf 路径, 与 rank 心跳上报一致) */
+    char resolve_model[128]; /* 租用/发现查询用的模型(llf 路径, 与 rank 心跳上报一致) */
+    char lease_strategy[32]; /* request(每次推理租/释) | timed | permanent */
+    int  lease_duration;     /* timed 租期(秒) */
+    int  lease_ranks;        /* 租到的组内 rank 数 */
+    char lease_peers[1024];  /* 组内各段节点 IP(逗号分隔, 段号顺序, 随 INFER 捎给 rank0) */
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */
