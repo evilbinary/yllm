@@ -326,7 +326,14 @@ int supervisor_run(Supervisor* s)
 {
     sock_init();
     int srv = sock_listen(s->port, 16);
-    if (srv < 0) return 1;
+    if (srv < 0) {
+#ifdef _WIN32
+        ylog_error("supervisor: sock_listen fail port=%u WSAErr=%d", s->port, WSAGetLastError());
+#else
+        ylog_error("supervisor: sock_listen fail port=%u errno=%d", s->port, errno);
+#endif
+        return 1;
+    }
     ylog_info("supervisor: listening on port %u", s->port);
 
     supervisor_bootstrap(s);

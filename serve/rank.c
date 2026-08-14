@@ -124,6 +124,21 @@ static int send_line(int fd, const char* fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    /* 帧级版本: 响应 "CMD v=<ver> <args>"(T 流帧不走这里, 保持裸流) */
+    char cmd[64];
+    int n = 0;
+    if (sscanf(buf, "%63s%n", cmd, &n) == 1) {
+        const char* p = buf + n;
+        while (*p == ' ') p++;
+        if (xsend_rank(fd, cmd, strlen(cmd)) != 0) return -1;
+        if (xsend_rank(fd, " v=", 3) != 0) return -1;
+        if (xsend_rank(fd, PROTO_VERSION_STR, strlen(PROTO_VERSION_STR)) != 0) return -1;
+        if (*p) {
+            if (xsend_rank(fd, " ", 1) != 0) return -1;
+            if (xsend_rank(fd, p, strlen(p)) != 0) return -1;
+        }
+        return xsend_rank(fd, "\n", 1);
+    }
     if (xsend_rank(fd, buf, strlen(buf)) != 0) return -1;
     return xsend_rank(fd, "\n", 1);
 }
@@ -172,15 +187,19 @@ static int handle_infer(int fd, Rank* r, char* args)
 {
     int max_tokens = 0;
     long nbytes = 0;
+    ylog_info("dbg: handle_infer args=[%s]", args);
     if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
         send_line(fd, "ERR bad INFER args");
         return 0;
     }
+    ylog_info("dbg: parsed max_tokens=%d nbytes=%ld", max_tokens, nbytes);
     /* 每请求独立缓冲(线程化后不可共享 r->ids) */
     char* pb = (char*)ymalloc((size_t)nbytes + 8192);
     if (!pb) { send_line(fd, "ERR oom"); return 0; }
-    if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); return -1; }
+    ylog_info("dbg: waiting for %ld payload bytes...", nbytes);
+    if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); ylog_info("dbg: recv payload FAILED"); return -1; }
     pb[nbytes] = '\0';
+    ylog_info("dbg: payload=[%s]", pb);
 
     uint32_t* ids = (uint32_t*)ymalloc((size_t)nbytes + 8192 + 4096);
     if (!ids) { free(pb); send_line(fd, "ERR oom"); return 0; }
@@ -248,11 +267,8 @@ static void* rank_conn(void* arg)
 static void rank_hb_thread(void* arg)
 {
     Rank* r = (Rank*)arg;
-    struct timespec ts;
-    ts.tv_sec = 2;
-    ts.tv_nsec = 0;
     while (!r->quit) {
-        nanosleep(&ts, NULL);
+        sock_sleep_ms(2000);
         if (r->node.sv_enabled) {
             r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
             node_heartbeat(&r->node);

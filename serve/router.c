@@ -206,8 +206,8 @@ int router_infer(Router* r, const char* model, int max_tokens,
     if (!s) { ylog_warn("router_infer: no ready server for %s", model); return -1; }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) { ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
-    char args[128];
-    snprintf(args, sizeof(args), "%d %zu", max_tokens, plen);
+    char args[64];
+    snprintf(args, sizeof(args), "%d", max_tokens);
     frame_send_payload(sfd, PROTO_INFER, args, prompt, plen);
 
     pthread_mutex_lock(&r->lock);
@@ -254,9 +254,9 @@ static void handle_client_infer(int fd, Router* r, const char *args)
         sock_send_line(fd, "ERR cannot connect server %s", s->id);
         return;
     }
-    /* 转发 INFER 头 + prompt */
-    char infer_args[128];
-    snprintf(infer_args, sizeof(infer_args), "%d %ld", max_tokens, nbytes);
+    /* 转发 INFER 头 + prompt(args 只含 max_tokens, nbytes 由 payload 函数追加) */
+    char infer_args[64];
+    snprintf(infer_args, sizeof(infer_args), "%d", max_tokens);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
         if (!pb) { sock_close(sfd); sock_send_line(fd, "ERR oom"); return; }
@@ -327,8 +327,8 @@ static int run_client(Router* r, const char* send)
         return 1;
     }
     size_t plen = strlen(prompt);
-    char args[128];
-    snprintf(args, sizeof(args), "%s %d %zu", model, max_tokens, plen);
+    char args[160];
+    snprintf(args, sizeof(args), "%s %d", model, max_tokens);
     frame_send_payload(fd, PROTO_INFER, args, prompt, plen);
     /* 读响应: T 帧打印 token 内容 */
     char out[RT_MAX_LINE];

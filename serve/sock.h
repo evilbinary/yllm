@@ -158,6 +158,19 @@ static inline int sock_connect_host(const char* host, size_t hlen, uint16_t port
     return sock_connect(tmp, port, retries);
 }
 
+/* 跨平台睡眠(毫秒) */
+static inline void sock_sleep_ms(int ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000 * 1000;
+    nanosleep(&ts, NULL);
+#endif
+}
+
 /* 创建 TCP 监听 socket(INADDR_ANY), 成功返回 fd, 失败返回 -1 */
 static inline int sock_listen(uint16_t port, int backlog)
 {

@@ -28,12 +28,14 @@
 /* INFER 转发: 连 leader rank → 发 INFER → 逐帧透传回客户端 */
 static void forward_infer(int client_fd, Server* s, const char* args)
 {
+    ylog_info("dbg: forward_infer args=[%s]", args);
     int fd = sock_connect(s->leader_host, s->leader_port, 5);
     if (fd < 0) {
         sock_send_line(client_fd, "ERR server: cannot connect leader %s:%u",
                        s->leader_host, s->leader_port);
         return;
     }
+    ylog_info("dbg: connected leader fd=%d", fd);
     /* leader 无响应(如 rank 被 STOP/僵死) 60s 后报错, 不无限挂起 */
     sock_set_timeout(fd, 60);
     Frame f;
@@ -43,10 +45,15 @@ static void forward_infer(int client_fd, Server* s, const char* args)
 
     /* 读 prompt 长度, 透传 prompt bytes */
     long nbytes = frame_payload_len(&f);
+    ylog_info("dbg: nbytes=%ld", nbytes);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
         if (!pb) { sock_close(fd); sock_send_line(client_fd, "ERR server: oom"); return; }
-        if (sock_recv_n(client_fd, pb, (size_t)nbytes) != 0) { free(pb); sock_close(fd); return; }
+        if (sock_recv_n(client_fd, pb, (size_t)nbytes) != 0) {
+            ylog_info("dbg: recv payload from client FAILED");
+            free(pb); sock_close(fd); return;
+        }
+        ylog_info("dbg: forwarding %ld payload bytes to leader", nbytes);
         sock_send_n(fd, pb, (size_t)nbytes);
         free(pb);
     }
@@ -56,7 +63,14 @@ static void forward_infer(int client_fd, Server* s, const char* args)
     int done = 0;
     while (!done) {
         int n = sock_recv_line(fd, out, sizeof(out));
-        if (n < 0) { sock_send_line(client_fd, "ERR server: leader disconnected"); break; }
+        if (n < 0) {
+#ifdef _WIN32
+            ylog_info("dbg: recv from leader FAILED WSAErr=%d", WSAGetLastError());
+#else
+            ylog_info("dbg: recv from leader FAILED errno=%d", errno);
+#endif
+            sock_send_line(client_fd, "ERR server: leader disconnected"); break;
+        }
         sock_send_line(client_fd, "%s", out);
         if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
         else if (strncmp(out, "T ", 2) == 0) {
@@ -109,11 +123,8 @@ static void* srv_conn(void* arg)
 static void srv_hb_thread(void* arg)
 {
     Server* s = (Server*)arg;
-    struct timespec ts;
-    ts.tv_sec = 2;
-    ts.tv_nsec = 0;
     while (!s->quit) {
-        nanosleep(&ts, NULL);
+        sock_sleep_ms(2000);
         s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
         node_heartbeat(&s->node);
     }
