@@ -34,7 +34,9 @@
 #define SLOT_QBIAS 9
 #define SLOT_KBIAS 10
 #define SLOT_VBIAS 11
-#define BLOCK_TENSORS 12
+#define SLOT_QNORM 12
+#define SLOT_KNORM 13
+#define BLOCK_TENSORS 14
 
 #pragma pack(push, 1)
 typedef struct {

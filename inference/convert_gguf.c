@@ -371,6 +371,8 @@ static int gg_slot_for(const char* name, int* layer)
             { "self_attn.k_proj.weight", SLOT_K },
             { "self_attn.v_proj.weight", SLOT_V },
             { "self_attn.o_proj.weight", SLOT_O },
+            { "self_attn.q_norm.weight", SLOT_QNORM },
+            { "self_attn.k_norm.weight", SLOT_KNORM },
             { "post_attention_layernorm.weight", SLOT_NORM2 },
             { "mlp.gate_proj.weight", SLOT_GATE },
             { "mlp.up_proj.weight", SLOT_UP },
@@ -404,6 +406,8 @@ static int gg_slot_for(const char* name, int* layer)
             { "attn_q.bias", SLOT_QBIAS },
             { "attn_k.bias", SLOT_KBIAS },
             { "attn_v.bias", SLOT_VBIAS },
+            { "attn_q_norm.weight", SLOT_QNORM },
+            { "attn_k_norm.weight", SLOT_KNORM },
         };
         size_t i;
         for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
@@ -482,15 +486,18 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         snprintf(err, errlen, "bad gguf kv section");
         return -1;
     }
-    if (!g.arch || (strcmp(g.arch, "llama") != 0 && strcmp(g.arch, "qwen2") != 0)) {
-        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' and 'qwen2' supported)", g.arch ? g.arch : "?");
+    if (!g.arch || (strcmp(g.arch, "llama") != 0 && strcmp(g.arch, "qwen2") != 0 &&
+                    strcmp(g.arch, "qwen3") != 0)) {
+        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' and 'qwen2/qwen3' supported)", g.arch ? g.arch : "?");
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
         free(g.arch); free(data);
         return -1;
     }
-    int is_qwen = g.arch && strcmp(g.arch, "qwen2") == 0;
+    /* qwen2/qwen3: 同构(interleaved RoPE, 无 head 输出 bias; qwen3 连 attention bias 都没有,
+     * 代码按 tensor 是否存在自动跳过) */
+    int is_qwen = g.arch && (strcmp(g.arch, "qwen2") == 0 || strcmp(g.arch, "qwen3") == 0);
     free(g.arch);
     if (g.n_blocks == 0 || g.hidden == 0 || g.heads == 0) {
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
@@ -624,7 +631,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         if (slot == SP_EMBED) { items[n].layer = 0; items[n].slot = 0; }
         else if (slot == SP_FINALNORM) { items[n].layer = g.n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
-        else if (slot >= SLOT_NORM1 && slot <= SLOT_VBIAS) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
+        else if (slot >= SLOT_NORM1 && slot <= SLOT_KNORM) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else continue;
         const GGTensor* t = &list.t[i];
         items[n].dtype = type_map[t->gtype];

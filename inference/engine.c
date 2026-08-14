@@ -303,6 +303,20 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
         for (j = 0; j < kv_dim; j++) v[j] += bv[j];
     }
 
+    /* qwen3 QK-norm: 对 q 每头 / k 每 kv 头做 RMSNorm(共享 head_dim 权重), 在 rope 之前 */
+    if (mt[SLOT_QNORM].size > 0) {
+        uint32_t hh;
+        for (hh = 0; hh < h->n_heads; hh++)
+            rmsnorm(q + (size_t)hh * h->head_dim, q + (size_t)hh * h->head_dim,
+                    base + mt[SLOT_QNORM].offset, h->head_dim, eps, mt[SLOT_QNORM].dtype);
+    }
+    if (mt[SLOT_KNORM].size > 0) {
+        uint32_t hh;
+        for (hh = 0; hh < h->n_kv_heads; hh++)
+            rmsnorm(k + (size_t)hh * h->head_dim, k + (size_t)hh * h->head_dim,
+                    base + mt[SLOT_KNORM].offset, h->head_dim, eps, mt[SLOT_KNORM].dtype);
+    }
+
     uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
     uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
@@ -459,6 +473,13 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
 {
     float* logits = e->logits;
     uint32_t i;
+    if (temp <= 0.0f) {
+        /* 贪婪: 严格取 argmax */
+        uint32_t best = 0;
+        for (i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
+        *out = best;
+        return 0;
+    }
     if (temp > 0 && temp != 1.0f) {
         for (i = 0; i < vocab; i++) logits[i] /= temp;
     }
@@ -481,7 +502,9 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
             cum += sorted[j].prob;
             if (cum >= top_p) { keep = j + 1; break; }
         }
-        float r = (float)(yrng(rng) >> 40) / 16777216.0f;
+        /* 在截断分布内采样: r ∈ [0, cum), 与累加概率对齐
+         * (此前 r ∈ [0,1) 在 r ≥ cum 时回退到概率最低的 top-p token, 产生垃圾) */
+        float r = ((float)(yrng(rng) >> 40) / 16777216.0f) * cum;
         float acc = 0.0f;
         uint32_t k;
         for (k = 0; k < keep; k++) {
