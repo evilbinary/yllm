@@ -187,20 +187,16 @@ static int handle_infer(int fd, Rank* r, char* args)
 {
     int max_tokens = 0;
     long nbytes = 0;
-    ylog_info("dbg: handle_infer args=[%s]", args);
     if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
         send_line(fd, "ERR bad INFER args");
         return 0;
     }
-    ylog_info("dbg: parsed max_tokens=%d nbytes=%ld", max_tokens, nbytes);
     /* 每请求独立缓冲(线程化后不可共享 r->ids) */
     char* pb = (char*)ymalloc((size_t)nbytes + 8192);
     if (!pb) { send_line(fd, "ERR oom"); return 0; }
-    ylog_info("dbg: waiting for %ld payload bytes...", nbytes);
-    if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); ylog_info("dbg: recv payload FAILED"); return -1; }
+    if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); ylog_warn("rank: recv payload FAILED"); return -1; }
     pb[nbytes] = '\0';
-    ylog_info("dbg: payload=[%s]", pb);
-
+    ylog_info("rank: payload=[%s]", pb);
     uint32_t* ids = (uint32_t*)ymalloc((size_t)nbytes + 8192 + 4096);
     if (!ids) { free(pb); send_line(fd, "ERR oom"); return 0; }
     int nprompt;
@@ -224,6 +220,8 @@ static int handle_infer(int fd, Rank* r, char* args)
     int rc = engine_generate(&r->engine, ids, nprompt, max_tokens,
                              r->temp, r->top_p, r->seed, r->vocab.eos,
                              on_token_rank, &tc, &tim, err, sizeof(err));
+    ylog_info("rank: generate rc=%d (%d tokens, %llu ms)",
+              rc, tim.n_decode, (unsigned long long)(ynow_ms() - t0));
     pthread_mutex_unlock(&r->engine_lock);
     free(ids);
     uint64_t ms = ynow_ms() - t0;
@@ -256,9 +254,12 @@ static void* rank_conn(void* arg)
     int fd = (int)(intptr_t)arg;
     Rank* r = rank_conn_rank;
     Frame f;
-    if (frame_recv(fd, &f) >= 0) {
+    ylog_info("rank: conn accepted fd=%d", fd);
+    int frc = frame_recv(fd, &f);
+    if (frc >= 0) {
         handle_frame(fd, r, &f);
     }
+    ylog_info("rank: closing conn fd=%d", fd);
     sock_close(fd);
     return NULL;
 }
@@ -288,10 +289,12 @@ static int run_rank(int port, Rank* r)
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
+            ylog_info("rank: accept fd=%d", fd);
             /* 每连接一线程: 长生成期间 PING/STAT 仍可即时响应,
              * 并发 INFER 在 engine_lock 排队 */
             pthread_t t;
             if (pthread_create(&t, NULL, rank_conn, (void*)(intptr_t)fd) != 0) {
+                ylog_error("rank: pthread_create FAILED, closing fd=%d", fd);
                 sock_close(fd);
             } else {
                 pthread_detach(t);

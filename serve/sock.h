@@ -207,4 +207,19 @@ static inline int sock_accept_with_timeout(int srv, int ms)
     return (int)accept(srv, NULL, NULL);
 }
 
+/* 等待 fd 可读(毫秒超时): 可读返回 1, 超时返回 0, 错误返回 -1。
+ * 用于收流前等待对端数据(避免阻塞 recv 的边界行为)。 */
+static inline int sock_wait_readable(int fd, int ms)
+{
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+    if (sel < 0) return -1;
+    return sel > 0 && FD_ISSET(fd, &rfds) ? 1 : 0;
+}
+
 #endif /* YLLM_SERVE_SOCK_H */

@@ -82,6 +82,7 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
             if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
             else if (strcmp(argv[i], "--cmd") == 0 && i + 1 < argc) cmd = argv[++i];
             else if (strcmp(argv[i], "--need-groups") == 0 && i + 1 < argc) need_groups = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) i++; /* main 已加载, 跳过 */
         } else {
             for (k = 0; k < 3; k++) if (!pos[k]) { pos[k] = argv[i]; break; }
         }

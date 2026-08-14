@@ -28,14 +28,12 @@
 /* INFER 转发: 连 leader rank → 发 INFER → 逐帧透传回客户端 */
 static void forward_infer(int client_fd, Server* s, const char* args)
 {
-    ylog_info("dbg: forward_infer args=[%s]", args);
     int fd = sock_connect(s->leader_host, s->leader_port, 5);
     if (fd < 0) {
         sock_send_line(client_fd, "ERR server: cannot connect leader %s:%u",
                        s->leader_host, s->leader_port);
         return;
     }
-    ylog_info("dbg: connected leader fd=%d", fd);
     /* leader 无响应(如 rank 被 STOP/僵死) 60s 后报错, 不无限挂起 */
     sock_set_timeout(fd, 60);
     Frame f;
@@ -45,30 +43,29 @@ static void forward_infer(int client_fd, Server* s, const char* args)
 
     /* 读 prompt 长度, 透传 prompt bytes */
     long nbytes = frame_payload_len(&f);
-    ylog_info("dbg: nbytes=%ld", nbytes);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
         if (!pb) { sock_close(fd); sock_send_line(client_fd, "ERR server: oom"); return; }
         if (sock_recv_n(client_fd, pb, (size_t)nbytes) != 0) {
-            ylog_info("dbg: recv payload from client FAILED");
             free(pb); sock_close(fd); return;
         }
-        ylog_info("dbg: forwarding %ld payload bytes to leader", nbytes);
         sock_send_n(fd, pb, (size_t)nbytes);
         free(pb);
     }
 
-    /* 透传响应(T 帧 + DONE) */
+    /* 透传响应(T 帧 + DONE): select 等待可读再 recv
+     * (Windows 上 SO_RCVTIMEO 阻塞 recv 在数据未到时可能立即返回 EOF) */
     char out[SRV_MAX_LINE];
     int done = 0;
     while (!done) {
+        int sel = sock_wait_readable(fd, 60000);
+        if (sel <= 0) {
+            ylog_warn("server: leader %s:%u no response (rc=%d)", s->leader_host, s->leader_port, sel);
+            sock_send_line(client_fd, "ERR server: leader timeout"); break;
+        }
         int n = sock_recv_line(fd, out, sizeof(out));
         if (n < 0) {
-#ifdef _WIN32
-            ylog_info("dbg: recv from leader FAILED WSAErr=%d", WSAGetLastError());
-#else
-            ylog_info("dbg: recv from leader FAILED errno=%d", errno);
-#endif
+            ylog_warn("server: recv from leader %s:%u disconnected", s->leader_host, s->leader_port);
             sock_send_line(client_fd, "ERR server: leader disconnected"); break;
         }
         sock_send_line(client_fd, "%s", out);
@@ -106,12 +103,15 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
     }
 }
 
-/* 单连接处理(线程化: 长生成不阻塞该 server 的其他连接) */
-static Server* srv_conn_server;
+/* 单连接处理(线程化: 长生成不阻塞该 server 的其他连接)。
+ * s 随线程参数传入, 不共享全局(多 server 并存时避免串台)。 */
+typedef struct { Server* s; int fd; } SrvConnArg;
 static void* srv_conn(void* arg)
 {
-    int fd = (int)(intptr_t)arg;
-    Server* s = srv_conn_server;
+    SrvConnArg* a = (SrvConnArg*)arg;
+    int fd = a->fd;
+    Server* s = a->s;
+    free(a);
     Frame f;
     if (frame_recv(fd, &f) >= 0)
         handle_frame(fd, s, f.cmd, f.args);
@@ -133,7 +133,6 @@ static void srv_hb_thread(void* arg)
 int server_run(Server* s)
 {
     sock_init();
-    srv_conn_server = s;
 
     int srv = sock_listen(s->port, 8);
     if (srv < 0) return 1;
@@ -146,9 +145,20 @@ int server_run(Server* s)
     for (;;) {
         int fd = sock_accept_with_timeout(srv, 500);
         if (fd >= 0) {
-            pthread_t t;
-            pthread_create(&t, NULL, srv_conn, (void*)(intptr_t)fd);
-            pthread_detach(t);
+            SrvConnArg* a = (SrvConnArg*)malloc(sizeof(*a));
+            if (a) {
+                a->s = s;
+                a->fd = fd;
+                pthread_t t;
+                if (pthread_create(&t, NULL, srv_conn, a) != 0) {
+                    free(a);
+                    sock_close(fd);
+                } else {
+                    pthread_detach(t);
+                }
+            } else {
+                sock_close(fd);
+            }
         }
         if (s->quit) break;
     }
