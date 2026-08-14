@@ -303,7 +303,7 @@ static void rank_hb_thread(void* arg)
     }
 }
 
-/* worker 段心跳线程: 每 2s 心跳 + 间隙监听 serve 管理口(PING/STAT/DRAIN/QUIT)。
+/* worker 段心跳线程: 管理口(PING/STAT/DRAIN/QUIT)优先 accept + 每 2s 心跳。
  * worker 主线程阻塞在 dist 等激活, 管理口由本线程承载, 进程内仍仅 2 线程。 */
 static void worker_hb_thread(void* arg)
 {
@@ -311,13 +311,9 @@ static void worker_hb_thread(void* arg)
     int srv = r->serve_port > 0 ? sock_listen((uint16_t)r->serve_port, 8) : -1;
     if (srv >= 0)
         ylog_info("rank: worker serve port %u up (管理口)", r->serve_port);
+    uint64_t last_hb = 0;
     while (!r->quit) {
-        sock_sleep_ms(2000);
-        if (r->node.sv_enabled) {
-            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
-            node_heartbeat(&r->node);
-        }
-        /* 间隙处理管理连接(短超时, 不阻塞心跳) */
+        /* 管理口优先(短超时 accept, 保证 PING/STAT 及时响应) */
         if (srv >= 0) {
             int i;
             for (i = 0; i < 4 && !r->quit; i++) {
@@ -329,6 +325,14 @@ static void worker_hb_thread(void* arg)
                 sock_close(fd);
             }
         }
+        /* 心跳节律(2s, 用时间判断, 不被管理口阻塞) */
+        uint64_t now = (uint64_t)time(NULL);
+        if (r->node.sv_enabled && now - last_hb >= 2) {
+            last_hb = now;
+            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
+            node_heartbeat(&r->node);
+        }
+        if (!r->quit) sock_sleep_ms(50);
     }
     if (srv >= 0) sock_close(srv);
 }
