@@ -97,14 +97,12 @@ static int server_lease(Server* s)
         strncat(args, d, sizeof(args) - strlen(args) - 1);
     }
     int fd = sock_connect(s->node.sv_host, s->node.sv_port, 3);
-    if (fd < 0) { ylog_warn("[dbg-lease] connect sv fail %s:%u", s->node.sv_host, s->node.sv_port); return -1; }
+    if (fd < 0) return -1;
     sock_set_timeout(fd, 5);
     frame_send(fd, PROTO_LEASE, args);
     Frame f;
     int rc = -1;
-    int frc = frame_recv(fd, &f);
-    ylog_warn("[dbg-lease] recv rc=%d cmd=%s args=%s", frc, frc >= 0 ? f.cmd : "-", frc >= 0 ? f.args : "-");
-    if (frc >= 0 && strcmp(f.cmd, "OK") == 0) {
+    if (frame_recv(fd, &f) >= 0 && strcmp(f.cmd, "OK") == 0) {
         const char* leader = proto_get(f.args, "leader");
         if (leader) {
             const char* colon = strchr(leader, ':');
