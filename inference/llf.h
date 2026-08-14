@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #define YLLM_MAGIC "YLLMLLF1"
-#define YLLM_VERSION 2
+#define YLLM_VERSION 3   /* BLOCK_TENSORS 12→14(qk-norm 槽位), 旧文件必须重转 */
 #define LLF_HEADER_SIZE 128
 #define LLF_DIR_ENTRY_SIZE 32
 #define LLF_TENSOR_META_SIZE 64
