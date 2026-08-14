@@ -16,6 +16,7 @@
 #include "sock.h"
 #include "supervisor.h"
 #include "../inference/log.h"
+#include <errno.h>
 #include <time.h>
 #include <signal.h>
 
