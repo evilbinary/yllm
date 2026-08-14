@@ -334,6 +334,7 @@ static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
             rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
     }
 
+
     uint32_t j;
     for (j = 0; j < kv_dim; j++) {
         kcache[kvp + j] = f32_to_f16(k[j]);

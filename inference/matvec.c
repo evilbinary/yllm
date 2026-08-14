@@ -213,7 +213,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
-        float acc = 0.0f;
+        __m256 acc_v = _mm256_setzero_ps();
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
@@ -222,6 +222,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* q = blk + 16;
             const uint8_t* scp = blk + 4;
+            if (b + 1 < nb) _mm_prefetch((const char*)(blk + 144), _MM_HINT_T0);
 
             int is = 0;
             for (int j = 0; j < 4; j++) {
@@ -265,17 +266,18 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
                     sum_x2_v  = _mm256_add_ps(sum_x2_v, _mm256_add_ps(x_h0, x_h1));
                 }
 
-                float sum_qx1 = hsum_avx2(sum_qx1_v);
-                float sum_x1  = hsum_avx2(sum_x1_v);
-                float sum_qx2 = hsum_avx2(sum_qx2_v);
-                float sum_x2  = hsum_avx2(sum_x2_v);
-                acc += d1 * sum_qx1 - m1 * sum_x1 + d2 * sum_qx2 - m2 * sum_x2;
+                /* 每块 8 次水平求和的替代: 缩放后并入行级向量累加, 整行只 hsum 一次 */
+                acc_v = _mm256_fmadd_ps(sum_qx1_v, _mm256_set1_ps(d1), acc_v);
+                acc_v = _mm256_fmadd_ps(sum_x1_v, _mm256_set1_ps(-m1), acc_v);
+                acc_v = _mm256_fmadd_ps(sum_qx2_v, _mm256_set1_ps(d2), acc_v);
+                acc_v = _mm256_fmadd_ps(sum_x2_v, _mm256_set1_ps(-m2), acc_v);
 
                 xp += 64;
                 q  += 32;
                 is += 2;
             }
         }
+        float acc = hsum_avx2(acc_v);
         y[oo] = acc;
     }
 #else
