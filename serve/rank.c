@@ -58,6 +58,7 @@ typedef struct {
     uint16_t pipe_base;  /* 协作口基址 = rank_port_base + RANK_PIPE_OFFSET */
     char addrs_csv[1024];/* 组内各段节点 IP(逗号分隔, 段号顺序) */
     int dist_fp16;
+    int serve_port;      /* 本段 serve 口(worker 段也监听, 供 PING/STAT/DRAIN 管理) */
 } Rank;
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
@@ -302,7 +303,37 @@ static void rank_hb_thread(void* arg)
     }
 }
 
-/* 主循环: worker 段(rank>0) = dist 等激活循环(不监听 serve 口, server 只连 rank0);
+/* worker 段心跳线程: 每 2s 心跳 + 间隙监听 serve 管理口(PING/STAT/DRAIN/QUIT)。
+ * worker 主线程阻塞在 dist 等激活, 管理口由本线程承载, 进程内仍仅 2 线程。 */
+static void worker_hb_thread(void* arg)
+{
+    Rank* r = (Rank*)arg;
+    int srv = r->serve_port > 0 ? sock_listen((uint16_t)r->serve_port, 8) : -1;
+    if (srv >= 0)
+        ylog_info("rank: worker serve port %u up (管理口)", r->serve_port);
+    while (!r->quit) {
+        sock_sleep_ms(2000);
+        if (r->node.sv_enabled) {
+            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
+            node_heartbeat(&r->node);
+        }
+        /* 间隙处理管理连接(短超时, 不阻塞心跳) */
+        if (srv >= 0) {
+            int i;
+            for (i = 0; i < 4 && !r->quit; i++) {
+                int fd = sock_accept_with_timeout(srv, 200);
+                if (fd < 0) break;
+                Frame f;
+                if (frame_recv(fd, &f) >= 0)
+                    handle_frame(fd, r, &f);
+                sock_close(fd);
+            }
+        }
+    }
+    if (srv >= 0) sock_close(srv);
+}
+
+/* 主循环: worker 段(rank>0) = dist 等激活循环(serve 管理口由心跳线程承载);
  * rank0 = 监听 serve 口, 串行处理连接(推理是一个过程, 不并发)。
  * 进程内仅主线程 + 心跳线程。 */
 static int run_rank(int port, Rank* r)
@@ -312,6 +343,7 @@ static int run_rank(int port, Rank* r)
     if (r->node.sv_enabled) ythread_create(&hb, rank_hb_thread, r);
 
     if (r->dist_rank > 0 && r->dist_ranks > 1) {
+        if (r->node.sv_enabled) ythread_create(&hb, worker_hb_thread, r);
         while (!r->quit) {
             int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
                               r->temp, r->top_p, r->seed,
@@ -418,6 +450,7 @@ int cmd_rank(ServeConfig* cfg)
     r.dist_rank = cfg->rank_idx;
     r.dist_ranks = cfg->ranks > 1 ? cfg->ranks : 1;
     r.pipe_base = (uint16_t)(cfg->rank_port_base - r.dist_rank + RANK_PIPE_OFFSET);
+    r.serve_port = cfg->rank_port_base;
     if (cfg->peers[0])
         snprintf(r.addrs_csv, sizeof(r.addrs_csv), "%s", cfg->peers);
     if (r.dist_ranks > 1) {
