@@ -160,6 +160,7 @@ static void query_servers(ServeConfig* cfg, const NodeInfo* infos, int n)
 
 int cmd_status(ServeConfig* cfg)
 {
+    sock_init();
     NodeInfo ranks[NODE_MAX], srvs[NODE_MAX];
     int n_rank = 0, n_srv = 0;
     print_procs();
