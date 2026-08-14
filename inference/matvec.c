@@ -530,7 +530,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * nb * blk;
-        float* acc = (float*)malloc((size_t)B * 4);
+        float acc[64];     /* B ≤ 64, 栈上避免每行 malloc/free */
         float tmp[256];   /* 每线程独立, 避免共享数组踩踏 */
         uint32_t b, g;
         for (g = 0; g < B; g++) acc[g] = 0.0f;
@@ -554,7 +554,6 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
             }
         }
         for (g = 0; g < B; g++) y[(size_t)g * out + oo] = acc[g];
-        free(acc);
     }
 }
 

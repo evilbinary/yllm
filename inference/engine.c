@@ -3,6 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* 批量 prefill: 默认开启; 编译期关闭用 -DYLLM_BATCH_PREFILL=0 */
+#ifndef YLLM_BATCH_PREFILL
+#define YLLM_BATCH_PREFILL 1
+#endif
+/* 批量收益拐点(实测: tinyllama/qwen3 均在 B≈16 后才优于顺序) */
+#define PREFILL_BATCH_MIN 16
 #include <math.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -446,6 +453,14 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
     while (off < n) {
         uint32_t nb = (uint32_t)(n - off);
         if (nb > B) nb = B;
+        /* 小批(< 16)批量收益不抵反量化/调度开销, 回退顺序逐 token */
+        if (nb < PREFILL_BATCH_MIN) {
+            uint32_t i;
+            for (i = 0; i < nb; i++)
+                engine_forward(e, tokens[off + i], (uint32_t)(start_pos + off + i));
+            off += (int)nb;
+            continue;
+        }
         /* embed 全部 batch token */
         uint32_t b;
         for (b = 0; b < nb; b++) {
@@ -750,11 +765,6 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
 }
 
 /* 返回 0 成功;-1 失败。timings 非空时填充 prefill/decode 分别的耗时与 token 数 */
-/* 批量 prefill: 默认开启; 编译期关闭用 -DYLLM_BATCH_PREFILL=0 */
-#ifndef YLLM_BATCH_PREFILL
-#define YLLM_BATCH_PREFILL 1
-#endif
-
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
                     int (*on_token)(uint32_t id, void* ctx), void* ctx,
