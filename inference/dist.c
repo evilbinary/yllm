@@ -34,7 +34,7 @@ static int sock_close_fd(int fd)
 #ifdef _WIN32
     return closesocket((SOCKET)fd);
 #else
-    return sock_close_fd(fd);
+    return close(fd);
 #endif
 }
 
