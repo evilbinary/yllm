@@ -59,9 +59,15 @@ static void collect_on_token(const char* utf8, size_t len, void* ctx)
 }
 
 /* SSE 回调: 逐 token 写 data 块 */
+typedef struct {
+    HttpResponse* r;
+    const char* model;
+} SseCtx;
+
 static void sse_on_token(const char* utf8, size_t len, void* ctx)
 {
-    HttpResponse* r = (HttpResponse*)ctx;
+    SseCtx* sc = (SseCtx*)ctx;
+    HttpResponse* r = sc->r;
     char* escaped = (char*)malloc(len * 2 + 1);
     if (!escaped) return;
     size_t o = 0, i;
@@ -77,9 +83,9 @@ static void sse_on_token(const char* utf8, size_t len, void* ctx)
     char json[512];
     snprintf(json, sizeof(json),
              "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\","
-             "\"created\":%lld,\"model\":\"yllm\","
+             "\"created\":%lld,\"model\":\"%s\","
              "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
-             (long long)time(NULL), escaped);
+             (long long)time(NULL), sc->model, escaped);
     http_sse_data(r, json);
     free(escaped);
 }
@@ -137,8 +143,11 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
 
     if (stream) {
         HttpResponse rr;
+        SseCtx sc;
+        sc.r = &rr;
+        sc.model = model;
         http_sse_begin(&rr, fd);
-        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &rr);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc);
         if (rc != 0)
             http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
@@ -212,8 +221,11 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
     }
     if (stream) {
         HttpResponse rr;
+        SseCtx sc;
+        sc.r = &rr;
+        sc.model = model;
         http_sse_begin(&rr, fd);
-        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &rr);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc);
         if (rc != 0)
             http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
