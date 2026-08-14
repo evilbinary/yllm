@@ -134,10 +134,10 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
         }
     }
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %u "
+             "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --rank %d --ranks %d --peers %s "
              "--log logs/%s-rank-%d.log",
-             s->bin, mc->model, mc->vocab, rport, s->sv_host, s->port,
+             s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
              mi * model_stride(s) + r, r, ranks, peers, mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
     int pid = spawn_proc(cmd);
@@ -373,9 +373,10 @@ static void handle_lease(Supervisor* s, int fd, const char* args)
         /* request: 由 server 推理后 RELEASE, 这里照常租出 */
     }
 
-    /* 找该模型全部 ready + 未租的 rank */
+    /* 找该模型全部 ready + 未租的 rank; leader = 端口最小(段0 = rank0) */
     int i, n = 0;
     const char* leader = NULL;
+    int leader_port = 0;
     for (i = 0; i < s->n_nodes; i++) {
         SvNode* sv = &s->nodes[i];
         Node* nd = &sv->node;
@@ -383,16 +384,16 @@ static void handle_lease(Supervisor* s, int fd, const char* args)
         if (nd->state != NODE_STATE_READY) continue;
         if (model[0] && nd->model[0] && strcmp(nd->model, model) != 0) continue;
         if (sv->leased_by[0] && strcmp(sv->leased_by, srv_id) != 0) continue; /* 别人租的跳过 */
-        if (sv->leased_by[0] && strcmp(sv->leased_by, srv_id) == 0 && expire == 0 && sv->lease_expire == 0) {
-            /* 自己已租(重租/续期) */
-        }
-        /* 段号最小 = leader */
-        if (!leader) leader = nd->addr;
         n++;
+        int p = 0;
+        const char* colon = strchr(nd->addr, ':');
+        if (colon) p = atoi(colon + 1);
+        if (!leader || p < leader_port) { leader = nd->addr; leader_port = p; }
     }
     if (n == 0 || !leader) { frame_send(fd, "ERR", "no-rank"); return; }
     /* 收集组内成员 IP(端口升序 = 段号序; 暂存 ip:port, 排序后去端口) */
     char peers[1024] = "";
+    char rank_ids[512] = "";
     {
         char ps[64][128];
         int pn = 0, j;
@@ -406,6 +407,8 @@ static void handle_lease(Supervisor* s, int fd, const char* args)
             if (pn < 64) {
                 snprintf(ps[pn], sizeof(ps[pn]), "%s", nd->addr);
                 pn++;
+                if (rank_ids[0]) strncat(rank_ids, ",", sizeof(rank_ids) - strlen(rank_ids) - 1);
+                strncat(rank_ids, nd->node_id, sizeof(rank_ids) - strlen(rank_ids) - 1);
             }
         }
         int a, b;
@@ -438,9 +441,10 @@ static void handle_lease(Supervisor* s, int fd, const char* args)
     }
     ylog_info("supervisor: LEASE %s model=%s ranks=%d leader=%s peers=%s",
               srv_id, model, n, leader, peers);
-    char a[512];
-    snprintf(a, sizeof(a), "LEASED ranks=%d leader=%s peers=%s", n, leader, peers);
+    char a[640];
+    snprintf(a, sizeof(a), "LEASED ranks=%d leader=%s peers=%s rank_ids=%s", n, leader, peers, rank_ids);
     frame_send(fd, "OK", a);
+    ylog_info("supervisor: LEASE reply sent to %s (n=%d)", srv_id, n);
 }
 
 /* server 释放租用: 该 server 的 rank 全部回池 */

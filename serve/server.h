@@ -16,6 +16,7 @@ typedef struct {
     int  lease_duration;     /* timed 租期(秒) */
     int  lease_ranks;        /* 租到的组内 rank 数 */
     char lease_peers[1024];  /* 组内各段节点 IP(逗号分隔, 段号顺序, 随 INFER 捎给 rank0) */
+    char lease_rank_ids[512]; /* 租用组内 rank 的 id 列表(rank-0,rank-1), 状态展示用 */
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */

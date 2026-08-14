@@ -88,8 +88,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
 static int server_lease(Server* s)
 {
     char args[512];
-    snprintf(args, sizeof(args), "%s model=%s", s->node.node_id,
-             s->resolve_model[0] ? s->resolve_model : s->node.model);
+    snprintf(args, sizeof(args), "%s model=%s", s->node.node_id, s->node.model);
     if (strcmp(s->lease_strategy, "permanent") == 0) {
         strncat(args, " permanent", sizeof(args) - strlen(args) - 1);
     } else if (strcmp(s->lease_strategy, "timed") == 0 && s->lease_duration > 0) {
@@ -122,6 +121,9 @@ static int server_lease(Server* s)
         const char* peers = proto_get(f.args, "peers");
         if (peers) snprintf(s->lease_peers, sizeof(s->lease_peers), "%s", peers);
         else s->lease_peers[0] = '\0';
+        const char* rids = proto_get(f.args, "rank_ids");
+        if (rids) snprintf(s->lease_rank_ids, sizeof(s->lease_rank_ids), "%s", rids);
+        else s->lease_rank_ids[0] = '\0';
     }
     sock_close(fd);
     return rc;
@@ -157,9 +159,14 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         frame_send(fd, "OK", "READY");
     } else if (strcmp(cmd, PROTO_STAT) == 0) {
         uint64_t uptime = s->start_s ? (uint64_t)(time(NULL) - (time_t)s->start_s) : 0;
-        char st[256];
-        snprintf(st, sizeof(st), "inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=%llu",
-                 s->node.inflight, (unsigned long long)uptime);
+        char st[640];
+        snprintf(st, sizeof(st),
+                 "inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=%llu "
+                 "lease_ranks=%d lease_peers=%s lease_rank_ids=%s",
+                 s->node.inflight, (unsigned long long)uptime,
+                 s->lease_ranks > 0 ? s->lease_ranks : 1,
+                 s->lease_peers[0] ? s->lease_peers : "127.0.0.1",
+                 s->lease_rank_ids[0] ? s->lease_rank_ids : "?");
         frame_send(fd, "OK", st);
     } else if (strcmp(cmd, PROTO_DRAIN) == 0 || strcmp(cmd, PROTO_QUIT) == 0) {
         frame_send(fd, "OK", NULL);

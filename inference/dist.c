@@ -158,19 +158,24 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
     d->log_fd = -1;
     int listen_fd = sock_listen((uint16_t)(port_base + (uint16_t)rank));
     if (listen_fd < 0) { fprintf(stderr, "dist: rank %d cannot listen on port %u\n", rank, port_base + rank); return -1; }
+    fprintf(stderr, "[distdbg] rank %d/%d: listen %u ok\n", rank, ranks, port_base + rank);
 
     if (rank < ranks - 1) {
         const char* ip = addrs ? addrs[rank + 1] : NULL;
         d->down_fd = sock_connect((uint16_t)(port_base + (uint16_t)(rank + 1)), ip);
+        fprintf(stderr, "[distdbg] rank %d: connect down %s:%u -> %d\n", rank, ip ? ip : "(null)", port_base + rank + 1, d->down_fd);
         if (d->down_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect to %u\n", rank, port_base + rank + 1); return -1; }
     }
     if (rank == 0) {
         d->log_fd = (int)accept(listen_fd, NULL, NULL);
+        fprintf(stderr, "[distdbg] rank %d: accept log -> %d\n", rank, d->log_fd);
     } else {
         d->up_fd = (int)accept(listen_fd, NULL, NULL);
+        fprintf(stderr, "[distdbg] rank %d: accept up -> %d\n", rank, d->up_fd);
         if (rank == ranks - 1) {
             const char* ip = addrs ? addrs[0] : NULL;
             d->log_fd = sock_connect(port_base, ip);
+            fprintf(stderr, "[distdbg] rank %d: connect back %s:%u -> %d\n", rank, ip ? ip : "(null)", port_base, d->log_fd);
             if (d->log_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect back to rank 0\n", rank); return -1; }
         }
     }
@@ -360,16 +365,19 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         uint32_t pos = 0;
         int i;
         int pend = 0;
+        ylog_info("[dist] master start nprompt=%d ntokens=%d hidden=%u", nprompt, ntokens, hidden);
         for (i = 0; i < nprompt; i++) {
             engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
-            dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
+            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; snprintf(err, sizeof(err), "send_x prompt failed"); break; }
             pos++;
         }
+        ylog_info("[dist] master prefill done, sent %d X, recv logits...", nprompt);
         float lse = 0.0f;
         /* 丢弃 prompt 阶段多余的 top-k(末 rank 对每个 X 帧都回 logits) */
         for (i = 0; i < nprompt - 1; i++) {
-            if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; break; }
+            if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break; }
         }
+        ylog_info("[dist] master prompt logits drained (rc=%d), gen loop...", rc);
         for (i = 0; i < ntokens && rc == 0; i++) {
             if (pos >= e->max_seq) break;
             int k = dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse);
@@ -384,7 +392,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (emit) emit(nxt, ctx);
             if (nxt == (uint32_t)v->eos) break;
             engine_forward_range(e, nxt, 1, pos, xbuf, NULL);
-            dist_send_x(&dist, pos, xbuf, hidden, dist_fp16);
+            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
             pos++;
             ngen++;
             pend = 1;
@@ -394,6 +402,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 dist_print_stats(&dist, tag);
             }
         }
+        ylog_info("[dist] master gen loop done rc=%d ngen=%d", rc, ngen);
         /* 若最后一个 X 帧刚发出、其 logits 响应尚未读走则冲刷掉,
          * 避免 last rank 的 send 打到已关闭 socket。eos/错误退出时 pend=0 则不占。 */
         if (pend) {
@@ -410,6 +419,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         uint32_t pos;
         int t;
         int nf = 0;
+        ylog_info("[dist] worker %d/%d: waiting X frames...", rank, ranks);
         while ((t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
             if (t == 3) { /* DONE: 向后转发并退出 */
                 dist_send_done(&dist);
@@ -425,12 +435,14 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 engine_forward_range(e, 0, 0, pos, xbuf, NULL);
                 if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
             }
+            if ((nf & 7) == 0) ylog_info("[dist] worker processed %d X frames", nf);
             if (dist_stats && (nf % STATS_EVERY) == 0) {
                 char tag[48];
                 snprintf(tag, sizeof(tag), "dist@X%d", nf);
                 dist_print_stats(&dist, tag);
             }
         }
+        ylog_info("[dist] worker done rc=%d nf=%d", rc, nf);
     }
     free(xbuf);
     free(k_ids);

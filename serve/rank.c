@@ -238,6 +238,10 @@ static int handle_infer(int fd, Rank* r, char* args)
     tc.fd = fd;
     tc.vocab = &r->vocab;
     tc.n_tokens = 0;
+    /* 通知 supervisor: 本 rank 进入 BUSY(推理中), 供调度/状态展示 */
+    r->node.state = NODE_STATE_BUSY;
+    r->node.inflight++;
+    node_heartbeat(&r->node);
     /* 引擎单实例: 串行执行推理; 并发 INFER 在此排队, PING/STAT 无需等锁 */
     pthread_mutex_lock(&r->engine_lock);
     int rc;
@@ -255,6 +259,10 @@ static int handle_infer(int fd, Rank* r, char* args)
     ylog_info("rank: generate rc=%d (%d tokens, %llu ms)",
               rc, tc.n_tokens, (unsigned long long)(ynow_ms() - t0));
     pthread_mutex_unlock(&r->engine_lock);
+    /* 推理结束: 恢复 READY 并通知 supervisor */
+    r->node.state = NODE_STATE_READY;
+    r->node.inflight--;
+    node_heartbeat(&r->node);
     free(ids);
     uint64_t ms = ynow_ms() - t0;
     if (rc != 0) {
@@ -307,7 +315,7 @@ static int run_rank(int port, Rank* r)
         while (!r->quit) {
             int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
                               r->temp, r->top_p, r->seed,
-                              r->dist_rank, r->dist_ranks, r->pipe_base, NULL, r->dist_fp16,
+                              r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
                               ynow_ms(), NULL, NULL);
             if (r->quit) break;
             if (rc != 0) {
@@ -364,7 +372,22 @@ int cmd_rank(ServeConfig* cfg)
     else
         snprintf(r.node.node_id, sizeof(r.node.node_id), "rank-%s", cfg->model);
     snprintf(r.node.type, sizeof(r.node.type), "rank");
-    snprintf(r.node.model, sizeof(r.node.model), "%s", cfg->model);
+    /* model 显示注册名(router/server 用), 缺省取路径 basename */
+    if (cfg->model_name[0] && strcmp(cfg->model_name, "default") != 0) {
+        snprintf(r.node.model, sizeof(r.node.model), "%s", cfg->model_name);
+    } else {
+        const char* base = strrchr(cfg->model, '/');
+        base = base ? base + 1 : cfg->model;
+        const char* dot = strrchr(base, '.');
+        if (dot && dot != base) {
+            size_t blen = (size_t)(dot - base);
+            if (blen >= sizeof(r.node.model)) blen = sizeof(r.node.model) - 1;
+            memcpy(r.node.model, base, blen);
+            r.node.model[blen] = '\0';
+        } else {
+            snprintf(r.node.model, sizeof(r.node.model), "%s", base);
+        }
+    }
     r.node.state = NODE_STATE_READY;
     /* addr 上报: 本机真实 IP + 监听端口(心跳携带, supervisor 直接存, server 据此连接) */
     {

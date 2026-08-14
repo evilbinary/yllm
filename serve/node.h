@@ -13,7 +13,8 @@
 
 #define NODE_STATE_LOADING 0
 #define NODE_STATE_READY   1
-#define NODE_STATE_DEAD    2
+#define NODE_STATE_BUSY    2   /* 推理中(rank: 处理 INFER; server: 转发中) */
+#define NODE_STATE_DEAD    3
 
 typedef struct {
     char node_id[128];
@@ -33,11 +34,13 @@ typedef struct {
 /* 组装 HEARTBEAT 参数串 */
 static inline int node_hb_args(const Node* n, char* out, size_t outsz)
 {
+    const char* st =
+        n->state == NODE_STATE_READY ? "ready" :
+        n->state == NODE_STATE_BUSY ? "busy" :
+        n->state == NODE_STATE_DEAD ? "dead" : "loading";
     return snprintf(out, outsz,
                     "%s type=%s state=%s inflight=%d kv_mb=%.1f%s%s%s%s",
-                    n->node_id, n->type,
-                    n->state == NODE_STATE_READY ? "ready" :
-                    n->state == NODE_STATE_DEAD ? "dead" : "loading",
+                    n->node_id, n->type, st,
                     n->inflight, n->kv_mb,
                     n->addr[0] ? " addr=" : "", n->addr[0] ? n->addr : "",
                     n->model[0] ? " model=" : "",
@@ -75,6 +78,7 @@ static inline void node_parse_hb(const char* args, Node* out)
     if (frame_get(&f, "addr", v, sizeof(v)) == 0)  snprintf(out->addr, sizeof(out->addr), "%s", v);
     if (frame_get(&f, "state", v, sizeof(v)) == 0) {
         if (strcmp(v, "ready") == 0) out->state = NODE_STATE_READY;
+        else if (strcmp(v, "busy") == 0) out->state = NODE_STATE_BUSY;
         else if (strcmp(v, "dead") == 0) out->state = NODE_STATE_DEAD;
         else out->state = NODE_STATE_LOADING;
     }
