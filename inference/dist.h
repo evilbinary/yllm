@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 /* 生成 token 输出回调(解码并打印到 stdout) */
-typedef void (*dist_token_cb)(uint32_t id, void* ctx);
+typedef int (*dist_token_cb)(uint32_t id, void* ctx);
 
 /* 层流水线分布式拓扑 */
 typedef struct {

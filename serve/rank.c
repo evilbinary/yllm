@@ -29,7 +29,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#define close(fd) closesocket(fd)
 #define ssize_t int
 #else
 #include <unistd.h>
@@ -242,7 +241,7 @@ static void* rank_conn(void* arg)
     if (n >= 0) {
         handle_frame(fd, r, line);
     }
-    close(fd);
+    sock_close(fd);
     return NULL;
 }
 
@@ -278,7 +277,7 @@ static int run_rank(int port, Rank* r)
              * 并发 INFER 在 engine_lock 排队 */
             pthread_t t;
             if (pthread_create(&t, NULL, rank_conn, (void*)(intptr_t)fd) != 0) {
-                close(fd);
+                sock_close(fd);
             } else {
                 pthread_detach(t);
             }
@@ -286,7 +285,7 @@ static int run_rank(int port, Rank* r)
         if (r->quit) break;
     }
     r->quit = 1;
-    close(srv);
+    sock_close(srv);
     return 0;
 }
 

@@ -214,7 +214,7 @@ static void notify_routers(Supervisor* s, const char* cmd, const char* args)
         int fd = sock_connect_host(rn->addr, (size_t)(colon - rn->addr), (uint16_t)atoi(colon + 1), 3);
         if (fd < 0) continue;
         frame_send(fd, cmd, args);
-        close(fd);
+        sock_close(fd);
     }
 }
 
@@ -338,7 +338,7 @@ int supervisor_run(Supervisor* s)
             Frame f;
             if (frame_recv(fd, &f) >= 0)
                 handle_frame(s, fd, f.cmd, f.args);
-            close(fd);
+            sock_close(fd);
         }
         /* 判死: server 超时 → DEL 通知 router(P3 补重拉) */
         uint64_t now = (uint64_t)time(NULL);
@@ -348,7 +348,7 @@ int supervisor_run(Supervisor* s)
         }
         if (s->quit) break;
     }
-    close(srv);
+    sock_close(srv);
     return 0;
 }
 

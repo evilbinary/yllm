@@ -29,7 +29,7 @@ static int spawn_detached(const char* cmdline, const char* logfile)
         setsid();
         if (logfile && logfile[0]) {
             int fd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); sock_close(fd); }
         }
         execl("/bin/sh", "sh", "-c", cmdline, (char*)NULL);
         _exit(127);
@@ -186,7 +186,7 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
                     frame_send(rfd, PROTO_DRAIN, NULL);
                     Frame rf;
                     if (frame_recv(rfd, &rf) >= 0) printf("%s: %s %s\n", label, rf.cmd, rf.args);
-                    close(rfd);
+                    sock_close(rfd);
                 } else {
                     printf("%s: 不可达(已停止?)\n", label);
                 }
@@ -197,7 +197,7 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
             frame_send(sfd, PROTO_QUIT, NULL);
             Frame sf;
             if (frame_recv(sfd, &sf) >= 0) printf("supervisor: %s %s\n", sf.cmd, sf.args);
-            close(sfd);
+            sock_close(sfd);
         } else {
             printf("supervisor: 不可达(已停止?)\n");
         }
@@ -228,6 +228,6 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
         if (strcmp(f.cmd, "OK") == 0 || strcmp(f.cmd, "ERR") == 0) break;
         if (strcmp(f.cmd, "QUERY_DONE") == 0) break;
     }
-    close(fd);
+    sock_close(fd);
     return 0;
 }

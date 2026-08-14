@@ -160,7 +160,7 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
             }
         }
     }
-    close(fd);
+    sock_close(fd);
 }
 
 /* 路由决策: 选一个 READY server */
@@ -233,7 +233,7 @@ int router_infer(Router* r, const char* model, int max_tokens,
     pthread_mutex_lock(&r->lock);
     s->inflight--;
     pthread_mutex_unlock(&r->lock);
-    close(sfd);
+    sock_close(sfd);
     return rc;
 }
 
@@ -263,8 +263,8 @@ static void handle_client_infer(int fd, Router* r, const char *args)
     sock_send_n(sfd, "\n", 1);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
-        if (!pb) { close(sfd); sock_send_line(fd, "ERR oom"); return; }
-        if (sock_recv_n(fd, pb, (size_t)nbytes) != 0) { free(pb); close(sfd); return; }
+        if (!pb) { sock_close(sfd); sock_send_line(fd, "ERR oom"); return; }
+        if (sock_recv_n(fd, pb, (size_t)nbytes) != 0) { free(pb); sock_close(sfd); return; }
         sock_send_n(sfd, pb, (size_t)nbytes);
         free(pb);
     }
@@ -290,7 +290,7 @@ static void handle_client_infer(int fd, Router* r, const char *args)
     pthread_mutex_lock(&r->lock);
     s->inflight--;
     pthread_mutex_unlock(&r->lock);
-    close(sfd);
+    sock_close(sfd);
 }
 
 /* 客户端模式: --send "<model> <max_tokens> <prompt>" */
@@ -325,7 +325,7 @@ static int run_client(Router* r, const char* send)
     addr.sin_port = htons(r->port);
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         fprintf(stderr, "cannot connect router on port %u\n", r->port);
-        close(fd);
+        sock_close(fd);
         return 1;
     }
     size_t plen = strlen(prompt);
@@ -352,7 +352,7 @@ static int run_client(Router* r, const char* send)
             if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
         }
     }
-    close(fd);
+    sock_close(fd);
     return 0;
 }
 
@@ -390,7 +390,7 @@ static void* router_conn(void* arg)
         } else
             frame_send(fd, "ERR", "unknown cmd");
     }
-    close(fd);
+    sock_close(fd);
     return NULL;
 }
 
@@ -423,7 +423,7 @@ int router_run(Router* r, const char* sv_host, uint16_t sv_port)
             query_servers(r, sv_host, sv_port);
         }
     }
-    close(srv);
+    sock_close(srv);
     return 0;
 }
 

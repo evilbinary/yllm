@@ -18,7 +18,6 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <time.h>
-#define close(fd) closesocket(fd)
 #define ssize_t int
 #else
 #include <unistd.h>
@@ -29,6 +28,15 @@
 #include <time.h>
 #include <math.h>
 #endif
+
+static int sock_close_fd(int fd)
+{
+#ifdef _WIN32
+    return closesocket((SOCKET)fd);
+#else
+    return sock_close_fd(fd);
+#endif
+}
 
 #define DTYPE_X 1
 #define DTYPE_LOGITS_K 2
@@ -45,8 +53,8 @@ static int sock_listen(uint16_t port)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
-    if (listen(fd, 8) != 0) { close(fd); return -1; }
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { sock_close_fd(fd); return -1; }
+    if (listen(fd, 8) != 0) { sock_close_fd(fd); return -1; }
     return fd;
 }
 
@@ -77,7 +85,7 @@ static int sock_connect(uint16_t port, const char* ip)
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
             return fd;
         }
-        close(fd);
+        sock_close_fd(fd);
         /* 对端可能尚未 listen(启动竞态), 每 200ms 重试 */
 #ifdef _WIN32
         Sleep(200);
@@ -166,7 +174,7 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
             if (d->log_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect back to rank 0\n", rank); return -1; }
         }
     }
-    close(listen_fd);
+    sock_close_fd(listen_fd);
     return 0;
 }
 
@@ -276,9 +284,9 @@ int dist_send_done(Dist* d)
 
 void dist_close(Dist* d)
 {
-    if (d->up_fd >= 0) close(d->up_fd);
-    if (d->down_fd >= 0) close(d->down_fd);
-    if (d->log_fd >= 0) close(d->log_fd);
+    if (d->up_fd >= 0) sock_close_fd(d->up_fd);
+    if (d->down_fd >= 0) sock_close_fd(d->down_fd);
+    if (d->log_fd >= 0) sock_close_fd(d->log_fd);
     free(d->x16);
     free(d->heap);
     memset(d, 0, sizeof(*d));

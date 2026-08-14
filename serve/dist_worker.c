@@ -38,7 +38,6 @@
 #include <windows.h>
 #include <sys/stat.h>
 #include <utime.h>
-#define close(fd) closesocket(fd)
 #define ssize_t int
 #define stat_ok(st) ((st).st_size)
 #else
@@ -51,6 +50,15 @@
 #include <signal.h>
 #include <utime.h>
 #endif
+
+static int sock_close_fd(int fd)
+{
+#ifdef _WIN32
+    return closesocket((SOCKET)fd);
+#else
+    return sock_close_fd(fd);
+#endif
+}
 
 #define MAX_LINE 8192
 #define MAX_CHILDREN 64
@@ -161,7 +169,7 @@ static int tcp_connect(const char* host, uint16_t port)
         nanosleep(&ts, NULL);
 #endif
     }
-    close(fd);
+    sock_close_fd(fd);
     return -1;
 }
 
@@ -241,26 +249,26 @@ static long long file_info(const char* path, long long* mtime)
 static void serve_conn(int fd, const char* root)
 {
     char line[MAX_LINE];
-    if (recv_line(fd, line, sizeof(line)) < 0) { close(fd); return; }
+    if (recv_line(fd, line, sizeof(line)) < 0) { sock_close_fd(fd); return; }
     char op[16];
     char path[1024];
-    if (sscanf(line, "%15s %1023s", op, path) != 2) { close(fd); return; }
+    if (sscanf(line, "%15s %1023s", op, path) != 2) { sock_close_fd(fd); return; }
     if (strcmp(op, "HEAD") != 0 && strcmp(op, "GET") != 0) {
         const char* e = "ERR bad op";
         xsend(fd, e, strlen(e));
-        close(fd);
+        sock_close_fd(fd);
         return;
     }
     char full[4096];
     size_t rootlen = strlen(root);
     int need_slash = rootlen > 0 && root[rootlen - 1] != '/' && root[rootlen - 1] != '\\';
-    if (snprintf(full, sizeof(full), "%s%s%s", root, need_slash ? "/" : "", path) >= (int)sizeof(full)) { close(fd); return; }
+    if (snprintf(full, sizeof(full), "%s%s%s", root, need_slash ? "/" : "", path) >= (int)sizeof(full)) { sock_close_fd(fd); return; }
     long long mtime = 0;
     long long size = file_info(full, &mtime);
     if (size < 0) {
         const char* nf = "ERR not found";
         xsend(fd, nf, strlen(nf));
-        close(fd);
+        sock_close_fd(fd);
         return;
     }
     char ok[128];
@@ -278,10 +286,10 @@ static void serve_conn(int fd, const char* root)
                 xsend(fd, buf, got);
                 left -= (long long)got;
             }
-            fclose(f);
+            fsock_close_fd(f);
         }
     }
-    close(fd);
+    sock_close_fd(fd);
 }
 
 static int run_serve(uint16_t port, const char* root)
@@ -298,8 +306,8 @@ static int run_serve(uint16_t port, const char* root)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(srv); return 1; }
-    if (listen(srv, 8) != 0) { close(srv); return 1; }
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { sock_close_fd(srv); return 1; }
+    if (listen(srv, 8) != 0) { sock_close_fd(srv); return 1; }
     WLN("worker: serving root %s on port %u", root, port);
     for (;;) {
         int fd = (int)accept(srv, NULL, NULL);
@@ -319,10 +327,10 @@ static int sync_file(const char* host, uint16_t port, const char* rel, const cha
     if (fd < 0) return -1;
     snprintf(line, sizeof(line), "HEAD %s\n", rel);
     xsend(fd, line, strlen(line));
-    if (recv_line(fd, line, sizeof(line)) < 0) { close(fd); return -2; }
+    if (recv_line(fd, line, sizeof(line)) < 0) { sock_close_fd(fd); return -2; }
     long long rsize = -1, rmtime = -1;
-    if (sscanf(line, "OK %lld %lld", &rsize, &rmtime) != 2) { close(fd); return -2; }
-    close(fd);
+    if (sscanf(line, "OK %lld %lld", &rsize, &rmtime) != 2) { sock_close_fd(fd); return -2; }
+    sock_close_fd(fd);
 
     long long lsize = -1, lmtime = -1;
     struct stat st;
@@ -340,15 +348,15 @@ static int sync_file(const char* host, uint16_t port, const char* rel, const cha
     if (fd < 0) return -1;
     snprintf(line, sizeof(line), "GET %s\n", rel);
     xsend(fd, line, strlen(line));
-    if (recv_line(fd, line, sizeof(line)) < 0) { close(fd); return -2; }
+    if (recv_line(fd, line, sizeof(line)) < 0) { sock_close_fd(fd); return -2; }
     long long gsize = -1, gmtime = -1;
-    if (sscanf(line, "OK %lld %lld", &gsize, &gmtime) != 2) { close(fd); return -2; }
+    if (sscanf(line, "OK %lld %lld", &gsize, &gmtime) != 2) { sock_close_fd(fd); return -2; }
     if (gmtime >= 0 && rmtime < 0) rmtime = gmtime;
 
     char tmp[4096];
     snprintf(tmp, sizeof(tmp), "%s.tmp", dest);
     FILE* f = fopen(tmp, "wb");
-    if (!f) { DBG("sync: fopen tmp fail %s", tmp); close(fd); return -1; }
+    if (!f) { DBG("sync: fopen tmp fail %s", tmp); sock_close_fd(fd); return -1; }
     char buf[65536];
     long long left = gsize;
     int ok = 1;
@@ -358,8 +366,8 @@ static int sync_file(const char* host, uint16_t port, const char* rel, const cha
         fwrite(buf, 1, want, f);
         left -= (long long)want;
     }
-    close(fd);
-    fclose(f);
+    sock_close_fd(fd);
+    fsock_close_fd(f);
     if (!ok || left != 0) { DBG("sync: short read left=%lld", left); remove(tmp); return -1; }
 #ifdef _WIN32
     /* Windows rename 不会覆盖已存在文件, 先删目标再改名 */
@@ -447,8 +455,8 @@ static int run_server(uint16_t port, const char* bin, const char* logdir)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(srv); return 1; }
-    if (listen(srv, 8) != 0) { close(srv); return 1; }
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { sock_close_fd(srv); return 1; }
+    if (listen(srv, 8) != 0) { sock_close_fd(srv); return 1; }
     WLN("worker: listening on port %u (bin=%s logdir=%s)", port, bin, logdir);
 
 for (;;) {
@@ -462,7 +470,7 @@ for (;;) {
 #else
             DBG("worker: recv_line fail fd=%d", fd);
 #endif
-            close(fd); continue;
+            sock_close_fd(fd); continue;
         }
         DBG("worker: got cmd [%s]", line);
         char out[64];
@@ -472,10 +480,10 @@ for (;;) {
         snprintf(reply, sizeof(reply), "%s\n", out);
         xsend(fd, reply, strlen(reply));
         DBG("worker: sent reply, closing");
-        close(fd);
+        sock_close_fd(fd);
         if (strcmp(out, "ok") == 0 && strcmp(line, "quit") == 0) break;
     }
-    close(srv);
+    sock_close_fd(srv);
     return 0;
 }
 
@@ -498,7 +506,7 @@ static int run_client(const char* host, uint16_t port, const char* send)
         usleep(300 * 1000);
 #endif
     }
-    close(fd);
+    sock_close_fd(fd);
     return 0;
 }
 
@@ -545,6 +553,6 @@ int main(int argc, char** argv)
     } else {
         rc = run_server(port, bin, logdir);
     }
-    ylog_close();
+    ylog_sock_close_fd();
     return rc;
 }

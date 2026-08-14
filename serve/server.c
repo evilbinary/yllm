@@ -17,6 +17,7 @@
 #include "node.h"
 #include "sock.h"
 #include "server.h"
+#include "../inference/yllm.h"
 #include "../inference/log.h"
 #include <time.h>
 #include <pthread.h>
@@ -44,8 +45,8 @@ static void forward_infer(int client_fd, Server* s, const char* args)
     long nbytes = frame_payload_len(&f);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
-        if (!pb) { close(fd); sock_send_line(client_fd, "ERR server: oom"); return; }
-        if (sock_recv_n(client_fd, pb, (size_t)nbytes) != 0) { free(pb); close(fd); return; }
+        if (!pb) { sock_close(fd); sock_send_line(client_fd, "ERR server: oom"); return; }
+        if (sock_recv_n(client_fd, pb, (size_t)nbytes) != 0) { free(pb); sock_close(fd); return; }
         sock_send_n(fd, pb, (size_t)nbytes);
         free(pb);
     }
@@ -66,7 +67,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
             if (payload != out) free(payload);
         }
     }
-    close(fd);
+    sock_close(fd);
 }
 
 static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
@@ -100,7 +101,7 @@ static void* srv_conn(void* arg)
     Frame f;
     if (frame_recv(fd, &f) >= 0)
         handle_frame(fd, s, f.cmd, f.args);
-    close(fd);
+    sock_close(fd);
     return NULL;
 }
 
@@ -140,7 +141,7 @@ int server_run(Server* s)
         }
         if (s->quit) break;
     }
-    close(srv);
+    sock_close(srv);
     return 0;
 }
 

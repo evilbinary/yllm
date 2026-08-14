@@ -104,7 +104,7 @@ static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, Nod
             found = 1;
         }
     }
-    close(fd);
+    sock_close(fd);
     if (!found) printf("  (无 server 节点)\n");
 }
 
@@ -123,7 +123,7 @@ static void query_role(const char* label, const char* addr)
         printf("  %s: %s %s\n", label, f.cmd, f.args);
     else
         printf("  %s: 无响应(超时) (%s)\n", label, addr);
-    close(fd);
+    sock_close(fd);
 }
 
 static void query_ranks(ServeConfig* cfg, const NodeInfo* infos, int n)

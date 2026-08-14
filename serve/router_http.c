@@ -276,7 +276,7 @@ static void handle_conn(int fd, Router* r)
 {
     HttpRequest req;
     if (http_parse_request(fd, &req) != 0) {
-        close(fd);
+        sock_close(fd);
         return;
     }
 
@@ -299,7 +299,7 @@ static void handle_conn(int fd, Router* r)
         http_reply(&rr, "{\"error\":{\"message\":\"not found\"}}");
     }
     if (req.body) free(req.body);
-    close(fd);
+    sock_close(fd);
 }
 
 /* HTTP 连接处理(每连接一线程: 长生成不阻塞其他连接) */
@@ -328,7 +328,7 @@ static void http_thread(void* arg)
             pthread_detach(t);
         }
     }
-    close(srv);
+    sock_close(srv);
 }
 
 /* 启动 HTTP 线程(由 router --http-port 调用) */

@@ -53,7 +53,7 @@ static inline void node_heartbeat(const Node* n)
     char args[512];
     node_hb_args(n, args, sizeof(args));
     frame_send(fd, "HEARTBEAT", args);
-    close(fd);
+    sock_close(fd);
 }
 
 /* 解析 HEARTBEAT args 进 Node(接收方: supervisor/router 用) */

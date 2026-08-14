@@ -13,8 +13,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#define close(fd) closesocket(fd)
 #define ssize_t int
+static inline int sock_close(int fd) { return closesocket((SOCKET)fd); }
 #else
 #include <unistd.h>
 #include <sys/socket.h>
@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+static inline int sock_close(int fd) { return close(fd); }
 #endif
 
 static inline void sock_init(void)
@@ -134,7 +135,7 @@ static inline int sock_connect(const char* host, uint16_t port, int retries)
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
             return fd;
         }
-        close(fd);
+        sock_close(fd);
 #ifdef _WIN32
         Sleep(200);
 #else
@@ -172,8 +173,8 @@ static inline int sock_listen(uint16_t port, int backlog)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(srv); return -1; }
-    if (listen(srv, backlog) != 0) { close(srv); return -1; }
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { sock_close(srv); return -1; }
+    if (listen(srv, backlog) != 0) { sock_close(srv); return -1; }
     return srv;
 }
 

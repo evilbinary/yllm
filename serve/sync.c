@@ -9,7 +9,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <direct.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -67,12 +69,12 @@ static int serve_sync(int port, const char* dir)
         Frame f;
         if (frame_recv(fd, &f) >= 0) {
             if (strcmp(f.cmd, "FILE_PUT") == 0) recv_file(fd, f.args, dir);
-            else if (strcmp(f.cmd, "QUIT") == 0) { frame_send(fd, "OK", NULL); close(fd); break; }
+            else if (strcmp(f.cmd, "QUIT") == 0) { frame_send(fd, "OK", NULL); sock_close(fd); break; }
             else frame_send(fd, "ERR", "unknown cmd");
         }
-        close(fd);
+        sock_close(fd);
     }
-    close(srv);
+    sock_close(srv);
     return 0;
 }
 
@@ -113,7 +115,7 @@ static int push_file(const char* file, const char* to, const char* dest)
     fclose(f);
     Frame r;
     if (frame_recv(fd, &r) >= 0) printf("sync: %s %s\n", r.cmd, r.args);
-    close(fd);
+    sock_close(fd);
     return 0;
 }
 
