@@ -93,6 +93,12 @@
 #define PROTO_SERVER_INFO "SERVER_INFO"
 #define PROTO_QUERY_DONE "QUERY_DONE"
 
+/* QUERY_RANKS model=<name>\n → RANK_INFO ... QUERY_DONE\n
+ * server 主动查询 supervisor: 该模型所有 ready rank 的真实地址(自动发现,
+ * 跨机器分布式: rank 心跳上报自身 IP, server 无需配置 leader) */
+#define PROTO_QUERY_RANKS "QUERY_RANKS"
+#define PROTO_RANK_INFO "RANK_INFO"
+
 /* ---- 流式 token 帧(server → router 透传, rank → server) ---- */
 
 /* T <len>\n<token utf8 bytes>: 生成的一个 token */

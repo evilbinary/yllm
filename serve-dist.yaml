@@ -1,0 +1,39 @@
+# yllm serve 分布式配置(rank 外部部署: 本机 hub + 远程 rank)
+# 用法:
+#   yllm hub --config serve-dist.yaml          # 本机: supervisor+router+server(http 8000)
+#   远程节点手工起 rank: yllm rank --model <llf> --vocab <vocab> --port <port>
+#                       --supervisor <本机IP>:9500 --id rank-N
+# ranks: 0 = 该模型 rank 由外部节点承担, supervisor 不 spawn
+
+# 日志
+log: logs/serve.log
+log-level: info
+
+bin: ./build/avx2/yllm
+
+# 端口(模型 mi 的 rank 基址 = rank-port-base + mi*16, server 端口 = server-port + mi*16)
+sv-port: 9500          # supervisor 心跳口
+router-port: 9400      # router 客户端口
+server-port: 9420      # 模型0 server 端口
+rank-port-base: 9410   # 模型0 rank 推理口基址
+http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
+
+# 拓扑
+sv-host: 127.0.0.1     # 本机 hub 内部角色心跳目标
+router-addrs: 127.0.0.1:9400
+servers: 1
+
+# 行为
+auto-heal: 1           # 自愈(外部 rank 由外部 supervisor 管, 本机不重拉)
+strategy: least
+
+# ---- 多模型(rank 在远程 192.168.0.23) ----
+models:
+  - name: tinyllama
+    model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+    vocab: models/tinyllama.vocab.txt
+    ranks: 0
+  - name: qwen2.5
+    model: models/qwen2.5-1.5b.llf
+    vocab: models/qwen2.5.vocab.txt
+    ranks: 0

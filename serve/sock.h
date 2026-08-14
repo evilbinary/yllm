@@ -20,6 +20,7 @@ static inline int sock_close(int fd) { return closesocket((SOCKET)fd); }
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <netdb.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -34,6 +35,40 @@ static inline void sock_init(void)
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
+}
+
+/* 本机主接口 IPv4(UDP 路由选择, 不真正发包; 失败 fallback 主机名解析) */
+static inline int sock_local_ip(char* buf, size_t sz)
+{
+    int fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = inet_addr("8.8.8.8");
+        a.sin_port = htons(80);
+        if (connect(fd, (struct sockaddr*)&a, sizeof(a)) == 0) {
+            struct sockaddr_in b;
+            int blen = sizeof(b);
+            memset(&b, 0, sizeof(b));
+            if (getsockname(fd, (struct sockaddr*)&b, &blen) == 0 && b.sin_addr.s_addr != 0) {
+                snprintf(buf, sz, "%s", inet_ntoa(b.sin_addr));
+                sock_close(fd);
+                return 0;
+            }
+        }
+        sock_close(fd);
+    }
+    char hn[256];
+    if (gethostname(hn, sizeof(hn)) == 0) {
+        struct hostent* he = gethostbyname(hn);
+        if (he && he->h_addrtype == AF_INET && he->h_addr) {
+            snprintf(buf, sz, "%s", inet_ntoa(*(struct in_addr*)he->h_addr));
+            return 0;
+        }
+    }
+    snprintf(buf, sz, "0.0.0.0");
+    return -1;
 }
 
 static inline int sock_recv_n(int fd, void* buf, size_t n)

@@ -334,7 +334,12 @@ int cmd_rank(ServeConfig* cfg)
     snprintf(r.node.type, sizeof(r.node.type), "rank");
     snprintf(r.node.model, sizeof(r.node.model), "%s", cfg->model);
     r.node.state = NODE_STATE_READY;
-    snprintf(r.node.addr, sizeof(r.node.addr), "%s:%u", cfg->sv_host, cfg->rank_port_base);
+    /* addr 上报: 本机真实 IP + 监听端口(心跳携带, supervisor 直接存, server 据此连接) */
+    {
+        char lip[64] = "127.0.0.1";
+        sock_local_ip(lip, sizeof(lip));
+        snprintf(r.node.addr, sizeof(r.node.addr), "%s:%u", lip, cfg->rank_port_base);
+    }
     if (cfg->sv_host[0]) {
         snprintf(r.node.sv_host, sizeof(r.node.sv_host), "%s", cfg->sv_host);
         r.node.sv_port = (uint16_t)cfg->sv_port;

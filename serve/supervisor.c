@@ -291,10 +291,29 @@ static void handle_query_servers(Supervisor* s, int fd)
     frame_send(fd, "QUERY_DONE", NULL);
 }
 
+/* server 主动查询: 返回该模型所有 ready rank 的真实地址(自动发现) */
+static void handle_query_ranks(Supervisor* s, int fd, const char* args)
+{
+    const char* want = proto_get(args, "model");
+    int i;
+    for (i = 0; i < s->n_nodes; i++) {
+        Node* n = &s->nodes[i].node;
+        if (strcmp(n->type, "rank") != 0) continue;
+        if (want && want[0] && n->model[0] && strcmp(n->model, want) != 0) continue;
+        if (n->state != NODE_STATE_READY) continue;
+        char a[512];
+        snprintf(a, sizeof(a), "%s type=rank model=%s addr=%s state=ready",
+                 n->node_id, n->model, n->addr);
+        frame_send(fd, PROTO_RANK_INFO, a);
+    }
+    frame_send(fd, PROTO_QUERY_DONE, NULL);
+}
+
 static void handle_frame(Supervisor* s, int fd, const char* cmd, const char* args)
 {
     if (strcmp(cmd, "HEARTBEAT") == 0) handle_heartbeat(s, fd, args);
     else if (strcmp(cmd, "QUERY_SERVERS") == 0) handle_query_servers(s, fd);
+    else if (strcmp(cmd, PROTO_QUERY_RANKS) == 0) handle_query_ranks(s, fd, args);
     else if (strcmp(cmd, PROTO_SCALE) == 0) { handle_scale(s, args); frame_send(fd, "OK", NULL); }
     else if (strcmp(cmd, PROTO_QUIT) == 0 || strcmp(cmd, PROTO_DRAIN) == 0) {
         frame_send(fd, "OK", NULL);
@@ -313,7 +332,12 @@ static void supervisor_bootstrap(Supervisor* s)
     int mi, r;
     for (mi = 0; mi < s->n_models; mi++) {
         ModelCfg* mc = &s->models[mi];
-        int ranks = mc->ranks > 0 ? mc->ranks : 1;
+        int ranks = mc->ranks;
+        if (ranks <= 0) {
+            /* ranks=0: 该模型 rank 外部部署(分布式), 不 spawn */
+            ylog_info("supervisor: model %s ranks=0, skip spawn (external rank)", mc->name);
+            continue;
+        }
         for (r = 0; r < ranks; r++)
             supervisor_spawn_rank(s, mi, r);
         if (!s->no_spawn_server)

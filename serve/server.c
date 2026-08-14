@@ -134,6 +134,22 @@ int server_run(Server* s)
 {
     sock_init();
 
+    /* leader 未指定(分布式自动发现): 向 supervisor 查询该模型 rank, 等心跳就绪重试 */
+    if (!s->leader_host[0]) {
+        const char* qmodel = s->resolve_model[0] ? s->resolve_model : s->node.model;
+        int tries;
+        for (tries = 0; tries < 90; tries++) {
+            if (server_resolve_leader(s, s->node.sv_host, s->node.sv_port, qmodel) == 0)
+                break;
+            sock_sleep_ms(1000);
+        }
+        if (!s->leader_host[0]) {
+            ylog_error("server: leader auto-discovery failed (no ready rank for %s)",
+                       s->node.model);
+            return 1;
+        }
+    }
+
     int srv = sock_listen(s->port, 8);
     if (srv < 0) return 1;
     ylog_info("server %s: listening on port %u (leader=%s:%u, heartbeat → %s:%u)",
@@ -166,10 +182,47 @@ int server_run(Server* s)
     return 0;
 }
 
+/* 自动发现 leader: 向 supervisor 查询该模型的 ready rank, 取第一个填 leader_host/port。
+ * 返回 0 成功, -1 失败(无 rank / 查询失败)。 */
+int server_resolve_leader(Server* s, const char* sv_host, uint16_t sv_port, const char* model)
+{
+    int fd = sock_connect(sv_host, sv_port, 3);
+    if (fd < 0) return -1;
+    sock_set_timeout(fd, 5);
+    char qargs[512];
+    snprintf(qargs, sizeof(qargs), "model=%s", model ? model : "");
+    frame_send(fd, PROTO_QUERY_RANKS, qargs);
+    for (;;) {
+        Frame f;
+        if (frame_recv(fd, &f) < 0) break;
+        if (strcmp(f.cmd, PROTO_RANK_INFO) == 0) {
+            const char* a = proto_get(f.args, "addr");
+            if (a) {
+                const char* colon = strchr(a, ':');
+                if (colon) {
+                    size_t hlen = (size_t)(colon - a);
+                    if (hlen >= sizeof(s->leader_host)) hlen = sizeof(s->leader_host) - 1;
+                    memcpy(s->leader_host, a, hlen);
+                    s->leader_host[hlen] = '\0';
+                    s->leader_port = (uint16_t)atoi(colon + 1);
+                    sock_close(fd);
+                    ylog_info("server: leader auto-discovered %s:%u (model=%s)",
+                              s->leader_host, s->leader_port, model);
+                    return 0;
+                }
+            }
+        } else if (strcmp(f.cmd, PROTO_QUERY_DONE) == 0) {
+            break;
+        }
+    }
+    sock_close(fd);
+    return -1;
+}
+
 int cmd_server(ServeConfig* cfg)
 {
-    if (!cfg->model_name[0] || !cfg->leader[0]) {
-        fprintf(stderr, "usage: yllm server --id <name> --model-name <name> --leader <ip:port> "
+    if (!cfg->model_name[0]) {
+        fprintf(stderr, "usage: yllm server --id <name> --model-name <name> [--leader <ip:port>] "
                         "--supervisor <ip:port> [--port N]\n");
         return 1;
     }
@@ -185,15 +238,25 @@ int cmd_server(ServeConfig* cfg)
     s.node.state = NODE_STATE_READY;
     s.port = (uint16_t)cfg->server_port;
     s.start_s = (uint64_t)time(NULL);
+    if (cfg->model[0])
+        snprintf(s.resolve_model, sizeof(s.resolve_model), "%s", cfg->model);
 
-    /* 解析 leader ip:port */
-    const char* colon = strchr(cfg->leader, ':');
-    if (!colon) { fprintf(stderr, "bad leader addr: %s\n", cfg->leader); return 1; }
-    size_t hlen = (size_t)(colon - cfg->leader);
-    if (hlen >= sizeof(s.leader_host)) hlen = sizeof(s.leader_host) - 1;
-    memcpy(s.leader_host, cfg->leader, hlen);
-    s.leader_host[hlen] = '\0';
-    s.leader_port = (uint16_t)atoi(colon + 1);
+    /* 解析 leader ip:port; 未配置 → 向 supervisor 查询该模型 rank 自动发现 */
+    if (cfg->leader[0]) {
+        const char* colon = strchr(cfg->leader, ':');
+        if (!colon) { fprintf(stderr, "bad leader addr: %s\n", cfg->leader); return 1; }
+        size_t hlen = (size_t)(colon - cfg->leader);
+        if (hlen >= sizeof(s.leader_host)) hlen = sizeof(s.leader_host) - 1;
+        memcpy(s.leader_host, cfg->leader, hlen);
+        s.leader_host[hlen] = '\0';
+        s.leader_port = (uint16_t)atoi(colon + 1);
+    } else {
+        if (server_resolve_leader(&s, cfg->sv_host, (uint16_t)cfg->sv_port, cfg->model) != 0) {
+            fprintf(stderr, "server: no ready rank for model %s (supervisor %s:%d)\n",
+                    cfg->model, cfg->sv_host, cfg->sv_port);
+            return 1;
+        }
+    }
 
     /* 自身 addr(上报 supervisor 用): ip:port */
     snprintf(s.node.addr, sizeof(s.node.addr), "%s:%u", cfg->sv_host, s.port);

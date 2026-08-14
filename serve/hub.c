@@ -114,10 +114,10 @@ int cmd_hub(ServeConfig* cfg)
         s->node.state = NODE_STATE_READY;
         s->port = (uint16_t)(cfg->server_port + mi * cfg_model_stride(cfg));
         snprintf(s->node.addr, sizeof(s->node.addr), "127.0.0.1:%d", s->port);
-        /* leader = 该模型 rank0 (rank_port_base + mi*16) */
-        int lbase = cfg->rank_port_base + mi * cfg_model_stride(cfg);
-        snprintf(s->leader_host, sizeof(s->leader_host), "%s", sv_host);
-        s->leader_port = (uint16_t)lbase;
+        /* leader = 该模型 rank0 (rank_port_base + mi*16); 主机由 server_run 自动发现(查询 supervisor 注册表) */
+        if (mc->model[0])
+            snprintf(s->resolve_model, sizeof(s->resolve_model), "%s", mc->model);
+        s->leader_port = (uint16_t)(cfg->rank_port_base + mi * cfg_model_stride(cfg));
         snprintf(s->node.sv_host, sizeof(s->node.sv_host), "127.0.0.1");
         s->node.sv_port = sv_port;
         s->node.sv_enabled = 1;
