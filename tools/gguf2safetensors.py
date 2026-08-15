@@ -58,6 +58,155 @@ def _gguf_field(reader, name):
         return None
 
 
+def _gguf_str(reader, name):
+    """读取标量字符串字段。"""
+    f = reader.fields.get(name)
+    if f is None:
+        return None
+    try:
+        return f.parts[4].tobytes().decode("utf-8", "ignore").split("\x00")[0]
+    except Exception:
+        return None
+
+
+def _gguf_arr_str(reader, name):
+    """读取字符串数组字段(gguf-python parts 布局: [0]=总长 [1]=名 [2]=类型 [3]=元素类型 [4]=数量 [5..]=每元素 2 part)。"""
+    f = reader.fields.get(name)
+    if f is None:
+        return None
+    try:
+        parts = f.parts
+        count = int.from_bytes(parts[4].tobytes(), "little")
+        vals = []
+        i = 5
+        for _ in range(count):
+            n = int.from_bytes(parts[i].tobytes(), "little")
+            vals.append(parts[i + 1].tobytes().decode("utf-8", "ignore") if n else "")
+            i += 2
+        return vals
+    except Exception:
+        return None
+
+
+def _gguf_arr_i32(reader, name):
+    """读取 int32 数组字段。"""
+    f = reader.fields.get(name)
+    if f is None:
+        return None
+    try:
+        parts = f.parts
+        count = int.from_bytes(parts[4].tobytes(), "little")
+        return [int.from_bytes(parts[5 + i].tobytes(), "little") for i in range(count)]
+    except Exception:
+        return None
+
+
+def _gguf_i64(reader, name):
+    f = reader.fields.get(name)
+    if f is None:
+        return None
+    try:
+        return int.from_bytes(f.parts[4].tobytes(), "little")
+    except Exception:
+        return None
+
+
+def _token_spec(content, lstrip=False, normalized=False, single_word=False):
+    return {"content": content, "lstrip": lstrip, "normalized": normalized,
+            "rstrip": False, "single_word": single_word}
+
+
+def write_tokenizer(outdir, reader):
+    """从 gguf 提取 tokenizer 数据, 生成 HF 格式 tokenizer.json + tokenizer_config.json + vocab.json + merges.txt。"""
+    tokens = _gguf_arr_str(reader, "tokenizer.ggml.tokens")
+    merges = _gguf_arr_str(reader, "tokenizer.ggml.merges")
+    if not tokens or not merges:
+        print("skip tokenizer: no tokens/merges in gguf")
+        return
+    types = _gguf_arr_i32(reader, "tokenizer.ggml.token_type") or [1] * len(tokens)
+    bos_id = _gguf_i64(reader, "tokenizer.ggml.bos_token_id")
+    eos_id = _gguf_i64(reader, "tokenizer.ggml.eos_token_id")
+    pad_id = _gguf_i64(reader, "tokenizer.ggml.padding_token_id")
+    unk_id = None
+    for i, t in enumerate(types):
+        if t == 2:
+            unk_id = i
+            break
+    if unk_id is None:
+        unk_id = bos_id
+    add_bos = bool(_gguf_i64(reader, "tokenizer.ggml.add_bos_token"))
+    model = _gguf_str(reader, "tokenizer.ggml.model") or "gpt2"
+    pre = _gguf_str(reader, "tokenizer.ggml.pre") or "bytelevel"
+    chat_template = _gguf_str(reader, "tokenizer.chat_template")
+
+    arch = _gguf_str(reader, "general.architecture") or "llama"
+    cls = "Qwen2Tokenizer" if arch.startswith("qwen") else "LlamaTokenizer"
+
+    # --- tokenizer.json(经 tokenizers 库构造, 保证格式正确) ---
+    import tokenizers
+    from tokenizers import Tokenizer as TK
+    from tokenizers import models as tk_models, pre_tokenizers as tk_pre, decoders as tk_dec
+    vocab = {p: i for i, p in enumerate(tokens)}
+    merges_tuples = [tuple(m.split(" ")) for m in merges if m]
+    bpe = tk_models.BPE(vocab=vocab, merges=merges_tuples,
+                        unk_token=tokens[unk_id] if unk_id is not None else None)
+    tk = TK(bpe)
+    if (pre or "").lower() in ("bytelevel", "gpt2", "qwen2", "qwen3"):
+        tk.pre_tokenizer = tk_pre.ByteLevel(add_prefix_space=False, use_regex=True)
+        tk.decoder = tk_dec.ByteLevel()
+    else:
+        tk.pre_tokenizer = tk_pre.Metaspace(replacement="\u2581")
+        tk.decoder = tk_dec.Metaspace(replacement="\u2581")
+    # 特殊 token 元数据(type != 1)
+    added = []
+    for i, t in enumerate(types):
+        if t != 1:
+            tk.add_special_tokens([tokens[i]])
+            added.append({"id": i, "content": tokens[i], "lstrip": False,
+                          "normalized": False, "rstrip": False, "single_word": False,
+                          "special": t == 3})
+    tk.save(os.path.join(outdir, "tokenizer.json"))
+    if added:
+        import json as _json
+        with open(os.path.join(outdir, "tokenizer.json"), "r") as f:
+            tj = _json.load(f)
+        tj["added_tokens"] = added
+        with open(os.path.join(outdir, "tokenizer.json"), "w") as f:
+            _json.dump(tj, f, ensure_ascii=False, indent=2)
+
+    # --- vocab.json + merges.txt(慢 tokenizer 兼容) ---
+    with open(os.path.join(outdir, "vocab.json"), "w") as f:
+        json.dump(vocab, f, ensure_ascii=False)
+    with open(os.path.join(outdir, "merges.txt"), "w") as f:
+        f.write("\n".join(merges) + "\n")
+
+    # --- tokenizer_config.json ---
+    cfg = {
+        "add_bos_token": add_bos,
+        "add_eos_token": False,
+        "bos_token": _token_spec(tokens[bos_id]) if bos_id is not None else None,
+        "clean_up_tokenization_spaces": False,
+        "eos_token": _token_spec(tokens[eos_id]) if eos_id is not None else None,
+        "pad_token": _token_spec(tokens[pad_id]) if pad_id is not None else None,
+        "unk_token": _token_spec(tokens[unk_id]) if unk_id is not None else None,
+        "model_max_length": 1000000000000000019884624838656,
+        "tokenizer_class": cls,
+        "tokenizer_config": {
+            "add_prefix_space": True,
+            "clean_up_tokenization_spaces": False,
+            "model_input_names": ["input_ids", "attention_mask"],
+            "tokenizer_class": cls,
+        },
+        "model_input_names": ["input_ids", "attention_mask"],
+    }
+    if chat_template:
+        cfg["chat_template"] = chat_template
+    with open(os.path.join(outdir, "tokenizer_config.json"), "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    print(f"tokenizer -> {outdir}/tokenizer.json + vocab.json + merges.txt + tokenizer_config.json "
+          f"({len(tokens)} tokens, {len(merges)} merges)")
+
+
 def write_config_json(outdir, reader):
     """从 gguf 元数据生成 HF config.json(与 safetensors 同目录)。
 
@@ -231,6 +380,7 @@ def main():
 
     reader = GGUFReader(src)
     write_config_json(outdir, reader)
+    write_tokenizer(outdir, reader)
     if len(sys.argv) > 5 and sys.argv[5] == "--config-only":
         print(f"config only -> {os.path.join(outdir, 'config.json')} (safetensors 已存在, 跳过转换)")
         return 0
