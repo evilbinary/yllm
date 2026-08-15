@@ -59,6 +59,9 @@ typedef struct {
     char addrs_csv[1024];/* 组内各段节点 IP(逗号分隔, 段号顺序) */
     int dist_fp16;
     int serve_port;      /* 本段 serve 口(worker 段也监听, 供 PING/STAT/DRAIN 管理) */
+    /* 会话模式最小记账: 引擎 KV 归属的会话 + 已推进位置 */
+    char sess_key[64];
+    uint32_t sess_pos;
 } Rank;
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
@@ -195,6 +198,76 @@ static int on_token_rank(uint32_t id, void* ctx)
     return 0;
 }
 
+/* 会话模式推理: payload = 增量 token 二进制(server 已渲染并算好续接点)。
+ * rank 只做最小记账: sess_key/sess_pos; token 列表/历史在 server 侧管理。 */
+static int handle_infer_session(int fd, Rank* r, const char* key, uint32_t max_tokens,
+                                uint32_t resume, const uint32_t* delta, uint32_t ndelta)
+{
+    EngineTimings tim;
+    memset(&tim, 0, sizeof(tim));
+    uint64_t t0 = ynow_ms();
+    TokenCtx tc;
+    tc.fd = fd;
+    tc.vocab = &r->vocab;
+    tc.n_tokens = 0;
+
+    /* 换会话: 引擎 KV 状态未知, 必须从 0 全量(server 应发全量历史) */
+    if (strcmp(key, r->sess_key) != 0) {
+        if (resume != 0) {
+            send_line(fd, "ERR session not cached on this rank, resume must be 0");
+            return 0;
+        }
+        snprintf(r->sess_key, sizeof(r->sess_key), "%s", key);
+        r->sess_pos = 0;
+    }
+    if (resume != r->sess_pos) {
+        send_line(fd, "ERR resume mismatch: rank has %u, got %u", r->sess_pos, resume);
+        return 0;
+    }
+    if ((uint64_t)r->sess_pos + ndelta > r->engine.max_seq) {
+        send_line(fd, "ERR context full");
+        return 0;
+    }
+
+    r->node.state = NODE_STATE_BUSY;
+    r->node.inflight++;
+    node_heartbeat(&r->node);
+    pthread_mutex_lock(&r->engine_lock);
+
+    /* 增量 prefill: 旧 token 的 KV 已在本引擎缓存, 只算新 token */
+    if (ndelta > 0)
+        engine_forward_prefill(&r->engine, delta, (int)ndelta, r->sess_pos);
+    r->sess_pos += ndelta;
+    tim.n_prefill = ndelta;
+
+    /* decode 循环: 采样 → 流式回 → 前向推进(与 engine_generate 同构) */
+    uint64_t rng = ysrand(r->seed);
+    uint32_t ngen = 0;
+    uint32_t pos = r->sess_pos;
+    for (uint32_t i = 0; i < max_tokens && pos < r->engine.max_seq; i++) {
+        uint32_t nxt;
+        if (engine_sample(&r->engine, r->engine.ws.model.h.vocab, r->temp, r->top_p, &rng, &nxt) != 0) break;
+        if ((int)nxt == r->vocab.eos) break;
+        if (on_token_rank(nxt, &tc) != 0) break;
+        engine_forward(&r->engine, nxt, pos);
+        pos++;
+        ngen++;
+    }
+    r->sess_pos = pos;
+    tim.n_decode = ngen;
+    tim.decode_ms = ynow_ms() - t0;
+
+    ylog_info("rank: session=%s generate ok (%u delta + %u gen tokens, %llu ms)",
+              key, ndelta, ngen, (unsigned long long)(ynow_ms() - t0));
+    pthread_mutex_unlock(&r->engine_lock);
+    r->node.state = NODE_STATE_READY;
+    r->node.inflight--;
+    node_heartbeat(&r->node);
+
+    send_line(fd, "DONE %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
+    return 0;
+}
+
 static int handle_infer(int fd, Rank* r, char* args)
 {
     int max_tokens = 0;
@@ -219,6 +292,20 @@ static int handle_infer(int fd, Rank* r, char* args)
     if (!pb) { send_line(fd, "ERR oom"); return 0; }
     if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); ylog_warn("rank: recv payload FAILED"); return -1; }
     pb[nbytes] = '\0';
+    /* 会话模式: 带 key= 字段时 payload 为增量 token 二进制(server 已渲染, 不 tokenize) */
+    {
+        const char* key = proto_get(args, "key");
+        if (key) {
+            const char* rs = proto_get(args, "resume");
+            uint32_t resume = rs ? (uint32_t)strtoul(rs, NULL, 10) : 0;
+            if (nbytes % 4 != 0) { free(pb); send_line(fd, "ERR session payload must be token bytes"); return 0; }
+            uint32_t ndelta = (uint32_t)(nbytes / 4);
+            int rc = handle_infer_session(fd, r, key, (uint32_t)max_tokens, resume,
+                                          (const uint32_t*)pb, ndelta);
+            free(pb);
+            return rc;
+        }
+    }
     ylog_info("rank: payload=[%s]", pb);
     uint32_t* ids = (uint32_t*)ymalloc((size_t)nbytes + 8192 + 4096);
     if (!ids) { free(pb); send_line(fd, "ERR oom"); return 0; }

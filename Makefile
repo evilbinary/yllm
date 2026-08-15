@@ -150,7 +150,7 @@ $(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/rout
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----
-TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c tests/test_prefill_batch.c
+TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c tests/test_prefill_batch.c tests/test_cache.c
 
 $(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/platform.c inference/llf.c inference/matvec.c | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Itests -o $@ $< inference/platform.c inference/llf.c inference/matvec.c $(LDFLAGS) $(LIBS)
@@ -179,6 +179,9 @@ $(OBJDIR_AVX2)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJD
 $(OBJDIR)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
 
+$(OBJDIR)/test_cache.exe: tests/test_cache.c inference/cache.c inference/platform.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+
 $(OBJDIR_AVX2)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
@@ -196,6 +199,8 @@ test: $(TEST_BIN)
 	./$(OBJDIR)/test_engine.exe
 	@echo "=== test_prefill_batch ==="
 	./$(OBJDIR)/test_prefill_batch.exe
+	@echo "=== test_cache ==="
+	./$(OBJDIR)/test_cache.exe
 
 test-avx2: $(TEST_BIN_AVX)
 	@echo "=== test_matvec (avx2) ==="
