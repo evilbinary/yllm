@@ -63,3 +63,4 @@ tmp/
 logs/
 *.gguf
 models/
+tests/__pycache__/*.pyc
