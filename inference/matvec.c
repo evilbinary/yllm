@@ -508,9 +508,9 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     const uint32_t blk = (dtype == DT_Q6K) ? 210 : 144;
     if (dtype == DT_F32 || dtype == DT_F16) {
         /* f32/f16: 逐 token 点积 */
-        uint32_t g, i;
         #pragma omp parallel for schedule(static)
         for (oo = 0; oo < out; oo++) {
+            uint32_t g, i;
             for (g = 0; g < B; g++) {
                 const float* xg = x + (size_t)g * in;
                 float acc = 0.0f;

@@ -253,6 +253,51 @@ static const STTensor* find_tensor(const STList* l, const char* name)
     return NULL;
 }
 
+/* 从同目录 config.json 读取模型结构字段(简单 JSON 扫描)。
+ * 返回 1 = 找到并复制到 out, 0 = 未找到。 */
+static int st_config_get(const char* config_path, const char* key, char* out, size_t outsz)
+{
+    FILE* f = fopen(config_path, "rb");
+    if (!f) return 0;
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    size_t klen = strlen(key);
+    const char* p = buf;
+    while ((p = strstr(p, key)) != NULL) {
+        const char* q = p + klen;
+        if (*q == '"') q++;          /* JSON 键带引号: "key": value */
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q != ':') { p = q; continue; }
+        q++;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '"') {
+            q++;
+            size_t o = 0;
+            while (*q && *q != '"' && o + 1 < outsz) out[o++] = *q++;
+            out[o] = 0;
+            return 1;
+        }
+        size_t o = 0;
+        while (*q && *q != ',' && *q != '}' && *q != '\n' && o + 1 < outsz) out[o++] = *q++;
+        out[o] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int st_config_path(const char* in_path, char* out, size_t outsz)
+{
+    const char* slash = strrchr(in_path, '/');
+    if (!slash) { snprintf(out, outsz, "config.json"); return 0; }
+    size_t d = (size_t)(slash - in_path) + 1;
+    if (d + 12 >= outsz) d = outsz - 13;
+    memcpy(out, in_path, d);
+    snprintf(out + d, outsz - d, "config.json");
+    return 0;
+}
+
 int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_seq, char* err, size_t errlen)
 {
     uint64_t fsize = 0;
@@ -291,15 +336,32 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
     const STTensor* q = find_tensor(&list, "model.layers.0.self_attn.q_proj.weight");
     const STTensor* k = find_tensor(&list, "model.layers.0.self_attn.k_proj.weight");
     if (!q || !k) { free(data); snprintf(err, errlen, "no q/k proj"); return -1; }
-    uint32_t heads = q->shape[0] / hidden;
-    uint32_t kv_heads = k->shape[0] / hidden;
-    uint32_t head_dim = q->shape[0] / heads;
+
+    /* 模型结构优先从同目录 config.json 读取(q 张量形状推导对 q_out==hidden 的模型无效) */
+    char cfg_path[1024];
+    st_config_path(in_path, cfg_path, sizeof(cfg_path));
+    char vbuf[128];
+    uint32_t heads = 0, kv_heads = 0, head_dim = 0;
+    uint32_t arch = ARCH_LLAMA;
+    float eps = 1e-5f, theta = 10000.0f;
+    if (st_config_get(cfg_path, "num_attention_heads", vbuf, sizeof(vbuf))) heads = (uint32_t)atoi(vbuf);
+    if (st_config_get(cfg_path, "num_key_value_heads", vbuf, sizeof(vbuf))) kv_heads = (uint32_t)atoi(vbuf);
+    if (st_config_get(cfg_path, "head_dim", vbuf, sizeof(vbuf))) head_dim = (uint32_t)atoi(vbuf);
+    if (st_config_get(cfg_path, "rms_norm_eps", vbuf, sizeof(vbuf))) eps = (float)atof(vbuf);
+    if (st_config_get(cfg_path, "rope_theta", vbuf, sizeof(vbuf))) theta = (float)atof(vbuf);
+    if (st_config_get(cfg_path, "model_type", vbuf, sizeof(vbuf))) {
+        if (strncmp(vbuf, "qwen", 4) == 0) arch = ARCH_QWEN;
+    }
+    /* 兜底: 形状推导(q_out != hidden 时有效) */
+    if (heads == 0) heads = q->shape[0] / hidden;
+    if (kv_heads == 0) kv_heads = k->shape[0] / hidden;
+    if (head_dim == 0) head_dim = hidden / (heads ? heads : 1);
 
     LlfHeader h;
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, YLLM_MAGIC, 8);
     h.version = YLLM_VERSION;
-    h.arch = ARCH_LLAMA;
+    h.arch = arch;
     h.n_blocks = n_blocks;
     h.vocab = vocab;
     h.hidden = hidden;
@@ -308,12 +370,8 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
     h.head_dim = head_dim;
     h.max_seq = max_seq;
     h.dtype = DT_F16;
-    {
-        float eps = 1e-5f;
-        memcpy(&h.norm_eps_bits, &eps, 4);
-        float theta = 10000.0f;
-        memcpy(&h.rope_theta_bits, &theta, 4);
-    }
+    memcpy(&h.norm_eps_bits, &eps, 4);
+    memcpy(&h.rope_theta_bits, &theta, 4);
 
     ConvItem* items = (ConvItem*)ymalloc((size_t)list.n * sizeof(ConvItem));
     const STTensor** stmap = (const STTensor**)ymalloc((size_t)list.n * sizeof(STTensor*));
