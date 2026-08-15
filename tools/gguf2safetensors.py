@@ -9,6 +9,7 @@
     outdir       输出目录(默认 safetensors-out)
     dtype        输出精度: f16(默认) / bf16(vLLM CPU 推荐, 范围大不易 NaN)
     outname      输出文件名(默认 <gguf名去后缀>.safetensors)
+    --config-only 只从 gguf 元数据生成 config.json(跳过 safetensors 转换)
 
 依赖: pip install gguf safetensors torch numpy
 支持张量类型: F32 / F16 / Q4_K / Q6_K(qwen3-8B Q4_K_M 实测)。
@@ -21,10 +22,91 @@ Q4_K/Q6_K 反量化按块向量化(numpy), 按行分块控制峰值内存。
     # 输出到 models/, bf16, 自定义文件名 qwen3-8b.safetensors
     python3 tests/gguf2safetensors.py Qwen3-8B-Q4_K_M.gguf models bf16 qwen3-8b.safetensors
 """
+import json
 import numpy as np
 import os
 import sys
 import time
+
+
+_ARCH_CLASS = {
+    "llama": "LlamaForCausalLM",
+    "qwen2": "Qwen2ForCausalLM",
+    "qwen3": "Qwen3ForCausalLM",
+    "mistral": "MistralForCausalLM",
+    "gemma2": "Gemma2ForCausalLM",
+}
+
+
+def _gguf_field(reader, name):
+    """读取 gguf 元数据字段值(字符串/数字), 不存在返回 None。"""
+    f = reader.fields.get(name)
+    if f is None:
+        return None
+    try:
+        data = f.parts[f.data[0]]
+        if data.dtype.kind in ("S", "O", "U") or data.dtype == np.uint8:
+            s = data.tobytes().decode("utf-8", "ignore").split("\x00")[0]
+            if s and not s.replace(".", "").replace("-", "").isdigit():
+                return s
+        v = data[0]
+        if isinstance(v, (bytes, bytearray)):
+            s = bytes(v).decode("utf-8", "ignore").split("\x00")[0]
+            return s
+        return float(v) if np.issubdtype(data.dtype, np.floating) else int(v)
+    except Exception:
+        return None
+
+
+def write_config_json(outdir, reader):
+    """从 gguf 元数据生成 HF config.json(与 safetensors 同目录)。
+
+    至少覆盖 convert_safetensors 需要的字段:
+    num_attention_heads / num_key_value_heads / head_dim /
+    rms_norm_eps / rope_theta / model_type。
+    """
+    arch = _gguf_field(reader, "general.architecture")
+    if not arch:
+        return
+    p = arch + "."
+    cfg = {
+        "architectures": [_ARCH_CLASS.get(arch, arch.capitalize() + "ForCausalLM")],
+        "model_type": arch,
+    }
+    mapping = [
+        ("hidden_size", "embedding_length"),
+        ("num_hidden_layers", "block_count"),
+        ("num_attention_heads", "attention.head_count"),
+        ("num_key_value_heads", "attention.head_count_kv"),
+        ("head_dim", "attention.key_length"),
+        ("rms_norm_eps", "attention.layer_norm_rms_epsilon"),
+        ("rope_theta", "rope.freq_base"),
+        ("vocab_size", "vocab_size"),
+        ("intermediate_size", "feed_forward_length"),
+        ("max_position_embeddings", "context_length"),
+    ]
+    for hf_key, g_key in mapping:
+        v = _gguf_field(reader, p + g_key)
+        if v is None and g_key == "attention.key_length":
+            v = _gguf_field(reader, p + "rope.dimension_count")
+        if v is not None:
+            if isinstance(v, float):
+                v = round(v, 7)
+            cfg[hf_key] = v
+    # head_dim 兜底: hidden / heads(标准 GQA)
+    if "head_dim" not in cfg and "hidden_size" in cfg and "num_attention_heads" in cfg:
+        cfg["head_dim"] = int(cfg["hidden_size"] // cfg["num_attention_heads"])
+    # 补充: 从张量形状兜底 vocab_size
+    if "vocab_size" not in cfg:
+        for t in reader.tensors:
+            if t.name in ("token_embd.weight", "output.weight"):
+                cfg["vocab_size"] = int(max(t.shape[0], t.shape[1]))
+                break
+    path = os.path.join(outdir, "config.json")
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print(f"config -> {path} ({len(cfg)} keys)")
 
 
 def f16_bytes(b):
@@ -146,9 +228,13 @@ def main():
 
     out_dtype = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] in ("f16", "bf16") else "f16"
     torch_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-    print(f"output: {out_path} (dtype {out_dtype})")
 
     reader = GGUFReader(src)
+    write_config_json(outdir, reader)
+    if len(sys.argv) > 5 and sys.argv[5] == "--config-only":
+        print(f"config only -> {os.path.join(outdir, 'config.json')} (safetensors 已存在, 跳过转换)")
+        return 0
+    print(f"output: {out_path} (dtype {out_dtype})")
     state = {}
     n = 0
     for t in reader.tensors:
