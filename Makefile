@@ -210,7 +210,7 @@ test-avx2: $(TEST_BIN_AVX)
 	./$(OBJDIR_AVX2)/test_prefill_batch.exe
 
 # ---- 集成: 转换模型 + 运行 chat/gen ----
-MODEL_GGUF  ?= tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+MODEL_GGUF  ?= models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 MODEL_LLF   ?= models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
 MODEL_VOCAB ?= models/tinyllama.vocab.txt
 CHAT_PROMPT ?= "Once upon a time"
@@ -238,10 +238,10 @@ gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
-Q25_GGUF  ?= qwen2.5-1.5b-instruct-q4_k_m.gguf
+Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 Q25_LLF   ?= models/qwen2.5-1.5b.llf
 Q25_VOCAB ?= models/qwen2.5.vocab.txt
-Q3_GGUF   ?= Qwen3-8B-Q4_K_M.gguf
+Q3_GGUF   ?= models/Qwen3-8B-Q4_K_M.gguf
 Q3_LLF    ?= models/qwen3-8b.llf
 Q3_VOCAB  ?= models/qwen3.vocab.txt
 
