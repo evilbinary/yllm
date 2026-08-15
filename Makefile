@@ -237,6 +237,34 @@ chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
 gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+# ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
+Q25_GGUF  ?= qwen2.5-1.5b-instruct-q4_k_m.gguf
+Q25_LLF   ?= models/qwen2.5-1.5b.llf
+Q25_VOCAB ?= models/qwen2.5.vocab.txt
+Q3_GGUF   ?= Qwen3-8B-Q4_K_M.gguf
+Q3_LLF    ?= models/qwen3-8b.llf
+Q3_VOCAB  ?= models/qwen3.vocab.txt
+
+$(Q25_LLF): $(Q25_GGUF) $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(Q25_GGUF) --out $(Q25_LLF) --vocab $(Q25_VOCAB) --seq 2048
+
+$(Q3_LLF): $(Q3_GGUF) $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(Q3_GGUF) --out $(Q3_LLF) --vocab $(Q3_VOCAB) --seq 2048
+
+chat-qwen2.5-1.5b: $(BIN) $(Q25_LLF)
+	$(RUN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen2.5-1.5b-avx2: $(BIN_AVX2) $(Q25_LLF)
+	$(RUN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3-8b: $(BIN) $(Q3_LLF)
+	$(RUN) chat --model $(Q3_LLF) --vocab $(Q3_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_LLF)
+	$(RUN_AVX2) chat --model $(Q3_LLF) --vocab $(Q3_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
 # ---- 常驻推理服务(serve 层) ----
 # 统一配置: serve.yaml(所有角色共用)
 # 用法:
