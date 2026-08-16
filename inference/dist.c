@@ -69,6 +69,12 @@ static int dist_wait_readable(int fd, int ms)
 #define DTYPE_SESS 4
 #define DTYPE_XB 5
 
+/* PP prefill 批量化(默认开): 批量 XB 帧消除逐 token logits 回执软同步。
+ * 编译时 -DYLLM_BATCH_PREFILL=0 关闭, 回到逐 token 路径。 */
+#ifndef YLLM_BATCH_PREFILL
+#define YLLM_BATCH_PREFILL 1
+#endif
+
 /* PP 批量 prefill 每批 token 数 */
 #define PP_XB 16
 
@@ -564,6 +570,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 rc = -1; snprintf(err, sizeof(err), "send sess failed");
             }
         }
+#if YLLM_BATCH_PREFILL
         for (i = 0; i < nprompt && rc == 0; ) {
             int nb = nprompt - i;
             if (nb > PP_XB) nb = PP_XB;
@@ -578,11 +585,24 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             pos += (uint32_t)nb;
             i += nb;
         }
+#else
+        for (i = 0; i < nprompt && rc == 0; i++) {
+            engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
+            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) {
+                rc = -1; snprintf(err, sizeof(err), "send_x prompt failed"); break;
+            }
+            pos++;
+        }
+#endif
         float lse = 0.0f;
         /* 丢弃 prompt 阶段多余的 logits(末 rank 每批回 1 个) */
         {
+#if YLLM_BATCH_PREFILL
             int nbatch = (nprompt + PP_XB - 1) / PP_XB;
             for (i = 0; i < nbatch - 1; i++) {
+#else
+            for (i = 0; i < nprompt - 1; i++) {
+#endif
                 if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break; }
             }
         }
