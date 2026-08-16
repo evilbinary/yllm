@@ -52,12 +52,14 @@ run_pair() {  # $1=标题  $2=yllm bin  $3=picolm bin
         OMP_NUM_THREADS=$t "$2" gen --model "$LLF" --vocab "$VOCAB" \
             --prompt "$PROMPT" --tokens 8 --temp 0 >/dev/null 2>&1
         "$3" "$GGUF" -p "$PROMPT" -n 8 -t 0 -j "$t" >/dev/null 2>&1
-        # measure
-        local yp yd pp pd
-        yp=$(y_vals "$2" "$t" | sed -n 1p)
-        yd=$(y_vals "$2" "$t" | sed -n 2p)
-        pp=$(p_vals "$3" "$t" | sed -n 1p)
-        pd=$(p_vals "$3" "$t" | sed -n 2p)
+        # measure (每配置只跑一次, 同时取 prefill/decode 两行)
+        local yv pv yp yd pp pd
+        yv=$(y_vals "$2" "$t")
+        yp=$(echo "$yv" | sed -n 1p)
+        yd=$(echo "$yv" | sed -n 2p)
+        pv=$(p_vals "$3" "$t")
+        pp=$(echo "$pv" | sed -n 1p)
+        pd=$(echo "$pv" | sed -n 2p)
         printf '%-7s | %-13s | %-13s | %-13s | %-13s\n' "$t" "$yp" "$yd" "$pp" "$pd"
     done
     echo
