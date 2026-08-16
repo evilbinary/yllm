@@ -7,6 +7,7 @@
  *   type 3 = DONE(终止)
  */
 #include "dist.h"
+#include "cache.h"
 #include "yllm.h"
 #include "log.h"
 #include <stdlib.h>
@@ -169,7 +170,20 @@ static int xrecv(Dist* d, int fd, void* buf, size_t n)
 
 /* 建立连接: 所有进程先 bind+listen(INADDR_ANY), 再按拓扑 connect。
  * addrs: 每 rank 节点 IP 数组(长度 ranks); NULL 时用 loopback。 */
-int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs)
+/* 等待 accept(可中断): 返回 fd; -2 = quit 信号; -1 = 错误 */
+static int dist_accept_wait(int listen_fd, const volatile int* quit)
+{
+    if (!quit) return (int)accept(listen_fd, NULL, NULL);
+    for (;;) {
+        if (*quit) { ylog_info("dist: accept interrupted by quit"); return -2; }
+        int sel = dist_wait_readable(listen_fd, 200);
+        if (sel < 0) return -1;
+        if (sel > 0) return (int)accept(listen_fd, NULL, NULL);
+    }
+}
+
+int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs,
+              const volatile int* quit)
 {
 #ifdef _WIN32
     WSADATA wsa;
@@ -181,6 +195,7 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
     d->up_fd = -1;
     d->down_fd = -1;
     d->log_fd = -1;
+    d->quit = quit;
     int listen_fd = sock_listen((uint16_t)(port_base + (uint16_t)rank));
     if (listen_fd < 0) { fprintf(stderr, "dist: rank %d cannot listen on port %u\n", rank, port_base + rank); return -1; }
 
@@ -190,15 +205,17 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
         if (d->down_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect to %u\n", rank, port_base + rank + 1); return -1; }
     }
     if (rank == 0) {
-        d->log_fd = (int)accept(listen_fd, NULL, NULL);
+        d->log_fd = dist_accept_wait(listen_fd, quit);
     } else {
-        d->up_fd = (int)accept(listen_fd, NULL, NULL);
+        d->up_fd = dist_accept_wait(listen_fd, quit);
+        if (quit && *quit) { sock_close_fd(listen_fd); return -2; }   /* 中断: 不再继续 connect */
         if (rank == ranks - 1) {
             const char* ip = addrs ? addrs[0] : NULL;
             d->log_fd = sock_connect(port_base, ip);
             if (d->log_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect back to rank 0\n", rank); return -1; }
         }
     }
+    if (quit && *quit) { sock_close_fd(listen_fd); return -2; }
     sock_close_fd(listen_fd);
     return 0;
 }
@@ -408,7 +425,10 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         }
         if (i == ranks) addr_arr = addr_list;
     }
-    if (dist_init(&dist, rank, ranks, (uint16_t)port_base, addr_arr) != 0) {
+    int init_rc = dist_init(&dist, rank, ranks, (uint16_t)port_base, addr_arr,
+                            sess ? sess->quit : NULL);
+    if (init_rc == -2) return 0;   /* 被 quit 中断: 正常退出, 不报错 */
+    if (init_rc != 0) {
         ylog_error("dist init failed");
         return 1;
     }
@@ -505,6 +525,18 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             } else {
                 snprintf(sess->key, sizeof(sess->key), "%s", skey);
                 sess->pos = spos;
+                /* 本段 kv 启动时未载入: 按会话 key 尝试从磁盘恢复(与 master 同 key 同段) */
+                if (sess->my_pos == 0 && sess->cache_dir) {
+                    char path[512];
+                    char ext[32];
+                    snprintf(ext, sizeof(ext), ".r%d.kv", rank);
+                    cache_path(path, sizeof(path), sess->cache_dir, skey, ext);
+                    uint32_t loaded = 0;
+                    if (sess_kv_load(e, path, &loaded) == 0) {
+                        sess->my_pos = loaded;
+                        ylog_info("dist worker: kv restored (%u tokens) from %s", loaded, path);
+                    }
+                }
                 if (spos != sess->my_pos) {
                     if (spos == 0) {
                         /* 全量重发: 本段 kv 由 X 流从 0 覆盖 */

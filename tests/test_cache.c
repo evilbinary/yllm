@@ -112,6 +112,20 @@ int main(void)
         free(ee.kv);
     }
 
+    /* 路径生成(文件名安全化 + 段号扩展) */
+    {
+        char p[512];
+        cache_path(p, sizeof(p), "sessions", "127.0.0.1:1dbaf6b4594a81e6", ".r0.kv");
+        CHECK(strcmp(p, "sessions/127.0.0.1_1dbaf6b4594a81e6.r0.kv") == 0, "cache_path dir+key+ext");
+        cache_path(p, sizeof(p), NULL, "127.0.0.1:1dbaf6b4594a81e6", ".sess");
+        CHECK(strcmp(p, "127.0.0.1_1dbaf6b4594a81e6.sess") == 0, "cache_path no dir");
+        cache_path(p, sizeof(p), "s", "a/b\\c:d?e*f<g>h|i\"j", ".kv");
+        CHECK(strcmp(p, "s/a_b_c_d_e_f_g_h_i_j.kv") == 0, "cache_path unsafe chars sanitized");
+        /* 相对路径穿越拒绝 */
+        cache_path(p, sizeof(p), "sessions", "../evil", ".kv");
+        CHECK(strncmp(p, "sessions/", 9) == 0 && strstr(p, "../evil") == NULL, "cache_path no traversal");
+    }
+
     sess_free(&c);
     if (fails == 0) {
         printf("cache tests: all passed\n");

@@ -56,6 +56,6 @@ int sess_kv_load(Engine* e, const char* path, uint32_t* pos);
 
 /* 生成缓存文件路径: <dir>/<安全化key><ext>。
  * key 中的 ':' 等文件系统非法字符替换为 '_'(NTFS 等不支持)。 */
-void sess_cache_path(char* out, size_t outsz, const char* dir, const char* key, const char* ext);
+void cache_path(char* out, size_t outsz, const char* dir, const char* key, const char* ext);
 
 #endif /* YLLM_CACHE_H */

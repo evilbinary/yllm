@@ -33,7 +33,8 @@ typedef struct {
 
 void dist_print_stats(Dist* d, const char* tag);
 
-int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs);
+int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs,
+              const volatile int* quit);
 int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16);
 int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16);
 int dist_send_logits(Dist* d, const float* logits, uint32_t vocab, uint32_t topk);

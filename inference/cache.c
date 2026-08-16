@@ -194,7 +194,7 @@ int sess_kv_save(Engine* e, uint32_t pos, const char* path)
     return rc;
 }
 
-void sess_cache_path(char* out, size_t outsz, const char* dir, const char* key, const char* ext)
+void cache_path(char* out, size_t outsz, const char* dir, const char* key, const char* ext)
 {
     size_t o = 0;
     if (dir && dir[0]) {
