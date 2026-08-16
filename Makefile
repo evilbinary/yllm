@@ -215,6 +215,13 @@ test-avx2: $(TEST_BIN_AVX)
 	./$(OBJDIR_AVX2)/test_engine.exe
 	@echo "=== test_prefill_batch (avx2) ==="
 	./$(OBJDIR_AVX2)/test_prefill_batch.exe
+	@echo "=== test_cache (avx2) ==="
+	./$(OBJDIR_AVX2)/test_cache.exe
+
+# ---- PP 会话缓存集成测试(2 段) ----
+# tools/test_pp_sess.sh: 临时 ranks:2 → 启动 → tests/test_pp_sess.py → 恢复 serve.yaml
+test-pp-sess: $(BIN_AVX2) $(MODEL_LLF)
+	@bash tools/test_pp_sess.sh $(BIN_AVX2)
 
 # ---- 集成: 转换模型 + 运行 chat/gen ----
 MODEL_GGUF  ?= models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
@@ -469,4 +476,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-avx2 chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop
+.PHONY: all avx2 clean test test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop
