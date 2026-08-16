@@ -37,6 +37,10 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
               const volatile int* quit);
 int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16);
 int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16);
+int dist_send_xb(Dist* d, uint32_t pos, const float* x, uint32_t count,
+                 uint32_t hidden, int fp16);
+int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
+                 uint32_t hidden, int fp16);
 int dist_send_logits(Dist* d, const float* logits, uint32_t vocab, uint32_t topk);
 int dist_recv_logits(Dist* d, uint32_t* ids, float* logits, uint32_t topk, float* lse_out);
 int dist_send_done(Dist* d);

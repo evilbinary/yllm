@@ -67,6 +67,10 @@ static int dist_wait_readable(int fd, int ms)
 #define DTYPE_LOGITS_K 2
 #define DTYPE_DONE 3
 #define DTYPE_SESS 4
+#define DTYPE_XB 5
+
+/* PP 批量 prefill 每批 token 数 */
+#define PP_XB 16
 
 static int sock_listen(uint16_t port)
 {
@@ -145,7 +149,13 @@ static int xio(Dist* d, int fd, const void* buf, size_t n, int is_send)
 #else
         ssize_t r = is_send ? (ssize_t)send(fd, p, n, 0)
                             : (ssize_t)recv(fd, p, n, 0);
-        if (r <= 0) goto err_fail;
+        if (r <= 0) {
+            int e0 = errno;
+            if (getenv("YLLM_DISTDBG"))
+                ylog_info("xio %s %s FAIL fd=%d n=%u errno=%d", is_send ? "send" : "recv",
+                          r == 0 ? "EOF" : "ERR", fd, (unsigned)n, e0);
+            goto err_fail;
+        }
         p += r;
         n -= (size_t)r;
 #endif
@@ -286,6 +296,97 @@ int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16)
     return -1;
 }
 
+/* 批量激活传输(prefill): [type=5][len][pos 4B][count 4B][x: count*hidden*(2|4)B] */
+int dist_send_xb(Dist* d, uint32_t pos, const float* x, uint32_t count,
+                 uint32_t hidden, int fp16)
+{
+    uint8_t hdr[8];
+    uint32_t esz = fp16 ? 2u : 4u;
+    uint32_t len = 4 + 4 + count * hidden * esz;
+    uint32_t type = DTYPE_XB;
+    memcpy(hdr, &type, 4);
+    memcpy(hdr + 4, &len, 4);
+    if (xio(d, d->down_fd, hdr, 8, 1) != 0) return -1;
+    if (xio(d, d->down_fd, &pos, 4, 1) != 0) return -1;
+    if (xio(d, d->down_fd, &count, 4, 1) != 0) return -1;
+    if (getenv("YLLM_DISTDBG"))
+        ylog_info("send_xb: count=%u fp16=%d pos=%u len=%u", count, fp16, pos, len);
+    if (fp16) {
+        uint16_t* x16 = (uint16_t*)ymalloc((size_t)count * hidden * 2);
+        uint32_t i;
+        for (i = 0; i < count * hidden; i++) x16[i] = f32_to_f16(x[i]);
+        int rc = xio(d, d->down_fd, x16, (size_t)count * hidden * 2, 1);
+        free(x16);
+        if (rc != 0) return -1;
+    } else {
+        if (xio(d, d->down_fd, x, (size_t)count * hidden * 4, 1) != 0) return -1;
+    }
+    d->n_x_sent++;
+    return 0;
+}
+
+/* 接收批量激活; 返回 count(>0), -1=错误 */
+int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
+                 uint32_t hidden, int fp16)
+{
+    int fd = d->rank == 0 ? d->log_fd : d->up_fd;
+    if (d->quit) {
+        for (;;) {
+            if (*d->quit) return -2;
+            int sel = dist_wait_readable(fd, 500);
+            if (sel > 0) break;
+            if (sel < 0) return -1;
+        }
+    }
+    uint8_t hdr[8];
+    if (xrecv(d, fd, hdr, 8) != 0) return -1;
+    uint32_t type, len;
+    memcpy(&type, hdr, 4);
+    memcpy(&len, hdr + 4, 4);
+    if (getenv("YLLM_DISTDBG"))
+        ylog_info("recv_xb: type=%u len=%u", type, len);
+    if (type == DTYPE_DONE) return -3;
+    if (type == DTYPE_X) {
+        /* decode 单 token 帧(与批量 prefill 混流): 按 count=1 处理 */
+        if (len < 4) return -1;
+        if (xrecv(d, fd, pos, 4) != 0) return -1;
+        if (fp16) {
+            if (d->x16 == NULL || d->cap_x < hidden) {
+                free(d->x16);
+                d->x16 = (uint16_t*)ymalloc((size_t)hidden * 2);
+                d->cap_x = hidden;
+            }
+            if (xrecv(d, fd, d->x16, (size_t)hidden * 2) != 0) return -1;
+            uint32_t i;
+            for (i = 0; i < hidden; i++) x[i] = f16_to_f32(d->x16[i]);
+        } else {
+            if (xrecv(d, fd, x, (size_t)hidden * 4) != 0) return -1;
+        }
+        d->n_x_recv++;
+        return 1;
+    }
+    if (type != DTYPE_XB) return -1;
+    uint32_t esz = fp16 ? 2u : 4u;
+    uint32_t count = (len - 8) / (hidden * esz);
+    if (count < 1 || count > cap_count) return -1;
+    if (xrecv(d, fd, pos, 4) != 0) return -1;
+    if (xrecv(d, fd, &count, 4) != 0) return -1;
+    if (fp16) {
+        if (d->x16 == NULL || d->cap_x < count * hidden) {
+            free(d->x16);
+            d->x16 = (uint16_t*)ymalloc((size_t)count * hidden * 2);
+            d->cap_x = count * hidden;
+        }
+        if (xrecv(d, fd, d->x16, (size_t)count * hidden * 2) != 0) return -1;
+        uint32_t i;
+        for (i = 0; i < count * hidden; i++) x[i] = f16_to_f32(d->x16[i]);
+    } else {
+        if (xrecv(d, fd, x, (size_t)count * hidden * 4) != 0) return -1;
+    }
+    d->n_x_recv++;
+    return (int)count;
+}
+
 /* logits 全量传输(保证采样与单机逐位一致) */
 int dist_send_logits(Dist* d, const float* logits, uint32_t vocab, uint32_t topk)
 {
@@ -306,11 +407,19 @@ int dist_recv_logits(Dist* d, uint32_t* ids, float* logits, uint32_t topk, float
 {
     int fd = d->log_fd;
     uint8_t hdr[8];
-    if (xrecv(d, fd, hdr, 8) != 0) return -1;
+    if (xrecv(d, fd, hdr, 8) != 0) {
+        if (getenv("YLLM_DISTDBG"))
+            ylog_info("recv_logits: xrecv hdr FAIL errno=%d", errno);
+        return -1;
+    }
     uint32_t type, len;
     memcpy(&type, hdr, 4);
     memcpy(&len, hdr + 4, 4);
-    if (type != DTYPE_LOGITS_K) return -1;
+    if (type != DTYPE_LOGITS_K) {
+        if (getenv("YLLM_DISTDBG"))
+            ylog_info("recv_logits: unexpected type=%u len=%u", type, len);
+        return -1;
+    }
     uint32_t n = len / 4;
     if (n > topk) n = topk;
     if (xrecv(d, fd, logits, (size_t)n * 4) != 0) return -1;
@@ -436,7 +545,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
     uint32_t hidden = e->ws.model.h.hidden;
     uint32_t vocab_sz = e->ws.model.h.vocab;
     enum { TOPK = 1024 };
-    float* xbuf = (float*)ymalloc((size_t)hidden * 4);
+    float* xbuf = (float*)ymalloc((size_t)hidden * 4 * PP_XB);
     uint32_t* k_ids = (uint32_t*)ymalloc((size_t)TOPK * 4);
 
     uint64_t rng = ysrand(seed);
@@ -455,15 +564,27 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 rc = -1; snprintf(err, sizeof(err), "send sess failed");
             }
         }
-        for (i = 0; i < nprompt && rc == 0; i++) {
-            engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
-            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; snprintf(err, sizeof(err), "send_x prompt failed"); break; }
-            pos++;
+        for (i = 0; i < nprompt && rc == 0; ) {
+            int nb = nprompt - i;
+            if (nb > PP_XB) nb = PP_XB;
+            float* xb = (float*)ymalloc((size_t)hidden * 4 * PP_XB);
+            if (engine_forward_batch_tokens(e, ids + i, nb, pos, xb) != 0) {
+                free(xb); rc = -1; snprintf(err, sizeof(err), "batch prefill failed"); break;
+            }
+            if (dist_send_xb(&dist, pos, xb, (uint32_t)nb, hidden, dist_fp16) != 0) {
+                free(xb); rc = -1; snprintf(err, sizeof(err), "send_xb prompt failed"); break;
+            }
+            free(xb);
+            pos += (uint32_t)nb;
+            i += nb;
         }
         float lse = 0.0f;
-        /* 丢弃 prompt 阶段多余的 top-k(末 rank 对每个 X 帧都回 logits) */
-        for (i = 0; i < nprompt - 1; i++) {
-            if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break; }
+        /* 丢弃 prompt 阶段多余的 logits(末 rank 每批回 1 个) */
+        {
+            int nbatch = (nprompt + PP_XB - 1) / PP_XB;
+            for (i = 0; i < nbatch - 1; i++) {
+                if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break; }
+            }
         }
         for (i = 0; i < ntokens && rc == 0; i++) {
             if (pos >= e->max_seq) break;
@@ -553,27 +674,66 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 }
             }
         }
-        while (!rc && (t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
-            if (t == 3) { /* DONE: 向后转发并退出 */
+        for (;;) {
+            t = dist_recv_xb(&dist, &pos, xbuf, PP_XB, hidden, dist_fp16);
+            if (t == -3) { /* DONE: 向后转发并退出 */
                 dist_send_done(&dist);
                 break;
             }
-            if (t != 1) break;            nf++;
-            memcpy(e->x, xbuf, (size_t)hidden * 4); /* 输入激活入引擎缓冲 */
-            if (rank == ranks - 1) {
-                engine_forward_range(e, 0, 0, pos, NULL, e->logits);
-                if (dist_send_logits(&dist, e->logits, vocab_sz, TOPK) != 0) { rc = -1; break; }
-            } else {
-                engine_forward_range(e, 0, 0, pos, xbuf, NULL);
-                if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
+            if (t < 1 || rc) {
+                if (t >= 0 && rc == 0 && getenv("YLLM_DISTDBG"))
+                    ylog_info("worker recv_xb exit: t=%d rc=%d", t, rc);
+                break;
             }
-            if (sess) sess->my_pos = pos + 1;   /* 本段 kv 已推进 */
+            nf += t;
+            uint64_t f0 = ynow_ms();
+            if (t == 1) {
+                /* 单 token(decode): 走单发路径 —— 批量路径在 B=1 时反量化开销
+                 * 无 batch 分摊, 比单发优化版 matmul 慢 ~7 倍 */
+                memcpy(e->x, xbuf, (size_t)hidden * 4);
+                if (rank == ranks - 1) {
+                    engine_forward_range(e, 0, 0, pos, NULL, e->logits);
+                    if (getenv("YLLM_DISTDBG"))
+                        ylog_info("frame %d: fwd %llu ms", nf,
+                                  (unsigned long long)(ynow_ms() - f0));
+                    if (dist_send_logits(&dist, e->logits, vocab_sz, TOPK) != 0) { rc = -1; break; }
+                } else {
+                    engine_forward_range(e, 0, 0, pos, xbuf, NULL);
+                    if (dist_send_xb(&dist, pos, xbuf, 1, hidden, dist_fp16) != 0) { rc = -1; break; }
+                }
+            } else if (rank == ranks - 1) {
+                if (getenv("YLLM_DISTDBG"))
+                    ylog_info("wbatch: t=%d pos=%u", t, pos);
+                if (engine_forward_batch_x(e, xbuf, t, pos, NULL, e->logits) != 0) {
+                    ylog_info("worker batch-x failed: t=%d pos=%u rc=%d", t, pos, rc);
+                    rc = -1; break;
+                }
+                if (dist_send_logits(&dist, e->logits, vocab_sz, TOPK) != 0) {
+                    ylog_info("worker send_logits failed: t=%d pos=%u", t, pos);
+                    rc = -1; break;
+                }
+            } else {
+                if (engine_forward_batch_x(e, xbuf, t, pos, xbuf, NULL) != 0) {
+                    ylog_info("worker batch-x failed: t=%d pos=%u rc=%d", t, pos, rc);
+                    rc = -1; break;
+                }
+                if (dist_send_xb(&dist, pos, xbuf, (uint32_t)t, hidden, dist_fp16) != 0) {
+                    ylog_info("worker send_xb failed: t=%d pos=%u", t, pos);
+                    rc = -1; break;
+                }
+            }
+            if (sess) sess->my_pos = pos + (uint32_t)t;   /* 本段 kv 已推进 */
+            if (getenv("YLLM_DISTDBG"))
+                ylog_info("frame %d: %u tokens in %llu ms", nf, (uint32_t)t,
+                          (unsigned long long)(ynow_ms() - f0));
             if (dist_stats && (nf % STATS_EVERY) == 0) {
                 char tag[48];
                 snprintf(tag, sizeof(tag), "dist@X%d", nf);
                 dist_print_stats(&dist, tag);
             }
         }
+        if (getenv("YLLM_DISTDBG"))
+            ylog_info("worker loop exit: t=%d rc=%d nf=%u", t, rc, (unsigned)nf);
     }
     free(xbuf);
     free(k_ids);

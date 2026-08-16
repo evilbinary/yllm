@@ -706,6 +706,92 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
     return 0;
 }
 
+/* 批量前向(distributed): tokens → 本 rank 层段 → 每 token 激活。
+ * 仅用于 PP 首段(rank 0): 内部 embed 全部 token, 层段批量计算。
+ * x_out 非空时填充 n*hidden; 返回 0/-1。 */
+int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32_t pos,
+                                float* x_out)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    uint32_t hidden = h->hidden;
+    uint32_t B = e->pb_cap ? e->pb_cap : 16;
+    if (n < 1 || (uint32_t)n > B) return -1;
+    if (e->layer_begin == 0) {
+        uint32_t hidx0 = m->base_idx[0];
+        const LlfTensorMeta* tm = &m->metas[hidx0];
+        const uint8_t* base = (const uint8_t*)ws->map.base;
+        const uint8_t* emb = base + m->dir[0].offset;
+        uint32_t b;
+        for (b = 0; b < (uint32_t)n; b++) {
+            switch (tm->dtype) {
+            case DT_F32: embed_f32(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
+            case DT_Q4K: embed_q4k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
+            case DT_Q6K: embed_q6k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
+            case DT_IQ4XS: embed_iq4xs(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
+            default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
+            }
+        }
+    }
+    uint32_t i;
+    for (i = e->layer_begin; i < e->layer_end; i++) {
+        if (i == 0 || i > h->n_blocks) continue;
+        forward_block_batch(e, i, pos, (uint32_t)n);
+    }
+    if (x_out) {
+        uint32_t b;
+        for (b = 0; b < (uint32_t)n; b++)
+            memcpy(x_out + (size_t)b * hidden, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
+    }
+    return 0;
+}
+
+/* 批量前向(distributed): 输入激活 → 本 rank 层段 → 输出激活或 logits。
+ * 中段: x_out 填 n*hidden(转发给下一段);
+ * 末段: logits_out 填最后 token 的 norm+output 结果。
+ * 返回 0/-1。 */
+int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
+                           float* x_out, float* logits_out)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    uint32_t hidden = h->hidden;
+    uint32_t B = e->pb_cap ? e->pb_cap : 16;
+    if (n < 1 || (uint32_t)n > B) return -1;
+    uint32_t b;
+    for (b = 0; b < (uint32_t)n; b++)
+        memcpy(e->pb + (size_t)b * hidden, xin + (size_t)b * hidden, (size_t)hidden * 4);
+    const uint8_t* base = (const uint8_t*)ws->map.base;
+    float eps;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    uint32_t i;
+    for (i = e->layer_begin; i < e->layer_end; i++) {
+        if (i == 0) continue;
+        if (i <= h->n_blocks) {
+            forward_block_batch(e, i, pos, (uint32_t)n);
+        } else if (i == h->n_blocks + 1) {
+            const LlfTensorMeta* fn = &m->metas[m->base_idx[i]];
+            rmsnorm(e->x, e->pb + (size_t)(n - 1) * hidden,
+                    base + m->dir[i].offset + fn->offset, hidden, eps, fn->dtype);
+        } else {
+            const LlfTensorMeta* out = &m->metas[m->base_idx[i]];
+            matmul(e->logits, e->x, base + m->dir[i].offset + out->offset,
+                   h->vocab, hidden, out->dtype);
+        }
+    }
+    if (x_out) {
+        for (b = 0; b < (uint32_t)n; b++)
+            memcpy(x_out + (size_t)b * hidden, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
+    }
+    if (logits_out) {
+        if (e->layer_end <= h->n_blocks) return -1;   /* 非末段无 logits */
+        memcpy(logits_out, e->logits, (size_t)h->vocab * 4);
+    }
+    return 0;
+}
+
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out)
 {
     float* logits = e->logits;

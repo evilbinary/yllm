@@ -143,6 +143,12 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
 
 /* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
 int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos);
+/* 分布式批量前向: tokens → 本 rank 层段 → 每 token 激活(仅 PP 首段, 内部 embed) */
+int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32_t pos,
+                                float* x_out);
+/* 分布式批量前向: 输入激活 → 本 rank 层段 → 输出激活(中段)或最后 token logits(末段) */
+int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
+                           float* x_out, float* logits_out);
 
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
