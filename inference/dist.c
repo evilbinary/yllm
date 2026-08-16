@@ -666,6 +666,12 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             } else {
                 snprintf(sess->key, sizeof(sess->key), "%s", skey);
                 sess->pos = spos;
+                /* 中段: 把手握转发给下一段(3+ rank 拓扑) */
+                if (rank < ranks - 1) {
+                    if (dist_send_sess(&dist, skey, spos) != 0) {
+                        rc = -1; snprintf(err, sizeof(err), "sess fwd failed");
+                    }
+                }
                 /* 新会话(与上次不同 key): 本段 kv 重置, 按会话 key 从磁盘恢复
                  * (仅 my_pos==0 会漏掉多会话交替场景: 上轮结束的 pos 非 0) */
                 if (sess->cache_dir && strcmp(sess->last_key, skey) != 0) {
