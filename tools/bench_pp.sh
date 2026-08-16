@@ -36,6 +36,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 切换 serve.yaml 中 tinyllama 的 ranks(只改第一个模型块内, 不影响 qwen2.5)
+set_ranks() {  # $1=ranks
+    python3 - "$CFG" "$1" <<'PYEOF'
+import sys
+cfg, r = sys.argv[1], sys.argv[2]
+lines = open(cfg).readlines()
+out, in_tiny, done = [], False, False
+for ln in lines:
+    if ln.strip().startswith("- name: tinyllama"):
+        in_tiny = True
+    elif in_tiny and ln.strip().startswith("- name:"):
+        in_tiny = False
+    if in_tiny and not done and ln.strip().startswith("ranks:"):
+        ln = f"    ranks: {r}             # 本模型 rank 进程数\n"
+        done = True
+    out.append(ln)
+open(cfg, "w").writelines(out)
+PYEOF
+}
 # 交错轮次: 1 2 3 4 1 2 3 4 ...
 SEQ=""
 for i in $(seq 1 "$RUNS"); do
@@ -44,7 +63,7 @@ done
 
 declare -A TOT DECT PRET PRE_CNT DEC_CNT
 for R in $SEQ; do
-    sed -i "s/^ranks: [0-9]* .*本模型 rank 进程数/ranks: $R             # 本模型 rank 进程数/" "$CFG"
+    set_ranks "$R"
     pkill -9 -f 'build/avx2/yllm (rank|serve|hub)' 2>/dev/null
     sleep 1
     rm -rf sessions && mkdir sessions

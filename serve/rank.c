@@ -334,11 +334,17 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     }
 
     /* 增量 prefill: 旧 token 的 KV 已在本引擎缓存, 只算新 token */
+    uint64_t t_prefill = ynow_ms();
     if (ndelta > 0)
         engine_forward_prefill(&r->engine, delta, (int)ndelta, r->cache_pos);
     r->cache_pos += ndelta;
+    if (ndelta > 0)
+        ylog_info("prefill: %u tokens in %.2f s (%.1f tok/s)", ndelta,
+               (double)(ynow_ms() - t_prefill) / 1000.0,
+               (double)ndelta * 1000.0 / (double)(ynow_ms() - t_prefill > 0 ? ynow_ms() - t_prefill : 1));
 
     /* decode 循环: 采样 → 流式回 → 前向推进(与 engine_generate 同构) */
+    uint64_t t_dec0 = ynow_ms();
     uint64_t rng = ysrand(r->seed);
     uint32_t ngen = 0;
     uint32_t pos = r->cache_pos;
@@ -358,8 +364,11 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     }
     r->cache_pos = pos;
     tim.n_decode = ngen;
-    tim.decode_ms = ynow_ms() - t0;
+    tim.decode_ms = ynow_ms() - t_dec0;
 
+    ylog_info("decode:  %u tokens in %.2f s (%.1f tok/s)", ngen,
+           (double)(ynow_ms() - t_dec0) / 1000.0,
+           (double)ngen * 1000.0 / (double)(ynow_ms() - t_dec0 > 0 ? ynow_ms() - t_dec0 : 1));
     ylog_info("rank: session=%s generate ok (%u delta + %u gen tokens, %llu ms)",
               key, ndelta, ngen, (unsigned long long)(ynow_ms() - t0));
     pthread_mutex_unlock(&r->engine_lock);

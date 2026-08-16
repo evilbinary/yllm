@@ -52,6 +52,26 @@
 即: 分布式 PP 的目标是**跨机/大模型内存扩展**, 在单机小模型上分段只会更慢;
 这是架构取舍, 不是实现缺陷。
 
+## 同等线程对比(每 rank 线程 T, 总线程 T×ranks)
+
+50-token prompt + 16 decode; `gen` 用 OMP_NUM_THREADS=T, `serve` 用
+OMP_NUM_THREADS=T + ranks(环境变量优先, 覆盖 rank.c 的 nproc/ranks 分配)。
+脚本: `tools/bench_threads.py`(可复跑, THREADS/RANKS/RUNS 覆盖)。
+
+| T | gen prefill | gen decode | r1 prefill | r1 decode | r2 prefill | r2 decode | r4 prefill | r4 decode |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 9.4 | 5.4 | 9.9 | 5.0 | 11.0 | 4.4 | 13.3 | 5.0 |
+| 4 | 33.5 | 18.4 | 32.4 | 14.8 | 31.6 | 14.8 | 29.8 | 13.9 |
+| 8 | 46.3 | **26.8** | 49.9 | 23.2 | 35.7 | 17.6 | 24.3 | 16.6 |
+| 16 | 41.0 | 19.8 | 44.6 | 18.8 | 11.3 | 12.0 | 8.6 | 7.8 |
+
+- **总线程 ≤ 16 核**(T=1/4/8): gen ≈ r1 > r2 ≈ r4。服务单机(r1)比 gen 慢
+  ~10-20%(HTTP/会话/日志框架); 分布式(r2/r4)因 PP 分段串行 + 传输再慢 ~20%。
+- **T=16 超订**: r2/r4 总线程 32/64 > 16 核, 线程争抢使性能崩溃(r2 prefill
+  11.3, r4 8.6 tok/s)。
+- decode 峰值在 T=8(核数的一半, 每层并行 + 带宽平衡)。
+- 同等线程下分布式对 1.1B 小模型无性能收益; 收益仅在跨机内存扩展场景。
+
 ## 分布式 PP(ranks=2, 批量 prefill 开/关)
 
 场景: 50-token prompt + 16 decode, serve 模式 curl 端到端耗时;
