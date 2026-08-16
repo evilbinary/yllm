@@ -97,17 +97,16 @@ OMP_NUM_THREADS=T + ranks(环境变量优先, 覆盖 rank.c 的 nproc/ranks 分�
 
 | 配置 | 层分割(32 层) | 总耗时 | prefill tok/s | decode tok/s | 总 tok/s |
 |---|---|---|---|---|---|
-| 无分布式(单 rank 直跑) | 32 | 2.38s | 34.9 | 16.8 | 27.7 |
-| rank0 + 1 worker(ranks=2) | 16 / 16 | **2.30s** | 36.7 | 17.0 | 28.6 |
-| rank0 + 2 worker(ranks=3) | 11 / 11 / 10 | 2.35s | 35.7 | 16.8 | 28.0 |
-| rank0 + 3 worker(ranks=4) | 8 / 8 / 8 / 8 | 2.35s | 35.7 | 17.0 | 28.0 |
+| 无分布式(单 rank 直跑) | 32 | **2.10s** | **42.9** | 16.6 | **30.9** |
+| rank0 + 1 worker(ranks=2) | 16 / 16 | 2.35s | 35.7 | 17.0 | 28.0 |
+| rank0 + 2 worker(ranks=3) | 11 / 11 / 10 | 2.80s | 30.3 | 13.9 | 23.5 |
+| rank0 + 3 worker(ranks=4) | 8 / 8 / 8 / 8 | 2.92s | 28.5 | 13.6 | 22.6 |
 
-无分布式(单 rank)与 1 worker 几乎持平, 2/3 worker 略慢(~+2%)。
-prefill 受批量前向控制(50 tokens ≈ 4 批, ~35 tok/s); decode 固定 ~17 tok/s
-(58 ms/step, 含 master 前向 + 传输 + 采样)。decode 单步延迟 = 最慢段 + 传输
-跳数: 段数增多时每段层数变少(计算降)但 fp32 激活每跳多传 256KB(1.1B 模型
-带宽主导), 净效果无收益; 自回归依赖链(无跨 token 并行空间)限制扩展性。
-更大模型(层/计算密度更高)分段收益会更明显。
+单 rank 直跑最快, 每加一个 worker 端到端递增 ~+20%(2.10 → 2.35 → 2.80 → 2.92s)。
+prefill 随 worker 数下降(42.9 → 28.5 tok/s): 层段切分后各段批量反量化效率下降 +
+每段 XB 帧传输; decode 类似(17.0 → 13.6): 每段 OMP 线程自动减半(nproc/ranks)
+且传输跳数增多。自回归依赖链(无跨 token 并行空间)限制扩展性;
+更大模型(层/计算密度更高)分段收益才会出现。
 
 ## 分析
 
@@ -141,6 +140,6 @@ yllm 的 AVX2 Q4K 内核对权重行连续流式读取 + 寄存器内反量化�
 - 分布式 PP(ranks=2):批量 prefill(默认开)比逐 token 快 ~20%,`make BATCH_PREFILL=0` 可关闭。
 - 直跑(gen)比服务(serve)decode 快 ~1.6x:PP 分段串行 + 传输 + 服务/会话开销;
   分布式目标是跨机/大模型内存扩展, 单机小模型上分段无性能收益。
-- 单机多 worker(ranks=1/2/3/4):单 rank 直跑与 1 worker 持平(2.38 vs 2.30s),
-  2/3 worker 略慢(~+2%); 受传输带宽与自回归依赖链限制, 小模型分段无扩展收益。
+- 单机多 worker(ranks=1/2/3/4):单 rank 直跑最快(2.10s),每加一个 worker
+  端到端 ~+20%(2.35/2.80/2.92s); 分段使 prefill/decode 双双下降。
   `tools/bench_pp.sh` 可复跑(prefill/decode/总 tok/s 一并输出)。

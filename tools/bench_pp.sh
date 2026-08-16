@@ -89,6 +89,14 @@ for R in $SEQ; do
     dec_tok=$(echo "$dec" | grep -oE "[0-9]+ tokens" | grep -oE "^[0-9]+")
     dec_s=$(echo "$dec" | grep -oE "[0-9.]+ s" | grep -oE "^[0-9.]+")
     end=$(eval "$LOGNEW" | grep -oE "pp done rc=0 \(resume=0 end=[0-9]+" | tail -1 | grep -oE "end=[0-9]+" | grep -oE "[0-9]+")
+    if [ -z "$end" ]; then
+        # ranks=1 单机路径: generate ok (N delta + M gen tokens
+        delta=$(eval "$LOGNEW" | grep -oE "generate ok \([0-9]+ delta" | tail -1 | grep -oE "[0-9]+")
+        if [ -n "$delta" ]; then
+            [ -z "$dec_tok" ] && dec_tok=$NTOKENS
+            end=$((delta + dec_tok))
+        fi
+    fi
     [ -z "$dec_tok" ] && dec_tok=$NTOKENS
     [ -z "$dec_s" ] && dec_s=0
     [ -z "$end" ] && end=$((NTOKENS + 1))
