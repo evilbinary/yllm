@@ -219,6 +219,19 @@ static void cache_file_name(char* out, size_t outsz, const char* key, const char
     if (o + strlen(ext) + 1 < outsz) memcpy(out + o, ext, strlen(ext) + 1);
 }
 
+/* 本 rank 的会话 kv 路径: <dir>/<安全化key>.r<rank>.kv(PP 各段不互相覆盖) */
+static void cache_kv_path(char* out, size_t outsz, const char* dir, const char* key, int rank)
+{
+    char base[512];
+    char ext[32];
+    snprintf(ext, sizeof(ext), ".r%d.kv", rank);
+    cache_file_name(base, sizeof(base), key, ext);
+    if (dir && dir[0])
+        snprintf(out, outsz, "%s/%s", dir, base);
+    else
+        snprintf(out, outsz, "%s", base);
+}
+
 static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tokens,
                                 uint32_t resume, const uint32_t* delta, uint32_t ndelta)
 {
@@ -239,7 +252,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     if (strcmp(key, r->cache_key) != 0) {
         if (r->cache_dir[0] && r->cache_key[0]) {
             char path[512];
-            cache_file_name(path + snprintf(path, sizeof(path), "%s/", r->cache_dir), sizeof(path), r->cache_key, ".kv");
+            cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
             if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
                 ylog_info("rank: session %s kv saved (%u tokens) -> %s", r->cache_key, r->cache_pos, path);
         }
@@ -248,7 +261,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         /* 磁盘恢复: 载入 <dir>/<key>.kv, resume 需与载入的 pos 一致 */
         if (r->cache_dir[0] && resume != 0) {
             char path[512];
-            cache_file_name(path + snprintf(path, sizeof(path), "%s/", r->cache_dir), sizeof(path), key, ".kv");
+            cache_kv_path(path, sizeof(path), r->cache_dir, key, r->dist_rank);
             uint32_t loaded = 0;
             if (sess_kv_load(&r->engine, path, &loaded) == 0 && loaded == resume) {
                 r->cache_pos = loaded;
@@ -265,9 +278,15 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         }
     }
     if (resume != r->cache_pos) {
-        ylog_warn("rank: resume mismatch: rank has %u, got %u", r->cache_pos, resume);
-        send_line(fd, "ERR resume mismatch: rank has %u, got %u", r->cache_pos, resume);
-        return 0;
+        if (resume == 0) {
+            /* 全量重发: 以 0 为基, KV 由 X 流从 pos=0 覆盖 */
+            ylog_warn("rank: full resend (pos %u -> 0)", r->cache_pos);
+            r->cache_pos = 0;
+        } else {
+            ylog_warn("rank: resume mismatch: rank has %u, got %u", r->cache_pos, resume);
+            send_line(fd, "ERR resume mismatch: rank has %u, got %u", r->cache_pos, resume);
+            return 0;
+        }
     }
     if ((uint64_t)r->cache_pos + ndelta > r->engine.max_seq) {
         send_line(fd, "ERR context full");
@@ -279,11 +298,41 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     node_heartbeat(&r->node);
     pthread_mutex_lock(&r->engine_lock);
 
+    tim.n_prefill = ndelta;
+
+    if (r->dist_ranks > 1) {
+        /* PP 流水线: 各段各自处理自己的层段; master 走 dist_gen(带会话握手) */
+        DistSess sess;
+        memset(&sess, 0, sizeof(sess));
+        snprintf(sess.key, sizeof(sess.key), "%s", key);
+        sess.pos = resume;                 /* master 从续接点开始 */
+        sess.my_pos = r->cache_pos;
+        sess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
+        int rc2 = dist_gen(&r->engine, &r->vocab, delta, (int)ndelta, (int)max_tokens,
+                           r->temp, r->top_p, r->seed,
+                           r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
+                           t0, on_token_rank, &tc, &sess);
+        r->cache_pos = sess.pos;
+        tim.n_decode = (uint32_t)tc.n_tokens;
+        tim.decode_ms = ynow_ms() - t0;
+        ylog_info("rank: sess %s pp done rc=%d (resume=%u end=%u, %d tokens)", key, rc2, resume, sess.pos, tc.n_tokens);
+        pthread_mutex_unlock(&r->engine_lock);
+        r->node.state = NODE_STATE_READY;
+        r->node.inflight--;
+        node_heartbeat(&r->node);
+        if (rc2 != 0) {
+            /* 失败不得伪装成功: server 收到 ERR 后走全量重发/退避重试 */
+            send_line(fd, "ERR dist generate failed");
+            return 0;
+        }
+        send_line(fd, "DONE %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
+        return 0;
+    }
+
     /* 增量 prefill: 旧 token 的 KV 已在本引擎缓存, 只算新 token */
     if (ndelta > 0)
         engine_forward_prefill(&r->engine, delta, (int)ndelta, r->cache_pos);
     r->cache_pos += ndelta;
-    tim.n_prefill = ndelta;
 
     /* decode 循环: 采样 → 流式回 → 前向推进(与 engine_generate 同构) */
     uint64_t rng = ysrand(r->seed);
@@ -398,7 +447,7 @@ static int handle_infer(int fd, Rank* r, char* args)
         rc = dist_gen(&r->engine, &r->vocab, ids, nprompt, max_tokens,
                       r->temp, r->top_p, r->seed,
                       r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
-                      t0, on_token_rank, &tc);
+                      t0, on_token_rank, &tc, NULL);
     } else {
         rc = engine_generate(&r->engine, ids, nprompt, max_tokens,
                              r->temp, r->top_p, r->seed, r->vocab.eos,
@@ -496,15 +545,31 @@ static int run_rank(int port, Rank* r)
     if (r->dist_rank > 0 && r->dist_ranks > 1) {
         if (r->node.sv_enabled) ythread_create(&hb, worker_hb_thread, r);
         while (!r->quit) {
+            DistSess wsess;
+            memset(&wsess, 0, sizeof(wsess));
+            wsess.my_pos = r->cache_pos;
+            wsess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
+            wsess.quit = &r->quit;
             int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
                               r->temp, r->top_p, r->seed,
                               r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
-                              ynow_ms(), NULL, NULL);
+                              ynow_ms(), NULL, NULL, &wsess);
+            /* 会话状态回写(worker 各段缓存记账) */
+            if (wsess.key[0])
+                snprintf(r->cache_key, sizeof(r->cache_key), "%s", wsess.key);
+            r->cache_pos = wsess.my_pos;
             if (r->quit) break;
             if (rc != 0) {
                 ylog_warn("rank: pipeline round failed (rc=%d), retry", rc);
                 sock_sleep_ms(1000);
             }
+        }
+        /* 退出: worker 段 KV 落盘(带段号, 与其它段互不覆盖) */
+        if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
+            char path[512];
+            cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
+            if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
+                ylog_info("rank: exit, session %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
         }
     } else {
         int srv = sock_listen((uint16_t)port, 8);
@@ -524,7 +589,7 @@ static int run_rank(int port, Rank* r)
         /* 退出: 当前会话 KV 落盘 */
         if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
             char path[512];
-            cache_file_name(path + snprintf(path, sizeof(path), "%s/", r->cache_dir), sizeof(path), r->cache_key, ".kv");
+            cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
             if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
                 ylog_info("rank: exit, session %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
         }

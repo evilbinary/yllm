@@ -200,7 +200,7 @@ static int cmd_gen(int argc, char** argv)
     if (ranks > 1) {
         /* 分布式层流水线各 rank 均执行 dist_gen */
         rc = dist_gen(&e, &v, ids, nprompt, ntokens, temp, top_p, seed,
-                      rank, ranks, port_base, dist_addrs, dist_fp16, t0, on_token_cb, &v);
+                      rank, ranks, port_base, dist_addrs, dist_fp16, t0, on_token_cb, &v, NULL);
         engine_free(&e);
         vocab_free(&v);
         free(ids);

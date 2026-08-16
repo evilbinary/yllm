@@ -203,7 +203,14 @@ int router_infer(Router* r, const char* model, int max_tokens,
                  void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx)
 {
     RtServer* s = pick_server(r, model);
-    if (!s) { ylog_warn("router_infer: no ready server for %s", model); return -1; }
+    if (!s) {   /* 模型 server 尚未注册(启动竞态): 轮询等待 */
+        int i;
+        for (i = 0; i < 60 && !s; i++) {
+            sock_sleep_ms(500);
+            s = pick_server(r, model);
+        }
+        if (!s) { ylog_warn("router_infer: no ready server for %s", model); return -1; }
+    }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) { ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
     char args[64];
@@ -242,7 +249,14 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
                       void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx)
 {
     RtServer* s = pick_server(r, model);
-    if (!s) { ylog_warn("router_infer_sess: no ready server for %s", model); return -1; }
+    if (!s) {   /* 模型 server 尚未注册(启动竞态): 轮询等待 */
+        int i;
+        for (i = 0; i < 60 && !s; i++) {
+            sock_sleep_ms(500);
+            s = pick_server(r, model);
+        }
+        if (!s) { ylog_warn("router_infer_sess: no ready server for %s", model); return -1; }
+    }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) { ylog_warn("router_infer_sess: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
     char args[192];

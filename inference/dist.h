@@ -16,6 +16,7 @@ typedef struct {
     int log_fd;    /* 末 rank→rank0 的 top-k logits 通道 */
     uint16_t* x16; /* fp16 激活中转缓冲 */
     uint32_t cap_x;
+    const volatile int* quit;   /* 非空时 worker 空闲等待周期检查(进程退出信号) */
     float lse;     /* 全量 log-sum-exp(logits 归一化常数) */
     uint32_t* heap; /* top-k 选择堆 */
     uint32_t cap_k;
@@ -42,10 +43,25 @@ void dist_close(Dist* d);
 
 /* 跨机分布式: 传 addrs(逗号分隔节点 IP, 长度=ranks, 第 i 个是 rank i 的地址)可为空,
  * 为空时用 127.0.0.1 退化为单机多进程测试。 */
+/* 会话模式参数(PP 各段共享):
+ *   master: key/pos = 会话续接点, 结束时 pos = 结束位置
+ *   worker: my_pos = 本段已有 kv 位置(校验用), 结束时 my_pos = 本段 kv 已推进位置
+ *   cache_dir = kv 落盘目录(空 = 纯内存) */
+typedef struct {
+    char key[64];
+    uint32_t pos;
+    uint32_t my_pos;
+    const char* cache_dir;
+    const volatile int* quit;   /* 非空时 worker 空闲等待周期检查(进程退出信号) */
+} DistSess;
+
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
              int ntokens, float temp, float top_p, uint64_t seed,
              int rank, int ranks, int port_base, const char* addrs, int dist_fp16,
-             uint64_t t0, dist_token_cb emit, void* ctx);
+             uint64_t t0, dist_token_cb emit, void* ctx,
+             DistSess* sess);   /* NULL = 非会话模式 */
+int dist_send_sess(Dist* d, const char* key, uint32_t pos);
+int dist_recv_sess(Dist* d, char* key, uint32_t* pos);
 
 /* 按字节均衡切层(末 rank 含 norm+head, 故少分块), 并设置本 rank 的层范围。
  * 返回 0 成功, -1 失败(ranks > blocks)。 */

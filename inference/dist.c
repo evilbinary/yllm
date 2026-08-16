@@ -27,6 +27,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <math.h>
+#include <poll.h>
 #endif
 
 static int sock_close_fd(int fd)
@@ -38,9 +39,33 @@ static int sock_close_fd(int fd)
 #endif
 }
 
+/* 等待 fd 可读(毫秒超时): 可读返回 1, 超时返回 0, 错误返回 -1 */
+static int dist_wait_readable(int fd, int ms)
+{
+#ifdef _WIN32
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+    if (sel < 0) return -1;
+    return sel > 0 && FD_ISSET(fd, &rfds) ? 1 : 0;
+#else
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int sel = poll(&pfd, 1, ms);
+    if (sel < 0) return -1;
+    return sel > 0 && (pfd.revents & POLLIN) ? 1 : 0;
+#endif
+}
+
 #define DTYPE_X 1
 #define DTYPE_LOGITS_K 2
 #define DTYPE_DONE 3
+#define DTYPE_SESS 4
 
 static int sock_listen(uint16_t port)
 {
@@ -208,6 +233,15 @@ int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16
 int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16)
 {
     int fd = d->rank == 0 ? d->log_fd : d->up_fd;
+    if (d->quit) {
+        /* worker 空闲等激活: 周期超时检查退出信号(DRAIN 后及时退出落盘) */
+        for (;;) {
+            if (*d->quit) return -2;
+            int sel = dist_wait_readable(fd, 500);
+            if (sel > 0) break;
+            if (sel < 0) return -1;
+        }
+    }
     uint8_t hdr[8];
     if (xrecv(d, fd, hdr, 8) != 0) return -1;
     uint32_t type, len;
@@ -269,6 +303,40 @@ int dist_recv_logits(Dist* d, uint32_t* ids, float* logits, uint32_t topk, float
     return (int)n;
 }
 
+/* 会话握手帧: [type=4][len=68][key 64B][pos 4B], 由 master 在首帧前发给下一段 */
+int dist_send_sess(Dist* d, const char* key, uint32_t pos)
+{
+    uint8_t hdr[8];
+    uint32_t type = DTYPE_SESS;
+    uint32_t len = 64 + 4;
+    memcpy(hdr, &type, 4);
+    memcpy(hdr + 4, &len, 4);
+    if (xio(d, d->down_fd, hdr, 8, 1) != 0) return -1;
+    char kbuf[64];
+    memset(kbuf, 0, sizeof(kbuf));
+    snprintf(kbuf, sizeof(kbuf), "%s", key);
+    if (xio(d, d->down_fd, kbuf, 64, 1) != 0) return -1;
+    if (xio(d, d->down_fd, &pos, 4, 1) != 0) return -1;
+    return 0;
+}
+
+int dist_recv_sess(Dist* d, char* key, uint32_t* pos)
+{
+    int fd = d->rank == 0 ? d->log_fd : d->up_fd;
+    uint8_t hdr[8];
+    if (xrecv(d, fd, hdr, 8) != 0) return -1;
+    uint32_t type, len;
+    memcpy(&type, hdr, 4);
+    memcpy(&len, hdr + 4, 4);
+    if (type != DTYPE_SESS || len < 68) return -1;
+    char kbuf[64];
+    if (xrecv(d, fd, kbuf, 64) != 0) return -1;
+    if (xrecv(d, fd, pos, 4) != 0) return -1;
+    kbuf[63] = 0;
+    snprintf(key, 64, "%s", kbuf);
+    return 0;
+}
+
 int dist_send_done(Dist* d)
 {
     uint8_t hdr[8];
@@ -319,7 +387,8 @@ void dist_print_stats(Dist* d, const char* tag)
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
              int ntokens, float temp, float top_p, uint64_t seed,
              int rank, int ranks, int port_base, const char* addrs, int dist_fp16,
-             uint64_t t0, dist_token_cb emit, void* ctx)
+             uint64_t t0, dist_token_cb emit, void* ctx,
+             DistSess* sess)
 {
     Dist dist;
     char err[256];
@@ -343,6 +412,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         ylog_error("dist init failed");
         return 1;
     }
+    dist.quit = sess ? sess->quit : NULL;
     uint32_t hidden = e->ws.model.h.hidden;
     uint32_t vocab_sz = e->ws.model.h.vocab;
     enum { TOPK = 1024 };
@@ -357,10 +427,15 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
 
     if (rank == 0) {
         /* master: embed + 自己块段, 采样由收到的 top-k logits 决定 */
-        uint32_t pos = 0;
+        uint32_t pos = sess ? sess->pos : 0;
         int i;
         int pend = 0;
-        for (i = 0; i < nprompt; i++) {
+        if (sess) {
+            if (dist_send_sess(&dist, sess->key, sess->pos) != 0) {
+                rc = -1; snprintf(err, sizeof(err), "send sess failed");
+            }
+        }
+        for (i = 0; i < nprompt && rc == 0; i++) {
             engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
             if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; snprintf(err, sizeof(err), "send_x prompt failed"); break; }
             pos++;
@@ -401,6 +476,17 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             (void)dist_recv_logits(&dist, NULL, flush, vocab_sz, NULL);
             free(flush);
         }
+        /* 会话模式: 生成结束(eos/上限)后各段补写 eos 的 kv, 与单机一致 */
+        if (sess && rc == 0 && pos < e->max_seq) {
+            engine_forward_range(e, (uint32_t)v->eos, 1, pos, xbuf, NULL);
+            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) == 0) {
+                pos++;
+                float* flush = (float*)ymalloc((size_t)vocab_sz * 4);
+                (void)dist_recv_logits(&dist, NULL, flush, vocab_sz, NULL);
+                free(flush);
+            }
+        }
+        if (sess) sess->pos = pos;
         dist_send_done(&dist);
         ylog_info("decode:  %d tokens in %.2f s (%.1f tok/s)", ngen,
                (double)(ynow_ms() - t0) / 1000.0,
@@ -410,13 +496,34 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         uint32_t pos;
         int t;
         int nf = 0;
-        while ((t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
+        /* 会话握手: 校验本段 kv 状态与期望一致 */
+        if (sess) {
+            char skey[64] = "";
+            uint32_t spos = 0;
+            if (dist_recv_sess(&dist, skey, &spos) != 0) {
+                rc = -1; snprintf(err, sizeof(err), "sess handshake failed");
+            } else {
+                snprintf(sess->key, sizeof(sess->key), "%s", skey);
+                sess->pos = spos;
+                if (spos != sess->my_pos) {
+                    if (spos == 0) {
+                        /* 全量重发: 本段 kv 由 X 流从 0 覆盖 */
+                        ylog_warn("dist worker: full resend (pos %u -> 0)", sess->my_pos);
+                        sess->my_pos = 0;
+                    } else {
+                        ylog_warn("dist worker: sess pos mismatch (%u vs %u), need full resend",
+                                  spos, sess->my_pos);
+                        rc = -1;
+                    }
+                }
+            }
+        }
+        while (!rc && (t = dist_recv_x(&dist, &pos, xbuf, hidden, dist_fp16)) >= 0) {
             if (t == 3) { /* DONE: 向后转发并退出 */
                 dist_send_done(&dist);
                 break;
             }
-            if (t != 1) break;
-            nf++;
+            if (t != 1) break;            nf++;
             memcpy(e->x, xbuf, (size_t)hidden * 4); /* 输入激活入引擎缓冲 */
             if (rank == ranks - 1) {
                 engine_forward_range(e, 0, 0, pos, NULL, e->logits);
@@ -425,6 +532,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 engine_forward_range(e, 0, 0, pos, xbuf, NULL);
                 if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
             }
+            if (sess) sess->my_pos = pos + 1;   /* 本段 kv 已推进 */
             if (dist_stats && (nf % STATS_EVERY) == 0) {
                 char tag[48];
                 snprintf(tag, sizeof(tag), "dist@X%d", nf);

@@ -161,6 +161,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     pthread_mutex_unlock(&s->sess_lock);
 
     int sent = 0;
+    int retry = 0;
     for (;;) {
         int fd = sock_connect(s->leader_host, s->leader_port, 5);
         if (fd < 0) { free(tokens); sock_send_line(client_fd, "ERR server: cannot connect leader"); return; }
@@ -215,6 +216,15 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
             if (nn < 0) { rc = -1; break; }
             if (strncmp(out, "ERR", 3) == 0) {
                 if (!sent) { sock_close(fd); sent = 1; rc = -2; break; }  /* 全量重试 */
+                if (retry < 5) {
+                    /* 生成前失败(未产出 token): 退避重试, 等 worker 段就绪 */
+                    sock_close(fd);
+                    retry++;
+                    rc = -2;
+                    ylog_warn("server: sess %s backend reject (%s), retry %d/5", key, out + 4, retry);
+                    sock_sleep_ms(1000 * retry);
+                    break;
+                }
                 sock_send_line(client_fd, "%s", out);
                 rc = -1;
                 break;

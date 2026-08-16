@@ -194,6 +194,28 @@ int sess_kv_save(Engine* e, uint32_t pos, const char* path)
     return rc;
 }
 
+void sess_cache_path(char* out, size_t outsz, const char* dir, const char* key, const char* ext)
+{
+    size_t o = 0;
+    if (dir && dir[0]) {
+        size_t dl = strlen(dir);
+        if (o + dl + 1 < outsz) {
+            memcpy(out + o, dir, dl);
+            o += dl;
+            out[o++] = '/';
+        }
+    }
+    const char* p;
+    for (p = key; *p && o + 16 < outsz; p++) {
+        char c = *p;
+        if (c == ':' || c == '/' || c == '\\' || c == '?' || c == '*' ||
+            c == '<' || c == '>' || c == '|' || c == '"')
+            c = '_';
+        out[o++] = c;
+    }
+    if (o + strlen(ext) + 1 < outsz) memcpy(out + o, ext, strlen(ext) + 1);
+}
+
 int sess_kv_load(Engine* e, const char* path, uint32_t* pos)
 {
     const LlfHeader* h = &e->ws.model.h;
