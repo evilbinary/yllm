@@ -47,21 +47,24 @@
 (~51 ms/step, master 24 + worker 27, 受自回归依赖链限制)。
 小批(<16 token)自动回退逐 token(`PREFILL_BATCH_MIN`), 避免反量化/调度开销。
 
-## 分布式 PP: worker 数量对比(单机, ranks=2/3/4)
+## 分布式 PP: 无分布式 vs worker 数量(单机, ranks=1/2/3/4)
 
 场景同上(50-token prompt + 16 decode, 全量 prefill, 预热 + 交错轮次均值)。
 脚本: `tools/bench_pp.sh`(可复跑, `RANKS_LIST=... RUNS=...` 覆盖)。
 
-| 配置 | 层分割(32 层) | 端到端 |
-|---|---|---|
-| rank0 + 1 worker(ranks=2) | 16 / 16 | **3.21s** |
-| rank0 + 2 worker(ranks=3) | 11 / 11 / 10 | 3.22s |
-| rank0 + 3 worker(ranks=4) | 8 / 8 / 8 / 8 | 3.32s |
+| 配置 | 层分割(32 层) | 总耗时 | prefill tok/s | decode tok/s | 总 tok/s |
+|---|---|---|---|---|---|
+| 无分布式(单 rank 直跑) | 32 | 2.38s | 34.9 | 16.8 | 27.7 |
+| rank0 + 1 worker(ranks=2) | 16 / 16 | **2.30s** | 36.7 | 17.0 | 28.6 |
+| rank0 + 2 worker(ranks=3) | 11 / 11 / 10 | 2.35s | 35.7 | 16.8 | 28.0 |
+| rank0 + 3 worker(ranks=4) | 8 / 8 / 8 / 8 | 2.35s | 35.7 | 17.0 | 28.0 |
 
-worker 1→2 个几乎持平, 3 个略慢(+3%)。decode 单步延迟 = 最慢段 + 传输跳数:
-段数增多时每段层数变少(计算降)但 fp32 激活每跳多传 256KB(1.1B 模型带宽
-主导), 净效果无收益; 分段均衡性(master 更重)与自回归依赖链(无跨 token
-并行空间)限制了扩展性。更大模型(层/计算密度更高)分段收益会更明显。
+无分布式(单 rank)与 1 worker 几乎持平, 2/3 worker 略慢(~+2%)。
+prefill 受批量前向控制(50 tokens ≈ 4 批, ~35 tok/s); decode 固定 ~17 tok/s
+(58 ms/step, 含 master 前向 + 传输 + 采样)。decode 单步延迟 = 最慢段 + 传输
+跳数: 段数增多时每段层数变少(计算降)但 fp32 激活每跳多传 256KB(1.1B 模型
+带宽主导), 净效果无收益; 自回归依赖链(无跨 token 并行空间)限制扩展性。
+更大模型(层/计算密度更高)分段收益会更明显。
 
 ## 分析
 
@@ -93,5 +96,6 @@ yllm 的 AVX2 Q4K 内核对权重行连续流式读取 + 寄存器内反量化�
 - 无 AVX2:标量已追平甚至反超(1/16 线程持平,4/8 线程领先,8 线程 +58%)。
 - decode 最终都被 DRAM 带宽封顶:单核 ~3-4GB/s,整机共享 ~10-13GB/s。
 - 分布式 PP(ranks=2):批量 prefill(默认开)比逐 token 快 ~20%,`make BATCH_PREFILL=0` 可关闭。
-- 单机多 worker(ranks=2/3/4):worker 1/2 个持平、3 个略慢(+3%),受传输带宽与
-  自回归依赖链限制,小模型分段无扩展收益。
+- 单机多 worker(ranks=1/2/3/4):单 rank 直跑与 1 worker 持平(2.38 vs 2.30s),
+  2/3 worker 略慢(~+2%); 受传输带宽与自回归依赖链限制, 小模型分段无扩展收益。
+  `tools/bench_pp.sh` 可复跑(prefill/decode/总 tok/s 一并输出)。

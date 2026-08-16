@@ -556,6 +556,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
 
     uint64_t rng = ysrand(seed);
     int ngen = 0;
+    uint64_t t_dec0 = 0;
     int dist_stats = getenv("YLLM_DIST_STATS") != NULL;
     const int STATS_EVERY = 8;
     int rc = 0;
@@ -608,6 +609,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         }
         for (i = 0; i < ntokens && rc == 0; i++) {
             if (pos >= e->max_seq) break;
+            if (t_dec0 == 0) t_dec0 = ynow_ms();
             int k = dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse);
             if (k <= 0) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed"); break; }
             pend = 0;
@@ -649,9 +651,11 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         }
         if (sess) sess->pos = pos;
         dist_send_done(&dist);
+        uint64_t t_end = ynow_ms();
+        uint64_t t_dec = t_dec0 ? t_dec0 : t_end;
         ylog_info("decode:  %d tokens in %.2f s (%.1f tok/s)", ngen,
-               (double)(ynow_ms() - t0) / 1000.0,
-               (double)ngen * 1000.0 / (double)(ynow_ms() - t0 > 0 ? ynow_ms() - t0 : 1));
+               (double)(t_end - t_dec) / 1000.0,
+               (double)ngen * 1000.0 / (double)(t_end - t_dec > 0 ? t_end - t_dec : 1));
     } else {
         /* 中段/末段 rank: 收激活 → 算自己块段 → 转发/出 top-k logits */
         uint32_t pos;
