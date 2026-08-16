@@ -656,7 +656,7 @@ int cmd_rank(ServeConfig* cfg)
     sock_init(); /* sock_local_ip(取本机 IP)依赖 winsock, 必须先初始化 */
 
     /* 多段 PP 且全部段在本机: 限制 OpenMP 线程数为 核数/段数, 避免多 rank
-     * 进程线程超额争抢核(实测 2 段默认 34 线程 vs 16 核, 速度慢 4 倍)。
+     * 进程线程超额争抢核(实测不减半 2 段 32 线程 vs 16 核, 速度慢 ~2.7 倍)。
      * 跨机部署(存在远端 peer)时各机只有本机段, 不限制, 跑满本机核。
      * 必须在首次 parallel 区域(engine_init)之前设置; 环境变量优先。 */
 #ifdef _OPENMP
