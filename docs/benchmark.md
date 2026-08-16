@@ -1,10 +1,11 @@
 # 性能对比: yllm vs picolm (TinyLlama-1.1B Q4_K_M)
 
-同模型、同 prompt("Once upon a time")、纯 decode(生成 64 token, greedy, 预热后计时)。
-脚本:`tools/compare.sh`(可复跑, `THREADS=... NTOKENS=...` 可覆盖)。
+同模型、同 prompt("Once upon a time")、生成 64 token(greedy, 预热后计时)。
+脚本:`tools/compare.sh`(可复跑, `THREADS=... NTOKENS=...` 可覆盖),
+每配置输出 **prefill / decode** 两组 tok/s。
 
-- yllm 读数: 二进制 `gen` 输出的 `decode:` 行(纯 decode tok/s)
-- picolm 读数: `Generation` 行(纯 decode tok/s)
+- yllm 读数: 二进制 `gen` 输出的 `prefill:` / `decode:` 行(纯引擎计时)
+- picolm 读数: `Prefill:` / `Generation` 行
 - picolm 构建: 标量 `make picolm`(基础 CFLAGS, 无 SIMD);AVX2 `make native-avx2`(`-O3 -mavx2 -mfma -mpopcnt`)
 
 > ⚠️ 注意: picolm 的 Makefile 中 `native` 是**第一个 target**,裸 `make` 会自动带
@@ -13,21 +14,42 @@
 
 ## 无 AVX2(标量)
 
-| 线程数 | yllm-scalar | picolm-scalar |
-|---|---|---|
-| 1 | 1.4 | 1.5 |
-| 4 | 5.1 | 4.7 |
-| 8 | **8.4** | 5.3 |
-| 16 | 6.7 | 6.7 |
+| 线程数 | yllm prefill | yllm decode | picolm prefill | picolm decode |
+|---|---|---|---|---|
+| 1 | 1.5 | 1.5 | 1.5 | 1.4 |
+| 4 | 5.3 | 5.0 | 5.0 | 4.8 |
+| 8 | **8.1** | **8.1** | 8.5 | 5.6 |
+| 16 | 6.4 | 6.7 | 8.4 | 6.7 |
 
 ## 有 AVX2
 
-| 线程数 | yllm-avx2 | picolm-avx2 |
+| 线程数 | yllm prefill | yllm decode | picolm prefill | picolm decode |
+|---|---|---|---|---|
+| 1 | 5.3 | 5.4 | 5.6 | 4.9 |
+| 4 | 17.4 | 17.0 | 19.0 | 13.8 |
+| 8 | 19.1 | **26.9** | 22.1 | 16.2 |
+| 16 | 23.4 | 21.3 | 28.9 | 17.5 |
+
+## 直跑(gen) vs 服务(serve)差距
+
+`gen` 是单进程直跑(引擎最优路径); serve 模式无论 ranks=1(无分布式)
+还是 ranks=2/3/4 都走 `dist_gen` 主分支, 每步多了框架开销:
+
+| 路径 | decode | 说明 |
 |---|---|---|
-| 1 | 5.1 | 4.9 |
-| 4 | 17.2 | 14.3 |
-| 8 | **27.2** | 15.4 |
-| 16 | 22.5 | 17.5 |
+| `gen` 直跑(8 线程) | **26.9 tok/s**(37 ms/step) | 单进程, 无网络/服务/会话 |
+| serve ranks=1(16 线程) | 16.8 tok/s(59 ms/step) | 服务 + 会话 KV 落盘/恢复 + 日志 |
+| serve ranks=2(每 rank 8 线程) | 17.0 tok/s(58 ms/step) | 上述 + PP 分段串行 + 传输 |
+
+差距 ~1.6x, 主要来自:
+- **PP 分段串行**: decode 每步 = master 段 + 传输 + worker 段(ranks=2 时
+  24+27 ms)串行相加, 且各段 OMP 线程减半(16/ranks), 层内并行度下降;
+  单进程 32 层一次算完反而更快(37 ms)
+- **传输 + 同步**: fp32 激活每跳 256KB, 每步一次往返 + 采样等待
+- **服务框架**: HTTP 解析、会话管理、KV 落盘/恢复(66-token KV ≈ 8MB/rank)
+
+即: 分布式 PP 的目标是**跨机/大模型内存扩展**, 在单机小模型上分段只会更慢;
+这是架构取舍, 不是实现缺陷。
 
 ## 分布式 PP(ranks=2, 批量 prefill 开/关)
 
@@ -86,16 +108,18 @@ gcc 在 `-O2` 下不向量化 fp 归约(`-ffast-math` 缺失),单线程仅 ~0.5 
 **3) 为什么 picolm 标量 ≈ picolm AVX2(旧困惑)**
 两个"版本"其实都是 AVX2 构建(见 ⚠️),所以性能相同。
 
-**4) 有 AVX2 时 yllm 8 线程 27.2 vs picolm 15.4**
+**4) 有 AVX2 时 yllm 8 线程 decode 26.9 vs picolm 16.2**
 yllm 的 AVX2 Q4K 内核对权重行连续流式读取 + 寄存器内反量化累加,FLOP/字节 效率更高;
 两者 16 线程都被 DRAM 带宽封顶(~10-13GB/s)。
 
 ## 结论
 
-- 有 AVX2:yllm 在 8 线程明显领先(+77%),是主力配置。
-- 无 AVX2:标量已追平甚至反超(1/16 线程持平,4/8 线程领先,8 线程 +58%)。
+- 有 AVX2:yllm 8 线程 decode 明显领先(+66%),是主力配置。
+- 无 AVX2:标量已追平甚至反超(1/16 线程持平,4/8 线程领先)。
 - decode 最终都被 DRAM 带宽封顶:单核 ~3-4GB/s,整机共享 ~10-13GB/s。
 - 分布式 PP(ranks=2):批量 prefill(默认开)比逐 token 快 ~20%,`make BATCH_PREFILL=0` 可关闭。
+- 直跑(gen)比服务(serve)decode 快 ~1.6x:PP 分段串行 + 传输 + 服务/会话开销;
+  分布式目标是跨机/大模型内存扩展, 单机小模型上分段无性能收益。
 - 单机多 worker(ranks=1/2/3/4):单 rank 直跑与 1 worker 持平(2.38 vs 2.30s),
   2/3 worker 略慢(~+2%); 受传输带宽与自回归依赖链限制, 小模型分段无扩展收益。
   `tools/bench_pp.sh` 可复跑(prefill/decode/总 tok/s 一并输出)。
