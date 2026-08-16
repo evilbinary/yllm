@@ -53,6 +53,7 @@ typedef struct {
     uint32_t pos;
     uint32_t my_pos;
     const char* cache_dir;
+    char last_key[64];          /* worker: 上次处理的会话 key(变化时重置本段 kv 并恢复) */
     const volatile int* quit;   /* 非空时 worker 空闲等待周期检查(进程退出信号) */
 } DistSess;
 

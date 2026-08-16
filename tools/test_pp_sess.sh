@@ -31,7 +31,9 @@ cleanup() {
 trap cleanup EXIT
 
 "$BIN" ctl stop >/dev/null 2>&1 || true
-rm -rf sessions; mkdir -p sessions
+sleep 2
+mkdir -p sessions
+find sessions -mindepth 1 -delete 2>/dev/null || rm -rf ./sessions && mkdir -p ./sessions
 "$BIN" ctl start >/dev/null 2>&1
 
 if python3 tests/test_pp_sess.py --bin "$BIN"; then

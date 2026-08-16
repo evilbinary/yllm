@@ -525,8 +525,11 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             } else {
                 snprintf(sess->key, sizeof(sess->key), "%s", skey);
                 sess->pos = spos;
-                /* 本段 kv 启动时未载入: 按会话 key 尝试从磁盘恢复(与 master 同 key 同段) */
-                if (sess->my_pos == 0 && sess->cache_dir) {
+                /* 新会话(与上次不同 key): 本段 kv 重置, 按会话 key 从磁盘恢复
+                 * (仅 my_pos==0 会漏掉多会话交替场景: 上轮结束的 pos 非 0) */
+                if (sess->cache_dir && strcmp(sess->last_key, skey) != 0) {
+                    snprintf(sess->last_key, sizeof(sess->last_key), "%s", skey);
+                    sess->my_pos = 0;
                     char path[512];
                     char ext[32];
                     snprintf(ext, sizeof(ext), ".r%d.kv", rank);

@@ -35,6 +35,9 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #endif
@@ -558,6 +561,14 @@ static int run_rank(int port, Rank* r)
             if (wsess.key[0])
                 snprintf(r->cache_key, sizeof(r->cache_key), "%s", wsess.key);
             r->cache_pos = wsess.my_pos;
+            /* 每会话结束即落盘(与 rank0 一致): 否则多会话时退出仅剩最后
+             * 活跃会话, 其余会话的 .rN.kv 丢失, 重启后 worker 无法续接 */
+            if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
+                char path[512];
+                cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
+                if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
+                    ylog_info("rank: worker sess %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
+            }
             if (r->quit) break;
             if (rc != 0) {
                 ylog_warn("rank: pipeline round failed (rc=%d), retry", rc);
@@ -604,6 +615,24 @@ static int run_rank(int port, Rank* r)
 
 #include "config.h"
 
+/* peers 是否全部在本机(同机 PP 部署): 任一地址非本机则视为跨机, 返回 0 */
+static int peers_all_local(const char* peers)
+{
+    if (!peers || !peers[0]) return 1;
+    char lip[64] = "127.0.0.1";
+    sock_local_ip(lip, sizeof(lip));
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", peers);
+    char* tok = strtok(buf, ",");
+    while (tok) {
+        if (strcmp(tok, "127.0.0.1") != 0 && strcmp(tok, "localhost") != 0 &&
+            strcmp(tok, lip) != 0)
+            return 0;
+        tok = strtok(NULL, ",");
+    }
+    return 1;
+}
+
 int cmd_rank(ServeConfig* cfg)
 {
     if (!cfg->model[0]) {
@@ -615,6 +644,24 @@ int cmd_rank(ServeConfig* cfg)
     }
 
     sock_init(); /* sock_local_ip(取本机 IP)依赖 winsock, 必须先初始化 */
+
+    /* 多段 PP 且全部段在本机: 限制 OpenMP 线程数为 核数/段数, 避免多 rank
+     * 进程线程超额争抢核(实测 2 段默认 34 线程 vs 16 核, 速度慢 4 倍)。
+     * 跨机部署(存在远端 peer)时各机只有本机段, 不限制, 跑满本机核。
+     * 必须在首次 parallel 区域(engine_init)之前设置; 环境变量优先。 */
+#ifdef _OPENMP
+    if (getenv("OMP_NUM_THREADS") == NULL) {
+        int nr = cfg->ranks > 1 ? cfg->ranks : 1;
+        if (nr > 1 && !peers_all_local(cfg->peers))
+            nr = 1;
+        int n = omp_get_num_procs();
+        if (n < 1) n = 1;
+        int t = n / nr;
+        if (t < 1) t = 1;
+        omp_set_num_threads(t);
+        ylog_info("rank: OpenMP threads=%d (nproc=%d / ranks=%d)", t, n, nr);
+    }
+#endif
 
     Rank r;
     memset(&r, 0, sizeof(r));
