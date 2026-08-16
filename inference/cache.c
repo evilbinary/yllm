@@ -184,7 +184,8 @@ int sess_kv_save(Engine* e, uint32_t pos, const char* path)
         rc = -1;
     size_t row = (size_t)pos * kv_dim;
     uint32_t l;
-    for (l = 0; !rc && l < nb; l++) {
+    /* 前向用块 1..nb 的 kv 分区(区域 1..nb 为 K, nb+1..2nb 为 V); 区域 0 未用 */
+    for (l = 1; !rc && l <= nb; l++) {
         const uint16_t* k = e->kv + (size_t)l * max_seq * kv_dim;
         const uint16_t* v = e->kv + (size_t)(h->n_blocks + l) * max_seq * kv_dim;
         if (write_all(f, k, row * 2) != 0 || write_all(f, v, row * 2) != 0) rc = -1;
@@ -212,7 +213,7 @@ int sess_kv_load(Engine* e, const char* path, uint32_t* pos)
     else {
         size_t row = (size_t)pos0 * kv_dim;
         uint32_t l;
-        for (l = 0; !rc && l < nb; l++) {
+        for (l = 1; !rc && l <= nb; l++) {
             uint16_t* k = e->kv + (size_t)l * max_seq * kv_dim;
             uint16_t* v = e->kv + (size_t)(h->n_blocks + l) * max_seq * kv_dim;
             if (read_all(f, k, row * 2) != 0 || read_all(f, v, row * 2) != 0) rc = -1;

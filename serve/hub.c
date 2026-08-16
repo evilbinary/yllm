@@ -66,6 +66,8 @@ int cmd_hub(ServeConfig* cfg)
     sv.rank_port_base = (uint16_t)cfg->rank_port_base;
     sv.server_port_base = (uint16_t)cfg->server_port;
     sv.auto_heal = cfg->auto_heal;
+    if (cfg->cache_dir[0])
+        snprintf(sv.cache_dir, sizeof(sv.cache_dir), "%s", cfg->cache_dir);
     sv.no_spawn_server = 1; /* hub 内已有 server 线程 */
     snprintf(sv.sv_host, sizeof(sv.sv_host), "%s", cfg->sv_host);
     snprintf(sv.bin, sizeof(sv.bin), "%s", cfg->bin);
@@ -90,6 +92,7 @@ int cmd_hub(ServeConfig* cfg)
     rt.port = (uint16_t)cfg->router_port;
     pthread_mutex_init(&rt.lock, NULL);
     rt.strategy = cfg->strategy;
+    snprintf(rt.node.sv_host, sizeof(rt.node.sv_host), "%s", cfg->sv_host);
     snprintf(rt.node.node_id, sizeof(rt.node.node_id), "router-0");
     snprintf(rt.node.type, sizeof(rt.node.type), "router");
     rt.node.state = NODE_STATE_READY;
@@ -117,6 +120,10 @@ int cmd_hub(ServeConfig* cfg)
         /* leader = 该模型 rank0 (rank_port_base + mi*16); 主机由 server_run 自动发现(查询 supervisor 注册表) */
         if (mc->model[0])
             snprintf(s->resolve_model, sizeof(s->resolve_model), "%s", mc->model);
+        if (mc->vocab[0])
+            snprintf(s->vocab_path, sizeof(s->vocab_path), "%s", mc->vocab);
+        if (cfg->cache_dir[0])
+            snprintf(s->cache_dir, sizeof(s->cache_dir), "%s", cfg->cache_dir);
         s->leader_port = (uint16_t)(cfg->rank_port_base + mi * cfg_model_stride(cfg));
         snprintf(s->node.sv_host, sizeof(s->node.sv_host), "127.0.0.1");
         s->node.sv_port = sv_port;

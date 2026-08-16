@@ -3,6 +3,8 @@
 
 #include "node.h"
 #include "config.h"
+#include "../inference/yllm.h"
+#include "../inference/cache.h"
 
 typedef struct {
     Node node;             /* 统一节点身份(type=server) */
@@ -17,6 +19,13 @@ typedef struct {
     int  lease_ranks;        /* 租到的组内 rank 数 */
     char lease_peers[1024];  /* 组内各段节点 IP(逗号分隔, 段号顺序, 随 INFER 捎给 rank0) */
     char lease_rank_ids[512]; /* 租用组内 rank 的 id 列表(rank-0,rank-1), 状态展示用 */
+    /* 会话模式: 本模型词表(渲染) + 会话缓存(前缀续接), 由 hub/cmd_server 设置 */
+    char vocab_path[256];
+    char cache_dir[256];   /* 会话缓存落盘目录(空 = 纯内存) */
+    Vocab sess_vocab;
+    int sess_vocab_ok;
+    SessCache sess;
+    pthread_mutex_t sess_lock;
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */

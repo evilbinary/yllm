@@ -235,6 +235,52 @@ int router_infer(Router* r, const char* model, int max_tokens,
     return rc;
 }
 
+/* 会话模式推理(转发): 带会话 key + 新消息文本发给 server(会话管理在 server 侧)。
+ * server 渲染/缓存后只把增量 token 发给 rank; 这里只透传 TS 帧文本。 */
+int router_infer_sess(Router* r, const char* model, int max_tokens,
+                      const char* sess_key, const char* new_msg, size_t msg_len,
+                      void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx)
+{
+    RtServer* s = pick_server(r, model);
+    if (!s) { ylog_warn("router_infer_sess: no ready server for %s", model); return -1; }
+    int sfd = sock_connect(s->leader_host, s->leader_port, 5);
+    if (sfd < 0) { ylog_warn("router_infer_sess: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
+    char args[192];
+    snprintf(args, sizeof(args), "%d %zu key=%s", max_tokens, msg_len, sess_key);
+#if YLLM_SESS_DEBUG
+    ylog_info("ROUTER->SERVER: INFER_SESS args=[%s] msg=[%.60s]", args, new_msg);
+#endif
+    frame_send_payload(sfd, PROTO_INFER_SESS, args, new_msg, msg_len);
+
+    pthread_mutex_lock(&r->lock);
+    s->inflight++;
+    pthread_mutex_unlock(&r->lock);
+    char out[RT_MAX_LINE];
+    int rc = 0;
+    int done = 0;
+    while (!done) {
+        int n2 = sock_recv_line(sfd, out, sizeof(out));
+        if (n2 < 0) { rc = -1; break; }
+        if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
+        else if (strncmp(out, "TS ", 3) == 0) {
+            size_t tlen = 0;
+            sscanf(out + 3, "%zu", &tlen);
+            if (tlen <= 0) { rc = -1; break; }
+            char* payload = (char*)malloc(tlen + 1);
+            if (!payload) { rc = -1; break; }
+            if (sock_recv_n(sfd, payload, tlen) != 0) { free(payload); rc = -1; break; }
+            payload[tlen] = '\0';
+            if (on_token) on_token(payload, tlen, ctx);
+            free(payload);
+        }
+    }
+    pthread_mutex_lock(&r->lock);
+    s->inflight--;
+    pthread_mutex_unlock(&r->lock);
+    sock_close(sfd);
+    return rc;
+}
+
 static void handle_client_infer(int fd, Router* r, const char *args)
 {
     char model[128];

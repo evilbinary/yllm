@@ -899,16 +899,20 @@ static int chat_append_ids(Vocab* v, const char* text, uint32_t* ids, int max, i
     return 0;
 }
 
-int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos)
+/* 多消息模板渲染: roles[i]/contents[i] 组成对话历史, 渲染完整模板。
+ * 返回渲染出的 token 数; 无模板返回 -1。 */
+int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* contents,
+                         int n_msgs, uint32_t* ids, int max, int add_bos)
 {
     if (!vocab_has_template(v)) return -1;
+    if (n_msgs < 1) return -1;
 
-    /* single-turn messages: [user] (+ optional generation prompt from template) */
-    ChatMsg msgs[2];
-    int n_msgs = 0;
-    msgs[n_msgs].role = "user";
-    msgs[n_msgs].content = user_msg;
-    n_msgs++;
+    ChatMsg* msgs = (ChatMsg*)ymalloc((size_t)n_msgs * sizeof(ChatMsg));
+    int mi2;
+    for (mi2 = 0; mi2 < n_msgs; mi2++) {
+        msgs[mi2].role = roles ? roles[mi2] : "user";
+        msgs[mi2].content = contents ? contents[mi2] : "";
+    }
 
     int n_out = 0;
     if (add_bos && v->bos >= 0 && n_out < max) ids[n_out++] = (uint32_t)v->bos;
@@ -1055,5 +1059,14 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
         }
         if (!is_last) continue;
     }
+    free(msgs);
     return n_out;
+}
+
+/* single-turn 兼容包装 */
+int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos)
+{
+    const char* roles[1] = {"user"};
+    const char* contents[1] = {user_msg};
+    return vocab_chat_ids_multi(v, roles, contents, 1, ids, max, add_bos);
 }

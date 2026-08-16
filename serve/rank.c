@@ -60,8 +60,9 @@ typedef struct {
     int dist_fp16;
     int serve_port;      /* 本段 serve 口(worker 段也监听, 供 PING/STAT/DRAIN 管理) */
     /* 会话模式最小记账: 引擎 KV 归属的会话 + 已推进位置 */
-    char sess_key[64];
-    uint32_t sess_pos;
+    char cache_key[64];
+    uint32_t cache_pos;
+    char cache_dir[256];   /* KV 落盘目录(空 = 纯内存) */
 } Rank;
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
@@ -180,6 +181,7 @@ typedef struct {
     int fd;
     Vocab* vocab;
     int n_tokens;
+    int cache_frame;   /* 1 = 会话模式: 发 TS 帧(带 token id, 供 router 记账) */
 } TokenCtx;
 
 /* 生成回调: 逐 token 流式回 T 帧; 返回非 0 中止生成(对端断开) */
@@ -191,7 +193,9 @@ static int on_token_rank(uint32_t id, void* ctx)
     vocab_decode(tc->vocab, &id, 1, tmp, sizeof(tmp));
     size_t len = strlen(tmp);
     char hdr[64];
-    int hn = snprintf(hdr, sizeof(hdr), "T %zu\n", len);
+    int hn = tc->cache_frame
+        ? snprintf(hdr, sizeof(hdr), "TS %zu %u\n", len, id)
+        : snprintf(hdr, sizeof(hdr), "T %zu\n", len);
     if (xsend_rank(tc->fd, hdr, (size_t)hn) != 0) return -1;
     if (xsend_rank(tc->fd, tmp, len) != 0) return -1;
     ylog_raw_log("%s", tmp);
@@ -199,8 +203,23 @@ static int on_token_rank(uint32_t id, void* ctx)
 }
 
 /* 会话模式推理: payload = 增量 token 二进制(server 已渲染并算好续接点)。
- * rank 只做最小记账: sess_key/sess_pos; token 列表/历史在 server 侧管理。 */
-static int handle_infer_session(int fd, Rank* r, const char* key, uint32_t max_tokens,
+ * rank 只做最小记账: cache_key/cache_pos; token 列表/历史在 server 侧管理。 */
+/* 缓存文件名安全化(与 server 一致): 替换 ':' 等文件系统非法字符 */
+static void cache_file_name(char* out, size_t outsz, const char* key, const char* ext)
+{
+    size_t o = 0;
+    const char* p;
+    for (p = key; *p && o + 16 < outsz; p++) {
+        char c = *p;
+        if (c == ':' || c == '/' || c == '\\' || c == '?' || c == '*' ||
+            c == '<' || c == '>' || c == '|' || c == '"')
+            c = '_';
+        out[o++] = c;
+    }
+    if (o + strlen(ext) + 1 < outsz) memcpy(out + o, ext, strlen(ext) + 1);
+}
+
+static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tokens,
                                 uint32_t resume, const uint32_t* delta, uint32_t ndelta)
 {
     EngineTimings tim;
@@ -210,21 +229,47 @@ static int handle_infer_session(int fd, Rank* r, const char* key, uint32_t max_t
     tc.fd = fd;
     tc.vocab = &r->vocab;
     tc.n_tokens = 0;
+    tc.cache_frame = 1;
 
-    /* 换会话: 引擎 KV 状态未知, 必须从 0 全量(server 应发全量历史) */
-    if (strcmp(key, r->sess_key) != 0) {
-        if (resume != 0) {
+    /* 换会话: 先把旧会话 KV 落盘, 再尝试从磁盘恢复新会话 KV */
+#if YLLM_SESS_DEBUG
+    ylog_info("rank: sess key=[%s] cur=[%s] resume=%u cur_pos=%u ndelta=%u",
+              key, r->cache_key, resume, r->cache_pos, ndelta);
+#endif
+    if (strcmp(key, r->cache_key) != 0) {
+        if (r->cache_dir[0] && r->cache_key[0]) {
+            char path[512];
+            cache_file_name(path + snprintf(path, sizeof(path), "%s/", r->cache_dir), sizeof(path), r->cache_key, ".kv");
+            if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
+                ylog_info("rank: session %s kv saved (%u tokens) -> %s", r->cache_key, r->cache_pos, path);
+        }
+        snprintf(r->cache_key, sizeof(r->cache_key), "%s", key);
+        r->cache_pos = 0;
+        /* 磁盘恢复: 载入 <dir>/<key>.kv, resume 需与载入的 pos 一致 */
+        if (r->cache_dir[0] && resume != 0) {
+            char path[512];
+            cache_file_name(path + snprintf(path, sizeof(path), "%s/", r->cache_dir), sizeof(path), key, ".kv");
+            uint32_t loaded = 0;
+            if (sess_kv_load(&r->engine, path, &loaded) == 0 && loaded == resume) {
+                r->cache_pos = loaded;
+                ylog_info("rank: session %s kv restored (%u tokens) from %s", key, loaded, path);
+            } else {
+                ylog_warn("rank: session %s kv load failed/pos mismatch (%u vs %u)", key, loaded, resume);
+                send_line(fd, "ERR session kv not cached on this rank, resume must be 0");
+                return 0;
+            }
+        } else if (resume != 0) {
+            ylog_warn("rank: sess key mismatch, resume must be 0");
             send_line(fd, "ERR session not cached on this rank, resume must be 0");
             return 0;
         }
-        snprintf(r->sess_key, sizeof(r->sess_key), "%s", key);
-        r->sess_pos = 0;
     }
-    if (resume != r->sess_pos) {
-        send_line(fd, "ERR resume mismatch: rank has %u, got %u", r->sess_pos, resume);
+    if (resume != r->cache_pos) {
+        ylog_warn("rank: resume mismatch: rank has %u, got %u", r->cache_pos, resume);
+        send_line(fd, "ERR resume mismatch: rank has %u, got %u", r->cache_pos, resume);
         return 0;
     }
-    if ((uint64_t)r->sess_pos + ndelta > r->engine.max_seq) {
+    if ((uint64_t)r->cache_pos + ndelta > r->engine.max_seq) {
         send_line(fd, "ERR context full");
         return 0;
     }
@@ -236,14 +281,14 @@ static int handle_infer_session(int fd, Rank* r, const char* key, uint32_t max_t
 
     /* 增量 prefill: 旧 token 的 KV 已在本引擎缓存, 只算新 token */
     if (ndelta > 0)
-        engine_forward_prefill(&r->engine, delta, (int)ndelta, r->sess_pos);
-    r->sess_pos += ndelta;
+        engine_forward_prefill(&r->engine, delta, (int)ndelta, r->cache_pos);
+    r->cache_pos += ndelta;
     tim.n_prefill = ndelta;
 
     /* decode 循环: 采样 → 流式回 → 前向推进(与 engine_generate 同构) */
     uint64_t rng = ysrand(r->seed);
     uint32_t ngen = 0;
-    uint32_t pos = r->sess_pos;
+    uint32_t pos = r->cache_pos;
     for (uint32_t i = 0; i < max_tokens && pos < r->engine.max_seq; i++) {
         uint32_t nxt;
         if (engine_sample(&r->engine, r->engine.ws.model.h.vocab, r->temp, r->top_p, &rng, &nxt) != 0) break;
@@ -253,7 +298,12 @@ static int handle_infer_session(int fd, Rank* r, const char* key, uint32_t max_t
         pos++;
         ngen++;
     }
-    r->sess_pos = pos;
+    /* 结束(命中 eos 或达上限)后补 eos 到 kv, 使 rank pos 与 router 缓存(回复+eos)一致 */
+    if (pos < r->engine.max_seq) {
+        engine_forward(&r->engine, (uint32_t)r->vocab.eos, pos);
+        pos++;
+    }
+    r->cache_pos = pos;
     tim.n_decode = ngen;
     tim.decode_ms = ynow_ms() - t0;
 
@@ -296,11 +346,21 @@ static int handle_infer(int fd, Rank* r, char* args)
     {
         const char* key = proto_get(args, "key");
         if (key) {
+            /* proto_get 返回行内剩余部分, 截到空格 */
+            char keybuf[64];
+            size_t kl = strcspn(key, " ");
+            if (kl >= sizeof(keybuf)) kl = sizeof(keybuf) - 1;
+            memcpy(keybuf, key, kl);
+            keybuf[kl] = '\0';
+            key = keybuf;
             const char* rs = proto_get(args, "resume");
             uint32_t resume = rs ? (uint32_t)strtoul(rs, NULL, 10) : 0;
+#if YLLM_SESS_DEBUG
+            ylog_info("rank: sess INFER key=[%s] resume=%u nbytes=%ld", key, resume, nbytes);
+#endif
             if (nbytes % 4 != 0) { free(pb); send_line(fd, "ERR session payload must be token bytes"); return 0; }
             uint32_t ndelta = (uint32_t)(nbytes / 4);
-            int rc = handle_infer_session(fd, r, key, (uint32_t)max_tokens, resume,
+            int rc = handle_infer_cache(fd, r, key, (uint32_t)max_tokens, resume,
                                           (const uint32_t*)pb, ndelta);
             free(pb);
             return rc;
@@ -461,6 +521,13 @@ static int run_rank(int port, Rank* r)
                 sock_close(fd);
             }
         }
+        /* 退出: 当前会话 KV 落盘 */
+        if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
+            char path[512];
+            cache_file_name(path + snprintf(path, sizeof(path), "%s/", r->cache_dir), sizeof(path), r->cache_key, ".kv");
+            if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
+                ylog_info("rank: exit, session %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
+        }
         sock_close(srv);
     }
     r->quit = 1;
@@ -490,6 +557,8 @@ int cmd_rank(ServeConfig* cfg)
     r.top_p = cfg->top_p;
     r.seed = cfg->seed;
     r.uptime_s = (uint64_t)time(NULL);
+    if (cfg->cache_dir[0])
+        snprintf(r.cache_dir, sizeof(r.cache_dir), "%s", cfg->cache_dir);
     if (cfg->node_id[0] && strcmp(cfg->node_id, "node-0") != 0)
         snprintf(r.node.node_id, sizeof(r.node.node_id), "%s", cfg->node_id);
     else

@@ -100,7 +100,7 @@ int main(void)
         CHECK(sess_kv_load(&ee, "/tmp/opencode/sess_test.kv", &rp) == 0, "kv_load ok");
         CHECK(rp == 5, "kv loaded pos");
         int ok = 1;
-        for (uint32_t l = 0; l < hh.n_blocks; l++)
+        for (uint32_t l = 1; l <= hh.n_blocks; l++)   /* 落盘覆盖块 1..nb */
             for (uint32_t p = 0; p < 5; p++)
                 for (uint32_t j = 0; j < ee.kv_dim; j++) {
                     uint16_t* k = ee.kv + l * ee.max_seq * ee.kv_dim;

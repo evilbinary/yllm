@@ -14,6 +14,12 @@
 #ifndef YLLM_SERVE_PROTOCOL_H
 #define YLLM_SERVE_PROTOCOL_H
 
+/* 会话数据包调试: 编译时 -DYLLM_SESS_DEBUG=1 开启,
+ * 打印 router/server/rank 各跳的实际数据包内容。 */
+#ifndef YLLM_SESS_DEBUG
+#define YLLM_SESS_DEBUG 0
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -47,6 +53,7 @@
  *       结束回 DONE <gen_tokens> <eos=0|1> <ms>\n
  * 错误回 ERR <msg> */
 #define PROTO_INFER "INFER"
+#define PROTO_INFER_SESS "INFER_SESS"
 
 /* DRAIN\n → OK\n(等当前请求完成) 后关连接退出
  * 优雅下线(滚动更新 / 缩容) */

@@ -38,6 +38,7 @@ typedef struct {
     char model[CFG_STR_MAX];        /* llf 路径(= models[0].model) */
     char vocab[CFG_STR_MAX];        /* vocab 路径 */
     char model_name[CFG_STR_MAX];   /* 注册名(router 路由用) */
+    char cache_dir[CFG_STR_MAX]; /* 会话缓存落盘目录(空 = 纯内存) */
     char bin[CFG_STR_MAX];          /* yllm 二进制路径 */
     ModelCfg models[CFG_MAX_MODELS];
     int n_models;
@@ -135,6 +136,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->rank_port_base = atoi(val);
     } else if (strcmp(key, "http-port") == 0) {
         c->http_port = atoi(val);
+    } else if (strcmp(key, "cache-dir") == 0) {
+        snprintf(c->cache_dir, sizeof(c->cache_dir), "%s", val);
     } else if (strcmp(key, "sv-host") == 0 || strcmp(key, "addr") == 0 ||
                strcmp(key, "supervisor") == 0) {
         /* supervisor 可能是 ip:port, 拆开存 host + port */

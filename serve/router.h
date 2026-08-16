@@ -38,4 +38,10 @@ int router_infer(Router* r, const char* model, int max_tokens,
                  const char* prompt, size_t plen,
                  void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx);
 
+/* 会话模式推理(转发): 带会话 key + 新消息文本发给 server(会话管理在 server 侧),
+ * server 渲染/缓存后只把增量 token 发给 rank。on_token 同 router_infer。 */
+int router_infer_sess(Router* r, const char* model, int max_tokens,
+                      const char* sess_key, const char* new_msg, size_t msg_len,
+                      void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx);
+
 #endif

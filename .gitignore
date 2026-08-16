@@ -65,3 +65,4 @@ logs/
 models/
 tests/__pycache__/*.pyc
 tools/__pycache__/gguf2safetensors.cpython-310.pyc
+sessions

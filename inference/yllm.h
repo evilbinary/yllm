@@ -90,6 +90,8 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max);
 int vocab_id(Vocab* v, const char* piece);
 /* chat template: render a single-turn user message, returns number of ids */
 int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos);
+int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* contents,
+                         int n_msgs, uint32_t* ids, int max, int add_bos);
 int vocab_has_template(Vocab* v);
 /* ---- 引擎 ---- */
 typedef struct {

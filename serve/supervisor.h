@@ -26,6 +26,7 @@ typedef struct {
     /* router 列表: 用统一 Node 抽象(type=router, addr="ip:port") */
     Node routers[SV_MAX_ROUTERS];
     int n_routers;
+    char cache_dir[256];   /* 会话缓存落盘目录(传给 rank/server) */
     uint16_t port;
     /* 生命周期配置(拉起/自愈用) */
     char bin[512];          /* yllm 二进制路径 */

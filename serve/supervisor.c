@@ -136,9 +136,10 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
     snprintf(cmd, sizeof(cmd),
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --rank %d --ranks %d --peers %s "
-             "--log logs/%s-rank-%d.log",
+             "--cache-dir \"%s\" --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
-             mi * model_stride(s) + r, r, ranks, peers, mc->name, r);
+             mi * model_stride(s) + r, r, ranks, peers,
+             s->cache_dir[0] ? s->cache_dir : ".", mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
     int pid = spawn_proc(cmd);
     if (pid > 0) {
@@ -159,9 +160,10 @@ static int supervisor_spawn_server(Supervisor* s, int mi)
     uint16_t lport = model_rank_base(s, mi);   /* leader = rank0 */
     snprintf(cmd, sizeof(cmd),
              "\"%s\" server --id server-%d --model-name \"%s\" --leader %s:%u "
-             "--supervisor %s:%u --port %u --log logs/%s-server-%d.log",
+             "--supervisor %s:%u --port %u --cache-dir \"%s\" "
+             "--log logs/%s-server-%d.log",
              s->bin, mi, mc->name, s->sv_host, lport, s->sv_host, s->port,
-             sport, mc->name, mi);
+             sport, s->cache_dir[0] ? s->cache_dir : ".", mc->name, mi);
     ylog_info("supervisor: spawn server %d (model %s) on port %u", mi, mc->name, sport);
     int pid = spawn_proc(cmd);
     if (pid > 0) {

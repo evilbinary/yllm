@@ -13,7 +13,7 @@ CC         ?= cc
 LDFLAGS    ?=
 LIBS       :=
 
-SRC      := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/dist.c
+SRC      := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/cache.c inference/dist.c
 TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c
 
 # ---- OS 检测 (Windows: MSYS2/MinGW 的 uname 会带 MINGW/MSYS, 也归为 Windows) ----
@@ -58,7 +58,9 @@ LIBS += $(PLATLIBS)
 # ---- 标量版本(默认) ----
 # 批量 prefill(编译期开关): 默认开启, 用 make BATCH_PREFILL=0 关闭
 BATCH_PREFILL ?= 1
-CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) $(PLATDEF) $(OMPFLAG)
+# 会话数据包调试: make YLLM_SESS_DEBUG=1 开启(0 默认关闭)
+YLLM_SESS_DEBUG ?= 0
+CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) -DYLLM_SESS_DEBUG=$(YLLM_SESS_DEBUG) $(PLATDEF) $(OMPFLAG)
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o $(OBJDIR)/status.o $(OBJDIR)/ctl.o $(OBJDIR)/sync.o

@@ -90,6 +90,51 @@ static void sse_on_token(const char* utf8, size_t len, void* ctx)
     free(escaped);
 }
 
+/* 会话 key: 客户端 IP + 首条用户消息哈希(同一对话稳定) */
+static void make_sess_key(int fd, const char* first, size_t flen, char* out, size_t outsz)
+{
+    char ip[64] = "0.0.0.0";
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof(sa);
+    if (getpeername(fd, (struct sockaddr*)&sa, &sl) == 0)
+        inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
+    uint64_t h = 1469598103934665603ull;
+    size_t i;
+    for (i = 0; i < flen; i++) { h ^= (unsigned char)first[i]; h *= 1099511628211ull; }
+    snprintf(out, outsz, "%s:%llx", ip, (unsigned long long)h);
+}
+
+/* 提取 chat 请求的全部消息(role/content), 返回消息数 */
+static int extract_chat_messages(const char* body, char* pool, size_t poolsz,
+                                 char** roles, char** contents, int max_msgs)
+{
+    int n = 0, i;
+    size_t off = 0;
+    for (i = 0; i < 32 && n < max_msgs; i++) {
+        char path[64];
+        JsonVal v;
+        roles[n] = NULL;
+        contents[n] = NULL;
+        snprintf(path, sizeof(path), "messages.%d.role", i);
+        if (json_find(body, path, &v) && v.type == JSON_STR && off + 64 < poolsz) {
+            size_t rlen = json_str_unescape(v.start, v.len, pool + off);
+            roles[n] = pool + off;
+            off += rlen + 1;
+        }
+        if (!roles[n]) break;   /* 没有更多消息 */
+        snprintf(path, sizeof(path), "messages.%d.content", i);
+        if (json_find(body, path, &v) && v.type == JSON_STR && off + 64 < poolsz) {
+            contents[n] = pool + off;
+            off += json_str_unescape(v.start, v.len, pool + off) + 1;
+        } else {
+            contents[n] = pool + off;
+            pool[off++] = '\0';
+        }
+        n++;
+    }
+    return n;
+}
+
 /* 提取 chat 请求的最后一条 content 作为 prompt */
 static size_t extract_chat_prompt(const char* body, char* out, size_t outsz)
 {
@@ -132,7 +177,26 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     if (json_find(body, "max_tokens", &v) && v.type == JSON_NUM)
         max_tokens = (int)json_num(&v);
 
-    if (plen == 0) {
+    /* 会话模式: 提取全部消息 + 会话 key, 渲染后只发增量 token 给 rank */
+    char* pool = (char*)malloc(HTTP_MAX_BODY);
+    char* roles[16];
+    char* contents[16];
+    int n_msgs = 0;
+    int sess_ok = 0;
+    char sess_key[128] = "";
+    if (pool) {
+        n_msgs = extract_chat_messages(body, pool, HTTP_MAX_BODY, roles, contents, 16);
+        if (n_msgs > 0) {
+            make_sess_key(fd, contents[0], strlen(contents[0]), sess_key, sizeof(sess_key));
+            sess_ok = 1;
+        }
+#if YLLM_SESS_DEBUG
+        ylog_info("router_http: sess_ok=%d n_msgs=%d key=%s", sess_ok, n_msgs, sess_key);
+#endif
+    }
+
+    if (plen == 0 && n_msgs == 0) {
+        if (pool) free(pool);
         free(prompt);
         free(collected);
         HttpResponse rr;
@@ -147,7 +211,12 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         sc.r = &rr;
         sc.model = model;
         http_sse_begin(&rr, fd);
-        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc);
+        int rc;
+        if (sess_ok)
+            rc = router_infer_sess(r, model, max_tokens, sess_key,
+                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), sse_on_token, &sc);
+        else
+            rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc);
         if (rc != 0)
             http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
@@ -158,7 +227,12 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         cc.len = 0;
         cc.n_tokens = 0;
         collected[0] = '\0';
-        int rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+        int rc;
+        if (sess_ok)
+            rc = router_infer_sess(r, model, max_tokens, sess_key,
+                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc);
+        else
+            rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
         if (rc != 0) {
             HttpResponse rr;
             http_begin(&rr, fd, 502, "application/json");
@@ -181,6 +255,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         http_reply(&rr, json);
         free(json);
     }
+    if (pool) free(pool);
     free(prompt);
     free(collected);
 }
