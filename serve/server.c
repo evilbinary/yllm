@@ -328,6 +328,8 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
 {
     if (strcmp(cmd, PROTO_INFER_SESS) == 0) {
         s->node.inflight++;
+        s->node.state = NODE_STATE_BUSY;   /* 转发中, 通知 supervisor */
+        node_heartbeat(&s->node);
         int request_lease = strcmp(s->lease_strategy, "request") == 0;
         int ok = 1;
         if (request_lease && server_lease(s) != 0) {
@@ -340,10 +342,14 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
             if (request_lease) server_release(s);
         }
         s->node.inflight--;
+        s->node.state = NODE_STATE_READY;  /* 转发结束 */
+        node_heartbeat(&s->node);
         return;
     }
     if (strcmp(cmd, PROTO_INFER) == 0) {
         s->node.inflight++;
+        s->node.state = NODE_STATE_BUSY;   /* 转发中, 通知 supervisor */
+        node_heartbeat(&s->node);
         int request_lease = strcmp(s->lease_strategy, "request") == 0;
         int ok = 1;
         if (request_lease && server_lease(s) != 0) {
@@ -354,6 +360,8 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         if (ok) forward_infer(fd, s, args);
         if (request_lease) server_release(s);
         s->node.inflight--;
+        s->node.state = NODE_STATE_READY;  /* 转发结束 */
+        node_heartbeat(&s->node);
     } else if (strcmp(cmd, PROTO_PING) == 0) {
         frame_send(fd, "OK", "READY");
     } else if (strcmp(cmd, PROTO_STAT) == 0) {
