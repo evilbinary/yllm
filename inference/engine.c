@@ -113,7 +113,7 @@ static void sched_refresh_resident(Ws* ws)
 static void sched_adapt_budget(Ws* ws)
 {
 #ifndef _WIN32
-    if (ws->budget == 0) return;
+    if (ws->budget == 0 || ws->hard) return;
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) return;
     long pf = ru.ru_majflt;
@@ -141,12 +141,17 @@ static void sched_release_budget(Ws* ws, uint32_t cur)
         uint32_t n = 0;
         uint64_t bytes = 0;
         for (i = 0; i < ws->model.n_layers; i++) {
-            if (ws->pstate[i] == 2) { n++; bytes += ws->layer_size[i]; }
+            /* hard 模式: 已算过、页缓存仍驻留的层(缺页重读回来的)也算入占用 */
+            if (ws->pstate[i] == 2 ||
+                (ws->hard && ws->pstate[i] == 3 && ws->res[i])) {
+                n++; bytes += ws->layer_size[i];
+            }
         }
         if (n <= ws->budget_layers && bytes <= ws->budget) return;
         int found = 0;
         for (i = 0; i < cur; i++) {
-            if (ws->pstate[i] == 2 && !ws->hot[i]) {
+            if ((ws->pstate[i] == 2 ||
+                 (ws->hard && ws->pstate[i] == 3 && ws->res[i])) && !ws->hot[i]) {
                 ws_release(ws, i);
                 ws->pstate[i] = 3;
                 ws->res[i] = 0;
@@ -174,6 +179,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     ws->budget = budget;
+    ws->hard = budget > 0; /* 预算即硬限制: 关自适应放大, 算后即释放 */
     ws->depth = depth > 0 ? depth : 2;
     ws->pstate = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->hot = (uint8_t*)ycalloc(m->n_layers, 1);
