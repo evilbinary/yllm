@@ -24,6 +24,7 @@ typedef struct {
     char peers[CFG_STR_MAX];  /* 组内各段节点 IP(逗号分隔, 段号顺序; worker 段 spawn 时下发) */
     int  ranks;               /* 该模型的 rank 段数(总) */
     int  local;               /* 本机拉起的段数(默认 = ranks; 0 = 全部外部; 1 = 只 rank0 本地) */
+    int  dist_fp16;           /* 段间激活 fp16 传输(带宽减半, 引入量化误差) */
 } ModelCfg;
 
 typedef struct {
@@ -68,6 +69,7 @@ typedef struct {
     /* rank 协作(多段) */
     int  rank_idx;                      /* --rank 段号(0..ranks-1) */
     char peers[CFG_STR_MAX];            /* 组内各段节点 IP(逗号分隔; worker 段命令行下发) */
+    int  dist_fp16;                     /* 段间激活 fp16 传输(带宽减半, 引入量化误差) */
 
     /* 推理参数(rank 用) */
     float temp;
@@ -171,6 +173,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->rank_idx = atoi(val);
     } else if (strcmp(key, "peers") == 0) {
         snprintf(c->peers, sizeof(c->peers), "%s", val);
+    } else if (strcmp(key, "dist-fp16") == 0) {
+        c->dist_fp16 = atoi(val);
     } else if (strcmp(key, "temp") == 0) {
         c->temp = (float)atof(val);
     } else if (strcmp(key, "top-p") == 0) {
@@ -237,6 +241,7 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
                         else if (strcmp(key, "vocab") == 0) snprintf(mc->vocab, sizeof(mc->vocab), "%s", val);
                         else if (strcmp(key, "ranks") == 0) mc->ranks = atoi(val);
                         else if (strcmp(key, "local") == 0) mc->local = atoi(val);
+                        else if (strcmp(key, "dist-fp16") == 0) mc->dist_fp16 = atoi(val);
                     }
                 }
                 line = strtok_r(NULL, "\n", &save);

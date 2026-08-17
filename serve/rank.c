@@ -731,6 +731,7 @@ int cmd_rank(ServeConfig* cfg)
      * 成员地址: worker 段来自命令(--peers, sv 自动下发); rank0 以 INFER 数据为准(启动时的兜底) */
     r.dist_rank = cfg->rank_idx;
     r.dist_ranks = cfg->ranks > 1 ? cfg->ranks : 1;
+    r.dist_fp16 = cfg->dist_fp16;
     r.pipe_base = (uint16_t)(cfg->rank_port_base - r.dist_rank + RANK_PIPE_OFFSET);
     r.serve_port = cfg->rank_port_base;
     if (cfg->peers[0])
