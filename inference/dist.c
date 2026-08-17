@@ -624,12 +624,14 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 fprintf(stderr, "R0 sampled k=%d id=%u [%s] logit=%.2f\n", k, nxt,
                         v->pieces[nxt], e->logits[nxt]);
             }
-            if (emit) emit(nxt, ctx);
             if (nxt == (uint32_t)v->eos) break;
             engine_forward_range(e, nxt, 1, pos, xbuf, NULL);
             uint64_t t3_tok = ynow_ms();
             if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
             uint64_t t4_tok = ynow_ms();
+            /* emit 放到 send_x 之后: 先让 worker 开工, 再输出 token。
+             * 避免 emit 的同步 send/日志阻塞推迟 worker 启动(stream/慢客户端下反压)。 */
+            if (emit) emit(nxt, ctx);
             if (dist_timing) {
                 t_wait += t1_tok - t0_tok;
                 t_samp += t2_tok - t1_tok;

@@ -124,9 +124,10 @@ def start_remote_ranks(t, ranks):
 
 
 def start_win_hub(t):
+    t0 = int(os.environ.get("RANK0_THREADS", str(t)))
     return subprocess.Popen(
         [WIN_BIN, "hub", "--config", CFG],
-        env=dict(os.environ, OMP_NUM_THREADS=str(t)),
+        env=dict(os.environ, OMP_NUM_THREADS=str(t0)),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

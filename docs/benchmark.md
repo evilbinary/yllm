@@ -304,3 +304,105 @@ yllm 的 AVX2 Q4K 内核对权重行连续流式读取 + 寄存器内反量化�
   使 master 前向变慢 + 网络调度。
 - 无论单机/跨机, **共同瓶颈都是"两段前向串行相加"**——流水化重叠是唯一能同时
   解放两者的优化, 单机也能从 16 提到 ~25 tok/s, 跨机同理。
+
+## HTTP / 会话框架对性能的影响(gen vs serve)
+
+`gen` 直跑与 `serve`(HTTP + 会话 + PP 分布式)在 **decode 热路径**上的差异,
+是 gen 26.8 而 serve 慢 ~13% 的直接原因。
+
+### 完整请求链路(serve 分布式)
+```
+curl POST → [router HTTP: 解析JSON] → [server: 词表渲染+sess_commit]
+→ [server→rank TCP] → [rank handle_infer_cache] → [dist_gen master循环 每token]:
+     dist_recv_logits → 采样 → emit(on_token_rank) → forward → send_x
+→ [server收 TS 行: sess_append加锁 + sock_send_n回HTTP]
+→ [HTTP collect: append到内存]
+```
+
+### 每 token 的框架开销(decode 热路径, 相对 gen 的增量)
+
+| 操作 | 频次 | 成本 | 位置 |
+|---|---|---|---|
+| `vocab_decode`(65536 大缓冲) | 每token | 高 | rank.c:200 `on_token_rank` |
+| `xsend_rank` ×2 | 每token | 中 | rank.c:206-207 (TCP 写回) |
+| `ylog_raw_log` | 每token | **高** | rank.c:208 → log.c:130 `fflush`(同步刷盘+全局锁) |
+| server `sess_append` + `sess_lock` | 每token | 中 | server.c:257-260 |
+| server `sock_send_n` 回 HTTP | 每token | 中 | server.c:261 |
+
+**`ylog_raw_log` 是最大杀手**: 每次 `fprintf + fflush` 同步刷磁盘, 且取全局 mutex。
+gen 直跑 decode 热路径只有 `engine_sample + engine_forward`, **零 IO/日志/锁/TCP**。
+
+### 量化
+| 配置 | decode | 每步 | 框架开销 |
+|---|---|---|---|
+| gen(8T) | 26.8 | 37ms | 无 |
+| serve r1(8T) | 23.2 | 43ms | **+6ms/步 (日志+TCP+锁)** |
+| serve r2 跨机 | 11.4 | 88ms | +6ms(叠加在分段串行+网络上) |
+
+- 6ms/步 框架开销在 r1 占 **~14%**, 是 gen vs serve 的核心差距。
+- 跨机下这 6ms **不在网络等待里**, 而是加长 master 本地周期
+  (recv_logits 后 → emit → forward), 让跨机从 82 也拖到 88ms。
+
+### 验证实验: 关日志后的实测(2026-08)
+临时注释掉 `on_token_rank` 里的 `ylog_raw_log`(消除每 token 同步刷盘 + 全局锁),
+两端重编后实测:
+
+| 场景 | 开日志 | 关日志 | 提升 |
+|---|---|---|---|
+| 跨机 r2(8T) | 11.4 | 11.8 | +3.5% |
+| 单机 r1(8T) | 14.1(同机测) | — | — |
+
+**结论: 日志刷盘 NOT 主要开销**(跨机仅 +3.5%)。原因:
+- `fflush` 虽同步刷盘, 但一次只刷几字节文本, 文件在内存缓存, 实际耗时不显著。
+- 全局 mutex 在 rank 单线程 decode 循环内无竞争, 锁开销可忽略。
+- decode 热路径真正的大头仍是"两段前向串行 + 网络", 框架 emit 链占比小。
+
+### 低风险优化建议(部分已验证, 未实施)
+1. ~~关掉 `ylog_raw_log`/`fflush`~~ — **已验证, 仅 +3.5%, 不值得改**(破坏日志)。
+2. **`vocab_decode` 改用小栈缓冲**(65536 太大, 每 token 分配/清零)——未验证, 潜在微收益。
+3. **合并 `xsend` 次数**(TS 头 + payload 一次 send)——未验证, 潜在微收益。
+4. 非 stream(collect)模式在 decode 热路径其实**无 HTTP 逐 token 转发**,
+   只有一次最终 JSON; stream 模式才有逐 token SSE 开销。
+
+**修正后结论: serve 比 gen 慢主要来自框架 emit 链, 但其中日志刷盘占比很小
+(+3.5%)。gen 与 serve 的差距更多是"分段串行 + 网络", 而非框架本身。
+框架优化的收益有限(~几个 %), 不值得为日志改动破坏可观测性。**
+
+### 优化实验: emit 移到 send_x 之后(2026-08, 已实施)
+
+**改动**: dist.c master decode 循环中, `emit` 回调从"forward 之前"移到
+"`send_x` 之后"。让 worker 先收到 X 开工, master 再同步输出 token,
+避免 emit 的同步 send/日志阻塞推迟 worker 启动。
+
+```
+优化前: recv_logits → 采样 → emit → forward → send_x
+优化后: recv_logits → 采样 → forward → send_x → emit
+```
+
+**实测(跨机 r2, 8T, YLLM_DISTTIMING)**:
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| decode | 11.1 | **11.8(+7%)** |
+| master fwd 总和 | 529ms | **472ms(-11%)** |
+| master wait 总和 | 673ms | 667ms |
+| worker wait | ~49ms | ~46ms |
+
+**结论**:
+- emit 后移让 worker 在 master 输出期间并行计算, decode +7%。
+- 风险场景缓解: stream/慢客户端下, emit 阻塞不再推迟 worker 开工。
+- 其余 emit 链优化(块读替代逐字节 recv、合并 send、SSE 异步转发)
+  对当前 collect 模式收益有限, 留作 stream 高并发场景再评估。
+
+### 对照实验: 完全去掉 emit 链(2026-08)
+
+临时注释 `if (emit) emit(nxt, ctx)` 后两端重编实测(跨机 r2, 8T):
+
+| 方案 | decode | master wait | master fwd |
+|---|---|---|---|
+| emit 在 forward 前(原) | 11.1 | 673ms | 529ms |
+| emit 后移(已实施) | 11.8 | 667ms | 472ms |
+| **完全去掉 emit** | **11.9** | 670ms | 472ms |
+
+**结论: 去掉 emit 仅比后移多 ~1%(0.1 tok/s)** → emit 链本身成本极低
+(collect 模式下), +7% 提升来自**排列顺序**(先发 X 让 worker 开工),
+而非省掉 emit 的工作。**emit 链不是瓶颈**, 保留后移版本即可。
