@@ -23,6 +23,7 @@ os.chdir(ROOT)
 
 THREADS = [int(x) for x in os.environ.get("THREADS", "8 16").split()]
 RANKS = [int(x) for x in os.environ.get("RANKS", "2 3").split()]
+WIN_RANKS = int(os.environ.get("WIN_RANKS", "1"))
 RUNS = int(os.environ.get("RUNS", "1"))
 PROMPT = os.environ.get(
     "PROMPT",
@@ -90,37 +91,55 @@ def write_cfg(ranks):
         "    model: %s" % LLF,
         "    vocab: %s" % VOCAB,
         "    ranks: %d             # 本模型总段数" % ranks,
-        "    local: 1             # 本机(Windows)只拉 rank0, 其余段 Linux 承担",
+        "    local: 1             # 本机(Windows)只自动拉 rank0, 其余段(含 Windows rank1)手动拉起",
         "",
     ]
     with open(CFG, "w") as f:
         f.write("\n".join(lines))
 
 
-def peers_csv(ranks):
-    parts = [WIN_IP] + [LIN_IP] * (ranks - 1)
+def peers_csv(ranks, win_ranks):
+    parts = [WIN_IP] * win_ranks + [LIN_IP] * (ranks - win_ranks)
     return ",".join(parts)
 
 
-def start_remote_ranks(t, ranks):
-    """在 Linux 拉起 rank1..N-1(后台), 每 rank OMP_NUM_THREADS=t。"""
+def start_extra_ranks(t, ranks, win_ranks):
+    """拉起 rank1..N-1: rank 1..win_ranks-1 在 Windows(本地 subprocess, 带正确 peers),
+    其余 win_ranks..ranks-1 在 Linux(ssh 后台)。每 rank OMP_NUM_THREADS=t。
+    注: supervisor 只自动拉 rank0(local=1, peers 是 127.0.0.1×N 连本地 rank1 可通),
+    但 rank1 必须手动起并带正确 peers 才能连到远端 rank2。"""
     dist_stats = "YLLM_DIST_STATS=1 " if os.environ.get("YLLM_DIST_STATS") else ""
     if os.environ.get("YLLM_DISTTIMING"):
         dist_stats += "YLLM_DISTTIMING=1 "
+    peers = peers_csv(ranks, win_ranks)
+    procs = []
     for r in range(1, ranks):
-        inner = ("rm -rf sessions && mkdir -p sessions logs && "
-                 "OMP_NUM_THREADS=%d %s%s rank "
-                 "--model %s --vocab %s --model-name %s "
-                 "--port %d --rank %d --ranks %d "
-                 "--supervisor %s:9500 --id rank-%d "
-                 "--peers %s --cache-dir sessions "
-                 "--log logs/%s-rank-%d.log > logs/rank-%d.out 2>&1"
-                 % (t, dist_stats, LIN_BIN, LLF, VOCAB, MODEL,
-                    9410 + r, r, ranks, WIN_IP, r, peers_csv(ranks), MODEL, r, r))
-        cmd = "setsid sh -c '%s &' </dev/null" % inner
-        rc = ssh_lin(cmd, timeout=30)
-        if rc.returncode != 0:
-            print("remote rank%d start rc=%d: %s" % (r, rc.returncode, rc.stderr.strip()))
+        args = [
+            "rank", "--model", LLF, "--vocab", VOCAB, "--model-name", MODEL,
+            "--port", str(9410 + r), "--rank", str(r), "--ranks", str(ranks),
+            "--supervisor", "%s:9500" % WIN_IP, "--id", "rank-%d" % r,
+            "--peers", peers, "--cache-dir", "sessions",
+            "--log", "logs/%s-rank-%d.log" % (MODEL, r),
+        ]
+        if r < win_ranks:
+            # Windows 本地 rank(rank1..win_ranks-1)
+            p = subprocess.Popen(
+                [WIN_BIN] + args,
+                env=dict(os.environ, OMP_NUM_THREADS=str(t),
+                         **{k: v for k, v in
+                            {"YLLM_DIST_STATS": dist_stats.strip(),
+                             "YLLM_DISTTIMING": dist_stats.strip()}.items() if v}),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(p)
+        else:
+            inner = ("rm -rf sessions && mkdir -p sessions logs && "
+                     "OMP_NUM_THREADS=%d %s%s %s > logs/rank-%d.out 2>&1"
+                     % (t, dist_stats, LIN_BIN, " ".join(args), r))
+            cmd = "setsid sh -c '%s &' </dev/null" % inner
+            rc = ssh_lin(cmd, timeout=30)
+            if rc.returncode != 0:
+                print("remote rank%d start rc=%d: %s" % (r, rc.returncode, rc.stderr.strip()))
+    return procs
 
 
 def start_win_hub(t):
@@ -144,13 +163,13 @@ def curl_payload(content, max_tokens):
         return resp.status
 
 
-def serve_vals(t, ranks):
+def serve_vals(t, ranks, win_ranks):
     write_cfg(ranks)
     kill_all()
     if os.path.isdir("sessions"):
         shutil.rmtree("sessions", ignore_errors=True)
     os.makedirs("sessions", exist_ok=True)
-    start_remote_ranks(t, ranks)
+    extra = start_extra_ranks(t, ranks, win_ranks)
     # 后台拉起 hub(rank0 由 hub 的 supervisor 拉起)
     p = start_win_hub(t)
     time.sleep(10)
@@ -200,7 +219,7 @@ def main():
             pre_avg, dec_avg = 0.0, 0.0
             ok = 0
             for _ in range(RUNS):
-                tot, pt, dt = serve_vals(t, ranks)
+                tot, pt, dt = serve_vals(t, ranks, WIN_RANKS)
                 if pt > 0 and dt > 0:
                     pre_avg += pt
                     dec_avg += dt

@@ -831,5 +831,7 @@ int dist_split_layers(Engine* e, int rank, int ranks)
     uint32_t end = rank + 1 < ranks ? bs[rank + 1] : e->ws.model.n_layers;
     if (rank == 0) begin = 0; /* rank0 含 embed */
     engine_set_layers(e, begin, end);
+    ylog_info("dist_split_layers: rank %d/%d layers [%u,%u) of %u (blocks %u)",
+              rank, ranks, begin, end, e->ws.model.n_layers, blocks);
     return 0;
 }

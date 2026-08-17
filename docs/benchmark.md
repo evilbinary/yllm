@@ -406,3 +406,48 @@ gen 直跑 decode 热路径只有 `engine_sample + engine_forward`, **零 IO/日
 **结论: 去掉 emit 仅比后移多 ~1%(0.1 tok/s)** → emit 链本身成本极低
 (collect 模式下), +7% 提升来自**排列顺序**(先发 X 让 worker 开工),
 而非省掉 emit 的工作。**emit 链不是瓶颈**, 保留后移版本即可。
+
+## 多 rank 段数对比(跨机, 8T, 2026-08)
+
+### 层分配(25 层, 按字节均衡切)
+| ranks | 拓扑 | rank0 | rank1 | rank2 | rank3 |
+|---|---|---|---|---|---|
+| 2 | Win1+Lin1 | [0,12) 12层 | [12,25) 13层 | — | — |
+| 3 | Win1+Lin2 | [0,9) 9层 | [9,16) 7层 | [16,25) 9层 | — |
+| 4 | Win2+Lin2 | [0,7) 7层 | [7,12) 5层 | [12,18) 6层 | [18,25) 7层 |
+
+### 性能对比
+| 配置 | prefill | decode | rank0 fwd/token | rank0 wait/token |
+|---|---|---|---|---|
+| ranks=2 | 35.8 | 11.4 | 33ms | 38ms |
+| ranks=3 | 43.6 | **13.0** | 21.5ms | 43ms |
+| ranks=4 | 39.1 | 11.9 | 17ms | 52ms |
+
+### 关键发现
+1. **每段层数越少 → fwd 越短**(33→21.5→17ms), 这是分段收益。
+2. **但 wait 随段数增加**(38→43→52ms): 跨机串行跳数增多,
+   master 要等全部下游算完 + 网络逐跳往返。
+3. **ranks=3 是甜点**: 每段够小(7-9 层)且跳数不多, decode 13.0 最佳。
+4. **ranks=4 反而降**: 多一跳的串行等待盖过了 fwd 减少 → 11.9。
+5. **结论: 小模型(1.1B)跨机 PP decode 收益在 3 段封顶**。等待主导后,
+   加段无益——这是串行链 + 网络跳数的物理规律。
+
+### 线程调优(多 rank 下)
+| 配置 | decode | 结论 |
+|---|---|---|
+| ranks=3, 全 8T | 13.0 | 基线 |
+| ranks=3, rank0=12T | 12.5 | Windows 12核跑9层, 12线程争抢, 反而降 |
+| ranks=3, worker=16T | 11.5 | 算完更早=更早等待, 降 |
+
+**结论: 多 rank 下 8 线程最优, 加线程有害**——decode 是等待主导,
+线程多只是让每段更快算完并更早进入等待, 总周期由最慢段+跳数决定。
+
+### 工具: bench_cross.py 支持 Windows 多 rank
+`WIN_RANKS` 环境变量控制 Windows 本地段数(默认 1):
+```
+WIN_RANKS=2 RANKS=4 THREADS=8 python3 tools/bench_cross.py
+```
+- supervisor 只自动拉 rank0(local=1)
+- rank1..win_ranks-1 在 Windows 手动拉起(带正确 peers 才能连远端)
+- rank win_ranks..ranks-1 在 Linux ssh 拉起
+- 全链路依赖: LEASE 按端口排序生成 peers → INFER 下发 → rank0 用正确 peers 连下游
