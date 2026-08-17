@@ -15,9 +15,7 @@ typedef struct {
     uint64_t* layer_size;
     uint64_t budget;        /* 字节预算(0=不限) */
     uint64_t resident;      /* 当前估算驻留字节 */
-    uint32_t budget_layers; /* 自适应层数预算(内存受限模式) */
-    int hard;               /* 硬限制: 关闭自适应放大, 已算层算后即释放 */
-    long last_majflt;       /* 上次 getrusage majflt(缺页反馈) */
+    uint32_t budget_layers; /* 层数预算(字节预算按平均层大小折算) */
     int depth;
     void* worker;
     void* worker_th;
