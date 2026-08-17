@@ -314,6 +314,7 @@ static void handle_query_servers(Supervisor* s, int fd)
         snprintf(args, sizeof(args), "%s type=%s model=%s leader=%s state=%s inflight=%d kv_mb=%.1f",
                  n->node_id, n->type, n->model, n->addr,
                  n->state == NODE_STATE_READY ? "ready" :
+                 n->state == NODE_STATE_BUSY ? "busy" :
                  n->state == NODE_STATE_DEAD ? "dead" : "loading",
                  n->inflight, n->kv_mb);
         frame_send(fd, "SERVER_INFO", args);

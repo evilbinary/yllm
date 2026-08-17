@@ -70,7 +70,7 @@
 
 /* ---- 统一心跳(所有常驻进程共用, 数据面: 活着就报) ----
  *
- * HEARTBEAT <node-id> type=<rank|server|router|supervisor> state=<loading|ready>
+ * HEARTBEAT <node-id> type=<rank|server|router|supervisor> state=<loading|ready|busy|dead>
  *            inflight=<n> kv_mb=<f> model=<name>\n → OK\n
  *
  * 发送方(数据面): 每个进程周期上报(默认 2s)。

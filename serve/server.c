@@ -177,9 +177,11 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
             sn = rv->n;
             pthread_mutex_unlock(&s->sess_lock);
         }
-        char fargs[192];
-        snprintf(fargs, sizeof(fargs), "%d %u key=%s resume=%u",
-                 max_tokens, sn * 4, key, sr);
+        char fargs[256];
+        snprintf(fargs, sizeof(fargs), "%d %u key=%s resume=%u seg=0 segs=%d peers=%s",
+                 max_tokens, sn * 4, key, sr,
+                 s->lease_ranks > 0 ? s->lease_ranks : 1,
+                 s->lease_peers[0] ? s->lease_peers : "127.0.0.1");
         frame_send(fd, PROTO_INFER, fargs);
         sock_send_n(fd, st, (size_t)sn * 4);
         ylog_info("server: sess key=%s resume=%u +%u tokens -> rank", key, sr, sn);
