@@ -104,15 +104,16 @@ def peers_csv(ranks):
 
 def start_remote_ranks(t, ranks):
     """在 Linux 拉起 rank1..N-1(后台), 每 rank OMP_NUM_THREADS=t。"""
+    dist_stats = "YLLM_DIST_STATS=1 " if os.environ.get("YLLM_DIST_STATS") else ""
     for r in range(1, ranks):
         inner = ("rm -rf sessions && mkdir -p sessions logs && "
-                 "OMP_NUM_THREADS=%d %s rank "
+                 "OMP_NUM_THREADS=%d %s%s rank "
                  "--model %s --vocab %s --model-name %s "
                  "--port %d --rank %d --ranks %d "
                  "--supervisor %s:9500 --id rank-%d "
                  "--peers %s --cache-dir sessions "
                  "--log logs/%s-rank-%d.log > logs/rank-%d.out 2>&1"
-                 % (t, LIN_BIN, LLF, VOCAB, MODEL,
+                 % (t, dist_stats, LIN_BIN, LLF, VOCAB, MODEL,
                     9410 + r, r, ranks, WIN_IP, r, peers_csv(ranks), MODEL, r, r))
         cmd = "setsid sh -c '%s &' </dev/null" % inner
         rc = ssh_lin(cmd, timeout=30)
