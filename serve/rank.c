@@ -355,24 +355,15 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     uint64_t rng = ysrand(r->seed);
     uint32_t ngen = 0;
     uint32_t pos = r->cache_pos;
-    uint64_t d_samp = 0, d_emit = 0, d_fwd = 0;
     for (uint32_t i = 0; i < max_tokens && pos < r->engine.max_seq; i++) {
         uint32_t nxt;
-        uint64_t a0 = ynow_ns();
         if (engine_sample(&r->engine, r->engine.ws.model.h.vocab, r->temp, r->top_p, &rng, &nxt) != 0) break;
-        uint64_t a1 = ynow_ns();
         if ((int)nxt == r->vocab.eos) break;
         if (on_token_rank(nxt, &tc) != 0) break;
-        uint64_t a2 = ynow_ns();
         engine_forward(&r->engine, nxt, pos);
-        uint64_t a3 = ynow_ns();
-        d_samp += (a1 - a0) / 1000000; d_emit += (a2 - a1) / 1000000; d_fwd += (a3 - a2) / 1000000;
         pos++;
         ngen++;
     }
-    ylog_info("r1dec: %u tok samp=%llu emit=%llu fwd=%llu ms",
-              ngen, (unsigned long long)d_samp, (unsigned long long)d_emit,
-              (unsigned long long)d_fwd);
     /* 结束(命中 eos 或达上限)后补 eos 到 kv, 使 rank pos 与 router 缓存(回复+eos)一致 */
     if (pos < r->engine.max_seq) {
         engine_forward(&r->engine, (uint32_t)r->vocab.eos, pos);
