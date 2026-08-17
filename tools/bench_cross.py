@@ -105,6 +105,8 @@ def peers_csv(ranks):
 def start_remote_ranks(t, ranks):
     """在 Linux 拉起 rank1..N-1(后台), 每 rank OMP_NUM_THREADS=t。"""
     dist_stats = "YLLM_DIST_STATS=1 " if os.environ.get("YLLM_DIST_STATS") else ""
+    if os.environ.get("YLLM_DISTTIMING"):
+        dist_stats += "YLLM_DISTTIMING=1 "
     for r in range(1, ranks):
         inner = ("rm -rf sessions && mkdir -p sessions logs && "
                  "OMP_NUM_THREADS=%d %s%s rank "

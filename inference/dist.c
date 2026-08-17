@@ -607,14 +607,19 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break; }
             }
         }
+        int dist_timing = getenv("YLLM_DISTTIMING") != NULL;
+        uint64_t t_wait = 0, t_samp = 0, t_fwd = 0, t_snd = 0;
         for (i = 0; i < ntokens && rc == 0; i++) {
             if (pos >= e->max_seq) break;
             if (t_dec0 == 0) t_dec0 = ynow_ms();
+            uint64_t t0_tok = ynow_ms();
             int k = dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse);
+            uint64_t t1_tok = ynow_ms();
             if (k <= 0) { rc = -1; snprintf(err, sizeof(err), "dist recv logits failed"); break; }
             pend = 0;
             uint32_t nxt;
             if (engine_sample(e, vocab_sz, temp, top_p, &rng, &nxt) != 0) { rc = -1; break; }
+            uint64_t t2_tok = ynow_ms();
             if (getenv("YLLM_DISTDBG")) {
                 fprintf(stderr, "R0 sampled k=%d id=%u [%s] logit=%.2f\n", k, nxt,
                         v->pieces[nxt], e->logits[nxt]);
@@ -622,7 +627,20 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (emit) emit(nxt, ctx);
             if (nxt == (uint32_t)v->eos) break;
             engine_forward_range(e, nxt, 1, pos, xbuf, NULL);
+            uint64_t t3_tok = ynow_ms();
             if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
+            uint64_t t4_tok = ynow_ms();
+            if (dist_timing) {
+                t_wait += t1_tok - t0_tok;
+                t_samp += t2_tok - t1_tok;
+                t_fwd += t3_tok - t2_tok;
+                t_snd += t4_tok - t3_tok;
+                ylog_info("tok%d: wait=%u sample=%u fwd=%u send=%u total=%u",
+                          i + 1,
+                          (unsigned)(t1_tok - t0_tok), (unsigned)(t2_tok - t1_tok),
+                          (unsigned)(t3_tok - t2_tok), (unsigned)(t4_tok - t3_tok),
+                          (unsigned)(t4_tok - t0_tok));
+            }
             pos++;
             ngen++;
             pend = 1;
@@ -631,6 +649,11 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 snprintf(tag, sizeof(tag), "dist@tok%d", ngen);
                 dist_print_stats(&dist, tag);
             }
+        }
+        if (dist_timing) {
+            ylog_info("tok sum: wait=%llu sample=%llu fwd=%llu send=%llu (16 tok)",
+                      (unsigned long long)t_wait, (unsigned long long)t_samp,
+                      (unsigned long long)t_fwd, (unsigned long long)t_snd);
         }
         /* 若最后一个 X 帧刚发出、其 logits 响应尚未读走则冲刷掉,
          * 避免 last rank 的 send 打到已关闭 socket。eos/错误退出时 pend=0 则不占。 */
@@ -704,8 +727,11 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 }
             }
         }
+        int w_timing = getenv("YLLM_DISTTIMING") != NULL;
         for (;;) {
+            uint64_t w0 = ynow_ms();
             t = dist_recv_xb(&dist, &pos, xbuf, PP_XB, hidden, dist_fp16);
+            uint64_t w1 = ynow_ms();
             if (t == -3) { /* DONE: 向后转发并退出 */
                 dist_send_done(&dist);
                 break;
@@ -723,9 +749,10 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 memcpy(e->x, xbuf, (size_t)hidden * 4);
                 if (rank == ranks - 1) {
                     engine_forward_range(e, 0, 0, pos, NULL, e->logits);
-                    if (getenv("YLLM_DISTDBG"))
-                        ylog_info("frame %d: fwd %llu ms", nf,
-                                  (unsigned long long)(ynow_ms() - f0));
+                    uint64_t f1 = ynow_ms();
+                    if (w_timing)
+                        ylog_info("wtok %d: wait=%u fwd=%u", nf,
+                                  (unsigned)(w1 - w0), (unsigned)(f1 - f0));
                     if (dist_send_logits(&dist, e->logits, vocab_sz, TOPK) != 0) { rc = -1; break; }
                 } else {
                     engine_forward_range(e, 0, 0, pos, xbuf, NULL);

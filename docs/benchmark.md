@@ -143,3 +143,164 @@ yllm 的 AVX2 Q4K 内核对权重行连续流式读取 + 寄存器内反量化�
 - 单机多 worker(ranks=1/2/3/4):单 rank 直跑最快(2.10s),每加一个 worker
   端到端 ~+20%(2.35/2.80/2.92s); 分段使 prefill/decode 双双下降。
   `tools/bench_pp.sh` 可复跑(prefill/decode/总 tok/s 一并输出)。
+
+## 跨机 PP(rank0 Windows + rank1/2 Linux)
+
+拓扑: rank0 跑本机 `yllm hub`(supervisor+router+server+rank0), rank1..N-1 经 ssh
+在 Linux(28 核)后台起 `yllm rank`。脚本: `tools/bench_cross.py`
+(THREADS/RANKS/RUNS 覆盖)。场景: 50-token prompt + 16 decode。
+
+| 线程×段数 | prefill tok/s | decode tok/s |
+|---|---|---|
+| 8×2 | 34.9 | 11.4 |
+| 8×3 | 43.5 | 13.0 |
+| 16×2 | 35.8 | 11.0 |
+| 16×3 | 38.6 | 11.5 |
+
+对比纯 Windows 单机(12 逻辑核):
+
+- **prefill**: 跨机 2 段比单机 2 段快约 30%,3 段接近翻倍(43.5 vs 21.6)
+  —— Linux 端核更多, 且各段并行算各自层段, prefill 天然并行加速。
+- **decode**: 持平或略降(跨机 2 段 11.4 vs 单机 12.3)—— decode 是串行流水线,
+  受跨机网络往返延迟拖累, 抵消 Linux 更多核的优势。
+
+**一句话: 跨机对 prefill 帮助大, decode 无明显收益(受网络延迟限制)。**
+
+### prefill / decode 关系(时序图)
+
+模型按**层切分**(PP),每个 rank 只持有部分层,激活 X 必须跨机流动。
+
+```
+一次请求 = prefill(处理整个输入) → decode(逐个生成 token)
+```
+
+```
+═══ 一次推理请求(rank0 Win 主控, rank1 Linux worker)═══
+                 rank0(Windows)                rank1(Linux)
+                 │ 层0..N/2                    │ 层N/2..N
+─────────────────┼─────────────────────────────┼─────────────
+ ① prefill(51token 分批)                        │
+   [16tok 前向]   │───X帧(128KB,16tok)──────────→│ 前半层→后半层前向
+   [16tok 前向]   │───X帧(128KB,16tok)──────────→│
+   [16tok 前向]   │───X帧(128KB,16tok)──────────→│
+   [3tok 前向]    │───X帧(128KB,3tok)───────────→│
+                 │←────logits(最后token)─────────│ 采样出第1个token
+ ② decode(逐 token ×16)                         │
+   采样t1→前向    │───X帧(8KB,1tok)────────────→│ 后半层前向
+                 │←────logits─────────────────│
+   采样t2→前向    │───X帧(8KB,1tok)────────────→│
+                 │←────logits─────────────────│
+      ... (每 token = 发1帧 → 等logits 返回)      ...
+   采样t16        │─(最后冲刷 logits)──────────→│
+                 │←DONE───────────────────────│
+```
+
+每 decode token 的周期(串行累加 = 1 token 时延):
+
+```
+  ┌─前向计算─┐ ┌─网络发X─┐ ┌─worker计算─┐ ┌─网络回logits─┐ ┌─采样─┐
+  │  rank0   │ │  send   │ │   rank1    │ │     recv     │ │ rank0 │
+  └──────────┘ └─────────┘ └────────────┘ └──────────────┘ └───────┘
+                          ↑ recv 等待约占整个周期的 ~57%
+```
+
+要点:
+
+- **prefill**: X 帧批量发(每帧 ≤16 token, ~128KB), 一次管道只走 4 次传输, 吞吐高。
+- **decode**: 16 个 token 逐帧, 每 token = rank0前向→发X→rank1前向→回logits→采样,
+  串行 16 次, 每次都吃一次跨机网络 RTT。
+- 同一请求 prefill 只 1 段、decode 16 段;decode 每段都吃网络往返延迟
+  → 这是 decode 跨机无收益的根因。
+
+### decode 的网络开销(实测)
+
+用 `YLLM_DIST_STATS=1` 采集 rank0(2段, 16 token decode @ 11.7 tok/s):
+
+| 项 | 值 |
+|----|----|
+| recv 阻塞(等远端 logits) | **778.2 ms**(占 decode 总时 1.37s 的 ~57%) |
+| send 阻塞 | 仅 1.7 ms(send 只写 TCP 缓冲, 异步不占时间) |
+| recv 带宽 | 3.3 MB/s |
+| send 带宽 | 309 MB/s(瞬时写入速率, 非链路速率) |
+
+结论: decode 变慢的主因是 **recv 等待**(master 等 worker 算完并回传 logits),
+纯网络传输本身不是瓶颈(send 几乎不阻塞)。`bench_cross.py` 读取环境变量
+`YLLM_DIST_STATS`,设 1 时自动传给两端;rank0 每 8 token 打印一次 `dist@tokN`,
+结束打印汇总(`X frames`/`block`/`bw`)。
+
+### X 帧构成: 一次请求发了多少数据
+
+本次请求 prefill 51 token + decode 16 token, rank0 共发 20 个 X 帧:
+
+- **prefill**: `ceil(51/16)=4` 个批量帧(每帧 ≤16 token, ~128KB, `PP_XB=16`)
+- **decode**: 16 个单帧(每 token 1 帧, ~8KB)
+- 单帧大小 = `4 + hidden×(fp16?2:4)`;tinyllama `hidden=2048`, 默认 fp32(4B) →
+  decode 单帧 ~8KB, prefill 批量帧 ~128KB。
+
+### decode 每 token 周期拆解(实测, YLLM_DISTTIMING)
+
+用 `YLLM_DISTTIMING=1` 采集 2 段跨机, rank0(master)/rank1(worker)每 token 各阶段耗时:
+
+**master(rank0, 6 线程)**:
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| wait | ~38ms | 等 worker 回 logits |
+| sample | ~4ms | 采样 |
+| fwd | ~33ms | 算前半层 |
+| send | ~0ms | 发 X(异步) |
+| **单 token 周期** | **~75ms** | |
+
+**worker(rank1, 8 线程)**:
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| wait | ~49ms | 等 master 发 X |
+| fwd | ~29ms | 算后半层 |
+| **单 token 周期** | **~78ms** | |
+
+两端对得上: master `wait`= 等 worker 算完, worker `wait`= 等 master 算完。
+
+**结论: 瓶颈 = 分段串行 + 并行度不足, 不是网络。**
+
+- 真实算力 = master fwd(33) + worker fwd(29) ≈ **62ms, 占单 token 周期 75ms 的 ~83%**
+- 当前 master/worker 前向是**加法不是重叠**: 75 ≈ 33(master) + 29(worker) + 13(RTT+调度)
+- 网络 RTT 实际只有 ~13ms(其中真跨机往返更少), **不是瓶颈**
+- 每段前向慢的原因: rank0 线程减半到 6, 且小模型 32/2=16 层分段后层内并行度不足
+
+**优化方向(按收益排序)**:
+
+1. **流水化(master/worker 前向重叠)**: 让 master 算前向的同时 worker 也在算,
+   单 token 周期 75 → max(33,29)+RTT ≈ **40ms**, decode 11 → **~25 tok/s, 接近翻倍**。
+   这是 PP 架构标准优化(micro-batch 交错), 但对单序列受自回归依赖链限制,
+   需多请求 batch 才能真正把等待隐藏。
+2. **提高单段并行度**: 不要按 nproc/ranks 减半线程, 缓解每段层内并行不足。
+3. **dist-fp16 / 降 RTT**: 次要, 因为网络只占 ~17%。
+
+**一句话: 跨机 decode 卡在"master 前向 + worker 前向 串行相加", 流水化重叠前向
+可翻倍到 ~25 tok/s; 网络不是当前瓶颈。**
+
+### 与单机逐段对比(同 8 线程, decode)
+
+把跨机 2 段的每 token 周期与单机对比, 分离"分段串行"与"网络"各自的代价:
+
+| 配置 | 每段线程 | 每 token 前向 | 网络 RTT | 单 token 周期 | decode |
+|---|---|---|---|---|---|
+| 单机 r1(直跑) | 8 | 一段 ~59ms | 无 | ~59ms | ~17 |
+| 单机 r2(本地分段) | 8 | master+worker 串行 ~62ms | 本地 pipe | ~62ms | ~16 |
+| 跨机 r2 | 6 / 8 | master 33 + worker 29 串行 | ~13ms | ~75ms | ~11.4 |
+
+要点:
+
+- **单机 r1 vs r2**: 本地分段后前向相加(~62ms)略增, 分段串行的代价很小(~+5%)。
+  单机 r1/r2 都 ~16-17 tok/s, 差别来自框架开销, 网络为零。
+- **单机 r2 vs 跨机 r2**: 前向相同(~62ms), 差别只在**网络 ~13ms** →
+  单 token 周期 62 → 75ms, decode 16 → 11.4, **跨网络净降 ~30%**。
+- **跨机增加的 13ms 里**, 真·网络 RTT 只是其中一部分, 另一部分是
+  master/worker 在本地 pipe → TCP 之间的调度抖动。其余 62ms 前向在跨机下
+  master 因线程减半(6 线程)反而比单机更慢。
+
+**结论**: 
+- 单机 r2 的瓶颈 = 分段串行(master+worker 前向相加), 但本地无网络, 代价小。
+- 跨机 r2 额外多付的只是 ~13ms 网络, 真正拉开差距的是 rank0 线程减半(6 线程)
+  使 master 前向变慢 + 网络调度。
+- 无论单机/跨机, **共同瓶颈都是"两段前向串行相加"**——流水化重叠是唯一能同时
+  解放两者的优化, 单机也能从 16 提到 ~25 tok/s, 跨机同理。
