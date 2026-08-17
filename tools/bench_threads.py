@@ -45,16 +45,29 @@ PAT_PPDONE = re.compile(r"pp done rc=0 \(resume=0 end=(\d+)")
 PAT_GENOK = re.compile(r"generate ok \((\d+) delta")
 
 
+MSYS_BASH = r"E:\soft\msys2\usr\bin\bash.exe"
+
+
 def sh(cmd, env=None, timeout=120):
     e = dict(os.environ)
     if env:
         e.update(env)
+    if os.name == "nt":
+        e.setdefault("MSYSTEM", "MINGW64")
+        e.setdefault("CHERE_INVOKING", "1")
+        e.setdefault("MSYS2_PATH_TYPE", "inherit")
+        return subprocess.run([MSYS_BASH, "--login", "-c", cmd],
+                              env=e, capture_output=True, text=True, timeout=timeout)
     return subprocess.run(cmd, env=e, shell=isinstance(cmd, str),
                           capture_output=True, text=True, timeout=timeout)
 
 
 def kill_all():
-    sh("pkill -9 -f 'build/avx2/yllm (rank|serve|hub)'")
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/IM", "yllm.exe"],
+                       capture_output=True, text=True)
+    else:
+        sh("pkill -9 -f 'build/avx2/yllm (rank|serve|hub)'")
     time.sleep(1)
 
 
@@ -70,6 +83,8 @@ def set_ranks(r):
         if in_tiny and not done and ln.strip().startswith("ranks:"):
             ln = f"    ranks: {r}             # 本模型 rank 进程数\n"
             done = True
+        if os.name == "nt" and ln.startswith("bin:") and ".exe" not in ln:
+            ln = ln.rstrip("\n").rstrip() + ".exe\n"
         out.append(ln)
     with open(CFG, "w") as f:
         f.writelines(out)

@@ -53,9 +53,35 @@ static int spawn_detached(const char* cmdline, const char* logfile)
     }
     return (int)pid;
 #else
-    char buf[4096];
-    snprintf(buf, sizeof(buf), "start /b %s", cmdline);
-    return system(buf);
+    char* cmddup = _strdup(cmdline);
+    if (!cmddup) return -1;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    HANDLE logh = INVALID_HANDLE_VALUE;
+    if (logfile && logfile[0]) {
+        logh = CreateFileA(logfile, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        si.hStdOutput = logh;
+        si.hStdError = logh;
+    } else {
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    }
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    int ok = CreateProcessA(NULL, cmddup, NULL, NULL, FALSE,
+                            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                            NULL, NULL, &si, &pi);
+    if (logh != INVALID_HANDLE_VALUE) CloseHandle(logh);
+    if (!ok) { free(cmddup); return -1; }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    free(cmddup);
+    return (int)pi.dwProcessId;
 #endif
 }
 
