@@ -41,6 +41,7 @@ ifeq ($(UNAME_S),Windows)
     EXE      := .exe
     PLATDEF  :=
     PLATLIBS := -lm -lws2_32
+    OMPFLAG  := -fopenmp
 else ifeq ($(UNAME_S),Darwin)
     EXE      :=
     PLATDEF  := -D_DARWIN_C_SOURCE

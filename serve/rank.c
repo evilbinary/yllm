@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
