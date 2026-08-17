@@ -1,6 +1,7 @@
 #ifndef YLLM_SERVE_SERVER_H
 #define YLLM_SERVE_SERVER_H
 
+#include <pthread.h>
 #include "node.h"
 #include "config.h"
 #include "../inference/yllm.h"

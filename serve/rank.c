@@ -16,6 +16,7 @@
 #include "node.h"
 #include "sock.h"
 #include "../inference/yllm.h"
+#include "../inference/cache.h"
 #include "../inference/dist.h"
 #include "../inference/log.h"
 #include <stdio.h>
