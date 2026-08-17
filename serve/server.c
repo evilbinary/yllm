@@ -178,10 +178,18 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
             pthread_mutex_unlock(&s->sess_lock);
         }
         char fargs[256];
-        snprintf(fargs, sizeof(fargs), "%d %u key=%s resume=%u seg=0 segs=%d peers=%s",
+        float ftemp = 1.0f, ftop_p = 0.9f;
+        const char* tp = strstr(args, "temp=");
+        if (tp) {
+            ftemp = (float)atof(tp + 5);
+            const char* pp = strstr(tp, "top_p=");
+            if (pp) ftop_p = (float)atof(pp + 6);
+        }
+        snprintf(fargs, sizeof(fargs), "%d %u key=%s resume=%u seg=0 segs=%d peers=%s temp=%.6g top_p=%.6g",
                  max_tokens, sn * 4, key, sr,
                  s->lease_ranks > 0 ? s->lease_ranks : 1,
-                 s->lease_peers[0] ? s->lease_peers : "127.0.0.1");
+                 s->lease_peers[0] ? s->lease_peers : "127.0.0.1",
+                 ftemp, ftop_p);
         frame_send(fd, PROTO_INFER, fargs);
         sock_send_n(fd, st, (size_t)sn * 4);
         ylog_info("server: sess key=%s resume=%u +%u tokens -> rank", key, sr, sn);

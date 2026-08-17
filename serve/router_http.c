@@ -176,6 +176,11 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     int max_tokens = 32;
     if (json_find(body, "max_tokens", &v) && v.type == JSON_NUM)
         max_tokens = (int)json_num(&v);
+    float rtemp = 1.0f, rtop_p = 0.9f;
+    if (json_find(body, "temperature", &v) && v.type == JSON_NUM)
+        rtemp = (float)json_num(&v);
+    if (json_find(body, "top_p", &v) && v.type == JSON_NUM)
+        rtop_p = (float)json_num(&v);
 
     /* 会话模式: 提取全部消息 + 会话 key, 渲染后只发增量 token 给 rank */
     char* pool = (char*)malloc(HTTP_MAX_BODY);
@@ -214,9 +219,11 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         int rc;
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
-                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), sse_on_token, &sc);
+                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), sse_on_token, &sc,
+                                   rtemp, rtop_p);
         else
-            rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc);
+            rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
+                              rtemp, rtop_p);
         if (rc != 0)
             http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
@@ -230,9 +237,11 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         int rc;
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
-                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc);
+                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc,
+                                   rtemp, rtop_p);
         else
-            rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+            rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
+                              rtemp, rtop_p);
         if (rc != 0) {
             HttpResponse rr;
             http_begin(&rr, fd, 502, "application/json");
@@ -285,6 +294,11 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
     int max_tokens = 32;
     if (json_find(body, "max_tokens", &v) && v.type == JSON_NUM)
         max_tokens = (int)json_num(&v);
+    float rtemp = 1.0f, rtop_p = 0.9f;
+    if (json_find(body, "temperature", &v) && v.type == JSON_NUM)
+        rtemp = (float)json_num(&v);
+    if (json_find(body, "top_p", &v) && v.type == JSON_NUM)
+        rtop_p = (float)json_num(&v);
 
     if (plen == 0) {
         free(prompt);
@@ -300,7 +314,8 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         sc.r = &rr;
         sc.model = model;
         http_sse_begin(&rr, fd);
-        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
+                              rtemp, rtop_p);
         if (rc != 0)
             http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
         http_sse_done(&rr);
@@ -311,7 +326,8 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         cc.len = 0;
         cc.n_tokens = 0;
         collected[0] = '\0';
-        int rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc);
+        int rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
+                              rtemp, rtop_p);
         if (rc != 0) {
             HttpResponse rr;
             http_begin(&rr, fd, 502, "application/json");

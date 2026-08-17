@@ -36,12 +36,14 @@ int router_run(Router* r, const char* sv_host, uint16_t sv_port);
 /* 通用 INFER 转发(HTTP 层等复用): 路由到 server → 转发 → 逐 token 回调 */
 int router_infer(Router* r, const char* model, int max_tokens,
                  const char* prompt, size_t plen,
-                 void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx);
+                 void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
+                 float temp, float top_p);
 
 /* 会话模式推理(转发): 带会话 key + 新消息文本发给 server(会话管理在 server 侧),
  * server 渲染/缓存后只把增量 token 发给 rank。on_token 同 router_infer。 */
 int router_infer_sess(Router* r, const char* model, int max_tokens,
                       const char* sess_key, const char* new_msg, size_t msg_len,
-                      void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx);
+                      void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
+                      float temp, float top_p);
 
 #endif

@@ -1,5 +1,6 @@
 #include "yllm.h"
 #include "matvec.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -886,16 +887,24 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         timings->prefill_ms = t1 - t0;
     }
     uint32_t ngen = 0;
+    uint64_t g_samp = 0, g_fwd = 0;
     for (i = 0; i < ntokens; i++) {
         if (pos >= e->max_seq) break;
         uint32_t nxt;
+        uint64_t b0 = ynow_ns();
         if (engine_sample(e, e->ws.model.h.vocab, temp, top_p, &rng, &nxt) != 0) return -1;
+        uint64_t b1 = ynow_ns();
         if (eos_stop >= 0 && (int)nxt == eos_stop) break;   /* eos 不发给对端 */
         if (on_token && on_token(nxt, ctx) != 0) break;     /* 回调可中止(如对端断开) */
         engine_forward(e, nxt, pos);
+        uint64_t b2 = ynow_ns();
+        g_samp += (b1 - b0) / 1000000; g_fwd += (b2 - b1) / 1000000;
         pos++;
         ngen++;
     }
+    if (getenv("YLLM_DISTTIMING"))
+        ylog_info("gen-dec: %u tok samp=%llu fwd=%llu ms",
+                  ngen, (unsigned long long)g_samp, (unsigned long long)g_fwd);
     if (timings) {
         timings->n_decode = ngen;
         timings->decode_ms = ynow_ms() - t1;

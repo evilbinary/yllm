@@ -200,10 +200,11 @@ static RtServer* pick_server(Router* r, const char* model)
  * on_token(token utf8, ctx) 每生成一个 token 回调一次; 返回 0 成功, -1 失败 */
 int router_infer(Router* r, const char* model, int max_tokens,
                  const char* prompt, size_t plen,
-                 void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx)
+                 void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
+                 float temp, float top_p)
 {
     RtServer* s = pick_server(r, model);
-    if (!s) {   /* 模型 server 尚未注册(启动竞态): 轮询等待 */
+    if (!s) {
         int i;
         for (i = 0; i < 60 && !s; i++) {
             sock_sleep_ms(500);
@@ -213,8 +214,8 @@ int router_infer(Router* r, const char* model, int max_tokens,
     }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) { ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
-    char args[64];
-    snprintf(args, sizeof(args), "%d", max_tokens);
+    char args[192];
+    snprintf(args, sizeof(args), "%d %zu temp=%.6g top_p=%.6g", max_tokens, plen, temp, top_p);
     frame_send_payload(sfd, PROTO_INFER, args, prompt, plen);
 
     pthread_mutex_lock(&r->lock);
@@ -246,7 +247,8 @@ int router_infer(Router* r, const char* model, int max_tokens,
  * server 渲染/缓存后只把增量 token 发给 rank; 这里只透传 TS 帧文本。 */
 int router_infer_sess(Router* r, const char* model, int max_tokens,
                       const char* sess_key, const char* new_msg, size_t msg_len,
-                      void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx)
+                      void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
+                      float temp, float top_p)
 {
     RtServer* s = pick_server(r, model);
     if (!s) {   /* 模型 server 尚未注册(启动竞态): 轮询等待 */
@@ -260,7 +262,8 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) { ylog_warn("router_infer_sess: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
     char args[192];
-    snprintf(args, sizeof(args), "%d %zu key=%s", max_tokens, msg_len, sess_key);
+    snprintf(args, sizeof(args), "%d %zu key=%s temp=%.6g top_p=%.6g",
+             max_tokens, msg_len, sess_key, temp, top_p);
 #if YLLM_SESS_DEBUG
     ylog_info("ROUTER->SERVER: INFER_SESS args=[%s] msg=[%.60s]", args, new_msg);
 #endif

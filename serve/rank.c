@@ -196,15 +196,19 @@ static int on_token_rank(uint32_t id, void* ctx)
 {
     TokenCtx* tc = (TokenCtx*)ctx;
     tc->n_tokens++;
-    char tmp[65536];
+    char tmp[256];
     vocab_decode(tc->vocab, &id, 1, tmp, sizeof(tmp));
     size_t len = strlen(tmp);
+    if (len + 32 > sizeof(tmp)) len = sizeof(tmp) - 32;
     char hdr[64];
     int hn = tc->cache_frame
         ? snprintf(hdr, sizeof(hdr), "TS %zu %u\n", len, id)
         : snprintf(hdr, sizeof(hdr), "T %zu\n", len);
-    if (xsend_rank(tc->fd, hdr, (size_t)hn) != 0) return -1;
-    if (xsend_rank(tc->fd, tmp, len) != 0) return -1;
+    /* 合并头+payload 为一次 send(减少系统调用) */
+    char one[320];
+    memcpy(one, hdr, (size_t)hn);
+    memcpy(one + hn, tmp, len);
+    if (xsend_rank(tc->fd, one, (size_t)hn + len) != 0) return -1;
     ylog_raw_log("%s", tmp);
     return 0;
 }
@@ -351,15 +355,24 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     uint64_t rng = ysrand(r->seed);
     uint32_t ngen = 0;
     uint32_t pos = r->cache_pos;
+    uint64_t d_samp = 0, d_emit = 0, d_fwd = 0;
     for (uint32_t i = 0; i < max_tokens && pos < r->engine.max_seq; i++) {
         uint32_t nxt;
+        uint64_t a0 = ynow_ns();
         if (engine_sample(&r->engine, r->engine.ws.model.h.vocab, r->temp, r->top_p, &rng, &nxt) != 0) break;
+        uint64_t a1 = ynow_ns();
         if ((int)nxt == r->vocab.eos) break;
         if (on_token_rank(nxt, &tc) != 0) break;
+        uint64_t a2 = ynow_ns();
         engine_forward(&r->engine, nxt, pos);
+        uint64_t a3 = ynow_ns();
+        d_samp += (a1 - a0) / 1000000; d_emit += (a2 - a1) / 1000000; d_fwd += (a3 - a2) / 1000000;
         pos++;
         ngen++;
     }
+    ylog_info("r1dec: %u tok samp=%llu emit=%llu fwd=%llu ms",
+              ngen, (unsigned long long)d_samp, (unsigned long long)d_emit,
+              (unsigned long long)d_fwd);
     /* 结束(命中 eos 或达上限)后补 eos 到 kv, 使 rank pos 与 router 缓存(回复+eos)一致 */
     if (pos < r->engine.max_seq) {
         engine_forward(&r->engine, (uint32_t)r->vocab.eos, pos);
@@ -401,6 +414,11 @@ static int handle_infer(int fd, Rank* r, char* args)
             if (seg) r->dist_rank = atoi(seg);
             if (peers) snprintf(r->addrs_csv, sizeof(r->addrs_csv), "%s", peers);
         }
+        /* 采样参数随请求覆盖(HTTP temperature/top_p 透传) */
+        const char* tp = proto_get(args, "temp");
+        const char* pp = proto_get(args, "top_p");
+        if (tp) r->temp = (float)atof(tp);
+        if (pp) r->top_p = (float)atof(pp);
     }
     /* 每请求独立缓冲(线程化后不可共享 r->ids) */
     char* pb = (char*)ymalloc((size_t)nbytes + 8192);

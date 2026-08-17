@@ -451,3 +451,47 @@ WIN_RANKS=2 RANKS=4 THREADS=8 python3 tools/bench_cross.py
 - rank1..win_ranks-1 在 Windows 手动拉起(带正确 peers 才能连远端)
 - rank win_ranks..ranks-1 在 Linux ssh 拉起
 - 全链路依赖: LEASE 按端口排序生成 peers → INFER 下发 → rank0 用正确 peers 连下游
+
+## Bug 修复: HTTP 采样参数未透传导致单 rank 慢 ~10%(2026-08)
+
+### 症状
+单机 serve r1(13.7-14.3 tok/s)比 gen(15.5-16.5)慢 ~10%, 且逐项计时显示
+**r1 的 sample 耗时 64ms/16tok(4ms/token), 而 gen 仅 0ms**。
+
+### 根因
+HTTP 请求的 `temperature=0` **没有透传链路**:
+
+```
+router_http: 只解析 max_tokens, 忽略 temperature/top_p  ✗
+  → router_infer_sess: args 不含 temp
+  → server forward_infer_sess: fargs 不含 temp
+  → rank: 用启动默认 temp=1.0, top_p=0.9(config.h:105)
+    → engine_sample 走 softmax+expf+qsort(32000 元素)慢路径
+```
+
+gen 直跑用 `--temp 0` → argmax 快路径, 采样近乎零成本。
+r1 的 rank 用默认 temp=1.0 → 每 token 4ms 做 softmax+qsort。
+
+### 修复(已实施)
+沿 HTTP→router→server→rank 四层透传 temp/top_p:
+1. **router_http.c**: 解析 body 的 `temperature`/`top_p`
+2. **router.c**: `router_infer`/`router_infer_sess` 签名加 temp/top_p, args 带 `temp=... top_p=...`
+3. **server.c**: `forward_infer_sess` 从 args 提取 temp/top_p 追加到 fargs
+   (`forward_infer` 原本透传 args, 无需改)
+4. **rank.c**: `handle_infer` 用 `proto_get("temp"/"top_p")` 覆盖 `r->temp`/`r->top_p`
+
+### 实测(单机 r1, 8T, 同 50-token prompt + 16 decode)
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| r1 decode | 13.7-14.3 | **14.4** |
+| sample 总耗时 | 64ms | **0ms** |
+| fwd 总耗时 | 1104ms | 1034ms |
+
+- sample 归零(走 argmax 快路径), decode +3~5%。
+- 剩余 ~4% 差距(fwd 1034 vs gen 967)为框架逐 token 转发/会话记账开销。
+- **此前所有 emit/日志优化无效的原因就是它: 瓶颈根本不是框架, 而是采样参数 bug。**
+
+### 附带发现
+- gen 与 r1 的引擎 forward 性能一致(fwd 967 vs 1034, 差 ~7% 为框架开销)。
+- emit 链本身只有 1ms/16tok, 不是瓶颈。
+- 合并 send、关日志、小缓冲均无效(+1%), 已回退或保留无害优化。
