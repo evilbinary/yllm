@@ -10,12 +10,12 @@ typedef struct {
     WMap map;
     LlModel model;
     uint8_t* pstate;
-    uint8_t* hot;
     uint8_t* res;           /* mincore 真实驻留位图: 1=该层页缓存已驻留 */
     uint64_t* layer_size;
     uint64_t budget;        /* 字节预算(0=不限) */
     uint64_t resident;      /* 当前估算驻留字节 */
-    uint32_t budget_layers; /* 层数预算(字节预算按平均层大小折算) */
+    uint32_t budget_layers; /* 层数预算(字节预算按平均层大小折算, 自适应微调) */
+    long last_majflt;       /* 上次 getrusage majflt(缺页反馈) */
     int depth;
     void* worker;
     void* worker_th;

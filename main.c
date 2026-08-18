@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 typedef struct {
     const char* key;
@@ -135,6 +136,48 @@ static int cmd_check(int argc, char** argv)
     return 0;
 }
 
+/* 系统可用内存(MemAvailable, Linux): 内核估算的可分配内存, 含可回收页缓存 */
+static uint64_t mem_available_bytes(void)
+{
+#ifdef _WIN32
+    return 0;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "MemAvailable:", 13) == 0) {
+                uint64_t kb = 0;
+                sscanf(line + 13, "%llu", (unsigned long long*)&kb);
+                fclose(f);
+                return kb * 1024;
+            }
+        }
+        fclose(f);
+    }
+    long avph = sysconf(_SC_AVPHYS_PAGES);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    return (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
+#endif
+}
+
+/* 自动内存模式: 预算 = min(模型大小, 可用内存 - 余量)。
+ * 富余机器 → 预算=全模型(等效全驻留); 紧张机器 → 自动封顶, 缺页重读但不 OOM。 */
+static uint64_t auto_budget_bytes(const char* model_path, uint64_t model_size_hint)
+{
+    uint64_t avail = mem_available_bytes();
+    uint64_t model_bytes = model_size_hint;
+    if (model_bytes == 0) {
+        struct stat st;
+        if (stat(model_path, &st) == 0) model_bytes = (uint64_t)st.st_size;
+    }
+    if (avail == 0) return model_bytes;
+    uint64_t reserve = avail / 8;
+    if (avail < (uint64_t)1024 * 1024 * 1024) reserve = avail / 4;
+    uint64_t cap = avail > reserve ? avail - reserve : avail / 2;
+    return model_bytes < cap ? model_bytes : cap;
+}
+
 static int cmd_gen(int argc, char** argv)
 {
     Arg a[16];
@@ -144,6 +187,7 @@ static int cmd_gen(int argc, char** argv)
     const char* prompt = opt(a, n, "prompt", "Once upon a time");
     int ntokens = atoi(opt(a, n, "tokens", "64"));
     int budget_mb = atoi(opt(a, n, "budget-mb", "0"));
+    int budget_auto = atoi(opt(a, n, "budget-auto", "0"));
     int depth = atoi(opt(a, n, "depth", "2"));
     float temp = (float)atof(opt(a, n, "temp", "1.0"));
     float top_p = (float)atof(opt(a, n, "top-p", "0.9"));
@@ -155,7 +199,7 @@ static int cmd_gen(int argc, char** argv)
     const char* dist_addrs = opt(a, n, "dist-addrs", NULL);
 
     if (!m) {
-        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
+        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget-mb N] [--budget-auto] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -173,6 +217,7 @@ static int cmd_gen(int argc, char** argv)
     Engine e;
     char err[1024];
     uint64_t budget = (uint64_t)budget_mb * 1024 * 1024;
+    if (budget_auto) budget = auto_budget_bytes(m, 0);
     if (engine_init(&e, m, budget, depth, err, sizeof(err)) != 0) {
         fprintf(stderr, "engine init failed: %s\n", err);
         vocab_free(&v);
@@ -236,7 +281,7 @@ static int cmd_gen(int argc, char** argv)
     ylog_info("total:   %.2f s", (double)ms / 1000.0);
     ylog_info("resident estimate: %.2f MB (budget: %s)",
             (double)engine_resident(&e) / 1048576.0,
-            budget_mb > 0 ? "limited" : "unlimited");
+            budget_mb > 0 ? "limited" : (budget_auto ? "auto" : "unlimited"));
     if (rc != 0) ylog_error("generate failed: %s", err);
 done_gen:;
     engine_free(&e);
@@ -254,6 +299,7 @@ static int cmd_chat(int argc, char** argv)
     const char* prompt = opt(a, n, "prompt", NULL);
     int ntokens = atoi(opt(a, n, "tokens", "128"));
     int budget_mb = atoi(opt(a, n, "budget-mb", "0"));
+    int budget_auto = atoi(opt(a, n, "budget-auto", "0"));
     int depth = atoi(opt(a, n, "depth", "2"));
     float temp = (float)atof(opt(a, n, "temp", "0.8"));
     float top_p = (float)atof(opt(a, n, "top-p", "0.9"));
@@ -262,7 +308,7 @@ static int cmd_chat(int argc, char** argv)
     int no_bos = atoi(opt(a, n, "no-bos", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget-mb N] [--budget-auto] [--depth N] [--temp F] [--top-p F] [--seed N] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -275,6 +321,7 @@ static int cmd_chat(int argc, char** argv)
     Engine e;
     char err[1024];
     uint64_t budget = (uint64_t)budget_mb * 1024 * 1024;
+    if (budget_auto) budget = auto_budget_bytes(m, 0);
     if (engine_init(&e, m, budget, depth, err, sizeof(err)) != 0) {
         fprintf(stderr, "engine init failed: %s\n", err);
         vocab_free(&v);
@@ -322,7 +369,7 @@ static int cmd_chat(int argc, char** argv)
     ylog_info("total:   %.2f s", (double)ms / 1000.0);
     ylog_info("resident estimate: %.2f MB (budget: %s)",
            (double)engine_resident(&e) / 1048576.0,
-           budget_mb > 0 ? "limited" : "unlimited");
+           budget_mb > 0 ? "limited" : (budget_auto ? "auto" : "unlimited"));
     if (rc != 0) ylog_error("chat failed: %s", err);
     engine_free(&e);
     vocab_free(&v);

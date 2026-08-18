@@ -76,6 +76,7 @@ typedef struct {
     float top_p;
     uint64_t seed;
     int budget_mb;
+    int budget_auto;                /* --budget-auto: 按可用内存自动预算 */
     int depth;
 
     /* 客户端模式(router --send) */
@@ -183,6 +184,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->seed = (uint64_t)strtoull(val, NULL, 10);
     } else if (strcmp(key, "budget-mb") == 0) {
         c->budget_mb = atoi(val);
+    } else if (strcmp(key, "budget-auto") == 0) {
+        c->budget_auto = atoi(val);
     } else if (strcmp(key, "depth") == 0) {
         c->depth = atoi(val);
     } else if (strcmp(key, "send") == 0) {

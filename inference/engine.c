@@ -109,6 +109,31 @@ static void sched_refresh_resident(Ws* ws)
     ws->resident = tot;
 }
 
+/* 预算自适应: 缺页太多且内存富余 → 多驻留一层(减重读); 内存告急 → 缩驻留。
+ * 只调层数上限 budget_layers; 字节上限由 sched_release_budget 的 bytes <= budget 硬约束保证。 */
+static void sched_adapt_budget(Ws* ws)
+{
+#ifndef _WIN32
+    if (ws->budget == 0) return;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return;
+    long pf = ru.ru_majflt;
+    long delta = pf - ws->last_majflt;
+    ws->last_majflt = pf;
+    long avph = sysconf(_SC_AVPHYS_PAGES);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    uint64_t mem_free = (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
+    uint64_t cap = ws->budget;
+    if (delta > 0 && mem_free > cap + cap / 2) {
+        if (ws->budget_layers < ws->model.n_layers) ws->budget_layers++;
+    } else if (mem_free < cap) {
+        if (ws->budget_layers > 1) ws->budget_layers--;
+    }
+#else
+    (void)ws;
+#endif
+}
+
 static void sched_release_budget(Ws* ws, uint32_t cur)
 {
     if (ws->budget == 0) return;
@@ -117,17 +142,16 @@ static void sched_release_budget(Ws* ws, uint32_t cur)
         uint32_t n = 0;
         uint64_t bytes = 0;
         for (i = 0; i < ws->model.n_layers; i++) {
-            /* budget>0 硬限制: 已算过、页缓存仍驻留的层(缺页重读回来的)也算入占用 */
-            if (ws->pstate[i] == 2 ||
-                (ws->budget > 0 && ws->pstate[i] == 3 && ws->res[i])) {
+            /* 已预取(pstate==2)或已算过(pstate==3)的层都算占用;
+             * pstate==3 无条件释放(DONTNEED 对未驻留页无害), 消除重读滞后 */
+            if (ws->pstate[i] == 2 || ws->pstate[i] == 3) {
                 n++; bytes += ws->layer_size[i];
             }
         }
         if (n <= ws->budget_layers && bytes <= ws->budget) return;
         int found = 0;
         for (i = 0; i < cur; i++) {
-            if ((ws->pstate[i] == 2 ||
-                 (ws->budget > 0 && ws->pstate[i] == 3 && ws->res[i])) && !ws->hot[i]) {
+            if (ws->pstate[i] == 2 || ws->pstate[i] == 3) {
                 ws_release(ws, i);
                 ws->pstate[i] = 3;
                 ws->res[i] = 0;
@@ -158,13 +182,11 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     
     ws->depth = depth > 0 ? depth : 2;
     ws->pstate = (uint8_t*)ycalloc(m->n_layers, 1);
-    ws->hot = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->res = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->layer_size = (uint64_t*)ymalloc((size_t)m->n_layers * 8);
     uint32_t i;
     for (i = 0; i < m->n_layers; i++) {
         ws->layer_size[i] = m->dir[i].size;
-        if (i == 0 || i == m->h.n_blocks + 1 || i == m->h.n_blocks + 2) ws->hot[i] = 1;
     }
     /* 自适应层预算初值: 由字节预算按平均层大小折算 */
     ws->budget_layers = m->n_layers;
@@ -177,6 +199,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         if (bl > m->n_layers) bl = m->n_layers;
         ws->budget_layers = bl;
     }
+    ws->last_majflt = 0;
 
     uint32_t hidden = m->h.hidden;
     uint32_t kv_dim = m->h.n_kv_heads * m->h.head_dim;
@@ -258,7 +281,6 @@ void engine_free(Engine* e)
     free(e->pba);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
-    if (e->ws.hot) free(e->ws.hot);
     if (e->ws.res) free(e->ws.res);
     if (e->ws.layer_size) free(e->ws.layer_size);
     free(w);
@@ -657,7 +679,10 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
     Worker* w = (Worker*)ws->worker;
     const LlfHeader* h = &m->h;
     uint32_t i;
-    if (ws->budget > 0) sched_refresh_resident(ws);
+    if (ws->budget > 0) {
+        sched_refresh_resident(ws);
+        sched_adapt_budget(ws);
+    }
     if (need_embed && e->layer_begin == 0) {
         forward_layer(e, 0, token, pos);
     }

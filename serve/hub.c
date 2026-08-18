@@ -66,6 +66,8 @@ int cmd_hub(ServeConfig* cfg)
     sv.rank_port_base = (uint16_t)cfg->rank_port_base;
     sv.server_port_base = (uint16_t)cfg->server_port;
     sv.auto_heal = cfg->auto_heal;
+    sv.budget_mb = cfg->budget_mb;
+    sv.budget_auto = cfg->budget_auto;
     if (cfg->cache_dir[0])
         snprintf(sv.cache_dir, sizeof(sv.cache_dir), "%s", cfg->cache_dir);
     sv.no_spawn_server = 1; /* hub 内已有 server 线程 */
