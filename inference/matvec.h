@@ -10,6 +10,14 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 
+/* 行分块 matmul: 只算 [row_begin, row_begin+n_rows) 行。
+ * 量化权重行主序; F32/F16 列主序(out = 总列数, 行区间在列上连续)。
+ * 不支持行分块的 dtype 退化为整算(n_rows 全量)。 */
+void matmul_rows(float* y, const float* x, const uint8_t* w,
+                 uint32_t row_begin, uint32_t n_rows, uint32_t in, uint32_t out, uint32_t dtype);
+/* 单行字节(行分块释放用); 不支持行分块的 dtype 返回 0 */
+size_t matmul_row_bytes(uint32_t dtype, uint32_t in);
+
 void embed_f32(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 void embed_f16(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 void embed_q4k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);

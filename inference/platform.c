@@ -245,6 +245,28 @@ void ws_release(const Ws* ws, uint32_t layer)
 #endif
 }
 
+#if YLLM_TENSOR_STREAM
+void ws_prefetch_range(const Ws* ws, uint64_t off, uint64_t sz)
+{
+#ifdef __linux__
+    if (sz == 0) return;
+    madvise((char*)ws->map.base + off, (size_t)sz, MADV_WILLNEED);
+#else
+    (void)ws; (void)off; (void)sz;
+#endif
+}
+
+void ws_release_range(const Ws* ws, uint64_t off, uint64_t sz)
+{
+#ifdef __linux__
+    if (sz == 0) return;
+    madvise((char*)ws->map.base + off, (size_t)sz, MADV_DONTNEED);
+#else
+    (void)ws; (void)off; (void)sz;
+#endif
+}
+#endif
+
 const void* ws_layer_ptr(const Ws* ws, uint32_t layer)
 {
     return (const uint8_t*)ws->map.base + ws->model.dir[layer].offset;
