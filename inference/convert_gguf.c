@@ -80,6 +80,7 @@ typedef struct {
     float freq_base;
     float rms_eps;
     uint32_t context_len;
+    uint32_t key_length;
     uint32_t alignment;
     char** tokens;
     uint32_t n_tokens;
@@ -153,6 +154,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(k, "embedding_length")) g->hidden = v;
         else if (!strcmp(k, "attention.head_count")) g->heads = v;
         else if (!strcmp(k, "attention.head_count_kv")) g->kv_heads = v;
+        else if (!strcmp(k, "attention.key_length")) g->key_length = v;
         else if (!strcmp(k, "context_length")) g->context_len = v;
         else if (!strcmp(k, "rope.freq_base")) { float f; memcpy(&f, &v, 4); g->freq_base = f; }
         else if (!strcmp(k, "attention.layer_norm_rms_epsilon")) { float f; memcpy(&f, &v, 4); g->rms_eps = f; }
@@ -168,6 +170,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(k, "embedding_length")) g->hidden = (uint32_t)v;
         else if (!strcmp(k, "attention.head_count")) g->heads = (uint32_t)v;
         else if (!strcmp(k, "attention.head_count_kv")) g->kv_heads = (uint32_t)v;
+        else if (!strcmp(k, "attention.key_length")) g->key_length = (uint32_t)v;
         else if (!strcmp(k, "context_length")) g->context_len = (uint32_t)v;
         else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
         else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
@@ -272,10 +275,9 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
 {
     static const struct { uint64_t nb; uint32_t dt; } cand[] = {
         { 210, DT_Q6K },
+        { 176, DT_Q5K },
         { 144, DT_Q4K },
         { 144, DT_IQ4XS },
-        { 66, 0 },
-        { 176, 0 },
         { 80, 0 },
         { 110, 0 },
         { 36, 0 },
@@ -400,6 +402,7 @@ static int gg_slot_for(const char* name, int* layer)
             { "attn_v.weight", SLOT_V },
             { "attn_output.weight", SLOT_O },
             { "ffn_norm.weight", SLOT_NORM2 },
+            { "post_attention_norm.weight", SLOT_NORM2 },
             { "ffn_gate.weight", SLOT_GATE },
             { "ffn_up.weight", SLOT_UP },
             { "ffn_down.weight", SLOT_DOWN },
@@ -408,6 +411,15 @@ static int gg_slot_for(const char* name, int* layer)
             { "attn_v.bias", SLOT_VBIAS },
             { "attn_q_norm.weight", SLOT_QNORM },
             { "attn_k_norm.weight", SLOT_KNORM },
+            { "attn_qkv.weight", SLOT_QKV },
+            { "attn_gate.weight", SLOT_GATE_ATTN },
+            { "ssm_conv1d.weight", SLOT_SSM_CONV1D },
+            { "ssm_a", SLOT_SSM_A },
+            { "ssm_dt.bias", SLOT_SSM_DT },
+            { "ssm_alpha.weight", SLOT_SSM_ALPHA },
+            { "ssm_beta.weight", SLOT_SSM_BETA },
+            { "ssm_norm.weight", SLOT_SSM_NORM },
+            { "ssm_out.weight", SLOT_SSM_OUT },
         };
         size_t i;
         for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
@@ -487,17 +499,18 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
     if (!g.arch || (strcmp(g.arch, "llama") != 0 && strcmp(g.arch, "qwen2") != 0 &&
-                    strcmp(g.arch, "qwen3") != 0)) {
-        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' and 'qwen2/qwen3' supported)", g.arch ? g.arch : "?");
+                    strcmp(g.arch, "qwen3") != 0 && strcmp(g.arch, "qwen35") != 0)) {
+        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' and 'qwen2/qwen3/qwen35' supported)", g.arch ? g.arch : "?");
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
         free(g.arch); free(data);
         return -1;
     }
-    /* qwen2/qwen3: 同构(interleaved RoPE, 无 head 输出 bias; qwen3 连 attention bias 都没有,
+    /* qwen2/qwen3/qwen35: 同构(interleaved RoPE, 无 head 输出 bias; qwen3 连 attention bias 都没有,
      * 代码按 tensor 是否存在自动跳过) */
     int is_qwen = g.arch && (strcmp(g.arch, "qwen2") == 0 || strcmp(g.arch, "qwen3") == 0);
+    int is_qwen35 = g.arch && strcmp(g.arch, "qwen35") == 0;
     free(g.arch);
     if (g.n_blocks == 0 || g.hidden == 0 || g.heads == 0) {
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
@@ -509,7 +522,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
     if (g.kv_heads == 0) g.kv_heads = g.heads;
-    if (g.hidden % g.heads != 0) {
+    if (!is_qwen35 && g.hidden % g.heads != 0) {
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
@@ -601,11 +614,11 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             if (dt == 255) { free(t->name); continue; }
             GGTensor c;
             c = *t;
-            if (dt == DT_F32) c.nbytes = nelem * 4;
+if (dt == DT_F32) c.nbytes = nelem * 4;
             else if (dt == DT_F16) c.nbytes = nelem * 2;
             else {
-                uint64_t nb = (dt == DT_Q6K) ? 210 : 144;
-                c.nbytes = nelem / 256 * nb;
+                uint64_t nb = (dt == DT_Q6K) ? 210 : (dt == DT_Q5K) ? 176 : 144;
+                c.nbytes = (nelem / 256) * nb;
             }
             /* reject truncated/corrupt file: tensor data must fit inside the file */
             if (c.offset > fsize - data_start || c.nbytes > fsize - data_start - c.offset) {
@@ -632,6 +645,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         else if (slot == SP_FINALNORM) { items[n].layer = g.n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
         else if (slot >= SLOT_NORM1 && slot <= SLOT_KNORM) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
+        else if (slot >= SLOT_QKV && slot <= SLOT_SSM_OUT) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else continue;
         const GGTensor* t = &list.t[i];
         items[n].dtype = type_map[t->gtype];
@@ -649,16 +663,35 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     {
         int p2;
         int missing = 0;
-        /* 只校验 9 个必需权重 slot(bias 可选) */
-        static const int all[9] = { SLOT_NORM1, SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_NORM2, SLOT_GATE, SLOT_UP, SLOT_DOWN };
+        /* 公共必需: ffn 三件套 + 两个 norm */
+        static const int common[5] = { SLOT_NORM1, SLOT_NORM2, SLOT_GATE, SLOT_UP, SLOT_DOWN };
         for (i = 1; i <= g.n_blocks && !missing; i++) {
             int s2;
-            for (s2 = 0; s2 < 9; s2++) {
+            for (s2 = 0; s2 < 5; s2++) {
                 int found = 0;
                 for (p2 = 0; p2 < n; p2++) {
-                    if (items[p2].layer == i && items[p2].slot == (uint32_t)all[s2]) { found = 1; break; }
+                    if (items[p2].layer == i && items[p2].slot == (uint32_t)common[s2]) { found = 1; break; }
                 }
                 if (!found) { missing = 1; break; }
+            }
+            if (missing) break;
+            if (is_qwen35) {
+                /* 混合层: 每层必须有 GDN 的 QKV 或 attention 的 Q(择一) */
+                int has_qkv = 0, has_q = 0;
+                for (p2 = 0; p2 < n; p2++) {
+                    if (items[p2].layer == i && items[p2].slot == SLOT_QKV) has_qkv = 1;
+                    if (items[p2].layer == i && items[p2].slot == SLOT_Q)   has_q = 1;
+                }
+                if (!has_qkv && !has_q) missing = 1;
+            } else {
+                static const int attn[4] = { SLOT_Q, SLOT_K, SLOT_V, SLOT_O };
+                for (s2 = 0; s2 < 4 && !missing; s2++) {
+                    int found = 0;
+                    for (p2 = 0; p2 < n; p2++) {
+                        if (items[p2].layer == i && items[p2].slot == (uint32_t)attn[s2]) { found = 1; break; }
+                    }
+                    if (!found) missing = 1;
+                }
             }
         }
         if (missing) {
@@ -673,12 +706,12 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, YLLM_MAGIC, 8);
     h.version = YLLM_VERSION;
-    h.arch = is_qwen ? ARCH_QWEN : ARCH_LLAMA;
+    h.arch = is_qwen35 ? ARCH_QWEN35 : (is_qwen ? ARCH_QWEN : ARCH_LLAMA);
     h.n_blocks = g.n_blocks;
     h.hidden = g.hidden;
     h.n_heads = g.heads;
     h.n_kv_heads = g.kv_heads;
-    h.head_dim = g.hidden / g.heads;
+    h.head_dim = g.key_length ? g.key_length : (g.hidden / g.heads);
     if (max_seq == 0 || (g.context_len > 0 && g.context_len < max_seq)) max_seq = g.context_len ? g.context_len : max_seq;
     h.max_seq = max_seq;
     h.dtype = DT_Q4K;

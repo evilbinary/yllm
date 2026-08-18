@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #define YLLM_MAGIC "YLLMLLF1"
-#define YLLM_VERSION 3   /* BLOCK_TENSORS 12→14(qk-norm 槽位), 旧文件必须重转 */
+#define YLLM_VERSION 4   /* 14→24(qwen35 SSM 槽位), 旧文件必须重转 */
 #define LLF_HEADER_SIZE 128
 #define LLF_DIR_ENTRY_SIZE 32
 #define LLF_TENSOR_META_SIZE 64
@@ -17,9 +17,11 @@
 #define DT_Q4K 3
 #define DT_Q6K 4
 #define DT_IQ4XS 5
+#define DT_Q5K 6
 
 #define ARCH_LLAMA 0
 #define ARCH_QWEN 1
+#define ARCH_QWEN35 2
 
 #define SLOT_EMBED 0
 #define SLOT_NORM1 0
@@ -36,7 +38,17 @@
 #define SLOT_VBIAS 11
 #define SLOT_QNORM 12
 #define SLOT_KNORM 13
-#define BLOCK_TENSORS 14
+#define SLOT_QKV 14         /* GDN attn_qkv [in, 2*hidden] */
+#define SLOT_GATE_ATTN 15   /* GDN attn_gate [in, hidden] */
+#define SLOT_QGATE 16       /* attention 层 attn_q 的 gate 半部(未用, 保留语义) */
+#define SLOT_SSM_CONV1D 17  /* GDN conv1d [conv_kernel, conv_channels] */
+#define SLOT_SSM_A 18       /* GDN ssm_a [n_vheads] */
+#define SLOT_SSM_DT 19      /* GDN ssm_dt.bias [n_vheads] */
+#define SLOT_SSM_ALPHA 20   /* GDN ssm_alpha [in, n_vheads] */
+#define SLOT_SSM_BETA 21    /* GDN ssm_beta [in, n_vheads] */
+#define SLOT_SSM_NORM 22    /* GDN ssm_norm [head_v_dim] */
+#define SLOT_SSM_OUT 23     /* GDN ssm_out [hidden, in] */
+#define BLOCK_TENSORS 24
 
 #pragma pack(push, 1)
 typedef struct {

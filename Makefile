@@ -280,6 +280,27 @@ chat-qwen3-8b: $(BIN) $(Q3_LLF)
 chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_LLF)
 	$(RUN_AVX2) chat --model $(Q3_LLF) --vocab $(Q3_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+# ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
+Q38_GGUF  ?= models/Qwen3.8-27B-Q4_K_M.gguf
+Q38_LLF   ?= models/qwen3.8-27b.llf
+Q38_VOCAB ?= models/qwen3.vocab.txt
+
+$(Q38_LLF): $(Q38_GGUF) | $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(Q38_GGUF) --out $(Q38_LLF) --vocab $(Q38_VOCAB) --seq 2048
+
+gen-qwen3.8-27b: $(BIN) $(Q38_LLF)
+	$(RUN) gen --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+gen-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
+	$(RUN_AVX2) gen --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3.8-27b: $(BIN) $(Q38_LLF)
+	$(RUN) chat --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
+	$(RUN_AVX2) chat --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
 # ---- 常驻推理服务(serve 层) ----
 # 统一配置: serve.yaml(所有角色共用)
 # 用法:

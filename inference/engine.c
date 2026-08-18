@@ -237,6 +237,31 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         e->pba = (float*)ymalloc((size_t)PB_MAX * m->h.n_heads * e->max_seq * 4);
     }
 
+    /* qwen35 混合架构: 分配 GDN 状态/conv 延迟线/临时工作区 */
+    if (m->h.arch == ARCH_QWEN35) {
+        uint32_t n_gdn = 0;
+        uint32_t conv_chan = 0, kwidth = 0;
+        uint32_t n_vheads = 0, hvd = 0;
+        uint32_t li;
+        for (li = 1; li <= m->h.n_blocks; li++) {
+            const LlfTensorMeta* mt = &m->metas[m->base_idx[li]];
+            if (mt[SLOT_SSM_CONV1D].size > 0) {
+                n_gdn++;
+                if (conv_chan == 0) {
+                    conv_chan = mt[SLOT_SSM_CONV1D].shape[1];
+                    kwidth = mt[SLOT_SSM_CONV1D].shape[0];
+                    n_vheads = mt[SLOT_SSM_A].shape[0];
+                    hvd = mt[SLOT_SSM_NORM].shape[0];
+                }
+            }
+        }
+        if (n_gdn > 0 && conv_chan > 0 && n_vheads > 0 && hvd > 0) {
+            e->ssm_state = (float*)ycalloc((size_t)n_gdn * n_vheads * hvd * hvd, 4);
+            e->ssm_conv = (float*)ycalloc((size_t)n_gdn * (kwidth > 1 ? kwidth - 1 : 0) * conv_chan, 4);
+            e->scratch = (float*)ymalloc(65536 * 4);
+        }
+    }
+
     Worker* w = (Worker*)ycalloc(1, sizeof(Worker));
     w->ws = ws;
     e->ws.worker = w;
@@ -275,6 +300,9 @@ void engine_free(Engine* e)
     free(e->pb); free(e->pb2); free(e->pbq);
     free(e->pbk); free(e->pbv); free(e->pbg); free(e->pbu);
     free(e->pba);
+    if (e->ssm_state) free(e->ssm_state);
+    if (e->ssm_conv) free(e->ssm_conv);
+    if (e->scratch) free(e->scratch);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
     if (e->ws.hot) free(e->ws.hot);
@@ -285,11 +313,20 @@ void engine_free(Engine* e)
 }
 
 /* 批量前向一层: 同时处理 B 个 token(pos 连续: pos_start..pos_start+B-1) */
+static int forward_block(Engine* e, uint32_t layer, uint32_t pos);
 static int forward_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
+    /* qwen35 混合架构: 先退化为逐 token 前向(GDN 状态在层内连续) */
+    if (h->arch == ARCH_QWEN35) {
+        uint32_t b;
+        for (b = 0; b < B; b++) {
+            if (forward_block(e, layer, pos_start + b) != 0) return -1;
+        }
+        return 0;
+    }
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
     uint32_t hidden = h->hidden;
     uint32_t kv_dim = h->n_kv_heads * h->head_dim;
@@ -470,6 +507,7 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             case DT_F32: embed_f32(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
             case DT_Q4K: embed_q4k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
             case DT_Q6K: embed_q6k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
+            case DT_Q5K: embed_q5k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
             case DT_IQ4XS: embed_iq4xs(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
             default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
             }
@@ -496,11 +534,262 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
     return 0;
 }
 
+/* qwen35: 返回该 gdn 层在所有 GDN 层中的序号(0-based); 非 gdn 层返回下一 gdn 序号 */
+static uint32_t gdn_index_of(const LlModel* m, uint32_t layer)
+{
+    uint32_t cnt = 0, i;
+    for (i = 1; i <= layer; i++) {
+        const LlfTensorMeta* mt = &m->metas[m->base_idx[i]];
+        if (mt[SLOT_SSM_CONV1D].size > 0) cnt++;
+    }
+    return cnt ? cnt - 1 : 0;
+}
+
+/* qwen35 混合架构单层前向: Gated Attention 层 + GDN 层 */
+static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
+    uint32_t hidden = h->hidden;
+    float eps, theta;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    memcpy(&theta, &h->rope_theta_bits, 4);
+    uint32_t hidx = m->base_idx[layer];
+    const LlfTensorMeta* mt = &m->metas[hidx];
+    float* x = e->x;
+    float* x2 = e->hb;
+    uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
+
+    if (mt[SLOT_SSM_CONV1D].size > 0) {
+        /* ===== GDN 层 ===== */
+        uint32_t conv_chan = mt[SLOT_SSM_CONV1D].shape[1];   /* 10240 */
+        uint32_t kwidth = mt[SLOT_SSM_CONV1D].shape[0];      /* 4 */
+        uint32_t n_vheads = mt[SLOT_SSM_A].shape[0];         /* 48 */
+        uint32_t hvd = mt[SLOT_SSM_NORM].shape[0];           /* 128 */
+        uint32_t value_dim = hvd * n_vheads;                 /* 6144 */
+        uint32_t key_dim = (conv_chan - value_dim) / 2;      /* 2048 */
+        uint32_t num_k_heads = key_dim / hvd;                /* 16 */
+        uint32_t n_hist = kwidth - 1;                        /* 3 */
+        const float scale = 1.0f / sqrtf((float)hvd);
+
+        float* scratch = e->scratch;
+        float* qkv = scratch;              /* [conv_chan] conv 输入/输出 */
+        float* z = scratch + 16384;        /* [value_dim] */
+        float* alpha = scratch + 32768;    /* [n_vheads] */
+        float* beta = scratch + 32816;     /* [n_vheads] */
+        float* gate = scratch + 32864;     /* [n_vheads] */
+        float* attn_out = scratch + 33000; /* [value_dim] */
+        float* ssm_o = scratch + 40000;    /* [hidden] ssm_out 输出缓冲 */
+
+        rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+        matmul(qkv, x2, base + mt[SLOT_QKV].offset, conv_chan, hidden, mt[SLOT_QKV].dtype);
+        matmul(z, x2, base + mt[SLOT_GATE_ATTN].offset, value_dim, hidden, mt[SLOT_GATE_ATTN].dtype);
+        matmul(alpha, x2, base + mt[SLOT_SSM_ALPHA].offset, n_vheads, hidden, mt[SLOT_SSM_ALPHA].dtype);
+        matmul(beta, x2, base + mt[SLOT_SSM_BETA].offset, n_vheads, hidden, mt[SLOT_SSM_BETA].dtype);
+
+        const float* ssm_dt = (const float*)(base + mt[SLOT_SSM_DT].offset);
+        const float* ssm_a = (const float*)(base + mt[SLOT_SSM_A].offset);
+        uint32_t vh;
+        for (vh = 0; vh < n_vheads; vh++) {
+            beta[vh] = 1.0f / (1.0f + expf(-beta[vh]));
+            float ab = alpha[vh] + ssm_dt[vh];
+            float sp = log1pf(expf(ab));
+            gate[vh] = sp * ssm_a[vh];
+        }
+
+        /* conv1d: 延迟线(前 kwidth-1 个输入) + 当前输入, 卷积+silu 就地到 qkv */
+        uint32_t gdn_idx = gdn_index_of(m, layer);
+        float* conv_state = e->ssm_conv + (size_t)gdn_idx * n_hist * conv_chan;
+        const uint8_t* conv_w = base + mt[SLOT_SSM_CONV1D].offset;
+        float* cur = scratch + 46000;  /* 当前 qkv_mixed 副本(延迟线更新用) */
+        memcpy(cur, qkv, (size_t)conv_chan * 4);
+        uint32_t i, ch;
+        for (ch = 0; ch < conv_chan; ch++) {
+            float acc = 0.0f;
+            for (i = 0; i < n_hist; i++)
+                acc += conv_state[(size_t)i * conv_chan + ch] *
+                       ((const float*)(conv_w + (size_t)i * conv_chan * 4))[ch];
+            acc += cur[ch] * ((const float*)(conv_w + (size_t)n_hist * conv_chan * 4))[ch];
+            qkv[ch] = acc / (1.0f + expf(-acc));  /* silu */
+        }
+        /* 更新延迟线: 前移, 末位放入当前输入 */
+        for (i = 0; i + 1 < n_hist; i++)
+            memcpy(conv_state + (size_t)i * conv_chan, conv_state + (size_t)(i + 1) * conv_chan,
+                   (size_t)conv_chan * 4);
+        memcpy(conv_state + (size_t)(n_hist - 1) * conv_chan, cur, (size_t)conv_chan * 4);
+
+        /* 切 q/k/v 并 L2 归一化 q/k 每 k_head */
+        float* q = qkv;
+        float* k = qkv + key_dim;
+        float* v = qkv + 2 * key_dim;
+        for (i = 0; i < num_k_heads; i++) l2norm_inplace(q + (size_t)i * hvd, hvd, eps);
+        for (i = 0; i < num_k_heads; i++) l2norm_inplace(k + (size_t)i * hvd, hvd, eps);
+
+        /* 递归状态更新(每 v_head): S 布局转置 S[j*hvd+i] = Smat[i][j] */
+        float* state_base = e->ssm_state + (size_t)gdn_idx * n_vheads * hvd * hvd;
+        for (vh = 0; vh < n_vheads; vh++) {
+            uint32_t kh = vh % num_k_heads;
+            const float* qh = q + (size_t)kh * hvd;
+            const float* khv = k + (size_t)kh * hvd;
+            const float* vh_ = v + (size_t)vh * hvd;
+            float* S = state_base + (size_t)vh * hvd * hvd;
+            float g = expf(gate[vh]);
+            float b = beta[vh];
+            uint32_t j;
+            /* S *= g;  delta[j] = (v[j] - Σ_i S[j][i]*k[i]) * beta;  S[j][i] += k[i]*delta[j] */
+            for (j = 0; j < hvd; j++) {
+                float* Sj = S + (size_t)j * hvd;
+                float dot = 0.0f, del;
+                uint32_t ii;
+                for (ii = 0; ii < hvd; ii++) { Sj[ii] *= g; dot += Sj[ii] * khv[ii]; }
+                del = (vh_[j] - dot) * b;
+                for (ii = 0; ii < hvd; ii++) Sj[ii] += khv[ii] * del;
+            }
+            /* attn_out[j] = (Σ_i S[j][i]*q[i]) * scale */
+            float* ao = attn_out + (size_t)vh * hvd;
+            for (j = 0; j < hvd; j++) {
+                const float* Sj = S + (size_t)j * hvd;
+                float dot = 0.0f;
+                uint32_t ii;
+                for (ii = 0; ii < hvd; ii++) dot += Sj[ii] * qh[ii];
+                ao[j] = dot * scale;
+            }
+        }
+
+        /* rmsnorm_gated: out = rmsnorm(attn_out, ssm_norm) * silu(z) */
+        const uint8_t* ssm_norm_w = base + mt[SLOT_SSM_NORM].offset;
+        uint32_t snd = mt[SLOT_SSM_NORM].dtype;
+        for (vh = 0; vh < n_vheads; vh++) {
+            float* ao = attn_out + (size_t)vh * hvd;
+            float* zh = z + (size_t)vh * hvd;
+            float s = 0.0f;
+            uint32_t ii;
+            for (ii = 0; ii < hvd; ii++) s += ao[ii] * ao[ii];
+            float inv = 1.0f / sqrtf(s / (float)hvd + eps);
+            for (ii = 0; ii < hvd; ii++) {
+                float w = (snd == DT_F32) ? ((const float*)ssm_norm_w)[ii]
+                                          : f16_to_f32(((const uint16_t*)ssm_norm_w)[ii]);
+                float zg = zh[ii];
+                ao[ii] = ao[ii] * w * inv * (zg / (1.0f + expf(-zg)));
+            }
+        }
+
+        /* 输出投影 + 残差 + FFN */
+        matmul(ssm_o, attn_out, base + mt[SLOT_SSM_OUT].offset, hidden, value_dim, mt[SLOT_SSM_OUT].dtype);
+        uint32_t j;
+        for (j = 0; j < hidden; j++) x[j] += ssm_o[j];
+        rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
+        float* fg = e->ffn;
+        float* fu = e->ffn + inter;
+        matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+        matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        swiglu(x2, fg, fu, inter);
+        matmul(attn_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
+        for (j = 0; j < hidden; j++) x[j] += attn_out[j];
+        return 0;
+    }
+
+    /* ===== Gated Attention 层 ===== */
+    {
+        uint32_t n_heads = h->n_heads;        /* 24 */
+        uint32_t n_kv = h->n_kv_heads;        /* 4 */
+        uint32_t hd = h->head_dim;            /* 256 */
+        uint32_t qdim = n_heads * hd;         /* 6144 */
+        uint32_t kv_dim = n_kv * hd;          /* 1024 */
+        uint32_t qg_full = 2 * qdim;          /* 12288 */
+        uint32_t n_rot = 64;                  /* rope.dimension_count */
+
+        float* scratch = e->scratch;
+        float* qraw = scratch;                /* [12288] = q|gate */
+        float* q = scratch;                   /* [6144] q 部分(视图, 收集) */
+        float* gate = scratch + qdim;         /* [6144] gate 部分 */
+        float* k = scratch + qg_full;         /* [1024] */
+        float* v = scratch + qg_full + kv_dim;/* [1024] */
+        float* att_out = e->hb2;              /* [6144] 复用 */
+
+        rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+        matmul(qraw, x2, base + mt[SLOT_Q].offset, qg_full, hidden, mt[SLOT_Q].dtype);
+        matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
+        matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+
+        /* q|gate 交错拆分: 每 head 512 = q[256] | gate[256] */
+        uint32_t hh, ii;
+        for (hh = 0; hh < n_heads; hh++) {
+            memcpy(q + (size_t)hh * hd, qraw + (size_t)hh * 2 * hd, (size_t)hd * 4);
+            memcpy(gate + (size_t)hh * hd, qraw + (size_t)hh * 2 * hd + hd, (size_t)hd * 4);
+        }
+
+        /* q/k QK-norm 每头 ×256 */
+        for (hh = 0; hh < n_heads; hh++)
+            rmsnorm(q + (size_t)hh * hd, q + (size_t)hh * hd, base + mt[SLOT_QNORM].offset, hd, eps, mt[SLOT_QNORM].dtype);
+        for (hh = 0; hh < n_kv; hh++)
+            rmsnorm(k + (size_t)hh * hd, k + (size_t)hh * hd, base + mt[SLOT_KNORM].offset, hd, eps, mt[SLOT_KNORM].dtype);
+
+        /* M-RoPE: 前 n_rot 维 interleaved */
+        for (hh = 0; hh < n_heads; hh++)
+            rope_inplace_mrope(q + (size_t)hh * hd, hd, n_rot, pos, theta);
+        for (hh = 0; hh < n_kv; hh++)
+            rope_inplace_mrope(k + (size_t)hh * hd, hd, n_rot, pos, theta);
+
+        /* 写 KV cache + attention(复用现有逻辑) */
+        uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
+        uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
+        uint64_t kvp = (uint64_t)pos * kv_dim;
+        for (ii = 0; ii < kv_dim; ii++) {
+            kcache[kvp + ii] = f32_to_f16(k[ii]);
+            vcache[kvp + ii] = f32_to_f16(v[ii]);
+        }
+        float* att = e->att;
+        float inv_d = 1.0f / sqrtf((float)hd);
+        #pragma omp parallel for schedule(static)
+        for (hh = 0; hh < n_heads; hh++) {
+            float* att_h = att + (size_t)hh * e->max_seq;
+            uint32_t kv_head = hh * n_kv / n_heads;
+            const float* qh = q + (size_t)hh * hd;
+            uint32_t s, jj;
+            for (s = 0; s <= pos; s++) {
+                const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+                float acc = 0.0f;
+                for (jj = 0; jj < hd; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
+                att_h[s] = acc * inv_d;
+            }
+            softmax(att_h, pos + 1);
+            float* out = att_out + (size_t)hh * hd;
+            memset(out, 0, (size_t)hd * 4);
+            for (s = 0; s <= pos; s++) {
+                const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+                float a = att_h[s];
+                for (jj = 0; jj < hd; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+            }
+        }
+        /* gate 门控: att_out *= sigmoid(gate) */
+        for (ii = 0; ii < qdim; ii++)
+            att_out[ii] *= 1.0f / (1.0f + expf(-gate[ii]));
+
+        memcpy(x2, att_out, (size_t)qdim * 4);
+        matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, qdim, mt[SLOT_O].dtype);
+        uint32_t j;
+        for (j = 0; j < hidden; j++) x[j] += att_out[j];
+        rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
+        float* fg = e->ffn;
+        float* fu = e->ffn + inter;
+        matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+        matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        swiglu(x2, fg, fu, inter);
+        matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
+        for (j = 0; j < hidden; j++) x[j] += att_out[j];
+    }
+    return 0;
+}
+
 static int forward_block(Engine* e, uint32_t layer, uint32_t pos)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
+    if (h->arch == ARCH_QWEN35) return fwd_block_qwen35(e, layer, pos);
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
     uint32_t hidden = h->hidden;
     uint32_t kv_dim = h->n_kv_heads * h->head_dim;
@@ -628,6 +917,7 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
         case DT_Q4K: embed_q4k(e->x, base + tm->offset, token, h->hidden); break;
         case DT_Q6K: embed_q6k(e->x, base + tm->offset, token, h->hidden); break;
+        case DT_Q5K: embed_q5k(e->x, base + tm->offset, token, h->hidden); break;
         case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
         default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
         }

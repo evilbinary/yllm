@@ -179,6 +179,38 @@ static void q6k_block(float* y, const uint8_t* blk)
     }
 }
 
+/* Q5_K 块反量化到 y[256] (176 B/256). 布局: d(f16,0) dmin(f16,2) scales(4,12B)
+   qh(16,32B) qs(48,128B). 每 64 元素一轮, 用 2 个 6-bit scale/min. */
+static void q5k_block(float* y, const uint8_t* blk)
+{
+    const float d = f16_to_f32(((const uint16_t*)blk)[0]);
+    const float min = f16_to_f32(((const uint16_t*)blk)[1]);
+    const uint8_t* sc = blk + 4;
+    const uint8_t* qh = blk + 16;
+    const uint8_t* qs = blk + 48;
+    uint32_t is = 0;
+    uint32_t u1 = 1, u2 = 2;
+    uint32_t r;
+    for (r = 0; r < 4; r++) {
+        uint8_t dsc, dm;
+        float d1, m1, d2, m2;
+        if (is + 0 < 4) { dsc = sc[is + 0] & 63; dm = sc[is + 4] & 63; }
+        else { dsc = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); dm = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+        d1 = d * (float)dsc; m1 = min * (float)dm;
+        if (is + 1 < 4) { dsc = sc[is + 1] & 63; dm = sc[is + 5] & 63; }
+        else { dsc = (sc[is + 5] & 0xF) | ((sc[is - 3] >> 6) << 4); dm = (sc[is + 5] >> 4) | ((sc[is + 1] >> 6) << 4); }
+        d2 = d * (float)dsc; m2 = min * (float)dm;
+        uint32_t l;
+        for (l = 0; l < 32; l++) {
+            float qv1 = (float)((qs[l] & 0xF) + ((qh[l] & u1) ? 16 : 0));
+            float qv2 = (float)((qs[l] >> 4) + ((qh[l] & u2) ? 16 : 0));
+            y[r * 64 + l]     = d1 * qv1 - m1;
+            y[r * 64 + l + 32] = d2 * qv2 - m2;
+        }
+        qs += 32; is += 2; u1 <<= 2; u2 <<= 2;
+    }
+}
+
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t nb = in / 256;
@@ -209,6 +241,37 @@ void embed_iq4xs(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
     for (b = 0; b < nb; b++) {
         float d = f16_to_f32(((const uint16_t*)r)[0]);
         iq4xs_block(y + (size_t)b * 256, r + (size_t)b * 144, d);
+    }
+}
+
+void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    uint32_t nb = in / 256;
+    uint32_t rowb = nb * 176;
+    float tmp[256];
+    uint32_t oo;
+    #pragma omp parallel for schedule(static)
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            q5k_block(tmp, row + (size_t)b * 176);
+            const float* xb = x + (size_t)b * 256;
+            uint32_t e;
+            for (e = 0; e < 256; e++) acc += xb[e] * tmp[e];
+        }
+        y[oo] = acc;
+    }
+}
+
+void embed_q5k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    const uint8_t* r = w + (size_t)row * nb * 176;
+    uint32_t b;
+    for (b = 0; b < nb; b++) {
+        q5k_block(y + (size_t)b * 256, r + (size_t)b * 176);
     }
 }
 
@@ -489,6 +552,7 @@ void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t i
     case DT_F32: matmul_f32(y, x, w, out, in); break;
     case DT_Q4K: matmul_q4k(y, x, w, out, in); break;
     case DT_Q6K: matmul_q6k(y, x, w, out, in); break;
+    case DT_Q5K: matmul_q5k(y, x, w, out, in); break;
     case DT_IQ4XS: matmul_iq4xs(y, x, w, out, in); break;
     default: matmul_f16(y, x, w, out, in); break;
     }
@@ -505,7 +569,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
 {
     uint32_t nb = in / 256;
     uint32_t oo;
-    const uint32_t blk = (dtype == DT_Q6K) ? 210 : 144;
+    const uint32_t blk = (dtype == DT_Q6K) ? 210 : (dtype == DT_Q5K) ? 176 : 144;
     if (dtype == DT_F32 || dtype == DT_F16) {
         /* f32/f16: 逐 token 点积 */
         #pragma omp parallel for schedule(static)
@@ -538,6 +602,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
             const uint8_t* bp = row + (size_t)b * blk;
             if (dtype == DT_Q4K) q4k_block(tmp, bp, 0);
             else if (dtype == DT_Q6K) q6k_block(tmp, bp);
+            else if (dtype == DT_Q5K) q5k_block(tmp, bp);
             else iq4xs_block(tmp, bp, f16_to_f32(((const uint16_t*)bp)[0]));
             for (g = 0; g < B; g++) {
                 const float* xg = x + (size_t)g * in + (size_t)b * 256;
@@ -595,6 +660,34 @@ void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
         v[j] = a * c - b * s;
         v[j + half] = a * s + b * c;
     }
+}
+
+/* M-RoPE(qwen35 纯文本): 只作用前 n_dims 维, interleaved pair(v[i], v[i+head_dim/2]) */
+void rope_inplace_mrope(float* v, uint32_t head_dim, uint32_t n_dims, uint32_t pos, float theta)
+{
+    uint32_t half = head_dim / 2;
+    uint32_t pairs = n_dims / 2;
+    uint32_t j;
+    for (j = 0; j < pairs; j++) {
+        float freq = powf(theta, -2.0f * (float)j / (float)n_dims);
+        float ang = freq * (float)pos;
+        float c = cosf(ang);
+        float s = sinf(ang);
+        float a = v[j];
+        float b = v[j + half];
+        v[j] = a * c - b * s;
+        v[j + half] = a * s + b * c;
+    }
+}
+
+/* L2 归一化(就地): y = x / max(sqrt(Σx²), eps) */
+void l2norm_inplace(float* v, uint32_t n, float eps)
+{
+    float s = 0.0f;
+    uint32_t i;
+    for (i = 0; i < n; i++) s += v[i] * v[i];
+    float scale = 1.0f / fmaxf(sqrtf(s), eps);
+    for (i = 0; i < n; i++) v[i] *= scale;
 }
 
 void softmax(float* v, uint32_t n)

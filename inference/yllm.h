@@ -108,6 +108,10 @@ typedef struct {
     float* ffn;
     float* att;
     float* logits;
+    /* qwen35(混合架构)专用: 每 GDN 层固定大小 O(1) 状态 */
+    float* ssm_state;   /* [n_gdn × n_vheads × head_v_dim²] 递归状态 S */
+    float* ssm_conv;    /* [n_gdn × (conv_kernel-1) × conv_channels] conv1d 延迟线 */
+    float* scratch;     /* GDN/attention 层临时工作区 */
     /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
     float* pb;      /* [PB_MAX × hidden]  输入/残差 */
     float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */
