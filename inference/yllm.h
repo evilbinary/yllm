@@ -22,11 +22,6 @@ typedef struct {
     uint64_t resident;      /* 当前估算驻留字节 */
     uint32_t budget_layers; /* 层数预算(字节预算按平均层大小折算, 自适应微调) */
     long last_majflt;       /* 上次 getrusage majflt(缺页反馈) */
-#if YLLM_TENSOR_STREAM
-    uint8_t* tstate;        /* 每张量状态: 0=未用 1=已算/驻留 2=已释放(每 token 清零) */
-    uint64_t* tsize;        /* 每张量字节 */
-    uint32_t n_tensor;      /* 总张量槽位数 = n_layers * BLOCK_TENSORS */
-#endif
     int depth;
     void* worker;
     void* worker_th;
@@ -75,7 +70,7 @@ void ws_prefetch(const Ws* ws, uint32_t layer);
 void ws_release(const Ws* ws, uint32_t layer);
 #if YLLM_TENSOR_STREAM
 void ws_prefetch_range(const Ws* ws, uint64_t off, uint64_t sz);
-void ws_release_range(const Ws* ws, uint64_t off, uint64_t sz);
+void ws_release_aligned(const Ws* ws, uint64_t off, uint64_t sz);
 #endif
 int wmap_resident(const WMap* m, uint64_t off, uint64_t sz);
 const void* ws_layer_ptr(const Ws* ws, uint32_t layer);
