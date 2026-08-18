@@ -662,11 +662,11 @@ void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
     }
 }
 
-/* M-RoPE(qwen35 纯文本): 只作用前 n_dims 维, interleaved pair(v[i], v[i+head_dim/2]) */
+/* M-RoPE(qwen35 纯文本): 只作用前 n_dims 维, interleaved pair (v[i], v[i+n_dims/2]) */
 void rope_inplace_mrope(float* v, uint32_t head_dim, uint32_t n_dims, uint32_t pos, float theta)
 {
-    uint32_t half = head_dim / 2;
-    uint32_t pairs = n_dims / 2;
+    uint32_t n_offset = n_dims / 2;  /* 32 */
+    uint32_t pairs = n_dims / 2;     /* 32 */
     uint32_t j;
     for (j = 0; j < pairs; j++) {
         float freq = powf(theta, -2.0f * (float)j / (float)n_dims);
@@ -674,9 +674,9 @@ void rope_inplace_mrope(float* v, uint32_t head_dim, uint32_t n_dims, uint32_t p
         float c = cosf(ang);
         float s = sinf(ang);
         float a = v[j];
-        float b = v[j + half];
+        float b = v[j + n_offset];
         v[j] = a * c - b * s;
-        v[j + half] = a * s + b * c;
+        v[j + n_offset] = a * s + b * c;
     }
 }
 
@@ -688,6 +688,77 @@ void l2norm_inplace(float* v, uint32_t n, float eps)
     for (i = 0; i < n; i++) s += v[i] * v[i];
     float scale = 1.0f / fmaxf(sqrtf(s), eps);
     for (i = 0; i < n; i++) v[i] *= scale;
+}
+
+/* conv1d 更新(qwen35 GDN, 因果无 bias):
+ * state 为 [kwidth × dim] 延迟线(末行 = 当前输入 x);
+ * 先把 x 滑入末行, 再输出 out[ch] = Σ_i state[i*dim+ch] × w[i*dim+ch] 写回 x。
+ * 注意: x 已被拷入 state 末行, 故可安全就地写回。 */
+void conv1d_update(float* state, const float* x, const uint8_t* w, uint32_t dim, uint32_t kwidth)
+{
+    uint32_t i, ch;
+    memmove(state, state + dim, (size_t)(kwidth - 1) * dim * 4);
+    memcpy(state + (size_t)(kwidth - 1) * dim, x, (size_t)dim * 4);
+    const float* wf = (const float*)w;
+    for (ch = 0; ch < dim; ch++) {
+        float acc = 0.0f;
+        for (i = 0; i < kwidth; i++)
+            acc += state[(size_t)i * dim + ch] * wf[(size_t)i * dim + ch];
+        ((float*)x)[ch] = acc;
+    }
+}
+
+/* GDN 递归状态更新 + 注意力输出(qwen35):
+ * 每 v_head h 复用 k_head = h % num_k_heads 的 q/k;
+ * S 存储转置 S[j*hv+i] = Smat[i][j];
+ * g=exp(gate[h]); S*=g; delta[j]=(v[j]-dot(S列j,k))*beta[h]; S列j+=k*delta[j];
+ * out[j] = dot(S列j,q) * (1/sqrt(hv))。 */
+void gdn_state_update(float* S, float* out, const float* q, const float* k,
+                      const float* v, const float* gate, const float* beta,
+                      uint32_t num_k_heads, uint32_t hk, uint32_t n_vheads, uint32_t hv)
+{
+    const float scale = 1.0f / sqrtf((float)hv);
+    uint32_t h, j, ii;
+    for (h = 0; h < n_vheads; h++) {
+        uint32_t kh = h % num_k_heads;
+        const float* qh = q + (size_t)kh * hk;
+        const float* khv = k + (size_t)kh * hk;
+        const float* vh = v + (size_t)h * hv;
+        float* Sh = S + (size_t)h * hk * hv;
+        float* oh = out + (size_t)h * hv;
+        float g = expf(gate[h]);
+        float b = beta[h];
+        for (j = 0; j < hv; j++) {
+            float* Sj = Sh + (size_t)j * hv;
+            float dot = 0.0f, del;
+            for (ii = 0; ii < hk; ii++) { Sj[ii] *= g; dot += Sj[ii] * khv[ii]; }
+            del = (vh[j] - dot) * b;
+            for (ii = 0; ii < hk; ii++) Sj[ii] += khv[ii] * del;
+        }
+        for (j = 0; j < hv; j++) {
+            const float* Sj = Sh + (size_t)j * hv;
+            float dot = 0.0f;
+            for (ii = 0; ii < hk; ii++) dot += Sj[ii] * qh[ii];
+            oh[j] = dot * scale;
+        }
+    }
+}
+
+/* rmsnorm_gated: y = rmsnorm(x, w) * silu(z), 逐维; y 可与 x 同缓冲 */
+void rmsnorm_gated(float* y, const float* x, const uint8_t* w, const float* z,
+                   uint32_t n, float eps, uint32_t dtype)
+{
+    float s = 0.0f;
+    uint32_t i;
+    for (i = 0; i < n; i++) s += x[i] * x[i];
+    float inv = 1.0f / sqrtf(s / (float)n + eps);
+    const float* wf = (dtype == DT_F32) ? (const float*)w : NULL;
+    const uint16_t* wh = (dtype == DT_F32) ? NULL : (const uint16_t*)w;
+    for (i = 0; i < n; i++) {
+        float wgt = wf ? wf[i] : f16_to_f32(wh[i]);
+        float zg = z[i];
+        y[i] = x[i] * wgt * inv * (zg / (1.0f + expf(-zg)));
+    }
 }
 
 void softmax(float* v, uint32_t n)

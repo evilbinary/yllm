@@ -23,6 +23,12 @@ void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta);
 void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta);
 void rope_inplace_mrope(float* v, uint32_t head_dim, uint32_t n_dims, uint32_t pos, float theta);
 void l2norm_inplace(float* v, uint32_t n, float eps);
+void conv1d_update(float* state, const float* x, const uint8_t* w, uint32_t dim, uint32_t kwidth);
+void gdn_state_update(float* S, float* out, const float* q, const float* k,
+                      const float* v, const float* gate, const float* beta,
+                      uint32_t num_k_heads, uint32_t hk, uint32_t n_vheads, uint32_t hv);
+void rmsnorm_gated(float* y, const float* x, const uint8_t* w, const float* z,
+                   uint32_t n, float eps, uint32_t dtype);
 void softmax(float* v, uint32_t n);
 void swiglu(float* y, const float* gate, const float* up, uint32_t n);
 

@@ -432,13 +432,11 @@ static int gg_slot_for(const char* name, int* layer)
 int convert_gguf(const char* in_path, const char* out_path, const char* vocab_out,
                  uint32_t max_seq, char* err, size_t errlen)
 {
-    uint64_t fsize = 0;
-    if (yfile_size(in_path, &fsize) != 0) { snprintf(err, errlen, "cannot open %s", in_path); return -1; }
-    uint8_t* data = (uint8_t*)ymalloc((size_t)fsize);
-    FILE* f = fopen(in_path, "rb");
-    if (!f) { free(data); snprintf(err, errlen, "cannot open %s", in_path); return -1; }
-    if (fread(data, 1, (size_t)fsize, f) != fsize) { fclose(f); free(data); snprintf(err, errlen, "read failed"); return -1; }
-    fclose(f);
+    /* 省内存模式: 只读 mmap 整个 gguf, 不整读进堆(17GB 模型避免 OOM) */
+    WMap gmap;
+    if (wmap_open(in_path, &gmap) != 0) { snprintf(err, errlen, "cannot open %s", in_path); return -1; }
+    uint8_t* data = (uint8_t*)gmap.base;
+    uint64_t fsize = gmap.size;
 
     GB b;
     b.p = data;
@@ -446,7 +444,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     b.err = 0;
     b.be = 0;
     if (fsize < 8 || memcmp(b.p, "GGUF", 4) != 0) {
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "not a gguf file");
         return -1;
     }
@@ -459,7 +457,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         ver = gb_u32(&b);
     }
     if (ver < 1 || ver > 3) {
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "unsupported gguf version %u (need 1, 2 or 3)", ver);
         return -1;
     }
@@ -494,7 +492,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         free(g.tokens);
         free(g.scores);
         free(g.chat_template);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "bad gguf kv section");
         return -1;
     }
@@ -504,7 +502,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
-        free(g.arch); free(data);
+        free(g.arch); wmap_close(&gmap);
         return -1;
     }
     /* qwen2/qwen3/qwen35: 同构(interleaved RoPE, 无 head 输出 bias; qwen3 连 attention bias 都没有,
@@ -517,7 +515,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         free(g.tokens);
         free(g.scores);
         free(g.chat_template);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "missing model dims in metadata");
         return -1;
     }
@@ -527,7 +525,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         free(g.tokens);
         free(g.scores);
         free(g.chat_template);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "hidden %u not divisible by heads %u", g.hidden, g.heads);
         return -1;
     }
@@ -536,7 +534,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         free(g.tokens);
         free(g.scores);
         free(g.chat_template);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "hidden %u not divisible by 256 (required for K-quants)", g.hidden);
         return -1;
     }
@@ -564,7 +562,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     if (b.err) {
         for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
         free(list.t);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "bad gguf tensor section");
         return -1;
     }
@@ -572,7 +570,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     if (g.alignment && (g.alignment < 8 || (g.alignment & (g.alignment - 1)) != 0)) {
         for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
         free(list.t);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "bad general.alignment %u (must be >=8 and a power of two)", g.alignment);
         return -1;
     }
@@ -583,7 +581,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     if (data_start > fsize) {
         for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
         free(list.t);
-        free(data);
+        wmap_close(&gmap);
         snprintf(err, errlen, "gguf data section out of range");
         return -1;
     }
@@ -626,7 +624,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
                 free(keep.t);
                 while (i < (uint64_t)list.n) free(list.t[i++].name);
                 free(list.t);
-                free(data);
+                wmap_close(&gmap);
                 snprintf(err, errlen, "gguf tensor '%s' data out of range (truncated file?)", t->name);
                 return -1;
             }
@@ -636,7 +634,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         list = keep;
     }
 
-    ConvItem* items = (ConvItem*)ymalloc((size_t)list.n * sizeof(ConvItem));
+    ConvItem* items = (ConvItem*)ymalloc((size_t)list.n * 2 * sizeof(ConvItem));
     int n = 0;
     for (i = 0; i < (uint64_t)list.n; i++) {
         int layer;
@@ -657,8 +655,26 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         items[n].src = data + data_start + t->offset;
         items[n].src_off = 0;
         n++;
+        if (is_qwen35 && slot == SLOT_Q && t->ndims == 2 && t->dims[0] == 2 * g.hidden) {
+            /* qwen35 attention 层: attn_q = [q|gate] 拼接(2×hidden 输出行)。
+               转换期拆两半: 前 hidden 行 → SLOT_Q, 后 hidden 行 → SLOT_QGATE */
+            uint64_t half = t->nbytes / 2;
+            items[n - 1].shape[0] = g.hidden;
+            items[n - 1].nbytes = half;
+            items[n].layer = items[n - 1].layer;
+            items[n].slot = SLOT_QGATE;
+            items[n].dtype = items[n - 1].dtype;
+            items[n].ndim = 2;
+            items[n].shape[0] = g.hidden;
+            items[n].shape[1] = items[n - 1].shape[1];
+            items[n].nbytes = half;
+            snprintf(items[n].name, sizeof(items[n].name), "%s.gate", t->name);
+            items[n].src = items[n - 1].src;
+            items[n].src_off = half;
+            n++;
+        }
     }
-    if (n == 0) { free(items); free(list.t); free(data); snprintf(err, errlen, "no recognized tensors"); return -1; }
+    if (n == 0) { free(items); free(list.t); wmap_close(&gmap); snprintf(err, errlen, "no recognized tensors"); return -1; }
 
     {
         int p2;
@@ -696,7 +712,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         }
         if (missing) {
             for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
-            free(list.t); free(items); free(data);
+            free(list.t); free(items); wmap_close(&gmap);
             snprintf(err, errlen, "some transformer tensors missing from gguf");
             return -1;
         }
@@ -735,7 +751,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
     }
     if (h.vocab == 0) {
         for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
-        free(list.t); free(items); free(data);
+        free(list.t); free(items); wmap_close(&gmap);
         snprintf(err, errlen, "cannot determine vocab size");
         return -1;
     }
@@ -806,6 +822,6 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
     for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
     free(list.t);
     free(items);
-    free(data);
+    wmap_close(&gmap);
     return rc;
 }

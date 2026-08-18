@@ -9,7 +9,7 @@
 log: logs/serve.log
 log-level: info
 
-bin: ./build/avx2/yllm
+bin: ./build/avx2/yllm.exe
 
 # 端口(模型 mi 的 rank 基址 = rank-port-base + mi*stride, server 端口 = server-port + mi*stride)
 sv-port: 9500          # supervisor 心跳口
@@ -38,7 +38,7 @@ models:
   - name: tinyllama
     model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
     vocab: models/tinyllama.vocab.txt
-    ranks: 2             # 本模型 rank 进程数(0 = 外部部署)
+    ranks: 1             # 本模型 rank 进程数
   - name: qwen2.5
     model: models/qwen2.5-1.5b.llf
     vocab: models/qwen2.5.vocab.txt

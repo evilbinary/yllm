@@ -1,0 +1,21 @@
+log: logs/serve.log
+log-level: info
+bin: ./build/avx2/yllm.exe
+sv-port: 9500
+router-port: 9400
+server-port: 9420
+rank-port-base: 9410
+http-port: 8000
+cache-dir: ./sessions
+sv-host: 127.0.0.1
+router-addrs: 127.0.0.1:9400
+servers: 1
+auto-heal: 1
+strategy: least
+lease-strategy: request
+models:
+  - name: tinyllama
+    model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
+    vocab: models/tinyllama.vocab.txt
+    ranks: 4             # 本模型总段数
+    local: 1             # 本机(Windows)只自动拉 rank0, 其余段(含 Windows rank1)手动拉起

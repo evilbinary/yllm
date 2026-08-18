@@ -94,12 +94,16 @@ int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* 
                          int n_msgs, uint32_t* ids, int max, int add_bos);
 int vocab_has_template(Vocab* v);
 /* ---- 引擎 ---- */
-typedef struct {
+typedef struct Engine {
     Ws ws;
     uint16_t* kv;
     uint32_t kv_dim;
     uint32_t max_seq;
     uint32_t inter;   /* FFN 中间维度(gate/up 输出宽) */
+    uint32_t arch;    /* 架构(ARCH_LLAMA/ARCH_QWEN/ARCH_QWEN35), engine_init 从 header 读入 */
+    /* 层前向分派(engine_init 填一次): 不同架构挂不同实现 */
+    int (*fwd_block)(struct Engine* e, uint32_t layer, uint32_t pos);
+    int (*fwd_block_batch)(struct Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
     uint32_t layer_begin; /* 分布式分片: 本进程层区间 [begin, end) */
     uint32_t layer_end;
     float* x;
