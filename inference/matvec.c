@@ -280,6 +280,62 @@ void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t rowb = nb * 176;
     float* xq = (float*)alloca((size_t)in * 4);
     q8k_quant(x, xq, in);
+#ifdef __AVX2__
+    #pragma omp parallel for schedule(static)
+    for (uint32_t oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        __m256 acc_v = _mm256_setzero_ps();
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 176;
+            const float* xp = xq + (size_t)b * 256;
+            float d    = f16_to_f32(((const uint16_t*)blk)[0]);
+            float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
+            const uint8_t* scp = blk + 4;
+            const uint8_t* qh = blk + 16;
+            const uint8_t* qs = blk + 48;
+            if (b + 1 < nb) _mm_prefetch((const char*)(blk + 176), _MM_HINT_T0);
+            uint32_t r;
+            for (r = 0; r < 4; r++) {
+                uint32_t is = 2 * r;
+                uint8_t dsc, dm;
+                get_scale_min_k4(is, scp, &dsc, &dm);
+                float d1 = d * (float)dsc, m1 = dmin * (float)dm;
+                get_scale_min_k4(is + 1, scp, &dsc, &dm);
+                float d2 = d * (float)dsc, m2 = dmin * (float)dm;
+                uint8_t bit1 = (uint8_t)(1u << (2 * r));
+                uint8_t bit2 = (uint8_t)(2u << (2 * r));
+                __m256 d1v = _mm256_set1_ps(d1), m1v = _mm256_set1_ps(m1);
+                __m256 d2v = _mm256_set1_ps(d2), m2v = _mm256_set1_ps(m2);
+                __m128i b1m = _mm_set1_epi8((char)bit1);
+                __m128i b2m = _mm_set1_epi8((char)bit2);
+                __m128i s16 = _mm_set1_epi8(16);
+                uint32_t l;
+                for (l = 0; l < 32; l += 8) {
+                    __m128i qs8 = _mm_loadu_si128((const __m128i*)(qs + l));
+                    __m128i qh8 = _mm_loadu_si128((const __m128i*)(qh + l));
+                    /* qv1 = (qs&0xF) + (bit1 set ? 16 : 0), qv2 = (qs>>4) + (bit2 ? 16:0) */
+                    __m128i lo = _mm_and_si128(qs8, _mm_set1_epi8(0x0F));
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(qs8, 4), _mm_set1_epi8(0x0F));
+                    __m128i b1 = _mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(qh8, b1m), b1m), s16);
+                    __m128i b2 = _mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(qh8, b2m), b2m), s16);
+                    __m128i qv1_8 = _mm_add_epi8(lo, b1);
+                    __m128i qv2_8 = _mm_add_epi8(hi, b2);
+                    /* xp 布局: qv1 -> r*64+l, qv2 -> r*64+32+l */
+                    __m256 x1 = _mm256_loadu_ps(xp + r * 64 + l);
+                    __m256 x2 = _mm256_loadu_ps(xp + r * 64 + 32 + l);
+                    __m256 q1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(qv1_8));
+                    __m256 q2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(qv2_8));
+                    acc_v = _mm256_fmadd_ps(d1v, _mm256_mul_ps(q1, x1), acc_v);
+                    acc_v = _mm256_fnmadd_ps(m1v, x1, acc_v);
+                    acc_v = _mm256_fmadd_ps(d2v, _mm256_mul_ps(q2, x2), acc_v);
+                    acc_v = _mm256_fnmadd_ps(m2v, x2, acc_v);
+                }
+            }
+        }
+        y[oo] = hsum_avx2(acc_v);
+    }
+#else
     uint32_t oo;
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
@@ -295,6 +351,7 @@ void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         }
         y[oo] = acc;
     }
+#endif
 }
 
 void embed_q5k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)

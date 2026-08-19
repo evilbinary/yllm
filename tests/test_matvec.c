@@ -139,6 +139,42 @@ static void test_matmul_q4k(void)
     CHECK_NEAR(y2[0], y[0], 1e-6, "matmul dispatch q4k");
 }
 
+/* ---- matmul_q5k: 2-block weight, known input ----
+ * 每 block 176 字节: d@[0], min@[1], sc@[4..15], qh@[16..47], qs@[48..175]。
+ * 4 组: 每组 qv1 = (qs&0xF)+(qh&u1?16:0), qv2 = (qs>>4)+(qh&u2?16:0)。
+ * 此处 d=1, min=0, 所有 sc=1(缩放 1, min 项因 min=0 归零):
+ *   row0: qs=0x11, qh=0 -> 每元素 1
+ *   row1: qs=0x21, qh=0 -> low nibble 1, high nibble 2
+ */
+static void test_matmul_q5k(void)
+{
+    uint8_t w[2 * 2 * 176];
+    uint32_t r, b, i;
+    for (r = 0; r < 2; r++) {
+        for (b = 0; b < 2; b++) {
+            uint8_t* blk = w + r * 2 * 176 + b * 176;
+            memset(blk, 0, 176);
+            blk[0] = 0x00; blk[1] = 0x3c; /* d = 1.0 */
+            blk[2] = 0x00; blk[3] = 0x00; /* min = 0 */
+            for (i = 0; i < 12; i++) blk[4 + i] = 0x01; /* scales=1, mins->0 */
+            for (i = 0; i < 128; i++) blk[48 + i] = (uint8_t)(r == 0 ? 0x11 : 0x21);
+            /* qh(blk+16..47) 保持 0 */
+        }
+    }
+    float x[512];
+    for (i = 0; i < 512; i++) x[i] = 1.0f;
+    float y[2];
+    matmul_q5k(y, x, w, 2, 512);
+    /* 每 block 256 元素: row0 全 1, row1 128*1 + 128*2; x=1 */
+    CHECK_NEAR(y[0], 256.0 * 2, 1e-3, "matmul_q5k row0 (all 1)");
+    CHECK_NEAR(y[1], (128.0 * 1 + 128.0 * 2) * 2, 1e-3, "matmul_q5k row1 (1/2 mix)");
+    /* 通过通用 dispatch */
+    float y2[2];
+    matmul(y2, x, w, 2, 512, DT_Q5K);
+    CHECK_NEAR(y2[0], y[0], 1e-6, "matmul dispatch q5k row0");
+    CHECK_NEAR(y2[1], y[1], 1e-6, "matmul dispatch q5k row1");
+}
+
 /* ---- matmul_q6k: synthetic blocks ---- */
 static void test_matmul_q6k(void)
 {
@@ -225,6 +261,8 @@ int main(void)
     test_embed_q4k();
     printf("running test_matmul_q4k...\n"); fflush(stdout);
     test_matmul_q4k();
+    printf("running test_matmul_q5k...\n"); fflush(stdout);
+    test_matmul_q5k();
     printf("running test_matmul_q6k...\n"); fflush(stdout);
     test_matmul_q6k();
     printf("running test_rmsnorm...\n"); fflush(stdout);
