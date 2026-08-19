@@ -238,12 +238,52 @@ void ws_release(const Ws* ws, uint32_t layer)
     uint64_t off = ws->model.dir[layer].offset;
     uint64_t sz = ws->model.dir[layer].size;
     if (sz == 0) return;
-    madvise((char*)ws->map.base + off, (size_t)sz, MADV_DONTNEED);
+    /* 丢 PTE、保页缓存: munmap + MAP_FIXED 重映射。
+     * 页缓存仍在 → 下次缺页是 minor fault(内存带宽级), 不会触发磁盘读。
+     * 层偏移/大小在 llf 写入时保证 4096 对齐。 */
+    uint8_t* p = (uint8_t*)ws->map.base + off;
+    if (munmap(p, (size_t)sz) == 0) {
+        void* r = mmap(p, (size_t)sz, PROT_READ, MAP_SHARED | MAP_FIXED,
+                       ws->map.fd, (off_t)off);
+        if (r == MAP_FAILED)
+            fprintf(stderr, "ws_release remap failed layer=%u\n", layer);
+    }
 #else
     (void)ws;
     (void)layer;
 #endif
 }
+
+#if YLLM_TENSOR_STREAM
+void ws_prefetch_range(const Ws* ws, uint64_t off, uint64_t sz)
+{
+#ifdef __linux__
+    if (sz == 0) return;
+    madvise((char*)ws->map.base + off, (size_t)sz, MADV_WILLNEED);
+#else
+    (void)ws; (void)off; (void)sz;
+#endif
+}
+
+/* 页对齐范围的 munmap+mmap 释放(要求 off 与 sz 均 4096 对齐)。
+ * 用于 lm_head 分块: 分块边界取整到页, 尾块保留驻留。 */
+void ws_release_aligned(const Ws* ws, uint64_t off, uint64_t sz)
+{
+#ifdef __linux__
+    if (sz == 0) return;
+    uint8_t* p = (uint8_t*)ws->map.base + off;
+    if (munmap(p, (size_t)sz) == 0) {
+        void* r = mmap(p, (size_t)sz, PROT_READ, MAP_SHARED | MAP_FIXED,
+                       ws->map.fd, (off_t)off);
+        if (r == MAP_FAILED)
+            fprintf(stderr, "ws_release_aligned remap failed off=%llu\n",
+                    (unsigned long long)off);
+    }
+#else
+    (void)ws; (void)off; (void)sz;
+#endif
+}
+#endif
 
 const void* ws_layer_ptr(const Ws* ws, uint32_t layer)
 {

@@ -38,6 +38,7 @@
 #else
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -655,11 +656,43 @@ static int peers_all_local(const char* peers)
     return 1;
 }
 
+/* --budget-auto: 预算 = min(模型大小, 可用内存 - 余量) */
+static uint64_t rank_auto_budget(ServeConfig* cfg)
+{
+    uint64_t avail = 0;
+#ifndef _WIN32
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "MemAvailable:", 13) == 0) {
+                uint64_t kb = 0;
+                sscanf(line + 13, "%llu", (unsigned long long*)&kb);
+                avail = kb * 1024;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    if (avail == 0) {
+        long avph = sysconf(_SC_AVPHYS_PAGES);
+        long pgsz = sysconf(_SC_PAGESIZE);
+        avail = (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
+    }
+#endif
+    struct stat st;
+    uint64_t model_bytes = stat(cfg->model, &st) == 0 ? (uint64_t)st.st_size : 0;
+    if (avail == 0) return model_bytes;
+    uint64_t reserve = avail / 8;
+    if (avail < (uint64_t)1024 * 1024 * 1024) reserve = avail / 4;
+    uint64_t cap = avail > reserve ? avail - reserve : avail / 2;
+    return model_bytes < cap ? model_bytes : cap;
+}
+
 int cmd_rank(ServeConfig* cfg)
 {
     if (!cfg->model[0]) {
-        fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "
-                        "[--supervisor <ip:port>] [--id <name>] "
+        fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N] "
                         "[--config <yaml>]\n");
         return 1;
@@ -733,6 +766,7 @@ int cmd_rank(ServeConfig* cfg)
     }
     char err[1024];
     uint64_t budget = (uint64_t)cfg->budget_mb * 1024 * 1024;
+    if (cfg->budget_auto) budget = rank_auto_budget(cfg);
     if (engine_init(&r.engine, cfg->model, budget, cfg->depth, err, sizeof(err)) != 0) {
         ylog_error("rank: engine init failed: %s", err);
         vocab_free(&r.vocab);

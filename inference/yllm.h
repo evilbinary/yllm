@@ -6,16 +6,21 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* 张量级流式: 受限模式下按张量粒度释放(当前层不再整层驻留),
+ * lm_head 按词汇行分块计算。默认开启, 编译期 -DYLLM_TENSOR_STREAM=0 关闭。 */
+#ifndef YLLM_TENSOR_STREAM
+#define YLLM_TENSOR_STREAM 1
+#endif
+
 typedef struct {
     WMap map;
     LlModel model;
     uint8_t* pstate;
-    uint8_t* hot;
     uint8_t* res;           /* mincore 真实驻留位图: 1=该层页缓存已驻留 */
     uint64_t* layer_size;
     uint64_t budget;        /* 字节预算(0=不限) */
     uint64_t resident;      /* 当前估算驻留字节 */
-    uint32_t budget_layers; /* 自适应层数预算(内存受限模式) */
+    uint32_t budget_layers; /* 层数预算(字节预算按平均层大小折算, 自适应微调) */
     long last_majflt;       /* 上次 getrusage majflt(缺页反馈) */
     int depth;
     void* worker;
@@ -63,6 +68,10 @@ int wmap_open(const char* path, WMap* m);
 void wmap_close(WMap* m);
 void ws_prefetch(const Ws* ws, uint32_t layer);
 void ws_release(const Ws* ws, uint32_t layer);
+#if YLLM_TENSOR_STREAM
+void ws_prefetch_range(const Ws* ws, uint64_t off, uint64_t sz);
+void ws_release_aligned(const Ws* ws, uint64_t off, uint64_t sz);
+#endif
 int wmap_resident(const WMap* m, uint64_t off, uint64_t sz);
 const void* ws_layer_ptr(const Ws* ws, uint32_t layer);
 

@@ -88,12 +88,21 @@ static void sched_enqueue(Worker* w, uint32_t begin, uint32_t end)
 
 static void sched_ensure(Ws* ws, uint32_t layer)
 {
+    if (ws->pstate[layer] == 4) ws->pstate[layer] = 0; /* 上轮已释放, 本轮重新武装 */
     if (ws->pstate[layer] != 0) return;
     if (ws->budget > 0 && ws->res[layer] == 1) {
         /* 页缓存已真实驻留 → 跳过预取 syscall(自适应跳过) */
         ws->pstate[layer] = 2;
         return;
     }
+#if YLLM_TENSOR_STREAM
+    /* 受限模式: 层大于预算时整层预取只会被立即释放(白读磁盘),
+     * 改为按需缺页(张量级释放会把已算完的张量立即 DONTNEED)。 */
+    if (ws->budget > 0 && ws->layer_size[layer] > ws->budget) {
+        ws->pstate[layer] = 2;
+        return;
+    }
+#endif
     ws_prefetch(ws, layer);
     ws->pstate[layer] = 2;
     ws->resident += ws->layer_size[layer];
@@ -112,7 +121,8 @@ static void sched_refresh_resident(Ws* ws)
     ws->resident = tot;
 }
 
-/* 预算自适应(§3.6): 缺页太多且内存富余 → 多驻留一层; 内存告急 → 缩驻留 */
+/* 预算自适应: 缺页太多且内存富余 → 多驻留一层(减重读); 内存告急 → 缩驻留。
+ * 只调层数上限 budget_layers; 字节上限由 sched_release_budget 的 bytes <= budget 硬约束保证。 */
 static void sched_adapt_budget(Ws* ws)
 {
 #ifndef _WIN32
@@ -144,14 +154,18 @@ static void sched_release_budget(Ws* ws, uint32_t cur)
         uint32_t n = 0;
         uint64_t bytes = 0;
         for (i = 0; i < ws->model.n_layers; i++) {
-            if (ws->pstate[i] == 2) { n++; bytes += ws->layer_size[i]; }
+            /* 已预取(pstate==2)或已算过(pstate==3)的层都算占用;
+             * pstate==4 已释放, 不计入(否则统计永不下降 → 死循环) */
+            if (ws->pstate[i] == 2 || ws->pstate[i] == 3) {
+                n++; bytes += ws->layer_size[i];
+            }
         }
         if (n <= ws->budget_layers && bytes <= ws->budget) return;
         int found = 0;
         for (i = 0; i < cur; i++) {
-            if (ws->pstate[i] == 2 && !ws->hot[i]) {
+            if (ws->pstate[i] == 2 || ws->pstate[i] == 3) {
                 ws_release(ws, i);
-                ws->pstate[i] = 3;
+                ws->pstate[i] = 4;
                 ws->res[i] = 0;
                 ws->resident -= ws->layer_size[i];
                 found = 1;
@@ -169,6 +183,19 @@ static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos);
 static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
 static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos);
 static int fwd_block_qwen35_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
+#if YLLM_TENSOR_STREAM
+/* 页对齐的 lm_head 分块行数: 最大 C <= max_rows 使 C*行字节 % 4096 == 0。
+ * 非量化(整行矩阵)返回 0 → 不分块整算。 */
+static uint32_t head_chunk_rows(size_t rbytes, uint32_t max_rows)
+{
+    if (rbytes == 0) return 0;
+    uint64_t g = 4096, r = rbytes;
+    while (r) { uint64_t t = g % r; g = r; r = t; }
+    uint64_t per = 4096 / g; /* 页对齐的最小行数 */
+    uint64_t c = (uint64_t)max_rows / per * per;
+    return c >= per ? (uint32_t)c : 0;
+}
+#endif
 
 int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, char* err, size_t errlen)
 {
@@ -185,15 +212,14 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     ws->budget = budget;
+    
     ws->depth = depth > 0 ? depth : 2;
     ws->pstate = (uint8_t*)ycalloc(m->n_layers, 1);
-    ws->hot = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->res = (uint8_t*)ycalloc(m->n_layers, 1);
     ws->layer_size = (uint64_t*)ymalloc((size_t)m->n_layers * 8);
     uint32_t i;
     for (i = 0; i < m->n_layers; i++) {
         ws->layer_size[i] = m->dir[i].size;
-        if (i == 0 || i == m->h.n_blocks + 1 || i == m->h.n_blocks + 2) ws->hot[i] = 1;
     }
     /* 自适应层预算初值: 由字节预算按平均层大小折算 */
     ws->budget_layers = m->n_layers;
@@ -325,7 +351,6 @@ void engine_free(Engine* e)
     if (e->scratch) free(e->scratch);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
-    if (e->ws.hot) free(e->ws.hot);
     if (e->ws.res) free(e->ws.res);
     if (e->ws.layer_size) free(e->ws.layer_size);
     free(w);
@@ -524,8 +549,11 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             }
         }
         uint32_t i;
-        for (i = 1; i <= h->n_blocks; i++)
+        for (i = 1; i <= h->n_blocks; i++) {
+            if (ws->budget > 0) sched_ensure(ws, i);
             e->fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
+            if (ws->budget > 0) sched_release_budget(ws, i);
+        }
         /* 最后一层: final norm + output(只算最后 token) */
         {
             const LlfTensorMeta* fn = &m->metas[m->base_idx[h->n_blocks + 1]];
@@ -536,8 +564,41 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
                 float* xlast = e->pb + (size_t)(nb - 1) * hidden;
                 rmsnorm(e->x, xlast, base + m->dir[h->n_blocks + 1].offset + fn->offset,
                         hidden, eps, fn->dtype);
+#if YLLM_TENSOR_STREAM
+                /* 受限模式: 量化 lm_head 按页对齐行分块, 每块算完 munmap 释放
+                 * (页缓存保留, 下个 token 重读是 minor fault); 尾块保留驻留。 */
+                if (ws->budget > 0) {
+                    size_t rbytes = matmul_row_bytes(out->dtype, h->hidden);
+                    uint32_t dl = h->n_blocks + 2;
+                    uint32_t chunk = head_chunk_rows(rbytes,
+                        ws->budget < 32u * 1024 * 1024 ? 2048u : 4096u);
+                    if (chunk > 0) {
+                        uint32_t rows = 0;
+                        while (rows + chunk <= h->vocab) {
+                            matmul_rows(e->logits + rows, e->x,
+                                        base + m->dir[dl].offset + out->offset,
+                                        rows, chunk, h->hidden, h->vocab, out->dtype);
+                            ws_release_aligned(ws, m->dir[dl].offset + out->offset +
+                                                   (uint64_t)rows * rbytes,
+                                               (uint64_t)chunk * rbytes);
+                            rows += chunk;
+                        }
+                        if (rows < h->vocab)
+                            matmul_rows(e->logits + rows, e->x,
+                                        base + m->dir[dl].offset + out->offset,
+                                        rows, h->vocab - rows, h->hidden, h->vocab, out->dtype);
+                    } else {
+                        matmul(e->logits, e->x, base + m->dir[dl].offset + out->offset,
+                               h->vocab, hidden, out->dtype);
+                    }
+                } else {
+                    matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
+                           h->vocab, hidden, out->dtype);
+                }
+#else
                 matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
                        h->vocab, hidden, out->dtype);
+#endif
             }
         }
         off += (int)nb;
@@ -985,8 +1046,37 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
     } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-        if (tm->shape[0] == h->vocab) {
+        if (tm->ndim == 2 && tm->size >= (uint64_t)h->hidden * 4) {
+#if YLLM_TENSOR_STREAM
+            /* 受限模式: 量化 lm_head 按页对齐行分块, 每块算完 munmap 释放
+             * (页缓存保留, 下个 token 重读是 minor fault); 尾块保留驻留。 */
+            size_t rbytes = matmul_row_bytes(tm->dtype, h->hidden);
+            if (ws->budget > 0 && rbytes > 0) {
+                uint32_t chunk = head_chunk_rows(rbytes,
+                    ws->budget < 32u * 1024 * 1024 ? 2048u : 4096u);
+                if (chunk > 0) {
+                    uint32_t rows = 0;
+                    while (rows + chunk <= h->vocab) {
+                        matmul_rows(e->logits + rows, e->x, base + tm->offset,
+                                    rows, chunk, h->hidden, h->vocab, tm->dtype);
+                        ws_release_aligned(ws, m->dir[i].offset + tm->offset +
+                                                (uint64_t)rows * rbytes,
+                                            (uint64_t)chunk * rbytes);
+                        rows += chunk;
+                    }
+                    if (rows < h->vocab)
+                        matmul_rows(e->logits + rows, e->x, base + tm->offset,
+                                    rows, h->vocab - rows, h->hidden, h->vocab, tm->dtype);
+                } else {
+                    matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+                }
+                return;
+            }
             matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+            if (ws->budget > 0) ws_release(ws, i);
+#else
+            matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+#endif
         } else {
             switch (tm->dtype) {
             case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
@@ -1027,6 +1117,10 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
     }
     if (need_embed && e->layer_begin == 0) {
         forward_layer(e, 0, token, pos);
+#if YLLM_TENSOR_STREAM
+        /* embed 只在 prefill 用一次, 受限模式下算完即释放 */
+        if (ws->budget > 0) ws_release(ws, 0);
+#endif
     }
     for (i = e->layer_begin; i < e->layer_end; i++) {
         if (i == 0) continue; /* embed 已在上方处理 */
@@ -1040,8 +1134,31 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
                 if (ne > m->n_layers) ne = m->n_layers;
                 while (nb < ne && ws->pstate[nb] != 0) nb++;
                 if (nb < ne) {
+#if YLLM_TENSOR_STREAM
+                    if (ws->budget > 0) {
+                        /* 受限模式: 预取窗口累计字节 <= 预算(当前层已占预算)。
+                         * 放不下的层标 2 走按需缺页, 防止预取即被释放的白读。 */
+                        uint64_t acc = ws->layer_size[i];
+                        uint32_t nb2 = nb;
+                        while (nb2 < ne) {
+                            if (ws->layer_size[nb2] > ws->budget ||
+                                acc + ws->layer_size[nb2] > ws->budget) {
+                                ws->pstate[nb2] = 2;
+                                break;
+                            }
+                            acc += ws->layer_size[nb2];
+                            ws->pstate[nb2] = 1;
+                            nb2++;
+                        }
+                        if (nb2 > nb) sched_enqueue(w, nb, nb2);
+                    } else {
+                        ws->pstate[nb] = 1;
+                        sched_enqueue(w, nb, ne);
+                    }
+#else
                     ws->pstate[nb] = 1;
                     sched_enqueue(w, nb, ne);
+#endif
                 }
             }
         }
@@ -1251,5 +1368,17 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
 
 uint64_t engine_resident(const Engine* e)
 {
+#ifdef __linux__
+    /* mincore 对 MAP_SHARED 页缓存恒为 present(假象), 直接读真实 RSS */
+    long v = 0;
+    FILE* f = fopen("/proc/self/status", "r");
+    char l[256];
+    if (f) {
+        while (fgets(l, sizeof l, f))
+            if (!strncmp(l, "VmRSS:", 6)) { sscanf(l + 6, "%ld", &v); break; }
+        fclose(f);
+    }
+    if (v > 0) return (uint64_t)v * 1024;
+#endif
     return e->ws.resident;
 }

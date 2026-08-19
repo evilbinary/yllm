@@ -136,10 +136,11 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
     snprintf(cmd, sizeof(cmd),
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --rank %d --ranks %d --peers %s "
-             "--dist-fp16 %d "
+             "--dist-fp16 %d --budget-mb %d --budget-auto %d "
              "--cache-dir \"%s\" --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
              mi * model_stride(s) + r, r, ranks, peers, mc->dist_fp16,
+             s->budget_mb, s->budget_auto,
              s->cache_dir[0] ? s->cache_dir : ".", mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
     int pid = spawn_proc(cmd);
@@ -584,6 +585,8 @@ int cmd_supervisor(ServeConfig* cfg)
     s.rank_port_base = (uint16_t)cfg->rank_port_base;
     s.server_port_base = (uint16_t)cfg->server_port;
     s.auto_heal = cfg->auto_heal;
+    s.budget_mb = cfg->budget_mb;
+    s.budget_auto = cfg->budget_auto;
     snprintf(s.sv_host, sizeof(s.sv_host), "%s", cfg->sv_host);
     snprintf(s.bin, sizeof(s.bin), "%s", cfg->bin);
     if (cfg->model[0]) snprintf(s.model, sizeof(s.model), "%s", cfg->model);

@@ -594,6 +594,28 @@ void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t i
     }
 }
 
+void matmul_rows(float* y, const float* x, const uint8_t* w,
+                 uint32_t row_begin, uint32_t n_rows, uint32_t in, uint32_t out, uint32_t dtype)
+{
+    (void)out;
+    switch (dtype) {
+    case DT_Q4K:   matmul_q4k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
+    case DT_Q6K:   matmul_q6k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 210), n_rows, in); break;
+    case DT_IQ4XS: matmul_iq4xs(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
+    default:       matmul(y, x, w, n_rows, in, dtype); break;
+    }
+}
+
+size_t matmul_row_bytes(uint32_t dtype, uint32_t in)
+{
+    switch (dtype) {
+    case DT_Q4K:
+    case DT_IQ4XS: return (size_t)(in / 256) * 144;
+    case DT_Q6K:   return (size_t)(in / 256) * 210;
+    default:       return 0;   /* F16/F32 列主序, 行不连续, 不支持行分块 */
+    }
+}
+
 /* ---- 批量 matmul(批量 prefill 用): y[B×out] = x[B×in] · W^T
  * 每个输出行 oo: 同时算 B 个 token 的点积, 权重行只读一次(每 4 token 一组 SIMD)。 */
 /* ---- 批量 matmul(批量 prefill 用): y[B×out] = x[B×in] · W^T
