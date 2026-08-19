@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 static int fails = 0;
 
@@ -61,26 +66,40 @@ int main(void)
                 (sess_get(&c, "s3") != NULL) + (sess_get(&c, "s4") != NULL);
     CHECK(alive == 3, "exactly one evicted");
 
-    /* ---- 磁盘落盘 ---- */
+    /* ---- 磁盘落盘 ----
+     * 临时目录: Windows 用 TEMP(Win 下 "/tmp" 是盘符根的 \tmp, 父目录常不存在);
+     * POSIX 用 /tmp。父目录不存在时先创建, 否则 sess_save 的 fopen 会失败。 */
+    const char* t = getenv("TEMP");
+    char tdir[512], sp[640], kp[640];
+    if (t && *t) snprintf(tdir, sizeof(tdir), "%s/opencode", t);
+    else snprintf(tdir, sizeof(tdir), "/tmp/opencode");
+#ifndef _WIN32
+    mkdir(tdir, 0755);
+#else
+    _mkdir(tdir);
+#endif
+    snprintf(sp, sizeof(sp), "%s/sess_test.sess", tdir);
+    snprintf(kp, sizeof(kp), "%s/sess_test.kv", tdir);
+
     /* token 列表落盘/载入(用新条目, 避免 LRU 淘汰后的悬垂指针) */
     SessVal* v5 = sess_put(&c, "s9");
     static const uint32_t d5[] = {1, 2, 3, 4, 5, 6};
     sess_commit(v5, d5, 6);
-    sess_save(v5, "/tmp/opencode/sess_test.sess");
+    sess_save(v5, sp);
     SessVal v3;
     memset(&v3, 0, sizeof(v3));
-    CHECK(sess_load(&v3, "/tmp/opencode/sess_test.sess") == 0, "sess_load ok");
+    CHECK(sess_load(&v3, sp) == 0, "sess_load ok");
     CHECK(v3.n == 6, "loaded n==6");
     CHECK(v3.tokens[5] == 6, "loaded tokens");
     CHECK(memcmp(v3.tokens, v5->tokens, 6 * 4) == 0, "loaded == saved");
     free(v3.tokens);
     /* 错误 magic 拒绝 */
     {
-        FILE* bad = fopen("/tmp/opencode/sess_test.sess", "wb");
+        FILE* bad = fopen(sp, "wb");
         fwrite("NOPEXXXX", 1, 8, bad);
         fclose(bad);
         SessVal v4; memset(&v4, 0, sizeof(v4));
-        CHECK(sess_load(&v4, "/tmp/opencode/sess_test.sess") != 0, "bad magic rejected");
+        CHECK(sess_load(&v4, sp) != 0, "bad magic rejected");
     }
 
     /* KV 落盘/载入(最小 Engine 结构) */
@@ -94,10 +113,10 @@ int main(void)
         ee.kv = (uint16_t*)calloc((2 * hh.n_blocks + 1) * ee.max_seq * ee.kv_dim, 2);
         uint32_t total = (2 * hh.n_blocks + 1) * ee.max_seq * ee.kv_dim;
         for (uint32_t i = 0; i < total; i++) ee.kv[i] = (uint16_t)(i * 7);
-        CHECK(sess_kv_save(&ee, 5, "/tmp/opencode/sess_test.kv") == 0, "kv_save ok");
+        CHECK(sess_kv_save(&ee, 5, kp) == 0, "kv_save ok");
         memset(ee.kv, 0, (size_t)total * 2);
         uint32_t rp = 0;
-        CHECK(sess_kv_load(&ee, "/tmp/opencode/sess_test.kv", &rp) == 0, "kv_load ok");
+        CHECK(sess_kv_load(&ee, kp, &rp) == 0, "kv_load ok");
         CHECK(rp == 5, "kv loaded pos");
         int ok = 1;
         for (uint32_t l = 1; l <= hh.n_blocks; l++)   /* 落盘覆盖块 1..nb */

@@ -4,7 +4,6 @@
 #   远程节点手工起 rank1:
 #     yllm rank --model models/qwen3.8-27b.llf --vocab models/qwen3.vocab.txt --port 9411
 #               --rank 1 --ranks 2 --supervisor <本机IP>:9500 --id rank-1
-#               --peers 192.168.1.161,192.168.0.23
 # ranks: 该模型总段数; local: 本机拉起的段数(1 = 只 rank0 本地, 其余外部)
 
 log: logs/serve.log

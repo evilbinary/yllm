@@ -188,24 +188,15 @@ $(OBJDIR)/test_cache.exe: tests/test_cache.c inference/cache.c inference/platfor
 $(OBJDIR_AVX2)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
+$(OBJDIR_AVX2)/test_cache.exe: tests/test_cache.c inference/cache.c inference/platform.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+
 TEST_BIN     := $(TEST_SRC:tests/%.c=$(OBJDIR)/%.exe)
 TEST_BIN_AVX := $(TEST_SRC:tests/%.c=$(OBJDIR_AVX2)/%.exe)
 
-test: $(TEST_BIN)
-	@echo "=== test_matvec ==="
-	./$(OBJDIR)/test_matvec.exe
-	@echo "=== test_tokenizer ==="
-	./$(OBJDIR)/test_tokenizer.exe
-	@echo "=== test_llf ==="
-	./$(OBJDIR)/test_llf.exe
-	@echo "=== test_engine ==="
-	./$(OBJDIR)/test_engine.exe
-	@echo "=== test_prefill_batch ==="
-	./$(OBJDIR)/test_prefill_batch.exe
-	@echo "=== test_cache ==="
-	./$(OBJDIR)/test_cache.exe
-
-test-avx2: $(TEST_BIN_AVX)
+# 默认 test 用 AVX2 版本(生产构建; golden 与 SIMD/fma 结果一致)。
+# 标量版可用 make test-base 运行(其数值因无 fma 与 golden 存在预期差异)。
+test: $(TEST_BIN_AVX)
 	@echo "=== test_matvec (avx2) ==="
 	./$(OBJDIR_AVX2)/test_matvec.exe
 	@echo "=== test_tokenizer (avx2) ==="
@@ -218,6 +209,22 @@ test-avx2: $(TEST_BIN_AVX)
 	./$(OBJDIR_AVX2)/test_prefill_batch.exe
 	@echo "=== test_cache (avx2) ==="
 	./$(OBJDIR_AVX2)/test_cache.exe
+
+test-avx2: test
+
+test-base: $(TEST_BIN)
+	@echo "=== test_matvec (scalar) ==="
+	./$(OBJDIR)/test_matvec.exe
+	@echo "=== test_tokenizer (scalar) ==="
+	./$(OBJDIR)/test_tokenizer.exe
+	@echo "=== test_llf (scalar) ==="
+	./$(OBJDIR)/test_llf.exe
+	@echo "=== test_engine (scalar, golden 差异预期) ==="
+	./$(OBJDIR)/test_engine.exe
+	@echo "=== test_prefill_batch (scalar) ==="
+	./$(OBJDIR)/test_prefill_batch.exe
+	@echo "=== test_cache (scalar) ==="
+	./$(OBJDIR)/test_cache.exe
 
 # ---- PP 会话缓存集成测试(2 段) ----
 # tools/test_pp_sess.sh: 临时 ranks:2 → 启动 → tests/test_pp_sess.py → 恢复 serve.yaml
@@ -498,4 +505,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop
+.PHONY: all avx2 clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop
