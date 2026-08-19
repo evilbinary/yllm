@@ -34,6 +34,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <sys/stat.h>   /* rank_auto_budget 用 stat()/struct stat */
 #define ssize_t int
 #else
 #include <unistd.h>
