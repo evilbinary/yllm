@@ -44,6 +44,15 @@ static void fill_q5k(uint8_t* w, uint32_t out, uint32_t in)
         }
 }
 
+/* 64MB 刷洗缓冲: 每次 rep 前触碰, 赶出 L3 残留, 测真实 DRAM 带宽 */
+static char flushbuf[64 * 1024 * 1024];
+
+static int cmp_ms(const void* a, const void* b)
+{
+    double da = *(const double*)a, db = *(const double*)b;
+    return (da > db) - (da < db);
+}
+
 static void bench_one(const char* name, uint32_t out, uint32_t in, int dtype)
 {
     uint32_t rowb = (dtype == DT_Q5K) ? (in / 256) * 176 : (in / 256) * 144;
@@ -54,23 +63,23 @@ static void bench_one(const char* name, uint32_t out, uint32_t in, int dtype)
     uint32_t i;
     for (i = 0; i < in; i++) x[i] = (float)(rand() & 0xFF) / 100.0f - 1.0f;
 
-    /* warmup */
-    matmul(y, x, w, out, in, dtype);
-    int reps = 9;
-    double best = 1e30;
-    double t0 = now_ms();
+    matmul(y, x, w, out, in, dtype);   /* warmup */
+    uint32_t j;
+    for (j = 0; j < sizeof(flushbuf); j += 4096) flushbuf[j] = (char)j;  /* 驻留 */
+
+    int reps = 7;
+    double times[16];
     for (i = 0; i < (uint32_t)reps; i++) {
+        for (j = 0; j < sizeof(flushbuf); j += 64) flushbuf[j] ^= 1;     /* 刷洗 L3 */
         double s = now_ms();
         matmul(y, x, w, out, in, dtype);
-        double e = now_ms();
-        double dt = e - s;
-        if (dt < best) best = dt;
+        times[i] = now_ms() - s;
     }
-    double ms = (now_ms() - t0) / reps;
-    (void)ms;
+    qsort(times, (size_t)reps, sizeof(double), cmp_ms);
+    double med = times[reps / 2];
     double gb = (double)out * rowb / 1e9;
-    printf("%-8s out=%u in=%u  %.2f ms(best)  %6.2f GB/s  y[0]=%.4f\n",
-           name, out, in, best, gb / (best / 1000.0), y[0]);
+    printf("%-8s out=%u in=%u  %6.2f ms(med)  %6.2f GB/s  y[0]=%.4f\n",
+           name, out, in, med, gb / (med / 1000.0), y[0]);
     free(w); free(x); free(y);
 }
 
@@ -79,6 +88,7 @@ int main(void)
     /* 模拟模型 FFN 维度 */
     bench_one("q4k", 5120, 5120, DT_Q4K);
     bench_one("q4k", 13696, 5120, DT_Q4K);
+    bench_one("q4k", 25600, 5120, DT_Q4K);
     bench_one("q5k", 5120, 5120, DT_Q5K);
     bench_one("q5k", 13696, 5120, DT_Q5K);
     return 0;
