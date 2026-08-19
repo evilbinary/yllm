@@ -29,6 +29,8 @@ typedef struct {
     uint64_t nanos_wait_send;  /* 网络阻塞(send) 纳秒 */
     uint64_t nanos_wait_recv;  /* 网络阻塞(recv) 纳秒 */
     double elapsed_ms;        /* 运行总时长(ms), 供平均带宽计算 */
+    uint8_t peek_hdr[8];      /* 无会话握手时暂存的首帧头(worker 探测用) */
+    int has_peek;             /* 是否有暂存帧头待 recv_xb 消费 */
 } Dist;
 
 void dist_print_stats(Dist* d, const char* tag);

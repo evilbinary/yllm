@@ -348,7 +348,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         engine_forward_prefill(&r->engine, delta, (int)ndelta, r->cache_pos);
     r->cache_pos += ndelta;
     if (ndelta > 0)
-        ylog_info("prefill: %u tokens in %.2f s (%.1f tok/s)", ndelta,
+        ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", ndelta,
                (double)(ynow_ms() - t_prefill) / 1000.0,
                (double)ndelta * 1000.0 / (double)(ynow_ms() - t_prefill > 0 ? ynow_ms() - t_prefill : 1));
 
@@ -375,7 +375,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     tim.n_decode = ngen;
     tim.decode_ms = ynow_ms() - t_dec0;
 
-    ylog_info("decode:  %u tokens in %.2f s (%.1f tok/s)", ngen,
+    ylog_info("decode:  %u tokens in %.2f s (%.2f tok/s)", ngen,
            (double)(ynow_ms() - t_dec0) / 1000.0,
            (double)ngen * 1000.0 / (double)(ynow_ms() - t_dec0 > 0 ? ynow_ms() - t_dec0 : 1));
     ylog_info("rank: session=%s generate ok (%u delta + %u gen tokens, %llu ms)",

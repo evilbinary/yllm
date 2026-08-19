@@ -287,10 +287,10 @@ static int cmd_gen(int argc, char** argv)
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
-    ylog_info("prefill: %u tokens in %.2f s (%.1f tok/s)", tim.n_prefill,
+    ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", tim.n_prefill,
             (double)tim.prefill_ms / 1000.0,
             tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
-    ylog_info("decode:  %u tokens in %.2f s (%.1f tok/s)", tim.n_decode,
+    ylog_info("decode:  %u tokens in %.2f s (%.2f tok/s)", tim.n_decode,
             (double)tim.decode_ms / 1000.0,
             tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
     ylog_info("total:   %.2f s", (double)ms / 1000.0);
@@ -375,10 +375,10 @@ static int cmd_chat(int argc, char** argv)
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
-    ylog_info("prefill: %u tokens in %.2f s (%.1f tok/s)", tim.n_prefill,
+    ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", tim.n_prefill,
            (double)tim.prefill_ms / 1000.0,
            tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
-    ylog_info("decode:  %u tokens in %.2f s (%.1f tok/s)", tim.n_decode,
+    ylog_info("decode:  %u tokens in %.2f s (%.2f tok/s)", tim.n_decode,
            (double)tim.decode_ms / 1000.0,
            tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0);
     ylog_info("total:   %.2f s", (double)ms / 1000.0);

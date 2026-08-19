@@ -345,7 +345,13 @@ int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
         }
     }
     uint8_t hdr[8];
-    if (xrecv(d, fd, hdr, 8) != 0) return -1;
+    if (d->has_peek) {
+        /* 会话握手探测暂存的帧头: 直接消费, 不重复 recv */
+        memcpy(hdr, d->peek_hdr, 8);
+        d->has_peek = 0;
+    } else {
+        if (xrecv(d, fd, hdr, 8) != 0) return -1;
+    }
     uint32_t type, len;
     memcpy(&type, hdr, 4);
     memcpy(&len, hdr + 4, 4);
@@ -460,7 +466,12 @@ int dist_recv_sess(Dist* d, char* key, uint32_t* pos)
     uint32_t type, len;
     memcpy(&type, hdr, 4);
     memcpy(&len, hdr + 4, 4);
-    if (type != DTYPE_SESS || len < 68) return -1;
+    if (type != DTYPE_SESS || len < 68) {
+        /* 非会话模式(master 未发握手): 暂存帧头供后续 recv_xb 读取, 返回 -2 表示无会话 */
+        memcpy(d->peek_hdr, hdr, 8);
+        d->has_peek = 1;
+        return -2;
+    }
     char kbuf[64];
     if (xrecv(d, fd, kbuf, 64) != 0) return -1;
     if (xrecv(d, fd, pos, 4) != 0) return -1;
@@ -684,7 +695,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         dist_send_done(&dist);
         uint64_t t_end = ynow_ms();
         uint64_t t_dec = t_dec0 ? t_dec0 : t_end;
-        ylog_info("decode:  %d tokens in %.2f s (%.1f tok/s)", ngen,
+        ylog_info("decode:  %d tokens in %.2f s (%.2f tok/s)", ngen,
                (double)(t_end - t_dec) / 1000.0,
                (double)ngen * 1000.0 / (double)(t_end - t_dec > 0 ? t_end - t_dec : 1));
     } else {
@@ -692,13 +703,15 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         uint32_t pos;
         int t;
         int nf = 0;
-        /* 会话握手: 校验本段 kv 状态与期望一致 */
+        /* 会话握手: 校验本段 kv 状态与期望一致
+         * (-2 = master 未握手, 非会话模式, 跳过会话初始化直接走 X/XB 流) */
         if (sess) {
             char skey[64] = "";
             uint32_t spos = 0;
-            if (dist_recv_sess(&dist, skey, &spos) != 0) {
+            int hs = dist_recv_sess(&dist, skey, &spos);
+            if (hs == -1) {
                 rc = -1; snprintf(err, sizeof(err), "sess handshake failed");
-            } else {
+            } else if (hs == 0) {
                 snprintf(sess->key, sizeof(sess->key), "%s", skey);
                 sess->pos = spos;
                 /* 中段: 把手握转发给下一段(3+ rank 拓扑) */
@@ -826,14 +839,41 @@ int dist_split_layers(Engine* e, int rank, int ranks)
     uint32_t b;
     uint64_t total = 0;
     for (b = 1; b <= blocks; b++) total += e->ws.model.dir[b].size;
-    uint64_t per = total / (uint32_t)ranks;
+    /* 可选按算力加权切层: YLLM_DIST_WEIGHTS="w0,w1,.." 为各 rank 相对权重
+     * (总字节占比), 用于异构机器(如本机 6 核 + 远程 28 核)均衡负载。
+     * 缺省或参数不合法时退化为按字节均分。 */
+    float wcum[64];
+    int i, have_w = 0;
+    const char* ws = getenv("YLLM_DIST_WEIGHTS");
+    if (ws && *ws && ranks <= 64) {
+        float w[64];
+        int cnt = 0;
+        const char* p = ws;
+        while (*p && cnt < ranks) {
+            w[cnt++] = (float)atof(p);
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        if (cnt == ranks) {
+            float sum = 0;
+            for (i = 0; i < ranks; i++) sum += w[i];
+            if (sum > 0) {
+                wcum[0] = w[0] / sum;
+                for (i = 1; i < ranks; i++) wcum[i] = wcum[i - 1] + w[i] / sum;
+                wcum[ranks - 1] = 1.0f;
+                have_w = 1;
+            }
+        }
+    }
+    if (!have_w)
+        for (i = 0; i < ranks; i++) wcum[i] = (float)(i + 1) / (float)ranks;
     uint32_t bs[64]; /* 每个 rank 的起始 block */
     bs[0] = 1;
     uint64_t acc = 0;
     int r = 1;
     for (b = 1; b <= blocks && r < ranks; b++) {
         acc += e->ws.model.dir[b].size;
-        if (acc >= per * (uint64_t)r) { bs[r] = b + 1; r++; }
+        if (acc >= (uint64_t)((double)total * wcum[r - 1])) { bs[r] = b + 1; r++; }
     }
     while (r < ranks) { bs[r] = blocks + 1; r++; }
     if (bs[ranks - 1] > blocks + 1) bs[ranks - 1] = blocks + 1;
