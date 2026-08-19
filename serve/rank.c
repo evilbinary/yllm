@@ -462,6 +462,7 @@ static int handle_infer(int fd, Rank* r, char* args)
     tc.fd = fd;
     tc.vocab = &r->vocab;
     tc.n_tokens = 0;
+    tc.cache_frame = 0;   /* 普通 INFER: 发 T 帧(server/route 只认 "T " 前缀) */
     /* 通知 supervisor: 本 rank 进入 BUSY(推理中), 供调度/状态展示 */
     r->node.state = NODE_STATE_BUSY;
     r->node.inflight++;

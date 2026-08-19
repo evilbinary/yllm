@@ -524,8 +524,8 @@ static void supervisor_bootstrap(Supervisor* s)
             ylog_info("supervisor: model %s ranks=0, skip spawn (external rank)", mc->name);
             continue;
         }
-        /* local: 本机拉起的段数(默认全部); 其余段由外部节点承担 */
-        int local = mc->local > 0 ? (mc->local < ranks ? mc->local : ranks) : ranks;
+        /* local: 本机拉起的段数(-1 未指定 = 全部; 0 = 全部外部; N = 前 N 段本地) */
+        int local = mc->local < 0 ? ranks : (mc->local < ranks ? mc->local : ranks);
         for (r = 0; r < local; r++)
             supervisor_spawn_rank(s, mi, r);
         if (local < ranks)

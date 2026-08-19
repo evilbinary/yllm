@@ -87,6 +87,10 @@ typedef struct {
 static inline void config_defaults(ServeConfig* c)
 {
     memset(c, 0, sizeof(*c));
+    {
+        int mi;
+        for (mi = 0; mi < CFG_MAX_MODELS; mi++) c->models[mi].local = -1; /* -1 = 未指定(默认全拉) */
+    }
     snprintf(c->node_id, sizeof(c->node_id), "%s", "node-0");
     snprintf(c->log_file, sizeof(c->log_file), "%s", "logs/serve.log");
     snprintf(c->log_level, sizeof(c->log_level), "%s", "info");

@@ -218,20 +218,20 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
     if (rank < ranks - 1) {
         const char* ip = addrs ? addrs[rank + 1] : NULL;
         d->down_fd = sock_connect((uint16_t)(port_base + (uint16_t)(rank + 1)), ip);
-        if (d->down_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect to %u\n", rank, port_base + rank + 1); return -1; }
+        if (d->down_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect to %u\n", rank, port_base + rank + 1); sock_close_fd(listen_fd); return -1; }
     }
     if (rank == 0) {
         d->log_fd = dist_accept_wait(listen_fd, quit);
+        if (d->log_fd < 0) { int rc = (d->log_fd == -2) ? -2 : -1; sock_close_fd(listen_fd); return rc; }
     } else {
         d->up_fd = dist_accept_wait(listen_fd, quit);
-        if (quit && *quit) { sock_close_fd(listen_fd); return -2; }   /* 中断: 不再继续 connect */
+        if (d->up_fd < 0) { int rc = (d->up_fd == -2) ? -2 : -1; sock_close_fd(listen_fd); return rc; }
         if (rank == ranks - 1) {
             const char* ip = addrs ? addrs[0] : NULL;
             d->log_fd = sock_connect(port_base, ip);
-            if (d->log_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect back to rank 0\n", rank); return -1; }
+            if (d->log_fd < 0) { fprintf(stderr, "dist: rank %d cannot connect back to rank 0\n", rank); sock_close_fd(listen_fd); return -1; }
         }
     }
-    if (quit && *quit) { sock_close_fd(listen_fd); return -2; }
     sock_close_fd(listen_fd);
     return 0;
 }

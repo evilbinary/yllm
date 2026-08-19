@@ -56,13 +56,21 @@ static void bench_one(const char* name, uint32_t out, uint32_t in, int dtype)
 
     /* warmup */
     matmul(y, x, w, out, in, dtype);
-    int reps = 3;
+    int reps = 9;
+    double best = 1e30;
     double t0 = now_ms();
-    for (i = 0; i < (uint32_t)reps; i++) matmul(y, x, w, out, in, dtype);
+    for (i = 0; i < (uint32_t)reps; i++) {
+        double s = now_ms();
+        matmul(y, x, w, out, in, dtype);
+        double e = now_ms();
+        double dt = e - s;
+        if (dt < best) best = dt;
+    }
     double ms = (now_ms() - t0) / reps;
+    (void)ms;
     double gb = (double)out * rowb / 1e9;
-    printf("%-8s out=%u in=%u  %.2f ms  %6.2f GB/s  y[0]=%.4f\n",
-           name, out, in, ms, gb / (ms / 1000.0), y[0]);
+    printf("%-8s out=%u in=%u  %.2f ms(best)  %6.2f GB/s  y[0]=%.4f\n",
+           name, out, in, best, gb / (best / 1000.0), y[0]);
     free(w); free(x); free(y);
 }
 

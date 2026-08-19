@@ -239,6 +239,29 @@ static void q8k_quant(const float* x, float* xq, uint32_t n)
     }
 }
 
+/* int8 量化 x + 每 256 元素块缩放(供 int8 maddubs 点积) */
+static void q8k_quant_i8(const float* x, int8_t* xq, float* xs, uint32_t n)
+{
+    uint32_t nb = n / 256;
+    uint32_t b, i;
+    for (b = 0; b < nb; b++) {
+        const float* xb = x + (size_t)b * 256;
+        int8_t* xqb = xq + (size_t)b * 256;
+        float amax = 0.0f;
+        for (i = 0; i < 256; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
+        float d = amax / 127.0f;
+        xs[b] = d;
+        if (d <= 0.0f) { memset(xqb, 0, 256); continue; }
+        float inv = 1.0f / d;
+        for (i = 0; i < 256; i++) {
+            float q = roundf(xb[i] * inv);
+            if (q > 127.0f) q = 127.0f;
+            else if (q < -128.0f) q = -128.0f;
+            xqb[i] = (int8_t)q;
+        }
+    }
+}
+
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t nb = in / 256;
@@ -395,9 +418,24 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 144;
     uint32_t oo;
-    float* xq = (float*)alloca((size_t)in * 4);
-    q8k_quant(x, xq, in);
 #ifdef __AVX2__
+    int8_t* xq8 = (int8_t*)alloca((size_t)in);
+    float* xs = (float*)alloca((size_t)nb * 4);
+    q8k_quant_i8(x, xq8, xs, in);
+    const __m256i ones_u8 = _mm256_set1_epi8(1);
+    const __m256i ones_i16 = _mm256_set1_epi16(1);
+    const __m128i lowmask = _mm_set1_epi8(0x0F);
+    /* 预计算每组 Σxq 的 8 个 4 元素部分和(仅依赖 x, 全部输出行共享):
+     * 与行内 maddubs(ones,xv)→madd 的逐车道结果逐位一致, 只是上移一次。 */
+    float* sxg = (float*)alloca((size_t)nb * 8 * 8 * 4);
+    for (uint32_t b = 0; b < nb; b++) {
+        const int8_t* xp = xq8 + (size_t)b * 256;
+        for (uint32_t g = 0; g < 8; g++) {
+            __m256i xv = _mm256_loadu_si256((const __m256i*)(xp + g * 32));
+            __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, xv), ones_i16);
+            _mm256_storeu_ps(sxg + ((size_t)b * 8 + g) * 8, _mm256_cvtepi32_ps(s32));
+        }
+    }
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
@@ -405,60 +443,49 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
-            const float* xp = xq + (size_t)b * 256;
+            const int8_t* xp = xq8 + (size_t)b * 256;
             float d    = f16_to_f32(((const uint16_t*)blk)[0]);
             float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* q = blk + 16;
             const uint8_t* scp = blk + 4;
             if (b + 1 < nb) _mm_prefetch((const char*)(blk + 144), _MM_HINT_T0);
+            float dsc = d * xs[b];      /* 折叠块内 x 的 int8 缩放 */
+            float msc = dmin * xs[b];
 
             int is = 0;
             for (int j = 0; j < 4; j++) {
                 uint8_t sc, mn;
                 get_scale_min_k4(is, scp, &sc, &mn);
-                float d1 = d * (float)sc;
-                float m1 = dmin * (float)mn;
+                float d1 = dsc * (float)sc;
+                float m1 = msc * (float)mn;
                 get_scale_min_k4(is + 1, scp, &sc, &mn);
-                float d2 = d * (float)sc;
-                float m2 = dmin * (float)mn;
+                float d2 = dsc * (float)sc;
+                float m2 = msc * (float)mn;
 
-                __m256 sum_qx1_v = _mm256_setzero_ps();
-                __m256 sum_x1_v  = _mm256_setzero_ps();
-                __m256 sum_qx2_v = _mm256_setzero_ps();
-                __m256 sum_x2_v  = _mm256_setzero_ps();
+                /* 32B qs: byte k 的低 nibble → x[k](组 is), 高 nibble → x[k+32](组 is+1) */
+                __m128i q0 = _mm_loadu_si128((const __m128i*)(q));
+                __m128i q1 = _mm_loadu_si128((const __m128i*)(q + 16));
+                __m128i lo0 = _mm_and_si128(q0, lowmask);
+                __m128i hi0 = _mm_and_si128(_mm_srli_epi16(q0, 4), lowmask);
+                __m128i lo1 = _mm_and_si128(q1, lowmask);
+                __m128i hi1 = _mm_and_si128(_mm_srli_epi16(q1, 4), lowmask);
+                __m256i qv1 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo0), lo1, 1);
+                __m256i qv2 = _mm256_inserti128_si256(_mm256_castsi128_si256(hi0), hi1, 1);
 
-                for (int l = 0; l < 32; l += 16) {
-                    __m128i q16 = _mm_loadu_si128((const __m128i*)(q + l));
+                __m256i xv1 = _mm256_loadu_si256((const __m256i*)(xp));
+                __m256i xv2 = _mm256_loadu_si256((const __m256i*)(xp + 32));
+                __m256i p1 = _mm256_maddubs_epi16(qv1, xv1);   /* u8×s8 → 16×s16 */
+                __m256i p2 = _mm256_maddubs_epi16(qv2, xv2);
 
-                    __m128i lo16 = _mm_and_si128(q16, _mm_set1_epi8(0x0F));
-                    __m128i hi16 = _mm_and_si128(_mm_srli_epi16(q16, 4), _mm_set1_epi8(0x0F));
+                __m256 dot1 = _mm256_cvtepi32_ps(_mm256_madd_epi16(p1, ones_i16));
+                __m256 dot2 = _mm256_cvtepi32_ps(_mm256_madd_epi16(p2, ones_i16));
+                __m256 sx1 = _mm256_loadu_ps(sxg + ((size_t)b * 8 + is) * 8);
+                __m256 sx2 = _mm256_loadu_ps(sxg + ((size_t)b * 8 + is + 1) * 8);
 
-                    /* Low nibbles: bytes 0-7 -> x[l..l+7], 8-15 -> x[l+8..l+15] */
-                    __m256i lo16_0 = _mm256_cvtepu8_epi16(lo16);
-                    __m256 lo_f_a0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(lo16_0)));
-                    __m256 lo_f_a1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(lo16_0, 1)));
-                    __m256 x_l0 = _mm256_loadu_ps(xp + l);
-                    __m256 x_l1 = _mm256_loadu_ps(xp + l + 8);
-                    sum_qx1_v = _mm256_fmadd_ps(lo_f_a0, x_l0, sum_qx1_v);
-                    sum_qx1_v = _mm256_fmadd_ps(lo_f_a1, x_l1, sum_qx1_v);
-                    sum_x1_v  = _mm256_add_ps(sum_x1_v, _mm256_add_ps(x_l0, x_l1));
-
-                    /* High nibbles: bytes 0-7 -> x[l+32..l+39], 8-15 -> x[l+40..l+47] */
-                    __m256i hi16_0 = _mm256_cvtepu8_epi16(hi16);
-                    __m256 hi_f_a0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(hi16_0)));
-                    __m256 hi_f_a1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(hi16_0, 1)));
-                    __m256 x_h0 = _mm256_loadu_ps(xp + l + 32);
-                    __m256 x_h1 = _mm256_loadu_ps(xp + l + 40);
-                    sum_qx2_v = _mm256_fmadd_ps(hi_f_a0, x_h0, sum_qx2_v);
-                    sum_qx2_v = _mm256_fmadd_ps(hi_f_a1, x_h1, sum_qx2_v);
-                    sum_x2_v  = _mm256_add_ps(sum_x2_v, _mm256_add_ps(x_h0, x_h1));
-                }
-
-                /* 每块 8 次水平求和的替代: 缩放后并入行级向量累加, 整行只 hsum 一次 */
-                acc_v = _mm256_fmadd_ps(sum_qx1_v, _mm256_set1_ps(d1), acc_v);
-                acc_v = _mm256_fmadd_ps(sum_x1_v, _mm256_set1_ps(-m1), acc_v);
-                acc_v = _mm256_fmadd_ps(sum_qx2_v, _mm256_set1_ps(d2), acc_v);
-                acc_v = _mm256_fmadd_ps(sum_x2_v, _mm256_set1_ps(-m2), acc_v);
+                acc_v = _mm256_fmadd_ps(dot1, _mm256_set1_ps(d1), acc_v);
+                acc_v = _mm256_fnmadd_ps(sx1, _mm256_set1_ps(m1), acc_v);
+                acc_v = _mm256_fmadd_ps(dot2, _mm256_set1_ps(d2), acc_v);
+                acc_v = _mm256_fnmadd_ps(sx2, _mm256_set1_ps(m2), acc_v);
 
                 xp += 64;
                 q  += 32;
@@ -469,6 +496,8 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         y[oo] = acc;
     }
 #else
+    float* xq = (float*)alloca((size_t)in * 4);
+    q8k_quant(x, xq, in);
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
