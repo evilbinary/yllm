@@ -417,13 +417,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    uint64_t fsize = 0;
-    if (yfile_size(g_fname, &fsize) != 0) { fprintf(stderr, "llfdump: cannot open %s\n", g_fname); return 1; }
-    FILE* f = fopen(g_fname, "rb");
-    if (!f) { fprintf(stderr, "llfdump: cannot open %s\n", g_fname); return 1; }
-    uint8_t* data = (uint8_t*)ymalloc((size_t)fsize);
-    if (fread(data, 1, (size_t)fsize, f) != fsize) { fclose(f); free(data); fprintf(stderr, "llfdump: read failed\n"); return 1; }
-    fclose(f);
+    WMap gmap;
+    if (wmap_open(g_fname, &gmap) != 0) { fprintf(stderr, "llfdump: cannot open %s\n", g_fname); return 1; }
+    uint8_t* data = (uint8_t*)gmap.base;
+    uint64_t fsize = gmap.size;
 
     int rc;
     if (fsize >= 8 && memcmp(data, "YLLMLLF1", 8) == 0) {
@@ -436,6 +433,6 @@ int main(int argc, char** argv)
         fprintf(stderr, "llfdump: unknown format\n");
         rc = 1;
     }
-    free(data);
+    wmap_close(&gmap);
     return rc;
 }

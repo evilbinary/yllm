@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* 批量 prefill: 默认开启; 编译期关闭用 -DYLLM_BATCH_PREFILL=0 */
 #ifndef YLLM_BATCH_PREFILL
@@ -571,12 +574,19 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
     const LlfHeader* h = &m->h;
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
     uint32_t hidden = h->hidden;
+    float* x = e->x;
     float eps, theta;
     memcpy(&eps, &h->norm_eps_bits, 4);
     memcpy(&theta, &h->rope_theta_bits, 4);
+    if (getenv("YLLM_QDBG")) {
+        float xn = 0; uint32_t kk;
+        for (kk = 0; kk < hidden; kk++) if (x[kk] != x[kk]) xn++;
+        fprintf(stderr, "[qdbg] layer=%u pos=%u x_nan=%g x[0..9]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                layer, pos, (double)xn, (double)x[0], (double)x[1], (double)x[2], (double)x[3],
+                (double)x[4], (double)x[5], (double)x[6], (double)x[7], (double)x[8], (double)x[9]);
+    }
     uint32_t hidx = m->base_idx[layer];
     const LlfTensorMeta* mt = &m->metas[hidx];
-    float* x = e->x;
     float* x2 = e->hb;
     uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
 
@@ -614,14 +624,32 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
             float sp = log1pf(expf(ab));
             gate[vh] = sp * ssm_a[vh];
         }
+        if (getenv("YLLM_QDBG")) {
+            fprintf(stderr, "[qdbg] layer=%u gate[0..2]=%g %g %g alpha0=%g dt0=%g a0=%g beta0=%g\n", layer,
+                    (double)gate[0], (double)gate[1], (double)gate[2],
+                    (double)alpha[0], (double)ssm_dt[0], (double)ssm_a[0], (double)beta[0]);
+        }
 
         /* conv1d: 延迟线滑入当前输入, 卷积+silu 就地到 qkv */
         uint32_t gdn_idx = gdn_index_of(m, layer);
         float* conv_state = e->ssm_conv + (size_t)gdn_idx * kwidth * conv_chan;
         const uint8_t* conv_w = base + mt[SLOT_SSM_CONV1D].offset;
+        if (getenv("YLLM_QDBG") && layer == 1) {
+            fprintf(stderr, "[qdbg] layer=1 conv_pre[0..2]=%g %g %g wf3=%g\n",
+                    (double)qkv[0], (double)qkv[1], (double)qkv[2],
+                    (double)((const float*)conv_w)[0 * kwidth + 3]);
+        }
         conv1d_update(conv_state, qkv, conv_w, conv_chan, kwidth);
+        if (getenv("YLLM_QDBG") && layer == 1) {
+            fprintf(stderr, "[qdbg] layer=1 conv_post[0..2]=%g %g %g\n",
+                    (double)qkv[0], (double)qkv[1], (double)qkv[2]);
+        }
         uint32_t ch;
         for (ch = 0; ch < conv_chan; ch++) qkv[ch] = qkv[ch] / (1.0f + expf(-qkv[ch]));  /* silu */
+        if (getenv("YLLM_QDBG") && layer == 1) {
+            fprintf(stderr, "[qdbg] layer=1 conv_silu[0..2]=%g %g %g\n",
+                    (double)qkv[0], (double)qkv[1], (double)qkv[2]);
+        }
 
         /* 切 q/k/v 并 L2 归一化 q/k 每 k_head */
         float* q = qkv;
@@ -634,19 +662,73 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         /* 递归状态更新 + 注意力输出 */
         float* state_base = e->ssm_state + (size_t)gdn_idx * n_vheads * hvd * hvd;
         gdn_state_update(state_base, attn_out, q, k, v, gate, beta, num_k_heads, hvd, n_vheads, hvd);
+        if (getenv("YLLM_QDBG") && layer == 1) {
+            fprintf(stderr, "[qdbg] layer=1 state_out[0..2]=%g %g %g z[0..2]=%g %g %g q0=%g k0=%g v0=%g\n",
+                    (double)attn_out[0], (double)attn_out[1], (double)attn_out[2],
+                    (double)z[0], (double)z[1], (double)z[2],
+                    (double)q[0], (double)k[0], (double)v[0]);
+        }
 
         /* rmsnorm_gated: out = rmsnorm(attn_out, ssm_norm) * silu(z) */
         const uint8_t* ssm_norm_w = base + mt[SLOT_SSM_NORM].offset;
         uint32_t snd = mt[SLOT_SSM_NORM].dtype;
+        if (getenv("YLLM_QDBG") && layer == 1) {
+            float s0 = 0.0f; uint32_t kk;
+            for (kk = 0; kk < hvd; kk++) s0 += attn_out[kk]*attn_out[kk];
+            float inv0 = 1.0f/sqrtf(s0/(float)hvd + eps);
+            float w0 = (snd == DT_F32) ? ((const float*)ssm_norm_w)[0] : f16_to_f32(((const uint16_t*)ssm_norm_w)[0]);
+            fprintf(stderr, "[qdbg] layer=1 rg_pre: s=%g inv=%g w0=%g x0=%g z0=%g snd=%u\n",
+                    (double)s0, (double)inv0, (double)w0, (double)attn_out[0], (double)z[0], snd);
+        }
         for (vh = 0; vh < n_vheads; vh++)
             rmsnorm_gated(attn_out + (size_t)vh * hvd, attn_out + (size_t)vh * hvd,
                           ssm_norm_w, z + (size_t)vh * hvd, hvd, eps, snd);
+        if (getenv("YLLM_QDBG") && layer == 1) {
+            fprintf(stderr, "[qdbg] layer=1 rg_post[0..2]=%g %g %g\n",
+                    (double)attn_out[0], (double)attn_out[1], (double)attn_out[2]);
+        }
 
         /* 输出投影 + 残差 + FFN */
+        if (getenv("YLLM_QDBG") && layer == 1 && pos == 0)
+            fprintf(stderr, "[qdbg] layer1 pre-ssmo attn_out[0]=%g ssm_o=%p attn_out=%p dtype=%u off=%llu\n", (double)attn_out[0], (void*)ssm_o, (void*)attn_out, mt[SLOT_SSM_OUT].dtype, (unsigned long long)mt[SLOT_SSM_OUT].offset);
+        if (getenv("YLLM_QDBG") && layer == 1 && pos == 0) {
+            FILE* ff = fopen("C:/Users/YFW/AppData/Local/Temp/opencode/yllm_attn_now.txt", "w");
+            if (ff) {
+                uint32_t kk2;
+                for (kk2 = 0; kk2 < value_dim; kk2++) fprintf(ff, "%.9f\n", (double)attn_out[kk2]);
+                fclose(ff);
+            }
+            fprintf(stderr, "[qdbg] attn_now[0..3]=%g %g %g %g\n", (double)attn_out[0], (double)attn_out[1], (double)attn_out[2], (double)attn_out[3]);
+            static float ssm_tmp[5120];
+            omp_set_num_threads(1);
+            matmul_q5k(ssm_tmp, attn_out, base + mt[SLOT_SSM_OUT].offset, hidden, value_dim);
+            omp_set_num_threads(0);
+            fprintf(stderr, "[qdbg] layer1 explicit(matmul_q5k, 1thread) ssm_tmp[0..2]=%g %g %g\n", (double)ssm_tmp[0], (double)ssm_tmp[1], (double)ssm_tmp[2]);
+        }
         matmul(ssm_o, attn_out, base + mt[SLOT_SSM_OUT].offset, hidden, value_dim, mt[SLOT_SSM_OUT].dtype);
+        if (getenv("YLLM_QDBG") && layer == 1 && pos == 0)
+            fprintf(stderr, "[qdbg] layer1 post-ssmo attn_out[0]=%g\n", (double)attn_out[0]);
         uint32_t j;
         for (j = 0; j < hidden; j++) x[j] += ssm_o[j];
+        if (getenv("YLLM_QDBG")) {
+            fprintf(stderr, "[qdbg] gdn layer=%u ssm_o[0..2]=%g %g %g x[0..2]=%g %g %g\n",
+                    layer, (double)ssm_o[0], (double)ssm_o[1], (double)ssm_o[2],
+                    (double)x[0], (double)x[1], (double)x[2]);
+            if (layer == 1 && pos == 0) {
+                fprintf(stderr, "[qdbg] dump_start attn_out[0]=%g value_dim=%u\n", (double)attn_out[0], value_dim);
+                FILE* f = fopen("yllm_final0.txt", "w");
+                uint32_t kk;
+                for (kk = 0; kk < value_dim; kk++) fprintf(f, "%.9f\n", (double)attn_out[kk]);
+                fclose(f);
+                FILE* f2 = fopen("yllm_final0.txt", "r");
+                float v0 = 0; if (f2) { fscanf(f2, "%f", &v0); fclose(f2); }
+                fprintf(stderr, "[qdbg] dump_file[0]=%g\n", (double)v0);
+            }
+        }
         rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
+        if (getenv("YLLM_QDBG")) {
+            fprintf(stderr, "[qdbg] gdn layer=%u x2[0..2]=%g %g %g\n", layer, (double)x2[0], (double)x2[1], (double)x2[2]);
+        }
         float* fg = e->ffn;
         float* fu = e->ffn + inter;
         matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
@@ -680,6 +762,12 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
 
         uint32_t hh, ii;
+        if (getenv("YLLM_QDBG")) {
+            float qn = 0, kn = 0, vn = 0; uint32_t kk;
+            for (kk = 0; kk < qdim; kk++) if (q[kk] != q[kk]) qn++;
+            for (kk = 0; kk < kv_dim; kk++) { if (k[kk] != k[kk]) kn++; if (v[kk] != v[kk]) vn++; }
+            fprintf(stderr, "[qdbg] attn layer=%u q_nan=%g q0=%g k0=%g v0=%g\n", layer, (double)qn, (double)q[0], (double)k[0], (double)v[0]);
+        }
 
         /* q/k QK-norm 每头 ×256 */
         for (hh = 0; hh < n_heads; hh++)
@@ -727,6 +815,14 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         /* gate 门控: att_out *= sigmoid(gate) */
         for (ii = 0; ii < qdim; ii++)
             att_out[ii] *= 1.0f / (1.0f + expf(-gate[ii]));
+        if (getenv("YLLM_QDBG")) {
+            float an = 0, gn = 0; uint32_t kk;
+            for (kk = 0; kk < qdim; kk++) { if (att_out[kk] != att_out[kk]) an++; if (gate[kk] != gate[kk]) gn++; }
+            fprintf(stderr, "[qdbg] attn layer=%u after_attn nan=%g gate_nan=%g gate0=%g att0=%g gate[0..7]=%g %g %g %g %g %g %g %g\n",
+                    layer, (double)an, (double)gn, (double)gate[0], (double)att_out[0],
+                    (double)gate[0], (double)gate[1], (double)gate[2], (double)gate[3],
+                    (double)gate[4], (double)gate[5], (double)gate[6], (double)gate[7]);
+        }
 
         memcpy(x2, att_out, (size_t)qdim * 4);
         matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, qdim, mt[SLOT_O].dtype);

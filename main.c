@@ -213,9 +213,24 @@ static int cmd_gen(int argc, char** argv)
             uint64_t rng2 = ysrand(seed);
             uint32_t pos = 0;
             int i2;
-            for (i2 = 0; i2 < nprompt; i2++) { engine_forward(&e, ids[i2], pos); pos++; }
+            for (i2 = 0; i2 < nprompt; i2++) { fprintf(stderr, "SINGLE prompt pos%u id=%u [%s]\n", pos, ids[i2], v.pieces[ids[i2]]); engine_forward(&e, ids[i2], pos); pos++; }
+            fprintf(stderr, "HIDDEN x[0..9]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    (double)e.x[0], (double)e.x[1], (double)e.x[2], (double)e.x[3], (double)e.x[4],
+                    (double)e.x[5], (double)e.x[6], (double)e.x[7], (double)e.x[8], (double)e.x[9]);
             for (i2 = 0; i2 < ntokens && rc == 0; i2++) {
                 uint32_t nxt;
+                {
+                    float mx = e.logits[0], mn = e.logits[0], nanf = 0;
+                    uint32_t kk;
+                    for (kk = 1; kk < (uint32_t)(e.ws.model.h.vocab < 64 ? e.ws.model.h.vocab : 64); kk++) {
+                        if (e.logits[kk] > mx) mx = e.logits[kk];
+                        if (e.logits[kk] < mn) mn = e.logits[kk];
+                        if (e.logits[kk] != e.logits[kk]) nanf++;
+                    }
+                    fprintf(stderr, "LOGITS pos%u [0..3]=%g %g %g %g max=%g min=%g nan=%g\n", pos,
+                            (double)e.logits[0], (double)e.logits[1], (double)e.logits[2], (double)e.logits[3],
+                            (double)mx, (double)mn, (double)nanf);
+                }
                 if (engine_sample(&e, e.ws.model.h.vocab, temp, top_p, &rng2, &nxt) != 0) { rc = -1; break; }
                 fprintf(stderr, "SINGLE pos%u id=%u [%s]\n", pos, nxt, v.pieces[nxt]);
                 if (nxt == (uint32_t)v.eos) break;

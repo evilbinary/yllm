@@ -635,6 +635,8 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
     }
 
     ConvItem* items = (ConvItem*)ymalloc((size_t)list.n * 2 * sizeof(ConvItem));
+    uint8_t* qg_bufs[32] = { 0 };  /* attn_q 交错重排临时缓冲(llf_emit 后释放) */
+    int qg_n = 0;
     int n = 0;
     for (i = 0; i < (uint64_t)list.n; i++) {
         int layer;
@@ -655,22 +657,43 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         items[n].src = data + data_start + t->offset;
         items[n].src_off = 0;
         n++;
-        if (is_qwen35 && slot == SLOT_Q && t->ndims == 2 && t->dims[0] == 2 * g.hidden) {
-            /* qwen35 attention 层: attn_q = [q|gate] 拼接(2×hidden 输出行)。
-               转换期拆两半: 前 hidden 行 → SLOT_Q, 后 hidden 行 → SLOT_QGATE */
-            uint64_t half = t->nbytes / 2;
-            items[n - 1].shape[0] = g.hidden;
-            items[n - 1].nbytes = half;
+        if (is_qwen35 && slot == SLOT_Q && t->ndims == 2 &&
+            t->dims[1] == 2 * (uint64_t)g.heads * (g.key_length ? g.key_length : g.hidden / g.heads)) {
+            /* qwen35 attention 层: attn_q = [q|gate] 拼接(输出维 2×qdim)。
+               每 head 输出 512 行 = [q 256 | gate 256] 交错。
+               转换期按 head 交错重排: q 半部(每 head 前 256 行) → SLOT_Q,
+               gate 半部(每 head 后 256 行) → SLOT_QGATE */
+            uint64_t qdim = (uint64_t)g.heads * (g.key_length ? g.key_length : g.hidden / g.heads);
+            uint32_t qper = qdim / g.heads;                 /* 256 */
+            uint64_t rowb = t->nbytes / t->dims[1];         /* 每输出行字节 */
+            uint8_t* nb = (uint8_t*)ymalloc((size_t)t->nbytes);
+            const uint8_t* src = data + data_start + t->offset;
+            uint32_t h, r;
+            for (h = 0; h < g.heads; h++) {
+                for (r = 0; r < qper; r++) {
+                    uint64_t q_src = (uint64_t)h * 2 * qper + r;
+                    uint64_t g_src = (uint64_t)h * 2 * qper + qper + r;
+                    uint64_t q_dst = (uint64_t)h * qper + r;
+                    uint64_t g_dst = (uint64_t)g.heads * qper + (uint64_t)h * qper + r;
+                    memcpy(nb + q_dst * rowb, src + q_src * rowb, (size_t)rowb);
+                    memcpy(nb + g_dst * rowb, src + g_src * rowb, (size_t)rowb);
+                }
+            }
+            if (qg_n < 32) qg_bufs[qg_n++] = nb;
+            items[n - 1].shape[1] = (uint32_t)qdim;
+            items[n - 1].nbytes = qdim * rowb;
+            items[n - 1].src = nb;
+            items[n - 1].src_off = 0;
             items[n].layer = items[n - 1].layer;
             items[n].slot = SLOT_QGATE;
             items[n].dtype = items[n - 1].dtype;
             items[n].ndim = 2;
             items[n].shape[0] = g.hidden;
-            items[n].shape[1] = items[n - 1].shape[1];
-            items[n].nbytes = half;
+            items[n].shape[1] = (uint32_t)qdim;
+            items[n].nbytes = qdim * rowb;
             snprintf(items[n].name, sizeof(items[n].name), "%s.gate", t->name);
-            items[n].src = items[n - 1].src;
-            items[n].src_off = half;
+            items[n].src = nb + qdim * rowb;
+            items[n].src_off = 0;
             n++;
         }
     }
@@ -713,6 +736,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         if (missing) {
             for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
             free(list.t); free(items); wmap_close(&gmap);
+            for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
             snprintf(err, errlen, "some transformer tensors missing from gguf");
             return -1;
         }
@@ -752,6 +776,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
     if (h.vocab == 0) {
         for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
         free(list.t); free(items); wmap_close(&gmap);
+        for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
         snprintf(err, errlen, "cannot determine vocab size");
         return -1;
     }
@@ -821,6 +846,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
     free(g.chat_template);
     for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
     free(list.t);
+    for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
     free(items);
     wmap_close(&gmap);
     return rc;

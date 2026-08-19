@@ -2,6 +2,11 @@
 #include "matvec.h"
 #include <math.h>
 #include <string.h>
+#ifdef _WIN32
+#include <malloc.h>
+#else
+#include <alloca.h>
+#endif
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -211,21 +216,46 @@ static void q5k_block(float* y, const uint8_t* blk)
     }
 }
 
+/* Q8_K 量化激活(与 llama.cpp vec_dot 一致):
+ * 每 256 元素 block: d = amax/127, q = clamp(round(x/d)) 还原为 float */
+static void q8k_quant(const float* x, float* xq, uint32_t n)
+{
+    uint32_t nb = n / 256;
+    uint32_t b, i;
+    for (b = 0; b < nb; b++) {
+        const float* xb = x + (size_t)b * 256;
+        float* xqb = xq + (size_t)b * 256;
+        float amax = 0.0f;
+        for (i = 0; i < 256; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
+        float d = amax / 127.0f;
+        if (d <= 0.0f) { memset(xqb, 0, 256 * 4); continue; }
+        float inv = 1.0f / d;
+        for (i = 0; i < 256; i++) {
+            float q = roundf(xb[i] * inv);
+            if (q > 127.0f) q = 127.0f;
+            else if (q < -128.0f) q = -128.0f;
+            xqb[i] = q * d;
+        }
+    }
+}
+
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 144;
-    float tmp[256];
+    float* xq = (float*)alloca((size_t)in * 4);
+    q8k_quant(x, xq, in);
     uint32_t oo;
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
+        float tmp[256];  /* 每线程私有, 避免多线程共享 tmp 数据竞争 */
         uint32_t b;
         for (b = 0; b < nb; b++) {
             float d = f16_to_f32(((const uint16_t*)row)[0]);
             iq4xs_block(tmp, row + (size_t)b * 144, d);
-            const float* xb = x + (size_t)b * 256;
+            const float* xb = xq + (size_t)b * 256;
             uint32_t e;
             for (e = 0; e < 256; e++) acc += xb[e] * tmp[e];
         }
@@ -248,16 +278,18 @@ void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 {
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 176;
-    float tmp[256];
+    float* xq = (float*)alloca((size_t)in * 4);
+    q8k_quant(x, xq, in);
     uint32_t oo;
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
         float acc = 0.0f;
+        float tmp[256];  /* 每线程私有, 避免多线程共享 tmp 数据竞争 */
         uint32_t b;
         for (b = 0; b < nb; b++) {
             q5k_block(tmp, row + (size_t)b * 176);
-            const float* xb = x + (size_t)b * 256;
+            const float* xb = xq + (size_t)b * 256;
             uint32_t e;
             for (e = 0; e < 256; e++) acc += xb[e] * tmp[e];
         }
@@ -306,6 +338,8 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 144;
     uint32_t oo;
+    float* xq = (float*)alloca((size_t)in * 4);
+    q8k_quant(x, xq, in);
 #ifdef __AVX2__
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
@@ -314,7 +348,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
-            const float* xp = x + (size_t)b * 256;
+            const float* xp = xq + (size_t)b * 256;
             float d    = f16_to_f32(((const uint16_t*)blk)[0]);
             float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* q = blk + 16;
@@ -385,7 +419,7 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
-            const float* xb = x + (size_t)b * 256;
+            const float* xb = xq + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[0]);
             float min = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* qs = blk + 16;
@@ -432,6 +466,8 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 210;
     uint32_t oo;
+    float* xq = (float*)alloca((size_t)in * 4);
+    q8k_quant(x, xq, in);
 #ifdef __AVX2__
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
@@ -440,7 +476,7 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 210;
-            const float* xb = x + (size_t)b * 256;
+            const float* xb = xq + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[104]);
             const uint8_t* ql = blk;
             const uint8_t* qh = blk + 128;
@@ -502,7 +538,7 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 210;
-            const float* xb = x + (size_t)b * 256;
+            const float* xb = xq + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[104]);
             /* 每次 3 个 load 解出 4 个 6-bit 权重(无 per-element 索引运算) */
             const uint8_t* ql = blk;
@@ -692,8 +728,9 @@ void l2norm_inplace(float* v, uint32_t n, float eps)
 
 /* conv1d 更新(qwen35 GDN, 因果无 bias):
  * state 为 [kwidth × dim] 延迟线(末行 = 当前输入 x);
- * 先把 x 滑入末行, 再输出 out[ch] = Σ_i state[i*dim+ch] × w[i*dim+ch] 写回 x。
- * 注意: x 已被拷入 state 末行, 故可安全就地写回。 */
+ * 先把 x 滑入末行, 再输出 out[ch] = Σ_i state[i*dim+ch] × w[ch*kwidth+i] 写回 x。
+ * 注意: gguf 权重布局为 [dim, kwidth](ne0=kwidth 最内层, 每 channel 的 taps 连续)。
+ * x 已被拷入 state 末行, 故可安全就地写回。 */
 void conv1d_update(float* state, const float* x, const uint8_t* w, uint32_t dim, uint32_t kwidth)
 {
     uint32_t i, ch;
@@ -703,7 +740,7 @@ void conv1d_update(float* state, const float* x, const uint8_t* w, uint32_t dim,
     for (ch = 0; ch < dim; ch++) {
         float acc = 0.0f;
         for (i = 0; i < kwidth; i++)
-            acc += state[(size_t)i * dim + ch] * wf[(size_t)i * dim + ch];
+            acc += state[(size_t)i * dim + ch] * wf[(size_t)ch * kwidth + i];
         ((float*)x)[ch] = acc;
     }
 }
