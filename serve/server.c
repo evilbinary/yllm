@@ -23,6 +23,14 @@
 #include <pthread.h>
 #include <stdint.h>
 
+/* 后端(leader rank)响应超时: 默认 60s, 可经 YLLM_SRV_TIMEOUT(秒)覆盖。
+ * 慢模型(如 27B Q4, 单 token 解码数十秒)需调大。 */
+static long srv_timeout_ms(void)
+{
+    const char* e = getenv("YLLM_SRV_TIMEOUT");
+    return e ? atol(e) * 1000 : 60000;
+}
+
 #define SRV_MAX_LINE 8192
 
 /* INFER 转发: 连 leader rank → 发 INFER → 逐帧透传回客户端 */
@@ -35,7 +43,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
         return;
     }
     /* leader 无响应(如 rank 被 STOP/僵死) 60s 后报错, 不无限挂起 */
-    sock_set_timeout(fd, 60);
+    sock_set_timeout(fd, (int)(srv_timeout_ms() / 1000));
     Frame f;
     snprintf(f.cmd, sizeof(f.cmd), "%s", PROTO_INFER);
     /* 组内 rank 信息随请求捎给 rank0(它按数据组织协作) */
@@ -61,7 +69,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
     char out[SRV_MAX_LINE];
     int done = 0;
     while (!done) {
-        int sel = sock_wait_readable(fd, 60000);
+        int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
         if (sel <= 0) {
             ylog_warn("server: leader %s:%u no response (rc=%d)", s->leader_host, s->leader_port, sel);
             sock_send_line(client_fd, "ERR server: leader timeout"); break;
@@ -165,7 +173,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     for (;;) {
         int fd = sock_connect(s->leader_host, s->leader_port, 5);
         if (fd < 0) { free(tokens); sock_send_line(client_fd, "ERR server: cannot connect leader"); return; }
-        sock_set_timeout(fd, 60);
+        sock_set_timeout(fd, (int)(srv_timeout_ms() / 1000));
         uint32_t sr = sent ? 0 : resume;
         const uint32_t* st = tokens;
         uint32_t sn = (uint32_t)n;
@@ -220,7 +228,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         char out[SRV_MAX_LINE];
         int done = 0, rc = 0;
         while (!done) {
-            int sel = sock_wait_readable(fd, 60000);
+int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
             if (sel <= 0) { sock_send_line(client_fd, "ERR server: leader timeout"); rc = -1; break; }
             int nn = sock_recv_line(fd, out, sizeof(out));
             if (nn < 0) { rc = -1; break; }

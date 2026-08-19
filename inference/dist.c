@@ -582,6 +582,9 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (dist_send_xb(&dist, pos, xb, (uint32_t)nb, hidden, dist_fp16) != 0) {
                 free(xb); rc = -1; snprintf(err, sizeof(err), "send_xb prompt failed"); break;
             }
+            if (getenv("YLLM_DISTDBG"))
+                ylog_info("R0 send_xb pos=%u xb[0..3]=%g %g %g %g", pos,
+                          (double)xb[0], (double)xb[1], (double)xb[2], (double)xb[3]);
             free(xb);
             pos += (uint32_t)nb;
             i += nb;
@@ -628,6 +631,9 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             engine_forward_range(e, nxt, 1, pos, xbuf, NULL);
             uint64_t t3_tok = ynow_ms();
             if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
+            if (getenv("YLLM_DISTDBG"))
+                ylog_info("R0 send_x pos=%u xbuf[0..3]=%g %g %g %g", pos,
+                          (double)xbuf[0], (double)xbuf[1], (double)xbuf[2], (double)xbuf[3]);
             uint64_t t4_tok = ynow_ms();
             /* emit 放到 send_x 之后: 先让 worker 开工, 再输出 token。
              * 避免 emit 的同步 send/日志阻塞推迟 worker 启动(stream/慢客户端下反压)。 */
@@ -752,6 +758,10 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 if (rank == ranks - 1) {
                     engine_forward_range(e, 0, 0, pos, NULL, e->logits);
                     uint64_t f1 = ynow_ms();
+                    if (getenv("YLLM_DISTDBG"))
+                        ylog_info("wtok last x[0..3]=%g %g %g %g logits[0..3]=%g %g %g %g",
+                                  (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3],
+                                  (double)e->logits[0], (double)e->logits[1], (double)e->logits[2], (double)e->logits[3]);
                     if (w_timing)
                         ylog_info("wtok %d: wait=%u fwd=%u", nf,
                                   (unsigned)(w1 - w0), (unsigned)(f1 - f0));

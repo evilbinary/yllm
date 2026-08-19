@@ -620,9 +620,13 @@ static uint32_t gdn_index_of(const LlModel* m, uint32_t layer)
 /* qwen35 混合架构批量前向: GDN 状态在层内连续, 退化为逐 token */
 static int fwd_block_qwen35_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
+    /* 批量输入/输出在 e->pb, 而 fwd_block_qwen35 就地读写 e->x: 逐 token 拷贝进出 */
+    uint32_t hidden = e->ws.model.h.hidden;
     uint32_t b;
     for (b = 0; b < B; b++) {
+        memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
         if (e->fwd_block(e, layer, pos_start + b) != 0) return -1;
+        memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
     }
     return 0;
 }
@@ -1126,6 +1130,25 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
         if (i == 0) continue; /* embed 已在上方处理 */
         sched_ensure(ws, i);
         forward_layer(e, i, token, pos);
+        if (getenv("YLLM_NANDBG") && i == 33)
+            fprintf(stderr, "[nandbg] x after layer33 pos %u: %g %g %g %g\n", pos,
+                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+        if (getenv("YLLM_NANDBG") && i == 59)
+            fprintf(stderr, "[nandbg] x after layer59 pos %u: %g %g %g %g\n", pos,
+                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+        if (getenv("YLLM_NANDBG") && (i == 34 || i == 40 || i == 50))
+            fprintf(stderr, "[nandbg] x after layer%u pos %u: %g %g %g %g\n", i, pos,
+                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+        if (getenv("YLLM_NANDBG") && (i == 35 || i == 36 || i == 37))
+            fprintf(stderr, "[nandbg] x after layer%u pos %u: %g %g %g %g\n", i, pos,
+                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+        if (getenv("YLLM_NANDBG") && (i == 33 || i == 35 || i == 36 || i == 59)) {
+            float l2 = 0, s = 0; unsigned h = 0; uint32_t j, hd = e->ws.model.h.hidden;
+            for (j = 0; j < hd; j++) { l2 += e->x[j]*e->x[j]; s += e->x[j]; h = h*131 + (unsigned)floorf(e->x[j]*1000.0f); }
+            fprintf(stderr, "[nandbg] chk layer%u pos %u: l2=%.5g sum=%.5g hash=%u\n", i, pos, (double)l2, (double)s, h);
+        }
+        if (getenv("YLLM_NANDBG") && e->x[0] != e->x[0])
+            fprintf(stderr, "[nandbg] rank rng NaN after layer %u pos %u\n", i, pos);
         if (w) {
             uint32_t d = (uint32_t)ws->depth;
             uint32_t nb = i + d;
@@ -1234,6 +1257,8 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
         if (i == 0) continue;
         if (i <= h->n_blocks) {
             e->fwd_block_batch(e, i, pos, (uint32_t)n);
+            if (getenv("YLLM_NANDBG") && e->pb[0] != e->pb[0])
+                fprintf(stderr, "[nandbg] batch NaN after layer %u pos %u\n", i, pos);
         } else if (i == h->n_blocks + 1) {
             const LlfTensorMeta* fn = &m->metas[m->base_idx[i]];
             rmsnorm(e->x, e->pb + (size_t)(n - 1) * hidden,

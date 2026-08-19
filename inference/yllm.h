@@ -115,7 +115,7 @@ typedef struct Engine {
     int (*fwd_block_batch)(struct Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
     uint32_t layer_begin; /* 分布式分片: 本进程层区间 [begin, end) */
     uint32_t layer_end;
-    float* x;
+    float* x; /* 单 token 路径的主激活缓冲 */
     float* hb;
     float* hb2;
     float* ffn;
