@@ -608,8 +608,13 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             uint64_t nelem = 1;
             uint32_t d;
             for (d = 0; d < t->ndims; d++) nelem *= t->dims[d];
+            if (strstr(t->name, "nextn")) {
+                printf("gguf: skip nextn head '%s' (not used by chat)\n", t->name);
+                free(t->name);
+                continue;
+            }
             uint32_t dt = type_map[t->gtype];
-            if (dt == 255) { free(t->name); continue; }
+            if (dt == 255) { printf("gguf: DROP '%s' gtype=%u\n", t->name, (unsigned)t->gtype); free(t->name); continue; }
             GGTensor c;
             c = *t;
 if (dt == DT_F32) c.nbytes = nelem * 4;
@@ -646,7 +651,7 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
         else if (slot >= SLOT_NORM1 && slot <= SLOT_KNORM) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else if (slot >= SLOT_QKV && slot <= SLOT_SSM_OUT) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
-        else continue;
+        else { printf("gguf: SKIP '%s'\n", list.t[i].name); continue; }
         const GGTensor* t = &list.t[i];
         items[n].dtype = type_map[t->gtype];
         items[n].ndim = t->ndims;

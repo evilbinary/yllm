@@ -756,20 +756,6 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         /* 输出投影 + 残差 + FFN */
         if (getenv("YLLM_QDBG") && layer == 1 && pos == 0)
             fprintf(stderr, "[qdbg] layer1 pre-ssmo attn_out[0]=%g ssm_o=%p attn_out=%p dtype=%u off=%llu\n", (double)attn_out[0], (void*)ssm_o, (void*)attn_out, mt[SLOT_SSM_OUT].dtype, (unsigned long long)mt[SLOT_SSM_OUT].offset);
-        if (getenv("YLLM_QDBG") && layer == 1 && pos == 0) {
-            FILE* ff = fopen("C:/Users/YFW/AppData/Local/Temp/opencode/yllm_attn_now.txt", "w");
-            if (ff) {
-                uint32_t kk2;
-                for (kk2 = 0; kk2 < value_dim; kk2++) fprintf(ff, "%.9f\n", (double)attn_out[kk2]);
-                fclose(ff);
-            }
-            fprintf(stderr, "[qdbg] attn_now[0..3]=%g %g %g %g\n", (double)attn_out[0], (double)attn_out[1], (double)attn_out[2], (double)attn_out[3]);
-            static float ssm_tmp[5120];
-            omp_set_num_threads(1);
-            matmul_q5k(ssm_tmp, attn_out, base + mt[SLOT_SSM_OUT].offset, hidden, value_dim);
-            omp_set_num_threads(0);
-            fprintf(stderr, "[qdbg] layer1 explicit(matmul_q5k, 1thread) ssm_tmp[0..2]=%g %g %g\n", (double)ssm_tmp[0], (double)ssm_tmp[1], (double)ssm_tmp[2]);
-        }
         matmul(ssm_o, attn_out, base + mt[SLOT_SSM_OUT].offset, hidden, value_dim, mt[SLOT_SSM_OUT].dtype);
         if (getenv("YLLM_QDBG") && layer == 1 && pos == 0)
             fprintf(stderr, "[qdbg] layer1 post-ssmo attn_out[0]=%g\n", (double)attn_out[0]);
@@ -779,16 +765,6 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
             fprintf(stderr, "[qdbg] gdn layer=%u ssm_o[0..2]=%g %g %g x[0..2]=%g %g %g\n",
                     layer, (double)ssm_o[0], (double)ssm_o[1], (double)ssm_o[2],
                     (double)x[0], (double)x[1], (double)x[2]);
-            if (layer == 1 && pos == 0) {
-                fprintf(stderr, "[qdbg] dump_start attn_out[0]=%g value_dim=%u\n", (double)attn_out[0], value_dim);
-                FILE* f = fopen("yllm_final0.txt", "w");
-                uint32_t kk;
-                for (kk = 0; kk < value_dim; kk++) fprintf(f, "%.9f\n", (double)attn_out[kk]);
-                fclose(f);
-                FILE* f2 = fopen("yllm_final0.txt", "r");
-                float v0 = 0; if (f2) { fscanf(f2, "%f", &v0); fclose(f2); }
-                fprintf(stderr, "[qdbg] dump_file[0]=%g\n", (double)v0);
-            }
         }
         rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
         if (getenv("YLLM_QDBG")) {

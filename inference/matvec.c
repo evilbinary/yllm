@@ -354,6 +354,7 @@ void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
                     acc_v = _mm256_fmadd_ps(d2v, _mm256_mul_ps(q2, x2), acc_v);
                     acc_v = _mm256_fnmadd_ps(m2v, x2, acc_v);
                 }
+                qs += 32;  /* 每 64 元素轮换 qs 偏移(与 q5k_block/llama.cpp 一致) */
             }
         }
         y[oo] = hsum_avx2(acc_v);
