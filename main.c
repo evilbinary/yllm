@@ -293,6 +293,7 @@ static int cmd_gen(int argc, char** argv)
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, -1, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
+    if (tim.n_decode > 0) { fputc('\n', stdout); fflush(stdout); ylog_raw_log("\n"); }   /* 生成文本末尾换行 */
     ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", tim.n_prefill,
             (double)tim.prefill_ms / 1000.0,
             tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
@@ -379,6 +380,7 @@ static int cmd_chat(int argc, char** argv)
         rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
+    if (tim.n_decode > 0) { fputc('\n', stdout); fflush(stdout); ylog_raw_log("\n"); }   /* 生成文本末尾换行 */
     ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", tim.n_prefill,
            (double)tim.prefill_ms / 1000.0,
            tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
