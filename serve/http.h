@@ -36,6 +36,38 @@ typedef struct {
     int chunked;         /* SSE 用: 连接保持, 流式写 */
 } HttpResponse;
 
+/* 从请求头提取 Bearer token(Authorization: Bearer <key>)。返回 key 指针或 NULL。
+ * 也兼容 "api-key: <key>" 头。写入 out(截断到 outsz)。返回 0 找到, -1 无。 */
+static inline int http_auth_key(const HttpRequest* req, char* out, size_t outsz)
+{
+    int i;
+    for (i = 0; i < req->n_headers; i++) {
+        const char* h = req->headers[i];
+        if (strncasecmp(h, "Authorization:", 14) == 0) {
+            const char* p = h + 14;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncasecmp(p, "Bearer ", 7) == 0) {
+                p += 7;
+                while (*p == ' ' || *p == '\t') p++;
+                size_t n = strlen(p);
+                if (n >= outsz) n = outsz - 1;
+                memcpy(out, p, n);
+                out[n] = '\0';
+                return 0;
+            }
+        } else if (strncasecmp(h, "api-key:", 8) == 0) {
+            const char* p = h + 8;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t n = strlen(p);
+            if (n >= outsz) n = outsz - 1;
+            memcpy(out, p, n);
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* 解析请求(阻塞读请求行+头+body)。返回 0 成功, -1 失败 */
 static inline int http_parse_request(int fd, HttpRequest* req)
 {

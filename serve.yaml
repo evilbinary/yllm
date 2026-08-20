@@ -13,6 +13,7 @@
 log: logs/serve.log
 log-level: info
 api-log: 1              # API 请求/响应日志(1 开启默认, 0 关闭; 请求含完整 body)
+api-key: "sk-yllm-123"   # OpenAI 兼容 API key(Authorization: Bearer <key>; 空/注释 = 不校验)
 
 bin: ./build/avx2/yllm.exe
 

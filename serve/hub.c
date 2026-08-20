@@ -158,7 +158,9 @@ int cmd_hub(ServeConfig* cfg)
     if (cfg->http_port > 0) {
         extern int router_http_start(Router* r, uint16_t http_port);
         extern void router_http_set_api_log(int on);
+        extern void router_http_set_api_key(const char* key);
         router_http_set_api_log(cfg->api_log);
+        router_http_set_api_key(cfg->api_key[0] ? cfg->api_key : NULL);
         router_http_start(&rt, (uint16_t)cfg->http_port);
     }
     ythread_create(&t1, sv_thread, &c1);

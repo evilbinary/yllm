@@ -26,6 +26,22 @@
 static int g_api_log = 1;
 void router_http_set_api_log(int on) { g_api_log = on; }
 
+/* OpenAI 兼容 API key(空 = 不校验) */
+static char g_api_key[CFG_STR_MAX] = "";
+void router_http_set_api_key(const char* key) {
+    if (key) snprintf(g_api_key, sizeof(g_api_key), "%s", key);
+    else g_api_key[0] = '\0';
+}
+
+/* 校验请求 key; 返回 0 通过, -1 拒绝 */
+static int http_check_auth(const HttpRequest* req)
+{
+    if (!g_api_key[0]) return 0;   /* 未配置 key, 不校验 */
+    char got[CFG_STR_MAX];
+    if (http_auth_key(req, got, sizeof(got)) != 0) return -1;
+    return strcmp(got, g_api_key) == 0 ? 0 : -1;
+}
+
 typedef struct {
     Router* router;
     uint16_t port;
@@ -479,6 +495,17 @@ static void handle_conn(int fd, Router* r)
 {
     HttpRequest req;
     if (http_parse_request(fd, &req) != 0) {
+        sock_close(fd);
+        return;
+    }
+
+    /* OpenAI 兼容 key 校验(health 除外); 失败返回 401 */
+    if (!(strcmp(req.method, "GET") == 0 && strcmp(req.path, "/health") == 0) &&
+        http_check_auth(&req) != 0) {
+        HttpResponse rr;
+        http_begin(&rr, fd, 401, NULL);
+        http_reply(&rr, "{\"error\":{\"message\":\"invalid api key\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}");
+        if (req.body) free(req.body);
         sock_close(fd);
         return;
     }

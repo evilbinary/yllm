@@ -10,4 +10,7 @@ int router_http_start(Router* r, uint16_t http_port);
 /* API 请求/响应日志开关(1 = 开启默认, 0 = 关闭) */
 void router_http_set_api_log(int on);
 
+/* 设置 OpenAI 兼容 API key(空 = 不校验) */
+void router_http_set_api_key(const char* key);
+
 #endif

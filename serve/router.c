@@ -530,6 +530,7 @@ int cmd_router(ServeConfig* cfg)
     /* OpenAI 兼容 HTTP(可选) */
     if (cfg->http_port > 0) {
         router_http_set_api_log(cfg->api_log);
+        router_http_set_api_key(cfg->api_key[0] ? cfg->api_key : NULL);
         router_http_start(&r, (uint16_t)cfg->http_port);
     }
     return router_run(&r, sv_host, sv_port);
