@@ -81,7 +81,8 @@ static inline void http_begin(HttpResponse* r, int fd, int status, const char* c
     memset(r, 0, sizeof(*r));
     r->fd = fd;
     r->status = status;
-    r->content_type = content_type ? content_type : "application/json";
+    /* 默认 application/json; 统一带 charset=utf-8 便于客户端正确解码中文 */
+    r->content_type = content_type ? content_type : "application/json; charset=utf-8";
 }
 
 static inline void http_write_head(HttpResponse* r)
@@ -115,7 +116,7 @@ static inline void http_sse_begin(HttpResponse* r, int fd)
     memset(r, 0, sizeof(*r));
     r->fd = fd;
     r->status = 200;
-    r->content_type = "text/event-stream";
+    r->content_type = "text/event-stream; charset=utf-8";
     http_write_head(r);
 }
 

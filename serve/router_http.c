@@ -220,7 +220,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         free(prompt);
         free(collected);
         HttpResponse rr;
-        http_begin(&rr, fd, 500, "application/json");
+        http_begin(&rr, fd, 500, NULL);
         http_reply(&rr, "{\"error\":{\"message\":\"oom\"}}");
         return;
     }
@@ -263,7 +263,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         free(prompt);
         free(collected);
         HttpResponse rr;
-        http_begin(&rr, fd, 400, "application/json");
+        http_begin(&rr, fd, 400, NULL);
         http_reply(&rr, "{\"error\":{\"message\":\"empty prompt\"}}");
         return;
     }
@@ -315,10 +315,10 @@ rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
         if (rc != 0) {
             HttpResponse rr;
             if (rc == -2) {
-                http_begin(&rr, fd, 404, "application/json");
+                http_begin(&rr, fd, 404, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
             } else {
-                http_begin(&rr, fd, 502, "application/json");
+                http_begin(&rr, fd, 502, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
             }
             free(prompt);
@@ -335,7 +335,7 @@ rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
                  "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":%d,\"total_tokens\":%d}}",
                  (long long)time(NULL), model, collected, cc.n_tokens, cc.n_tokens);
         HttpResponse rr;
-        http_begin(&rr, fd, 200, "application/json");
+        http_begin(&rr, fd, 200, NULL);
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP CHAT reply-json", json); }
         free(json);
@@ -360,7 +360,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         free(prompt);
         free(collected);
         HttpResponse rr;
-        http_begin(&rr, fd, 500, "application/json");
+        http_begin(&rr, fd, 500, NULL);
         http_reply(&rr, "{\"error\":{\"message\":\"oom\"}}");
         return;
     }
@@ -386,7 +386,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         free(prompt);
         free(collected);
         HttpResponse rr;
-        http_begin(&rr, fd, 400, "application/json");
+        http_begin(&rr, fd, 400, NULL);
         http_reply(&rr, "{\"error\":{\"message\":\"empty prompt\"}}");
         return;
     }
@@ -425,10 +425,10 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         if (rc != 0) {
             HttpResponse rr;
             if (rc == -2) {
-                http_begin(&rr, fd, 404, "application/json");
+                http_begin(&rr, fd, 404, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
             } else {
-                http_begin(&rr, fd, 502, "application/json");
+                http_begin(&rr, fd, 502, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
             }
             free(prompt);
@@ -443,7 +443,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
                  "\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"length\"}]}",
                  (long long)time(NULL), model, collected);
         HttpResponse rr;
-        http_begin(&rr, fd, 200, "application/json");
+        http_begin(&rr, fd, 200, NULL);
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP COMPLETIONS reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP COMPLETIONS reply-json", json); }
         free(json);
@@ -471,7 +471,7 @@ static void handle_models(int fd, Router* r)
     pthread_mutex_unlock(&r->lock);
     strncat(json, "]}", sizeof(json) - strlen(json) - 1);
     HttpResponse rr;
-    http_begin(&rr, fd, 200, "application/json");
+    http_begin(&rr, fd, 200, NULL);
     http_reply(&rr, json);
 }
 
@@ -485,7 +485,7 @@ static void handle_conn(int fd, Router* r)
 
     if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/health") == 0) {
         HttpResponse rr;
-        http_begin(&rr, fd, 200, "application/json");
+        http_begin(&rr, fd, 200, NULL);
         http_reply(&rr, "{\"status\":\"ok\"}");
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/v1/models") == 0) {
         handle_models(fd, r);
@@ -500,7 +500,7 @@ static void handle_conn(int fd, Router* r)
         handle_completions(fd, r, req.body ? req.body : "", stream);
     } else {
         HttpResponse rr;
-        http_begin(&rr, fd, 404, "application/json");
+        http_begin(&rr, fd, 404, NULL);
         http_reply(&rr, "{\"error\":{\"message\":\"not found\"}}");
     }
     if (req.body) free(req.body);
