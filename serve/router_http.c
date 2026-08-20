@@ -104,26 +104,59 @@ typedef struct {
     const char* model;
     int n_tokens;        /* 已发出的内容 token 数(usage 统计) */
     int include_usage;   /* 客户端请求 stream_options.include_usage */
+    char pending[8];     /* 未完成 UTF-8 字符的尾字节缓冲(防跨 chunk 切分中文) */
+    int pending_len;
 } SseCtx;
+
+/* 返回 buf[0..len) 中完整 UTF-8 字符的字节数(能安全作为 SSE chunk 独立解码的部分)。
+ * 保留末尾可能的不完整多字节序列(留到下次拼接)。 */
+static size_t utf8_complete_len(const char* buf, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)buf[i];
+        size_t need;
+        if (c < 0x80) need = 1;
+        else if ((c >> 5) == 0x6) need = 2;
+        else if ((c >> 4) == 0xE) need = 3;
+        else if ((c >> 3) == 0x1E) need = 4;
+        else { i++; continue; }   /* 非法字节, 当 1 字节 */
+        if (i + need > len) break;   /* 末尾不完整, 留到下次 */
+        i += need;
+    }
+    return i;
+}
 
 static void sse_on_token(const char* utf8, size_t len, void* ctx)
 {
     SseCtx* sc = (SseCtx*)ctx;
     HttpResponse* r = sc->r;
     sc->n_tokens++;
-    char* escaped = (char*)malloc(len * 2 + 1);
+    /* 拼上残留的不完整 UTF-8 序列 */
+    char buf[512];
+    size_t blen = 0;
+    if (sc->pending_len) { memcpy(buf, sc->pending, sc->pending_len); blen = sc->pending_len; }
+    if (blen + len < sizeof(buf)) { memcpy(buf + blen, utf8, len); blen += len; }
+    else { blen = 0; }   /* 超缓冲, 丢弃(罕见) */
+    size_t complete = utf8_complete_len(buf, blen);
+    /* 保存不完整尾部 */
+    sc->pending_len = (int)(blen - complete);
+    if (sc->pending_len > 0) memcpy(sc->pending, buf + complete, sc->pending_len);
+    if (complete == 0) return;   /* 全是不完整序列, 等下次 */
+
+    char* escaped = (char*)malloc(complete * 2 + 1);
     if (!escaped) return;
     size_t o = 0, i;
-    for (i = 0; i < len; i++) {
-        if (utf8[i] == '"') { escaped[o++] = '\\'; escaped[o++] = '"'; }
-        else if (utf8[i] == '\\') { escaped[o++] = '\\'; escaped[o++] = '\\'; }
-        else if (utf8[i] == '\n') { escaped[o++] = '\\'; escaped[o++] = 'n'; }
-        else if (utf8[i] == '\r') { escaped[o++] = '\\'; escaped[o++] = 'r'; }
-        else if (utf8[i] == '\t') { escaped[o++] = '\\'; escaped[o++] = 't'; }
-        else escaped[o++] = utf8[i];
+    for (i = 0; i < complete; i++) {
+        if (buf[i] == '"') { escaped[o++] = '\\'; escaped[o++] = '"'; }
+        else if (buf[i] == '\\') { escaped[o++] = '\\'; escaped[o++] = '\\'; }
+        else if (buf[i] == '\n') { escaped[o++] = '\\'; escaped[o++] = 'n'; }
+        else if (buf[i] == '\r') { escaped[o++] = '\\'; escaped[o++] = 'r'; }
+        else if (buf[i] == '\t') { escaped[o++] = '\\'; escaped[o++] = 't'; }
+        else escaped[o++] = buf[i];
     }
     escaped[o] = '\0';
-    size_t jlen = 256 + len * 2;
+    size_t jlen = 256 + complete * 2;
     char* json = (char*)malloc(jlen);
     if (!json) { free(escaped); return; }
     snprintf(json, jlen,
