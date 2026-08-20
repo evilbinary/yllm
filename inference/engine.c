@@ -324,10 +324,14 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
             e->mtp_enorm_slot = SLOT_MTP_ENORM;
             e->mtp_hnorm_slot = SLOT_MTP_HNORM;
             e->mtp_headnorm_slot = SLOT_MTP_HEAD_NORM;
-            ylog_info("engine: MTP weights detected (eh_proj=%s size=%llu)",
-                      tm->name, (unsigned long long)tm->size);
+            e->mtp_layer = m->h.n_blocks;   /* blk.64 = MTP 块, 不进主干 */
+            e->mtp_h = (float*)ycalloc(m->h.hidden, 4);
+            e->mtp_logits = (float*)ymalloc((size_t)m->h.vocab * 4);
+            ylog_info("engine: MTP weights detected (eh_proj=%s size=%llu, trunk=%u layers)",
+                      tm->name, (unsigned long long)tm->size, m->h.n_blocks - 1);
         } else {
             e->mtp_eh_slot = 0;
+            e->mtp_layer = 0;
         }
     }
     /* 层前向分派: 按架构挂实现(一次) */
@@ -358,6 +362,8 @@ void engine_free(Engine* e)
     free(e->ffn);
     free(e->att);
     free(e->logits);
+    if (e->mtp_h) free(e->mtp_h);
+    if (e->mtp_logits) free(e->mtp_logits);
     free(e->pb); free(e->pb2); free(e->pbq);
     free(e->pbk); free(e->pbv); free(e->pbg); free(e->pbu);
     free(e->pba);
@@ -564,10 +570,15 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             }
         }
         uint32_t i;
-        for (i = 1; i <= h->n_blocks; i++) {
+        uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
+        for (i = 1; i <= trunk; i++) {
             if (ws->budget > 0) sched_ensure(ws, i);
             e->fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
             if (ws->budget > 0) sched_release_budget(ws, i);
+        }
+        if (e->mtp_h) {
+            memcpy(e->mtp_h, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
+            e->mtp_h_ready = 1;
         }
         /* 最后一层: final norm + output(只算最后 token) */
         {
@@ -1032,8 +1043,14 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
         default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
         }
-    } else if (i <= h->n_blocks) {
+    } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
         e->fwd_block(e, i, pos);
+        if (e->mtp_h && i == (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
+            memcpy(e->mtp_h, e->x, (size_t)h->hidden * 4);
+            e->mtp_h_ready = 1;
+        }
+    } else if (e->mtp_layer && i == e->mtp_layer) {
+        /* MTP 块不进主干, 仅 MTP 预测时使用 */
     } else if (i == h->n_blocks + 1) {
         float eps;
         memcpy(&eps, &h->norm_eps_bits, 4);
@@ -1246,10 +1263,12 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
     uint32_t i;
     for (i = e->layer_begin; i < e->layer_end; i++) {
         if (i == 0) continue;
-        if (i <= h->n_blocks) {
+        if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
             e->fwd_block_batch(e, i, pos, (uint32_t)n);
             if (getenv("YLLM_NANDBG") && e->pb[0] != e->pb[0])
                 fprintf(stderr, "[nandbg] batch NaN after layer %u pos %u\n", i, pos);
+        } else if (e->mtp_layer && i == e->mtp_layer) {
+            /* MTP 块不进主干, 仅 MTP 预测时使用 */
         } else if (i == h->n_blocks + 1) {
             const LlfTensorMeta* fn = &m->metas[m->base_idx[i]];
             rmsnorm(e->x, e->pb + (size_t)(n - 1) * hidden,
@@ -1271,70 +1290,119 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
     return 0;
 }
 
-/* MTP(Multi-Token Prediction)基础前向: 给定当前 token 的主干 hidden(e->x),
- * 预测下一 token 的 logits(写入 e->logits)。P1: 单层, 结构就位。
- * 公式(DeepSeek-V3 风格, 简化):
- *   emb   = embed(next_token)                    # 由调用方传 token, 取 embed
- *   h_in  = eh_proj(emb)                         # [in → eh_out]
- *   h'    = hnorm( e->x + h_in[0:hidden] )       # hidden norm
- *   logits = shared_head( h' )                   # 共享 lm_head
+/* MTP(Multi-Token Prediction)前向: 与 llama.cpp qwen35 graph_mtp 等价。
+ * 输入: h_main = 主干最后一层输出(norm 前)的 hidden, token = 下一个 token,
+ *       pos = token 的位置(rope)。
+ * 公式:
+ *   e_norm = rmsnorm(embed(token), enorm)
+ *   h_norm = rmsnorm(h_main, hnorm)
+ *   cur    = eh_proj([e_norm | h_norm])           # [2*hidden → hidden], F16
+ *   cur   += attn_block(cur, q/k/v/gate, 单 token self-attention, 无历史 KV)
+ *   cur   += ffn(cur)
+ *   head   = rmsnorm(cur, shared_head_norm)
+ *   logits = lm_head(head)
  * 返回 0 成功, -1 无 MTP。 */
-/* MTP 预测: 给定"当前 token 的主干 hidden"(e->x 应为该 token 算完最后一层、norm 之前的原始 hidden?),
- * 以及"下一个要预测的 token"(下一 token 的 embed), 输出预测的 logits。
- *
- * DeepSeek-V3 单层 MTP 公式:
- *   h' = hnorm( h_main + eh_proj( embed(t_next) ) )
- *   logits = shared_head( h' )    # 共享主 lm_head
- *
- * 注: eh_proj 在 qwen3.8-27b 输出 2×hidden(10240), 前 hidden 作为嵌入投影,
- *     后 hidden 可能是附加输出(暂忽略, P1 只取前 half)。 */
-int engine_mtp_predict(Engine* e, uint32_t next_token, float* logits_out)
+int engine_mtp_predict(Engine* e, const float* h_main, uint32_t token, uint32_t pos, float* logits_out)
 {
     if (!e->mtp_eh_slot) return -1;
     LlModel* m = &e->ws.model;
     const LlfHeader* h = &m->h;
-    uint32_t ol = h->n_blocks + 2;
+    const uint8_t* base = (const uint8_t*)e->ws.map.base;
     uint32_t hidden = h->hidden;
-    uint8_t* base = (uint8_t*)e->ws.map.base;
-
-    /* ① embed(next_token) */
+    uint32_t mb = h->n_blocks;                  /* MTP 块 llf 层 */
+    uint32_t ol = h->n_blocks + 2;              /* output 层(nextn 权重) */
+    const LlfTensorMeta* mt = &m->metas[m->base_idx[mb]];
+    const LlfTensorMeta* nt = &m->metas[m->base_idx[ol]];
     const LlfTensorMeta* emb = &m->metas[m->base_idx[0] + SLOT_EMBED];
-    float* embv = (float*)e->hb;
-    switch (emb->dtype) {
-        case DT_F32: embed_f32(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
-        case DT_Q4K: embed_q4k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
-        case DT_Q6K: embed_q6k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
-        case DT_Q5K: embed_q5k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
-        default:     embed_f16(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
-    }
-
-    /* ② eh_proj: [hidden → eh_out], 取前 hidden 作为嵌入投影 */
-    const LlfTensorMeta* eh = &m->metas[m->base_idx[ol] + e->mtp_eh_slot];
-    uint8_t* ehw = base + m->dir[ol].offset + eh->offset;
-    uint32_t eh_out = eh->shape[0] ? eh->shape[0] : hidden;
-    float* h_in = (float*)e->att;   /* 复用 att 作 eh_proj 输出, 大小 eh_out */
-    if (eh->dtype == DT_F16)
-        matmul_f16_t(h_in, embv, ehw, hidden, eh_out);
-    else
-        matmul_f32_t(h_in, embv, ehw, hidden, eh_out);
-
-    /* ③ h' = hnorm( h_main + h_in[0:hidden] ); 结果放 e->x 覆盖主 hidden */
-    const LlfTensorMeta* hn = &m->metas[m->base_idx[ol] + e->mtp_hnorm_slot];
-    float eps;
+    uint32_t n_heads = h->n_heads;
+    uint32_t n_kv = h->n_kv_heads;
+    uint32_t hd = h->head_dim;
+    uint32_t qdim = n_heads * hd;
+    uint32_t kv_dim = n_kv * hd;
+    uint32_t n_rot = 64;
+    float eps, theta;
     memcpy(&eps, &h->norm_eps_bits, 4);
-    float* hnorm_in = (float*)e->hb2;
-    uint32_t i;
-    for (i = 0; i < hidden; i++) {
-        float proj = eh_out > 0 ? h_in[i] : 0.0f;
-        hnorm_in[i] = e->x[i] + proj;
-    }
-    rmsnorm(e->x, hnorm_in, base + m->dir[ol].offset + hn->offset, hidden, eps, hn->dtype);
+    memcpy(&theta, &h->rope_theta_bits, 4);
+    uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
 
-    /* ④ shared lm_head: logits_out[vocab] = lm_head( e->x ) */
-    const LlfTensorMeta* out = &m->metas[m->base_idx[ol] + 0];   /* slot 0 = lm_head */
-    matmul_rows(logits_out, e->x,
-                base + m->dir[ol].offset + out->offset,
-                0, h->vocab, hidden, h->vocab, out->dtype);
+    /* 缓冲布局(scratch 65536 floats, 与 GDN/attention 不并发):
+     * concat[2*hidden] | cur[hidden] | q[qdim] | gate[qdim] | k[kv_dim] | v[kv_dim] | attn_out[qdim] */
+    float* scratch = e->scratch;
+    float* concat = scratch;
+    float* cur = scratch + 2 * hidden;
+    float* q = scratch + 3 * hidden;
+    float* gate = scratch + 3 * hidden + qdim;
+    float* k = scratch + 3 * hidden + 2 * qdim;
+    float* v = scratch + 3 * hidden + 2 * qdim + kv_dim;
+    float* attn_out = scratch + 3 * hidden + 2 * qdim + 2 * kv_dim;
+    float* x2 = e->hb;
+    uint32_t j;
+
+    /* ① embed + e_norm(就地到 concat 前半) */
+    switch (emb->dtype) {
+    case DT_F32: embed_f32(concat, base + m->dir[0].offset + emb->offset, token, hidden); break;
+    case DT_Q4K: embed_q4k(concat, base + m->dir[0].offset + emb->offset, token, hidden); break;
+    case DT_Q6K: embed_q6k(concat, base + m->dir[0].offset + emb->offset, token, hidden); break;
+    case DT_Q5K: embed_q5k(concat, base + m->dir[0].offset + emb->offset, token, hidden); break;
+    default:     embed_f16(concat, base + m->dir[0].offset + emb->offset, token, hidden); break;
+    }
+    rmsnorm(concat, concat, base + m->dir[ol].offset + nt[e->mtp_enorm_slot].offset,
+            hidden, eps, nt[e->mtp_enorm_slot].dtype);
+    /* ② h_norm 到 concat 后半 */
+    rmsnorm(concat + hidden, h_main, base + m->dir[ol].offset + nt[e->mtp_hnorm_slot].offset,
+            hidden, eps, nt[e->mtp_hnorm_slot].dtype);
+    /* ③ eh_proj: [2*hidden → hidden] F16 */
+    matmul_f16_t(cur, concat, base + m->dir[ol].offset + nt[e->mtp_eh_slot].offset,
+                 2 * hidden, hidden);
+    /* ④ attn_norm + q/k/v/gate */
+    rmsnorm(x2, cur, base + m->dir[mb].offset + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+    matmul(q, x2, base + m->dir[mb].offset + mt[SLOT_Q].offset, qdim, hidden, mt[SLOT_Q].dtype);
+    matmul(gate, x2, base + m->dir[mb].offset + mt[SLOT_QGATE].offset, qdim, hidden, mt[SLOT_QGATE].dtype);
+    matmul(k, x2, base + m->dir[mb].offset + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
+    matmul(v, x2, base + m->dir[mb].offset + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+    /* ⑤ q/k QK-norm + M-RoPE */
+    {
+        uint32_t hh;
+        for (hh = 0; hh < n_heads; hh++)
+            rmsnorm(q + (size_t)hh * hd, q + (size_t)hh * hd,
+                    base + m->dir[mb].offset + mt[SLOT_QNORM].offset, hd, eps, mt[SLOT_QNORM].dtype);
+        for (hh = 0; hh < n_kv; hh++)
+            rmsnorm(k + (size_t)hh * hd, k + (size_t)hh * hd,
+                    base + m->dir[mb].offset + mt[SLOT_KNORM].offset, hd, eps, mt[SLOT_KNORM].dtype);
+        for (hh = 0; hh < n_heads; hh++)
+            rope_inplace_mrope(q + (size_t)hh * hd, hd, n_rot, pos, theta);
+        for (hh = 0; hh < n_kv; hh++)
+            rope_inplace_mrope(k + (size_t)hh * hd, hd, n_rot, pos, theta);
+    }
+    /* ⑥ 单 token self-attention: softmax(q·k)=1, 输出 = v(按 q 头组复制), ×sigmoid(gate) */
+    {
+        uint32_t hh;
+        for (hh = 0; hh < n_heads; hh++) {
+            uint32_t kv_head = hh * n_kv / n_heads;
+            memcpy(attn_out + (size_t)hh * hd, v + (size_t)kv_head * hd, (size_t)hd * 4);
+        }
+        for (j = 0; j < qdim; j++)
+            attn_out[j] *= 1.0f / (1.0f + expf(-gate[j]));
+    }
+    /* ⑦ o_proj + 残差 */
+    matmul(x2, attn_out, base + m->dir[mb].offset + mt[SLOT_O].offset, hidden, qdim, mt[SLOT_O].dtype);
+    for (j = 0; j < hidden; j++) cur[j] += x2[j];
+    /* ⑧ post norm + FFN */
+    rmsnorm(x2, cur, base + m->dir[mb].offset + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
+    {
+        float* fg = e->ffn;
+        float* fu = e->ffn + inter;
+        matmul(fg, x2, base + m->dir[mb].offset + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+        matmul(fu, x2, base + m->dir[mb].offset + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        swiglu(x2, fg, fu, inter);
+        matmul(attn_out, x2, base + m->dir[mb].offset + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
+    }
+    for (j = 0; j < hidden; j++) cur[j] += attn_out[j];
+    /* ⑨ shared head norm + lm_head */
+    rmsnorm(x2, cur, base + m->dir[ol].offset + nt[e->mtp_headnorm_slot].offset,
+            hidden, eps, nt[e->mtp_headnorm_slot].dtype);
+    matmul_rows(logits_out, x2, base + m->dir[ol].offset + nt[0].offset,
+                0, h->vocab, hidden, h->vocab, nt[0].dtype);
     return 0;
 }
 
@@ -1432,15 +1500,60 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         timings->prefill_ms = t1 - t0;
     }
     uint32_t ngen = 0;
+    uint32_t n_accept = 0, n_try = 0;
+    int pending = 0;              /* 上一轮 MTP 接受: 本轮跳过采样直接 forward */
+    uint32_t pending_tok = 0;
+    uint32_t vocab = e->ws.model.h.vocab;
     for (i = 0; i < ntokens; i++) {
         if (pos >= e->max_seq) break;
         uint32_t nxt;
-        if (engine_sample(e, e->ws.model.h.vocab, temp, top_p, &rng, &nxt) != 0) return -1;
-        if (eos_stop >= 0 && (int)nxt == eos_stop) break;   /* eos 不发给对端 */
-        if (on_token && on_token(nxt, ctx) != 0) break;     /* 回调可中止(如对端断开) */
+        if (pending) { nxt = pending_tok; pending = 0; }
+        else {
+            if (engine_sample(e, vocab, temp, top_p, &rng, &nxt) != 0) return -1;
+            if (eos_stop >= 0 && (int)nxt == eos_stop) break;
+            if (on_token && on_token(nxt, ctx) != 0) break;     /* 回调可中止(如对端断开) */
+        }
+        /* MTP draft: 输入 hidden(pos-1 主干输出) + embed(nxt=pos) → 预测 pos+1 */
+        uint32_t draft = 0xFFFFFFFFu;
+        if (e->mtp_enable && e->mtp_eh_slot && e->mtp_h_ready) {
+            if (engine_mtp_predict(e, e->mtp_h, nxt, pos, e->mtp_logits) == 0) {
+                uint32_t b2, best = 0;
+                for (b2 = 1; b2 < vocab; b2++)
+                    if (e->mtp_logits[b2] > e->mtp_logits[best]) best = b2;
+                draft = best;
+            }
+        }
+        if (pos >= e->max_seq) break;
         engine_forward(e, nxt, pos);
         pos++;
         ngen++;
+        if (draft != 0xFFFFFFFFu) {
+            n_try++;
+            uint32_t real = 0, b3;
+            for (b3 = 1; b3 < vocab; b3++)
+                if (e->logits[b3] > e->logits[real]) real = b3;
+            if (getenv("YLLM_MTDBG")) {
+                fprintf(stderr, "[mtdbg] nxt=%u pos=%u draft=%u real=%u %s\n", nxt, pos, draft, real,
+                        draft == real ? "ACCEPT" : "reject");
+            }
+            if (real == draft) {
+                if (eos_stop >= 0 && (int)draft == eos_stop) { /* eos 不入列 */ }
+                else if (on_token && on_token(draft, ctx) != 0) { break; }
+                else {
+                    pending = 1;
+                    pending_tok = draft;
+                    ngen++;
+                    n_accept++;
+                    pos++;          /* draft 占位; KV 由下轮 forward 写入 */
+                    if (pos >= e->max_seq) break;
+                }
+            }
+        }
+    }
+    if (e->mtp_enable && e->mtp_eh_slot && n_try > 0) {
+        uint32_t nfwd = ngen > n_accept ? ngen - n_accept : 1;
+        ylog_info("mtp: draft accepted %u/%u (%.0f%%) -> %.2f tok/forward", n_accept, n_try,
+                  (double)n_accept * 100.0 / (double)n_try, (double)ngen / (double)nfwd);
     }
     if (timings) {
         timings->n_decode = ngen;

@@ -396,7 +396,7 @@ void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint3
     for (oo = 0; oo < out; oo++) {
         float acc = 0.0f;
         uint32_t ii;
-        for (ii = 0; ii < in; ii++) acc += x[ii] * wp[(size_t)ii * out + oo];
+        for (ii = 0; ii < in; ii++) acc += x[ii] * wp[(size_t)oo * in + ii];
         y[oo] = acc;
     }
 }
@@ -409,7 +409,7 @@ void matmul_f16_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint3
     for (oo = 0; oo < out; oo++) {
         float acc = 0.0f;
         uint32_t ii;
-        for (ii = 0; ii < in; ii++) acc += x[ii] * f16_to_f32(wp[(size_t)ii * out + oo]);
+        for (ii = 0; ii < in; ii++) acc += x[ii] * f16_to_f32(wp[(size_t)oo * in + ii]);
         y[oo] = acc;
     }
 }

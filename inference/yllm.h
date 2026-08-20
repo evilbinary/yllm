@@ -143,6 +143,11 @@ typedef struct Engine {
     uint32_t mtp_enorm_slot; /* embed norm */
     uint32_t mtp_hnorm_slot; /* hidden norm */
     uint32_t mtp_headnorm_slot; /* shared head norm */
+    uint32_t mtp_layer;      /* MTP 块所在 llf 层(n_blocks, 0 = 无); 主干到 mtp_layer-1 */
+    float* mtp_h;            /* [hidden] 主干最后一层 norm 前 hidden(MTP 输入) */
+    float* mtp_logits;       /* [vocab] MTP 预测 logits */
+    int mtp_enable;          /* 运行期开关: 1 = speculative decoding */
+    int mtp_h_ready;         /* mtp_h 已由最近一次主干前向刷新 */
 } Engine;
 
 typedef struct {
