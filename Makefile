@@ -75,7 +75,7 @@ BIN_AVX2      := build/avx2/yllm$(EXE)
 OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o $(OBJDIR_AVX2)/server.o $(OBJDIR_AVX2)/router.o $(OBJDIR_AVX2)/supervisor.o $(OBJDIR_AVX2)/hub.o $(OBJDIR_AVX2)/router_http.o $(OBJDIR_AVX2)/status.o $(OBJDIR_AVX2)/ctl.o $(OBJDIR_AVX2)/sync.o
 OBJ_AVX2      := $(sort $(OBJ_AVX2))
 ifeq ($(ARCH),x86_64)
-CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma
+CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma -mf16c
 endif
 
 all: $(BIN)

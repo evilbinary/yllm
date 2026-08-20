@@ -445,24 +445,40 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
             const int8_t* xp = xq8 + (size_t)b * 256;
-            float d    = f16_to_f32(((const uint16_t*)blk)[0]);
-            float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
             const uint8_t* q = blk + 16;
             const uint8_t* scp = blk + 4;
             if (b + 1 < nb) _mm_prefetch((const char*)(blk + 144), _MM_HINT_T0);
+#ifdef __F16C__
+            __m128i hb = _mm_loadl_epi64((const __m128i*)blk);
+            __m128 fd = _mm_cvtph_ps(hb);
+            float d = _mm_cvtss_f32(fd);
+            float dmin = _mm_cvtss_f32(_mm_shuffle_ps(fd, fd, _MM_SHUFFLE(1, 1, 1, 1)));
+#else
+            float d    = f16_to_f32(((const uint16_t*)blk)[0]);
+            float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
+#endif
             float dsc = d * xs[b];      /* 折叠块内 x 的 int8 缩放 */
             float msc = dmin * xs[b];
 
+            /* 展开解 8 组 scale/min(无分支, 替代逐组 gsm_k4 调用) */
+            uint8_t sc8[8], mn8[8];
+            sc8[0] = scp[0] & 63;  mn8[0] = scp[4] & 63;
+            sc8[1] = scp[1] & 63;  mn8[1] = scp[5] & 63;
+            sc8[2] = scp[2] & 63;  mn8[2] = scp[6] & 63;
+            sc8[3] = scp[3] & 63;  mn8[3] = scp[7] & 63;
+            sc8[4] = (scp[8] & 15) | ((scp[0] >> 6) << 4);
+            mn8[4] = (scp[8] >> 4) | ((scp[4] >> 6) << 4);
+            sc8[5] = (scp[9] & 15) | ((scp[1] >> 6) << 4);
+            mn8[5] = (scp[9] >> 4) | ((scp[5] >> 6) << 4);
+            sc8[6] = (scp[10] & 15) | ((scp[2] >> 6) << 4);
+            mn8[6] = (scp[10] >> 4) | ((scp[6] >> 6) << 4);
+            sc8[7] = (scp[11] & 15) | ((scp[3] >> 6) << 4);
+            mn8[7] = (scp[11] >> 4) | ((scp[7] >> 6) << 4);
+            float d1[8], m1[8];
+            for (int ii = 0; ii < 8; ii++) { d1[ii] = dsc * sc8[ii]; m1[ii] = msc * mn8[ii]; }
+
             int is = 0;
             for (int j = 0; j < 4; j++) {
-                uint8_t sc, mn;
-                get_scale_min_k4(is, scp, &sc, &mn);
-                float d1 = dsc * (float)sc;
-                float m1 = msc * (float)mn;
-                get_scale_min_k4(is + 1, scp, &sc, &mn);
-                float d2 = dsc * (float)sc;
-                float m2 = msc * (float)mn;
-
                 /* 32B qs: byte k 的低 nibble → x[k](组 is), 高 nibble → x[k+32](组 is+1) */
                 __m128i q0 = _mm_loadu_si128((const __m128i*)(q));
                 __m128i q1 = _mm_loadu_si128((const __m128i*)(q + 16));
@@ -483,10 +499,10 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
                 __m256 sx1 = _mm256_loadu_ps(sxg + ((size_t)b * 8 + is) * 8);
                 __m256 sx2 = _mm256_loadu_ps(sxg + ((size_t)b * 8 + is + 1) * 8);
 
-                acc_v = _mm256_fmadd_ps(dot1, _mm256_set1_ps(d1), acc_v);
-                acc_v = _mm256_fnmadd_ps(sx1, _mm256_set1_ps(m1), acc_v);
-                acc_v = _mm256_fmadd_ps(dot2, _mm256_set1_ps(d2), acc_v);
-                acc_v = _mm256_fnmadd_ps(sx2, _mm256_set1_ps(m2), acc_v);
+                acc_v = _mm256_fmadd_ps(dot1, _mm256_set1_ps(d1[is]), acc_v);
+                acc_v = _mm256_fnmadd_ps(sx1, _mm256_set1_ps(m1[is]), acc_v);
+                acc_v = _mm256_fmadd_ps(dot2, _mm256_set1_ps(d1[is + 1]), acc_v);
+                acc_v = _mm256_fnmadd_ps(sx2, _mm256_set1_ps(m1[is + 1]), acc_v);
 
                 xp += 64;
                 q  += 32;
