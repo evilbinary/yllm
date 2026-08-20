@@ -89,6 +89,31 @@ yllm ctl --target r0 --cmd PING
 yllm ctl --target sv --cmd SCALE --need-groups 2
 ```
 
+## 模型转换与运行
+
+```sh
+# 从 GGUF 转换(顺带导出 vocab)
+yllm convert --gguf model.Q4_K_M.gguf --out model.llf --vocab vocab.txt --seq 2048
+
+# 生成 dummy 模型
+yllm convert --out dummy.llf --blocks 2 --hidden 64 --heads 4 --vocab-size 32000
+
+# 校验 / 生成 / 聊天
+yllm check --model model.llf
+yllm gen   --model model.llf --vocab vocab.txt --prompt "Hello" --tokens 64
+yllm chat  --model model.llf --vocab vocab.txt --prompt "你好啊" --tokens 80 --temp 0.8 --top-p 0.9
+```
+
+源码构建时用 make 包装(等价):
+
+```sh
+make chat-avx2 NTHREADS=16 CHAT_PROMPT=你好啊 CHAT_TOKENS=80   # 聊天
+make gen NTHREADS=4 CHAT_PROMPT="Once upon a time"             # 生成
+```
+
+- `model` 未转换时会自动从 `MODEL_GGUF` 转成 `MODEL_LLF` 再运行;
+- 相关变量均可覆盖:`MODEL_GGUF` / `MODEL_LLF` / `MODEL_VOCAB` / `CHAT_PROMPT` / `CHAT_TOKENS` / `NTHREADS`(默认本机核心数)。
+
 ## 推理请求
 
 ```sh
@@ -101,6 +126,25 @@ yllm router --config serve.yaml --send "tinyllama 64 Hello"
 
 `--send` 格式:`"<model> <max_tokens> <prompt>"`,模型名需匹配 serve.yaml 的 `model-name`。
 集群返回流式 token,末尾 `DONE <tokens> <ms>`。
+
+## 两机部署示例(本机 hub + 远端 rank)
+
+控制面(本地)与推理面(远端)分离:远端只跑 rank(权重常驻),本机只做路由/管理。
+
+```sh
+# 本机(管理+控制面)
+build/avx2/yllm hub --port 9500 --router-port 9400 --server-port 9420 \
+    --server-model tinyllama --server-leader 192.168.0.23:9410 --log logs/hub.log
+
+# 远端(推理节点, 心跳发本机 supervisor)
+build/avx2/yllm rank --model model.llf --vocab vocab.txt --port 9410 \
+    --supervisor 192.168.1.161:9500 --id rank-r0 --log logs/rank.log
+
+# 客户端(本机)
+build/avx2/yllm router --port 9400 --send "tinyllama 30 Once upon a time"
+```
+
+生产环境推荐用 `serve.yaml` 的 `models[].ranks / local` 描述拓扑(`ranks` 总段数,`local` 本机拉起的段数,`local: 0` 表示全部外部部署),用 `yllm hub --config` 拉起。
 
 ## 文件分发(sync)
 
@@ -192,3 +236,5 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
 - 流式: `data: {...}` SSE 块,`finish_reason` 结束
 
 > 请求经 router → server → rank 流水线处理;若节点未就绪会返回错误。
+
+
