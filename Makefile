@@ -263,6 +263,9 @@ gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 Q25_LLF   ?= models/qwen2.5-1.5b.llf
 Q25_VOCAB ?= models/qwen2.5.vocab.txt
+Q25_7B_GGUF  ?= models/qwen2.5-7b-instruct-q4_k_m.gguf
+Q25_7B_LLF   ?= models/qwen2.5-7b.llf
+Q25_7B_VOCAB ?= models/qwen2.5-7b.vocab.txt
 Q3_GGUF   ?= models/Qwen3-8B-Q4_K_M.gguf
 Q3_LLF    ?= models/qwen3-8b.llf
 Q3_VOCAB  ?= models/qwen3.vocab.txt
@@ -270,6 +273,10 @@ Q3_VOCAB  ?= models/qwen3.vocab.txt
 $(Q25_LLF): $(Q25_GGUF) $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(Q25_GGUF) --out $(Q25_LLF) --vocab $(Q25_VOCAB) --seq 2048
+
+$(Q25_7B_LLF): $(Q25_7B_GGUF) $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(Q25_7B_GGUF) --out $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --seq 4096
 
 $(Q3_LLF): $(Q3_GGUF) $(BIN)
 	@mkdir -p $(dir $@)
@@ -307,6 +314,34 @@ chat-qwen3.8-27b: $(BIN) $(Q38_LLF)
 
 chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
 	$(RUN_AVX2) chat --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+# ---- 指定模型的 serve 快捷目标(全部用 serve.yaml 同一 hub, 类似 chat-xxx) ----
+#   用 make server-qwen2.5-7b 一键拉起 hub(serve.yaml 同时服务全部模型, 端口自动错开)
+#   qwen38 的 rank 在远程, 需先远程手工起; 其余模型本机自动拉起
+server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN_AVX2) hub --config serve.yaml > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-qwen38: $(BIN_AVX2) $(Q38_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN_AVX2) hub --config serve.yaml > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml); 用 make infer-qwen38 发请求 (HTTP 127.0.0.1:8000)"
+
+server-tinyllama: $(BIN_AVX2) $(MODEL_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup $(BIN_AVX2) hub --config serve.yaml > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
+
+# 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 model-name)
+infer-qwen2.5-7b: $(BIN)
+	$(BIN) router --config serve.yaml --send "qwen2.5 $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-qwen38: $(BIN)
+	$(BIN) router --config serve.yaml --send "qwen38 $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-tinyllama: $(BIN)
+	$(BIN) router --config serve.yaml --send "tinyllama $(CHAT_TOKENS) $(SERVE_PROMPT)"
 
 # ---- 常驻推理服务(serve 层) ----
 # 统一配置: serve.yaml(所有角色共用)
@@ -505,4 +540,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop
+.PHONY: all avx2 clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
