@@ -58,16 +58,38 @@ static void collect_on_token(const char* utf8, size_t len, void* ctx)
     cc->n_tokens++;
 }
 
+/* 完整打印请求 body 到日志(绕过 4096 日志缓冲截断, 分块写) */
+static void ylog_body(const char* tag, const char* body)
+{
+    if (!body) { ylog_info("%s body=NULL", tag); return; }
+    size_t blen = strlen(body);
+    ylog_info("%s body_len=%zu", tag, blen);
+    const size_t CHUNK = 2000;
+    size_t off = 0;
+    while (off < blen) {
+        size_t take = (blen - off > CHUNK) ? CHUNK : (blen - off);
+        char buf[CHUNK + 1];
+        memcpy(buf, body + off, take);
+        buf[take] = '\0';
+        ylog_raw("%s", buf);
+        ylog_raw("\n");
+        off += take;
+    }
+}
+
 /* SSE 回调: 逐 token 写 data 块 */
 typedef struct {
     HttpResponse* r;
     const char* model;
+    int n_tokens;        /* 已发出的内容 token 数(usage 统计) */
+    int include_usage;   /* 客户端请求 stream_options.include_usage */
 } SseCtx;
 
 static void sse_on_token(const char* utf8, size_t len, void* ctx)
 {
     SseCtx* sc = (SseCtx*)ctx;
     HttpResponse* r = sc->r;
+    sc->n_tokens++;
     char* escaped = (char*)malloc(len * 2 + 1);
     if (!escaped) return;
     size_t o = 0, i;
@@ -80,14 +102,39 @@ static void sse_on_token(const char* utf8, size_t len, void* ctx)
         else escaped[o++] = utf8[i];
     }
     escaped[o] = '\0';
-    char json[512];
-    snprintf(json, sizeof(json),
+    size_t jlen = 256 + len * 2;
+    char* json = (char*)malloc(jlen);
+    if (!json) { free(escaped); return; }
+    snprintf(json, jlen,
              "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\","
              "\"created\":%lld,\"model\":\"%s\","
              "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
              (long long)time(NULL), sc->model, escaped);
     http_sse_data(r, json);
+    free(json);
     free(escaped);
+}
+
+/* SSE 收尾 chunk: OpenAI 要求流结束时必须带 finish_reason(否则客户端报 "Stream ended without finish_reason") */
+static void sse_on_done(SseCtx* sc, const char* reason)
+{
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\","
+             "\"created\":%lld,\"model\":\"%s\","
+             "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}",
+             (long long)time(NULL), sc->model, reason);
+    http_sse_data(sc->r, json);
+    /* include_usage 请求时补 usage 收尾 chunk(空 choices), 否则客户端 tok/s 统计为 0 */
+    if (sc->include_usage) {
+        int ct = sc->n_tokens;
+        snprintf(json, sizeof(json),
+                 "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\","
+                 "\"created\":%lld,\"model\":\"%s\","
+                 "\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+                 (long long)time(NULL), sc->model, ct, ct);
+        http_sse_data(sc->r, json);
+    }
 }
 
 /* 会话 key: 客户端 IP + 首条用户消息哈希(同一对话稳定) */
@@ -173,7 +220,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         return;
     }
     size_t plen = extract_chat_prompt(body, prompt, HTTP_MAX_BODY);
-    int max_tokens = 32;
+    int max_tokens = 1024;
     if (json_find(body, "max_tokens", &v) && v.type == JSON_NUM)
         max_tokens = (int)json_num(&v);
     float rtemp = 1.0f, rtop_p = 0.9f;
@@ -181,7 +228,13 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         rtemp = (float)json_num(&v);
     if (json_find(body, "top_p", &v) && v.type == JSON_NUM)
         rtop_p = (float)json_num(&v);
-
+    int include_usage = 0;
+    if (json_find(body, "stream_options.include_usage", &v) && v.type == JSON_BOOL) {
+        /* true/false 均可能(JSON_BOOL 表示 true 或 false); 取值并判断 true */
+        int bv = 0;
+        if (v.start) bv = (v.start[0] == 't');
+        include_usage = bv;
+    }
     /* 会话模式: 提取全部消息 + 会话 key, 渲染后只发增量 token 给 rank */
     char* pool = (char*)malloc(HTTP_MAX_BODY);
     char* roles[16];
@@ -215,6 +268,10 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         SseCtx sc;
         sc.r = &rr;
         sc.model = model;
+        sc.n_tokens = 0;
+        sc.include_usage = include_usage;
+        ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu",
+                  model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen);
         http_sse_begin(&rr, fd);
         int rc;
         if (sess_ok)
@@ -224,9 +281,16 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p);
-        if (rc != 0)
-            http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+        if (rc != 0) {
+            if (rc == -2)
+                http_sse_data(&rr, "{\"error\":{\"message\":\"model not found\"}}");
+            else
+                http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+        } else {
+            sse_on_done(&sc, "stop");
+        }
         http_sse_done(&rr);
+        ylog_info("HTTP CHAT stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
     } else {
         CollectCtx cc;
         cc.buf = collected;
@@ -240,12 +304,17 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                                    contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc,
                                    rtemp, rtop_p);
         else
-            rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
+rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
                               rtemp, rtop_p);
         if (rc != 0) {
             HttpResponse rr;
-            http_begin(&rr, fd, 502, "application/json");
-            http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            if (rc == -2) {
+                http_begin(&rr, fd, 404, "application/json");
+                http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
+            } else {
+                http_begin(&rr, fd, 502, "application/json");
+                http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            }
             free(prompt);
             free(collected);
             return;
@@ -262,6 +331,8 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         HttpResponse rr;
         http_begin(&rr, fd, 200, "application/json");
         http_reply(&rr, json);
+        ylog_info("HTTP CHAT reply n_tokens=%d", cc.n_tokens);
+        ylog_body("HTTP CHAT reply-json", json);
         free(json);
     }
     if (pool) free(pool);
@@ -291,7 +362,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
     size_t plen = 0;
     if (json_find(body, "prompt", &v) && v.type == JSON_STR)
         plen = json_str_unescape(v.start, v.len, prompt);
-    int max_tokens = 32;
+    int max_tokens = 1024;
     if (json_find(body, "max_tokens", &v) && v.type == JSON_NUM)
         max_tokens = (int)json_num(&v);
     float rtemp = 1.0f, rtop_p = 0.9f;
@@ -299,6 +370,12 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         rtemp = (float)json_num(&v);
     if (json_find(body, "top_p", &v) && v.type == JSON_NUM)
         rtop_p = (float)json_num(&v);
+    int include_usage = 0;
+    if (json_find(body, "stream_options.include_usage", &v) && v.type == JSON_BOOL) {
+        int bv = 0;
+        if (v.start) bv = (v.start[0] == 't');
+        include_usage = bv;
+    }
 
     if (plen == 0) {
         free(prompt);
@@ -313,12 +390,23 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         SseCtx sc;
         sc.r = &rr;
         sc.model = model;
+        sc.n_tokens = 0;
+        sc.include_usage = include_usage;
+        ylog_info("HTTP COMPLETIONS stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d plen=%zu",
+                  model, max_tokens, rtemp, rtop_p, include_usage, plen);
         http_sse_begin(&rr, fd);
         int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p);
-        if (rc != 0)
-            http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+        if (rc != 0) {
+            if (rc == -2)
+                http_sse_data(&rr, "{\"error\":{\"message\":\"model not found\"}}");
+            else
+                http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+        } else {
+            sse_on_done(&sc, "length");
+        }
         http_sse_done(&rr);
+        ylog_info("HTTP COMPLETIONS stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
     } else {
         CollectCtx cc;
         cc.buf = collected;
@@ -330,8 +418,13 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
                               rtemp, rtop_p);
         if (rc != 0) {
             HttpResponse rr;
-            http_begin(&rr, fd, 502, "application/json");
-            http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            if (rc == -2) {
+                http_begin(&rr, fd, 404, "application/json");
+                http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
+            } else {
+                http_begin(&rr, fd, 502, "application/json");
+                http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            }
             free(prompt);
             free(collected);
             return;
@@ -346,6 +439,8 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         HttpResponse rr;
         http_begin(&rr, fd, 200, "application/json");
         http_reply(&rr, json);
+        ylog_info("HTTP COMPLETIONS reply n_tokens=%d", cc.n_tokens);
+        ylog_body("HTTP COMPLETIONS reply-json", json);
         free(json);
     }
     free(prompt);
@@ -391,9 +486,11 @@ static void handle_conn(int fd, Router* r)
         handle_models(fd, r);
     } else if (strcmp(req.method, "POST") == 0 &&
                strcmp(req.path, "/v1/chat/completions") == 0) {
+        ylog_body("HTTP CHAT", req.body);
         int stream = req.body && strstr(req.body, "\"stream\":true");
         handle_chat_completions(fd, r, req.body ? req.body : "", stream);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/completions") == 0) {
+        ylog_body("HTTP COMPLETIONS", req.body);
         int stream = req.body && strstr(req.body, "\"stream\":true");
         handle_completions(fd, r, req.body ? req.body : "", stream);
     } else {

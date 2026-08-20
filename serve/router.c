@@ -164,6 +164,17 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
 }
 
 /* 路由决策: 选一个 READY server */
+/* 模型是否已注册(存在 server 条目, 无论是否就绪) */
+static int router_model_known(Router* r, const char* model)
+{
+    int i, known = 0;
+    pthread_mutex_lock(&r->lock);
+    for (i = 0; i < r->n_servers; i++)
+        if (strcmp(r->servers[i].model, model) == 0) { known = 1; break; }
+    pthread_mutex_unlock(&r->lock);
+    return known;
+}
+
 static RtServer* pick_server(Router* r, const char* model)
 {
     int i;
@@ -205,6 +216,10 @@ int router_infer(Router* r, const char* model, int max_tokens,
 {
     RtServer* s = pick_server(r, model);
     if (!s) {
+        if (!router_model_known(r, model)) {
+            ylog_warn("router_infer: model %s not registered", model);
+            return -2;   /* 模型不存在, 立即返回, 不轮询 */
+        }
         int i;
         for (i = 0; i < 60 && !s; i++) {
             sock_sleep_ms(500);
@@ -251,7 +266,11 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
                       float temp, float top_p)
 {
     RtServer* s = pick_server(r, model);
-    if (!s) {   /* 模型 server 尚未注册(启动竞态): 轮询等待 */
+    if (!s) {
+        if (!router_model_known(r, model)) {
+            ylog_warn("router_infer_sess: model %s not registered", model);
+            return -2;   /* 模型不存在, 立即返回, 不轮询 */
+        }
         int i;
         for (i = 0; i < 60 && !s; i++) {
             sock_sleep_ms(500);
