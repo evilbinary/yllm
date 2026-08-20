@@ -1279,6 +1279,15 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
  *   h'    = hnorm( e->x + h_in[0:hidden] )       # hidden norm
  *   logits = shared_head( h' )                   # 共享 lm_head
  * 返回 0 成功, -1 无 MTP。 */
+/* MTP 预测: 给定"当前 token 的主干 hidden"(e->x 应为该 token 算完最后一层、norm 之前的原始 hidden?),
+ * 以及"下一个要预测的 token"(下一 token 的 embed), 输出预测的 logits。
+ *
+ * DeepSeek-V3 单层 MTP 公式:
+ *   h' = hnorm( h_main + eh_proj( embed(t_next) ) )
+ *   logits = shared_head( h' )    # 共享主 lm_head
+ *
+ * 注: eh_proj 在 qwen3.8-27b 输出 2×hidden(10240), 前 hidden 作为嵌入投影,
+ *     后 hidden 可能是附加输出(暂忽略, P1 只取前 half)。 */
 int engine_mtp_predict(Engine* e, uint32_t next_token, float* logits_out)
 {
     if (!e->mtp_eh_slot) return -1;
@@ -1288,9 +1297,9 @@ int engine_mtp_predict(Engine* e, uint32_t next_token, float* logits_out)
     uint32_t hidden = h->hidden;
     uint8_t* base = (uint8_t*)e->ws.map.base;
 
-    /* embed: 取 next_token 的嵌入向量 */
+    /* ① embed(next_token) */
     const LlfTensorMeta* emb = &m->metas[m->base_idx[0] + SLOT_EMBED];
-    float* embv = (float*)e->hb;   /* 复用 hb 作 embed 缓冲 */
+    float* embv = (float*)e->hb;
     switch (emb->dtype) {
         case DT_F32: embed_f32(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
         case DT_Q4K: embed_q4k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
@@ -1299,30 +1308,33 @@ int engine_mtp_predict(Engine* e, uint32_t next_token, float* logits_out)
         default:     embed_f16(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
     }
 
-    /* eh_proj: emb → 投影(取前 hidden 作为增量) */
+    /* ② eh_proj: [hidden → eh_out], 取前 hidden 作为嵌入投影 */
     const LlfTensorMeta* eh = &m->metas[m->base_idx[ol] + e->mtp_eh_slot];
     uint8_t* ehw = base + m->dir[ol].offset + eh->offset;
     uint32_t eh_out = eh->shape[0] ? eh->shape[0] : hidden;
-    float* h_in = (float*)e->att;   /* 复用 att 作 eh_proj 输出 */
-    /* eh_proj 是 F16: [eh_out × hidden] */
+    float* h_in = (float*)e->att;   /* 复用 att 作 eh_proj 输出, 大小 eh_out */
     if (eh->dtype == DT_F16)
         matmul_f16_t(h_in, embv, ehw, hidden, eh_out);
     else
         matmul_f32_t(h_in, embv, ehw, hidden, eh_out);
 
-    /* h' = hnorm( e->x + h_in[0:hidden] ) */
+    /* ③ h' = hnorm( h_main + h_in[0:hidden] ); 结果放 e->x 覆盖主 hidden */
     const LlfTensorMeta* hn = &m->metas[m->base_idx[ol] + e->mtp_hnorm_slot];
     float eps;
     memcpy(&eps, &h->norm_eps_bits, 4);
     float* hnorm_in = (float*)e->hb2;
     uint32_t i;
-    for (i = 0; i < hidden; i++)
-        hnorm_in[i] = e->x[i] + h_in[i % eh_out < hidden ? i : i];
+    for (i = 0; i < hidden; i++) {
+        float proj = eh_out > 0 ? h_in[i] : 0.0f;
+        hnorm_in[i] = e->x[i] + proj;
+    }
     rmsnorm(e->x, hnorm_in, base + m->dir[ol].offset + hn->offset, hidden, eps, hn->dtype);
 
-    /* shared_head_norm + lm_head: 用主 lm_head 输出 */
-    const LlfTensorMeta* out = &m->metas[m->base_idx[ol] + SLOT_EMBED]; /* slot0=lm_head */
-    (void)out;
+    /* ④ shared lm_head: logits_out[vocab] = lm_head( e->x ) */
+    const LlfTensorMeta* out = &m->metas[m->base_idx[ol] + 0];   /* slot 0 = lm_head */
+    matmul_rows(logits_out, e->x,
+                base + m->dir[ol].offset + out->offset,
+                0, h->vocab, hidden, h->vocab, out->dtype);
     return 0;
 }
 
