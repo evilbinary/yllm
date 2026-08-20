@@ -352,7 +352,30 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
     }
 }
 
-enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4 };
+enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4, SP_MTP_EH = 100, SP_MTP_ENORM = 101, SP_MTP_HNORM = 102, SP_MTP_HEAD_NORM = 103 };
+
+/* Q8_0 去量化成 F16: 每 32 元素 = 1 fp16 scale + 32 int8。
+ * 返回 malloc 的 F16 缓冲(nelem*2 字节), 调用方负责释放。 */
+static uint8_t* q8_0_to_f16(const uint8_t* src, uint64_t nelem)
+{
+    uint8_t* out = (uint8_t*)ymalloc((size_t)nelem * 2);
+    const uint8_t* p = src;
+    uint64_t i = 0;
+    while (i + 32 <= nelem) {
+        float s = f16_to_f32((uint16_t)(p[0] | (p[1] << 8)));
+        const int8_t* q = (const int8_t*)(p + 2);
+        uint32_t k;
+        for (k = 0; k < 32; k++) {
+            float v = s * (float)q[k];
+            uint16_t h = f32_to_f16(v);
+            out[(i + k) * 2] = (uint8_t)(h & 0xFF);
+            out[(i + k) * 2 + 1] = (uint8_t)(h >> 8);
+        }
+        p += 2 + 32;
+        i += 32;
+    }
+    return out;
+}
 
 static int gg_slot_for(const char* name, int* layer)
 {
@@ -396,6 +419,10 @@ static int gg_slot_for(const char* name, int* layer)
         if (*p != '.') return -1;
         p++;
         static const struct { const char* suf; int slot; } tab[] = {
+            { "nextn.eh_proj.weight", SP_MTP_EH },
+            { "nextn.enorm.weight", SP_MTP_ENORM },
+            { "nextn.hnorm.weight", SP_MTP_HNORM },
+            { "nextn.shared_head_norm.weight", SP_MTP_HEAD_NORM },
             { "attn_norm.weight", SLOT_NORM1 },
             { "attn_q.weight", SLOT_Q },
             { "attn_k.weight", SLOT_K },
@@ -609,15 +636,26 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             uint32_t d;
             for (d = 0; d < t->ndims; d++) nelem *= t->dims[d];
             if (strstr(t->name, "nextn")) {
-                printf("gguf: skip nextn head '%s' (not used by chat)\n", t->name);
-                free(t->name);
-                continue;
+                /* MTP 权重: 保留, 走 gg_slot_for 映射到 output 层 MTP 槽 */
+                printf("gguf: MTP '%s' nd=%u nelem=%llu nbytes=%llu gtype=%u\n",
+                       t->name, t->ndims,
+                       (unsigned long long)nelem,
+                       (unsigned long long)t->nbytes, (unsigned)t->gtype);
             }
             uint32_t dt = type_map[t->gtype];
-            if (dt == 255) { printf("gguf: DROP '%s' gtype=%u\n", t->name, (unsigned)t->gtype); free(t->name); continue; }
+            if (dt == 255 && !strstr(t->name, "nextn")) {
+                printf("gguf: DROP '%s' gtype=%u\n", t->name, (unsigned)t->gtype); free(t->name); continue;
+            }
+            if (strstr(t->name, "nextn") && t->gtype == 8) {
+                /* MTP eh_proj Q8_0: dt 未知但转换时去量化成 F16, 放行;
+                 * 源数据是 Q8_0(272B/256元素), 非 F16 */
+                dt = DT_F16;
+            }
             GGTensor c;
             c = *t;
-if (dt == DT_F32) c.nbytes = nelem * 4;
+            if (strstr(t->name, "nextn") && t->gtype == 8) {
+                c.nbytes = (nelem / 256) * 272;   /* Q8_0 块大小 */
+            } else if (dt == DT_F32) c.nbytes = nelem * 4;
             else if (dt == DT_F16) c.nbytes = nelem * 2;
             else {
                 uint64_t nb = (dt == DT_Q6K) ? 210 : (dt == DT_Q5K) ? 176 : 144;
@@ -649,6 +687,10 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         if (slot == SP_EMBED) { items[n].layer = 0; items[n].slot = 0; }
         else if (slot == SP_FINALNORM) { items[n].layer = g.n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
+        else if (slot == SP_MTP_EH) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_EH; }
+        else if (slot == SP_MTP_ENORM) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_ENORM; }
+        else if (slot == SP_MTP_HNORM) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_HNORM; }
+        else if (slot == SP_MTP_HEAD_NORM) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_HEAD_NORM; }
         else if (slot >= SLOT_NORM1 && slot <= SLOT_KNORM) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else if (slot >= SLOT_QKV && slot <= SLOT_SSM_OUT) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else { printf("gguf: SKIP '%s'\n", list.t[i].name); continue; }
@@ -661,6 +703,15 @@ if (dt == DT_F32) c.nbytes = nelem * 4;
         snprintf(items[n].name, sizeof(items[n].name), "%s", t->name);
         items[n].src = data + data_start + t->offset;
         items[n].src_off = 0;
+        /* MTP 权重(小, 55MB): 量化(Q8_0=gtype8)直接去量化成 F16 存 llf, 便于 engine 使用 */
+        if (slot >= SP_MTP_EH && slot <= SP_MTP_HEAD_NORM && t->gtype == 8) {
+            uint64_t mnelem = 1;
+            for (d = 0; d < t->ndims; d++) mnelem *= t->dims[d];
+            items[n].src = q8_0_to_f16(items[n].src, mnelem);
+            items[n].src_off = 0;
+            items[n].dtype = DT_F16;
+            items[n].nbytes = mnelem * 2;
+        }
         n++;
         if (is_qwen35 && slot == SLOT_Q && t->ndims == 2 &&
             t->dims[1] == 2 * (uint64_t)g.heads * (g.key_length ? g.key_length : g.hidden / g.heads)) {

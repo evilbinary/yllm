@@ -38,7 +38,7 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
     uint32_t* per = (uint32_t*)ycalloc(n_layers, 4);
     int i;
     for (i = 0; i < n; i++) {
-        if (items[i].layer >= n_layers || items[i].slot >= BLOCK_TENSORS) {
+        if (items[i].layer >= n_layers || items[i].slot >= BLOCK_TENSORS_MTP) {
             free(per);
             snprintf(err, errlen, "bad layer/slot in plan");
             return -1;
@@ -53,10 +53,10 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         }
     }
 
-    LlfTensorMeta* metas = (LlfTensorMeta*)ycalloc((size_t)n_layers * BLOCK_TENSORS, LLF_TENSOR_META_SIZE);
+    LlfTensorMeta* metas = (LlfTensorMeta*)ycalloc((size_t)n_layers * BLOCK_TENSORS_MTP, LLF_TENSOR_META_SIZE);
     LlfLayerDir* dir = (LlfLayerDir*)ycalloc(n_layers, LLF_DIR_ENTRY_SIZE);
     uint64_t dir_size = (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE;
-    uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size + (uint64_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE, LLF_ALIGN);
+    uint64_t cursor = align_up(LLF_HEADER_SIZE + dir_size + (uint64_t)n_layers * BLOCK_TENSORS_MTP * LLF_TENSOR_META_SIZE, LLF_ALIGN);
 
     uint32_t last_li = (uint32_t)-1;
     for (i = 0; i < n; i++) {
@@ -67,7 +67,7 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
             dir[li].offset = cursor;
             last_li = li;
         }
-        LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS + slot];
+        LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS_MTP + slot];
         memset(tm, 0, sizeof(*tm));
         snprintf(tm->name, sizeof(tm->name), "%s", items[i].name);
         tm->dtype = items[i].dtype;
@@ -83,7 +83,7 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         uint64_t lend = 0;
         uint32_t s2;
         for (s2 = 0; s2 < per[i]; s2++) {
-            LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + s2];
+            LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS_MTP + s2];
             tm->offset += loff - first;
             if (loff + tm->offset + tm->size > lend) lend = loff + tm->offset + tm->size;
         }
@@ -107,13 +107,13 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         write_at(out, 0, hb, sizeof(hb));
     }
     write_at(out, LLF_HEADER_SIZE, dir, dir_size);
-    write_at(out, LLF_HEADER_SIZE + dir_size, metas, (size_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE);
+    write_at(out, LLF_HEADER_SIZE + dir_size, metas, (size_t)n_layers * BLOCK_TENSORS_MTP * LLF_TENSOR_META_SIZE);
 
     uint8_t* buf = (uint8_t*)ymalloc(1 << 22);
     for (i = 0; i < n; i++) {
         uint32_t li = items[i].layer;
         uint32_t slot = items[i].slot;
-        LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS + slot];
+        LlfTensorMeta* tm = &metas[(size_t)li * BLOCK_TENSORS_MTP + slot];
         const uint8_t* sp = items[i].src + items[i].src_off;
         uint64_t done = 0;
         while (done < items[i].nbytes) {

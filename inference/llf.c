@@ -33,7 +33,7 @@ int llf_read(const WMap* map, LlModel* out)
     out->base_idx = (uint32_t*)ymalloc((size_t)n_layers * 4);
     uint32_t i;
     for (i = 0; i < n_layers; i++) {
-        out->base_idx[i] = i * BLOCK_TENSORS;
+        out->base_idx[i] = i * BLOCK_TENSORS_MTP;
     }
     out->metas = (LlfTensorMeta*)((uint8_t*)map->base + dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE);
     uint32_t j;

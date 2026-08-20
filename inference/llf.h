@@ -49,6 +49,14 @@
 #define SLOT_SSM_NORM 22    /* GDN ssm_norm [head_v_dim] */
 #define SLOT_SSM_OUT 23     /* GDN ssm_out [hidden, in] */
 #define BLOCK_TENSORS 24
+/* MTP(Multi-Token Prediction)槽: 存 output(lm_head)层的高槽位 24..27,
+ * 与主 transformer 块共用 BLOCK_TENSORS 上限之外; llf 层目录 n_tensors 需容纳。
+ * 布局(见 convert.c): output 层 = blocks+2, 槽 24=eh_proj 25=enorm 26=hnorm 27=shared_head_norm */
+#define SLOT_MTP_EH 24
+#define SLOT_MTP_ENORM 25
+#define SLOT_MTP_HNORM 26
+#define SLOT_MTP_HEAD_NORM 27
+#define BLOCK_TENSORS_MTP 28
 
 #pragma pack(push, 1)
 typedef struct {

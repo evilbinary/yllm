@@ -138,6 +138,11 @@ typedef struct Engine {
     uint64_t stat_reads;
     uint64_t stat_releases;
     uint64_t stat_faults;
+    /* MTP(Multi-Token Prediction)权重槽(在 output 层)。0 = 模型无 MTP。 */
+    uint32_t mtp_eh_slot;    /* eh_proj [in→out] */
+    uint32_t mtp_enorm_slot; /* embed norm */
+    uint32_t mtp_hnorm_slot; /* hidden norm */
+    uint32_t mtp_headnorm_slot; /* shared head norm */
 } Engine;
 
 typedef struct {

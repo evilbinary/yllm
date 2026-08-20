@@ -315,6 +315,21 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         }
     }
     e->ws.pstate = ws->pstate;
+    /* MTP 权重检测: output 层槽 24..27 是否存在(eh_proj 为标志) */
+    {
+        uint32_t ol = m->h.n_blocks + 2;
+        const LlfTensorMeta* tm = &m->metas[m->base_idx[ol] + SLOT_MTP_EH];
+        if (tm->size > 0 && tm->name[0]) {
+            e->mtp_eh_slot = SLOT_MTP_EH;
+            e->mtp_enorm_slot = SLOT_MTP_ENORM;
+            e->mtp_hnorm_slot = SLOT_MTP_HNORM;
+            e->mtp_headnorm_slot = SLOT_MTP_HEAD_NORM;
+            ylog_info("engine: MTP weights detected (eh_proj=%s size=%llu)",
+                      tm->name, (unsigned long long)tm->size);
+        } else {
+            e->mtp_eh_slot = 0;
+        }
+    }
     /* 层前向分派: 按架构挂实现(一次) */
     e->arch = m->h.arch;
     if (m->h.arch == ARCH_QWEN35) {
@@ -1253,6 +1268,61 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
         if (e->layer_end <= h->n_blocks) return -1;   /* 非末段无 logits */
         memcpy(logits_out, e->logits, (size_t)h->vocab * 4);
     }
+    return 0;
+}
+
+/* MTP(Multi-Token Prediction)基础前向: 给定当前 token 的主干 hidden(e->x),
+ * 预测下一 token 的 logits(写入 e->logits)。P1: 单层, 结构就位。
+ * 公式(DeepSeek-V3 风格, 简化):
+ *   emb   = embed(next_token)                    # 由调用方传 token, 取 embed
+ *   h_in  = eh_proj(emb)                         # [in → eh_out]
+ *   h'    = hnorm( e->x + h_in[0:hidden] )       # hidden norm
+ *   logits = shared_head( h' )                   # 共享 lm_head
+ * 返回 0 成功, -1 无 MTP。 */
+int engine_mtp_predict(Engine* e, uint32_t next_token, float* logits_out)
+{
+    if (!e->mtp_eh_slot) return -1;
+    LlModel* m = &e->ws.model;
+    const LlfHeader* h = &m->h;
+    uint32_t ol = h->n_blocks + 2;
+    uint32_t hidden = h->hidden;
+    uint8_t* base = (uint8_t*)e->ws.map.base;
+
+    /* embed: 取 next_token 的嵌入向量 */
+    const LlfTensorMeta* emb = &m->metas[m->base_idx[0] + SLOT_EMBED];
+    float* embv = (float*)e->hb;   /* 复用 hb 作 embed 缓冲 */
+    switch (emb->dtype) {
+        case DT_F32: embed_f32(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
+        case DT_Q4K: embed_q4k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
+        case DT_Q6K: embed_q6k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
+        case DT_Q5K: embed_q5k(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
+        default:     embed_f16(embv, base + m->dir[0].offset + emb->offset, next_token, hidden); break;
+    }
+
+    /* eh_proj: emb → 投影(取前 hidden 作为增量) */
+    const LlfTensorMeta* eh = &m->metas[m->base_idx[ol] + e->mtp_eh_slot];
+    uint8_t* ehw = base + m->dir[ol].offset + eh->offset;
+    uint32_t eh_out = eh->shape[0] ? eh->shape[0] : hidden;
+    float* h_in = (float*)e->att;   /* 复用 att 作 eh_proj 输出 */
+    /* eh_proj 是 F16: [eh_out × hidden] */
+    if (eh->dtype == DT_F16)
+        matmul_f16_t(h_in, embv, ehw, hidden, eh_out);
+    else
+        matmul_f32_t(h_in, embv, ehw, hidden, eh_out);
+
+    /* h' = hnorm( e->x + h_in[0:hidden] ) */
+    const LlfTensorMeta* hn = &m->metas[m->base_idx[ol] + e->mtp_hnorm_slot];
+    float eps;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    float* hnorm_in = (float*)e->hb2;
+    uint32_t i;
+    for (i = 0; i < hidden; i++)
+        hnorm_in[i] = e->x[i] + h_in[i % eh_out < hidden ? i : i];
+    rmsnorm(e->x, hnorm_in, base + m->dir[ol].offset + hn->offset, hidden, eps, hn->dtype);
+
+    /* shared_head_norm + lm_head: 用主 lm_head 输出 */
+    const LlfTensorMeta* out = &m->metas[m->base_idx[ol] + SLOT_EMBED]; /* slot0=lm_head */
+    (void)out;
     return 0;
 }
 
