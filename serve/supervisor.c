@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <inttypes.h>
 
 static SvNode* find_node(Supervisor* s, const char* id)
 {
@@ -133,16 +134,20 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
             strncat(peers, lip, sizeof(peers) - strlen(peers) - 1);
         }
     }
+    char bud[128];
+    if (s->budget >= 0)
+        snprintf(bud, sizeof(bud), "--budget %" PRId64 "MB", s->budget);
+    else
+        snprintf(bud, sizeof(bud), "--budget auto");
     snprintf(cmd, sizeof(cmd),
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --rank %d --ranks %d --peers %s "
-             "--dist-fp16 %d --budget-mb %d --budget-auto %d "
+             "--dist-fp16 %d %s "
              "--cache-dir \"%s\" --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
-             mi * model_stride(s) + r, r, ranks, peers, mc->dist_fp16,
-             s->budget_mb, s->budget_auto,
+             mi * model_stride(s) + r, r, ranks, peers, mc->dist_fp16, bud,
              s->cache_dir[0] ? s->cache_dir : ".", mc->name, r);
-    ylog_info("supervisor: spawn rank %d (model %s) on port %u", r, mc->name, rport);
+    ylog_info("supervisor: spawn rank %d (model %s) on port %u cmd=%s", r, mc->name, rport, cmd);
     int pid = spawn_proc(cmd);
     if (pid > 0) {
         char id[128];
@@ -595,8 +600,7 @@ int cmd_supervisor(ServeConfig* cfg)
     s.rank_port_base = (uint16_t)cfg->rank_port_base;
     s.server_port_base = (uint16_t)cfg->server_port;
     s.auto_heal = cfg->auto_heal;
-    s.budget_mb = cfg->budget_mb;
-    s.budget_auto = cfg->budget_auto;
+    s.budget = cfg->budget;
     snprintf(s.sv_host, sizeof(s.sv_host), "%s", cfg->sv_host);
     snprintf(s.bin, sizeof(s.bin), "%s", cfg->bin);
     if (cfg->model[0]) snprintf(s.model, sizeof(s.model), "%s", cfg->model);

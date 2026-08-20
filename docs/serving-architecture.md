@@ -147,7 +147,7 @@ rank/server/router 的二进制与模型由 supervisor 先分发(sync)到目标�
 
 **启动阶段(一次)**
 
-1. 解析 `--model --vocab --rank --ranks --port-base --dist-addrs --budget-mb --depth` 等;
+1. 解析 `--model --vocab --rank --ranks --port-base --dist-addrs --budget --depth` 等;
 2. `engine_init`(mmap 模型) → `dist_split_layers`(领自己的层段) → `vocab_load`;
 3. `dist_init` 与组内兄弟 rank 建立常驻 TCP(流水线握手一次,不复用后销毁);
 4. 监听推理端口,进入事件循环。

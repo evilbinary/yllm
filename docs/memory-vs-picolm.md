@@ -34,7 +34,7 @@ engine.c, per forward:
     sched_release_budget(ws, i) /* release layers beyond the budget */
 ```
 
-- `--budget-mb N` limits resident layers; `ws_release` issues `madvise(DONTNEED)`
+- `--budget NMB` limits resident layers; `ws_release` issues `madvise(DONTNEED)`
   on freed layers (Linux) so physical pages are reclaimed.
 - On Windows, `ws_release` is currently a no-op (mmap pages cannot be returned
   without unmap), so the working set stays at the full model size. A future
@@ -44,7 +44,7 @@ engine.c, per forward:
 
 ## Budget behavior (Linux)
 
-With `--budget-mb 200`, yllm keeps only ~200 MB of model pages resident and
+With `--budget 200MB`, yllm keeps only ~200 MB of model pages resident and
 re-faults layers from disk on demand. picolm would keep all 667 MB resident.
 
 ## Residency tracking and adaptive budget (v2)
@@ -55,7 +55,7 @@ re-faults layers from disk on demand. picolm would keep all 667 MB resident.
 - **预算自适应**: 层数预算由字节预算折算,并按反馈浮动——本 token 发生缺页且
   系统空闲内存富余 → 多驻留一层;空闲内存告急 → 主动缩驻留。
 - **回收下限**: `embed` / `final norm` / `lm_head` 为 hot 层恒驻留(豁免回收);
-  因此驻留无法低于 hot 层之和(本模型 ~74MB),`--budget-mb 50` 时实测驻留 ~86MB。
+  因此驻留无法低于 hot 层之和(本模型 ~74MB),`--budget 50MB` 时实测驻留 ~86MB。
 
 ## Key takeaway
 

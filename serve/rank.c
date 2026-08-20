@@ -5,7 +5,7 @@
  *
  * 用法:
  *   yllm rank --model <file.llf> --vocab <file> [--port N]
- *             [--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N]
+ *             [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N]
  *             [--log <file>] [--log-level lvl] [--no-console]
  *
  * P1 阶段: 单 rank(ranks=1, 完整模型本地推理)。
@@ -659,7 +659,7 @@ static int peers_all_local(const char* peers)
     return 1;
 }
 
-/* --budget-auto: 预算 = min(模型大小, 可用内存 - 余量) */
+/* budget auto: 预算 = min(模型大小, 可用内存 - 余量) */
 static uint64_t rank_auto_budget(ServeConfig* cfg)
 {
     uint64_t avail = 0;
@@ -696,7 +696,7 @@ int cmd_rank(ServeConfig* cfg)
 {
     if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
-                        "[--budget-mb N] [--depth N] [--temp F] [--top-p F] [--seed N] "
+                        "[--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] "
                         "[--config <yaml>]\n");
         return 1;
     }
@@ -768,8 +768,8 @@ int cmd_rank(ServeConfig* cfg)
         return 1;
     }
     char err[1024];
-    long budget_mb = config_budget_mb(cfg);   /* -1 = 自动 */
-    uint64_t budget = (uint64_t)(budget_mb < 0 ? (long)(rank_auto_budget(cfg) / (1024 * 1024)) : budget_mb) * 1024 * 1024;
+    int64_t budget_mb = cfg->budget;   /* -1 = 自动 */
+    uint64_t budget = (uint64_t)(budget_mb < 0 ? (int64_t)(rank_auto_budget(cfg) / (1024 * 1024)) : budget_mb) * 1024 * 1024;
     if (engine_init(&r.engine, cfg->model, budget, cfg->depth, err, sizeof(err)) != 0) {
         ylog_error("rank: engine init failed: %s", err);
         vocab_free(&r.vocab);

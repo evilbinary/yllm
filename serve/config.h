@@ -82,9 +82,7 @@ typedef struct {
     float temp;
     float top_p;
     uint64_t seed;
-    int budget_mb;
-    int budget_auto;                /* --budget-auto: 按可用内存自动预算 */
-    char budget[CFG_STR_MAX];       /* 内存预算模式: "auto" | "<n>MB" | "<n>G" | "<n>KB" 等(合并 budget-mb/budget-auto) */
+    int64_t budget;         /* rank KV 内存预算(MB; -1 = auto)。解析时由 "auto"/"1024MB"/"1.5G" 转成 */
     int depth;
 
     /* 客户端模式(router --send) */
@@ -162,36 +160,29 @@ static inline void config_defaults(ServeConfig* c)
     c->temp = 1.0f;
     c->top_p = 0.9f;
     c->seed = 42;
-    c->budget_mb = 0;
+    c->budget = -1;   /* 默认自动 */
     c->depth = 2;
     c->api_log = 1;   /* 默认开启 */
 }
 
-/* 解析内存预算模式 → MB 数。
+/* 解析内存预算字符串 → MB 数。
  * "auto" / 空 → -1(自动); "1024MB" / "1024m" → 1024; "1.5G" → 1536; "512KB" → 0(舍入)。
  * 无单位纯数字按 MB。 */
-static inline long config_budget_mb(const ServeConfig* c)
+static inline int64_t config_budget_parse(const char* s)
 {
-    if (c->budget[0]) {
-        const char* p = c->budget;
-        char* end = NULL;
-        double v = strtod(p, &end);
-        while (end && (*end == ' ' || *end == '\t')) end++;
-        if (end && end != p) {
-            double mb;
-            if (*end == 'g' || *end == 'G')      mb = v * 1024.0;
-            else if (*end == 'm' || *end == 'M') mb = v;
-            else if (*end == 'k' || *end == 'K') mb = v / 1024.0;
-            else if (*end == 't' || *end == 'T') mb = v * 1024.0 * 1024.0;
-            else                                 mb = v;   /* 无单位按 MB */
-            return (long)mb;
-        }
-        if (strncmp(p, "auto", 4) == 0) return -1;
-        return (long)v;   /* 兜底: 纯数字按 MB */
-    }
-    if (c->budget_auto) return -1;      /* 旧配置兼容 */
-    if (c->budget_mb > 0) return c->budget_mb;
-    return -1;
+    if (!s || !s[0]) return -1;
+    if (strncmp(s, "auto", 4) == 0) return -1;
+    char* end = NULL;
+    double v = strtod(s, &end);
+    if (end == s) return -1;
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    double mb;
+    if (*end == 'g' || *end == 'G')      mb = v * 1024.0;
+    else if (*end == 'm' || *end == 'M') mb = v;
+    else if (*end == 'k' || *end == 'K') mb = v / 1024.0;
+    else if (*end == 't' || *end == 'T') mb = v * 1024.0 * 1024.0;
+    else                                 mb = v;   /* 无单位按 MB */
+    return (int64_t)mb;
 }
 
 /* 按 key 填一个字段(字符串/数字)。返回 1 认识该 key */
@@ -266,12 +257,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->top_p = (float)atof(val);
     } else if (strcmp(key, "seed") == 0) {
         c->seed = (uint64_t)strtoull(val, NULL, 10);
-    } else if (strcmp(key, "budget-mb") == 0) {
-        c->budget_mb = atoi(val);
-    } else if (strcmp(key, "budget-auto") == 0) {
-        c->budget_auto = atoi(val);
     } else if (strcmp(key, "budget") == 0) {
-        snprintf(c->budget, sizeof(c->budget), "%s", val);
+        c->budget = config_budget_parse(val);
     } else if (strcmp(key, "depth") == 0) {
         c->depth = atoi(val);
     } else if (strcmp(key, "send") == 0) {
