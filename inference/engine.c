@@ -206,7 +206,8 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     }
     if (llf_read(&e->ws.map, &e->ws.model) != 0) {
         wmap_close(&e->ws.map);
-        snprintf(err, errlen, "bad llf file %s", model_path);
+        LlfHeader* h = (LlfHeader*)e->ws.map.base;
+        snprintf(err, errlen, "bad llf file %s: %s %d", model_path, h->magic,h->version);
         return -1;
     }
     Ws* ws = &e->ws;
