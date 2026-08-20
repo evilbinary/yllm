@@ -263,7 +263,7 @@ int router_infer(Router* r, const char* model, int max_tokens,
 int router_infer_sess(Router* r, const char* model, int max_tokens,
                       const char* sess_key, const char* new_msg, size_t msg_len,
                       void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
-                      float temp, float top_p)
+                      float temp, float top_p, int* prompt_tokens)
 {
     RtServer* s = pick_server(r, model);
     if (!s) {
@@ -294,10 +294,18 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
     char out[RT_MAX_LINE];
     int rc = 0;
     int done = 0;
+    if (prompt_tokens) *prompt_tokens = 0;
     while (!done) {
         int n2 = sock_recv_line(sfd, out, sizeof(out));
         if (n2 < 0) { rc = -1; break; }
-        if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
+        if (strncmp(out, PROTO_DONE, 4) == 0) {
+            /* DONE <gen> <eos> <ms> [prompt_tokens]: 末尾字段为 server 追加的 prompt 数 */
+            if (prompt_tokens) {
+                const char* sp = strrchr(out, ' ');
+                if (sp) *prompt_tokens = atoi(sp + 1);
+            }
+            done = 1;
+        }
         else if (strncmp(out, "TS ", 3) == 0) {
             size_t tlen = 0;
             sscanf(out + 3, "%zu", &tlen);

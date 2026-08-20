@@ -338,7 +338,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
             send_line(fd, "ERR dist generate failed");
             return 0;
         }
-        send_line(fd, "DONE %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
+        send_line(fd, PROTO_DONE " %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
         return 0;
     }
 
@@ -386,7 +386,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     r->node.inflight--;
     node_heartbeat(&r->node);
 
-    send_line(fd, "DONE %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
+    send_line(fd, PROTO_DONE " %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
     return 0;
 }
 
@@ -498,7 +498,7 @@ static int handle_infer(int fd, Rank* r, char* args)
             send_line(fd, "ERR generate: %s", err);
         return 0;
     }
-    send_line(fd, "DONE %u %d %llu", tc.n_tokens, 0, (unsigned long long)ms);
+    send_line(fd, PROTO_DONE " %u %d %llu", tc.n_tokens, 0, (unsigned long long)ms);
     return 0;
 }
 

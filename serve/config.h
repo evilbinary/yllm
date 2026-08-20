@@ -300,6 +300,10 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
                         if (hash) *hash = 0;
                         size_t vl = strlen(val);
                         while (vl > 0 && (val[vl-1] == ' ' || val[vl-1] == '\t' || val[vl-1] == '\r')) val[--vl] = 0;
+                        if (vl >= 2 && (val[0] == '"' || val[0] == '\'') && val[vl-1] == val[0]) {
+                            memmove(val, val + 1, vl - 2);
+                            val[vl - 2] = '\0';
+                        }
                         ModelCfg* mc = &c->models[c->n_models - 1];
                         if (strcmp(key, "name") == 0) snprintf(mc->name, sizeof(mc->name), "%s", val);
                         else if (strcmp(key, "model") == 0) snprintf(mc->model, sizeof(mc->model), "%s", val);
@@ -326,6 +330,11 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
             if (hash) *hash = 0;
             size_t vl = strlen(val);
             while (vl > 0 && (val[vl-1] == ' ' || val[vl-1] == '\t' || val[vl-1] == '\r')) val[--vl] = 0;
+            /* 剥离 YAML 字符串两侧引号 */
+            if (vl >= 2 && (val[0] == '"' || val[0] == '\'') && val[vl-1] == val[0]) {
+                memmove(val, val + 1, vl - 2);
+                val[vl - 2] = '\0';
+            }
             if (strcmp(key, "models") == 0) in_models = 1;
             else config_set(c, key, val);
         }

@@ -247,12 +247,19 @@ int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
                 rc = -1;
                 break;
             }
-            sock_send_line(client_fd, "%s", out);
             if (strncmp(out, PROTO_DONE, 4) == 0) {
                 done = 1;
                 pthread_mutex_lock(&s->sess_lock);
                 SessVal* ev = sess_get(&s->sess, key);
                 if (ev && s->sess_vocab.eos >= 0) sess_append(ev, (uint32_t)s->sess_vocab.eos);
+                /* DONE 帧末尾追加 prompt token 数(会话累积总 token), 供 HTTP usage 统计 */
+                if (ev) {
+                    char dline[SRV_MAX_LINE];
+                    snprintf(dline, sizeof(dline), "%s %u", out, ev->n);
+                    sock_send_line(client_fd, "%s", dline);
+                } else {
+                    sock_send_line(client_fd, "%s", out);
+                }
                 /* 落盘: token 列表(会话重启恢复用) */
                 if (ev && s->cache_dir[0]) {
                     char path[512];
@@ -262,6 +269,7 @@ int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
                 }
                 pthread_mutex_unlock(&s->sess_lock);
             } else if (strncmp(out, "TS ", 3) == 0) {
+                sock_send_line(client_fd, "%s", out);
                 uint32_t tok = 0;
                 size_t tlen = 0;
                 sscanf(out + 3, "%zu %u", &tlen, &tok);
@@ -276,6 +284,8 @@ int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
                 pthread_mutex_unlock(&s->sess_lock);
                 sock_send_n(client_fd, payload, tlen);
                 free(payload);
+            } else {
+                sock_send_line(client_fd, "%s", out);
             }
         }
         sock_close(fd);

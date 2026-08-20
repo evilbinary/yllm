@@ -103,6 +103,7 @@ typedef struct {
     HttpResponse* r;
     const char* model;
     int n_tokens;        /* 已发出的内容 token 数(usage 统计) */
+    int prompt_tokens;   /* 会话模式真实 prompt token 数(server 渲染统计) */
     int include_usage;   /* 客户端请求 stream_options.include_usage */
     char pending[8];     /* 未完成 UTF-8 字符的尾字节缓冲(防跨 chunk 切分中文) */
     int pending_len;
@@ -182,11 +183,12 @@ static void sse_on_done(SseCtx* sc, const char* reason)
     /* include_usage 请求时补 usage 收尾 chunk(空 choices), 否则客户端 tok/s 统计为 0 */
     if (sc->include_usage) {
         int ct = sc->n_tokens;
+        int pt = sc->prompt_tokens > 0 ? sc->prompt_tokens : 0;
         snprintf(json, sizeof(json),
                  "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\","
                  "\"created\":%lld,\"model\":\"%s\","
-                 "\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-                 (long long)time(NULL), sc->model, ct, ct);
+                 "\"choices\":[],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+                 (long long)time(NULL), sc->model, pt, ct, pt + ct);
         http_sse_data(sc->r, json);
     }
 }
@@ -323,6 +325,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         sc.r = &rr;
         sc.model = model;
         sc.n_tokens = 0;
+        sc.prompt_tokens = 0;
         sc.include_usage = include_usage;
         if (g_api_log)
             ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu",
@@ -332,7 +335,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
                                    contents[n_msgs - 1], strlen(contents[n_msgs - 1]), sse_on_token, &sc,
-                                   rtemp, rtop_p);
+                                   rtemp, rtop_p, &sc.prompt_tokens);
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p);
@@ -353,11 +356,12 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         cc.len = 0;
         cc.n_tokens = 0;
         collected[0] = '\0';
+        int ptoken = 0;
         int rc;
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
                                    contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc,
-                                   rtemp, rtop_p);
+                                   rtemp, rtop_p, &ptoken);
         else
 rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
                               rtemp, rtop_p);
@@ -381,12 +385,12 @@ rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
                  "\"created\":%lld,\"model\":\"%s\","
                  "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                  "\"finish_reason\":\"length\"}],"
-                 "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-                 (long long)time(NULL), model, collected, cc.n_tokens, cc.n_tokens);
+                 "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+                 (long long)time(NULL), model, collected, ptoken, cc.n_tokens, ptoken + cc.n_tokens);
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
         http_reply(&rr, json);
-        if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP CHAT reply-json", json); }
+        if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d ptoken=%d", cc.n_tokens, ptoken); ylog_body("HTTP CHAT reply-json", json); }
         free(json);
     }
     if (pool) free(pool);

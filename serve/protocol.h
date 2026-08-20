@@ -126,7 +126,8 @@
 /* T <len>\n<token utf8 bytes>: 生成的一个 token */
 #define PROTO_TOKEN "T"
 
-/* DONE <gen_tokens> <eos=0|1> <ms>\n: 生成结束 */
+/* DONE <gen_tokens> <eos=0|1> <ms>\n: 生成结束。
+ * 会话模式时 server 会在末尾追加 <prompt_tokens>(HTTP usage 统计用)。 */
 #define PROTO_DONE "DONE"
 
 /* ---- 通用解析辅助 ---- */
