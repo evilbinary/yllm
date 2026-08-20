@@ -267,9 +267,9 @@ Q25_VOCAB ?= models/qwen2.5.vocab.txt
 Q25_7B_GGUF  ?= models/qwen2.5-7b-instruct-q4_k_m.gguf
 Q25_7B_LLF   ?= models/qwen2.5-7b.llf
 Q25_7B_VOCAB ?= models/qwen2.5-7b.vocab.txt
-Q3_GGUF   ?= models/Qwen3-8B-Q4_K_M.gguf
-Q3_LLF    ?= models/qwen3-8b.llf
-Q3_VOCAB  ?= models/qwen3.vocab.txt
+Q3_8B_GGUF   ?= models/Qwen3-8B-Q4_K_M.gguf
+Q3_8B_LLF    ?= models/qwen3-8b.llf
+Q3_8B_VOCAB  ?= models/qwen3-8b.vocab.txt
 
 $(Q25_LLF): $(Q25_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
@@ -279,9 +279,9 @@ $(Q25_7B_LLF): $(Q25_7B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(Q25_7B_GGUF) --out $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --seq 4096
 
-$(Q3_LLF): $(Q3_GGUF) | $(BIN)
+$(Q3_8B_LLF): $(Q3_8B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
-	$(BIN) convert --gguf $(Q3_GGUF) --out $(Q3_LLF) --vocab $(Q3_VOCAB) --seq 2048
+	$(BIN) convert --gguf $(Q3_8B_GGUF) --out $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --seq 2048
 
 chat-qwen2.5-1.5b: $(BIN) $(Q25_LLF)
 	$(RUN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
@@ -289,32 +289,32 @@ chat-qwen2.5-1.5b: $(BIN) $(Q25_LLF)
 chat-qwen2.5-1.5b-avx2: $(BIN_AVX2) $(Q25_LLF)
 	$(RUN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3-8b: $(BIN) $(Q3_LLF)
-	$(RUN) chat --model $(Q3_LLF) --vocab $(Q3_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+chat-qwen3-8b: $(BIN) $(Q3_8B_LLF)
+	$(RUN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_LLF)
-	$(RUN_AVX2) chat --model $(Q3_LLF) --vocab $(Q3_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_8B_LLF)
+	$(RUN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 # ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
-Q38_GGUF  ?= models/Qwen3.8-27B-Q4_K_M.gguf
-Q38_LLF   ?= models/qwen3.8-27b.llf
-Q38_VOCAB ?= models/qwen3.vocab.txt
+Q3_27B_GGUF  ?= models/Qwen3.8-27B-Q4_K_M.gguf
+Q3_27B_LLF   ?= models/qwen3.8-27b.llf
+Q3_27B_VOCAB ?= models/qwen3.vocab.txt
 
-$(Q38_LLF): $(Q38_GGUF) | $(BIN)
+$(Q3_27B_LLF): $(Q3_27B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
-	$(BIN) convert --gguf $(Q38_GGUF) --out $(Q38_LLF) --vocab $(Q38_VOCAB) --seq 2048
+	$(BIN) convert --gguf $(Q3_27B_GGUF) --out $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --seq 2048
 
-gen-qwen3.8-27b: $(BIN) $(Q38_LLF)
-	$(RUN) gen --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+gen-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
+	$(RUN) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-gen-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
-	$(RUN_AVX2) gen --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+gen-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
+	$(RUN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3.8-27b: $(BIN) $(Q38_LLF)
-	$(RUN) chat --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+chat-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
+	$(RUN) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
-	$(RUN_AVX2) chat --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
+	$(RUN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
 #   make server-qwen2.5-7b   # 只起 qwen2.5(本机 rank)
@@ -325,7 +325,7 @@ server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
 
-server-qwen38: $(BIN_AVX2) $(Q38_LLF)
+server-qwen38: $(BIN_AVX2) $(Q3_27B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen38 > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen38); 用 make infer-qwen38 发请求 (HTTP 127.0.0.1:8000)"
