@@ -12,6 +12,7 @@
 # 日志
 log: logs/serve.log
 log-level: info
+api-log: 1              # API 请求/响应日志(1 开启默认, 0 关闭; 请求含完整 body)
 
 bin: ./build/avx2/yllm.exe
 

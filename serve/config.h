@@ -13,6 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 #define CFG_STR_MAX 1024
 
@@ -82,9 +89,47 @@ typedef struct {
     /* 客户端模式(router --send) */
     char send[CFG_STR_MAX];
 
+    /* API 日志(router HTTP 请求/响应打印) */
+    int  api_log;               /* 1 = 打印(默认) 0 = 关闭 */
+
     /* hub/supervisor 按模型名筛选(多模型 serve.yaml 只拉起指定模型; 逗号分隔多个) */
     char only_model[CFG_STR_MAX];
 } ServeConfig;
+
+/* 确保目录存在(逐级创建, 支持 "/" 与 "\\" 分隔)。返回 0 成功 */
+static inline int config_ensure_dir(const char* path)
+{
+    if (!path || !path[0]) return 0;
+    char buf[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(buf)) return -1;
+    memcpy(buf, path, n + 1);
+    size_t i;
+    for (i = 0; buf[i]; i++) {
+        if (buf[i] == '/' || buf[i] == '\\') {
+            if (i == 0) continue;
+            buf[i] = '\0';
+#ifdef _WIN32
+            if (_mkdir(buf) != 0 && errno != EEXIST) return -1;
+#else
+            if (mkdir(buf, 0755) != 0 && errno != EEXIST) return -1;
+#endif
+            buf[i] = '/';
+        }
+    }
+#ifdef _WIN32
+    if (_mkdir(buf) != 0 && errno != EEXIST) return -1;
+#else
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST) return -1;
+#endif
+    return 0;
+}
+
+/* 启动时确保 cache_dir 存在(不存在则创建) */
+static inline void config_ensure_cache_dir(const ServeConfig* c)
+{
+    if (c->cache_dir[0]) config_ensure_dir(c->cache_dir);
+}
 
 /* 填默认值 */
 static inline void config_defaults(ServeConfig* c)
@@ -115,6 +160,7 @@ static inline void config_defaults(ServeConfig* c)
     c->seed = 42;
     c->budget_mb = 0;
     c->depth = 2;
+    c->api_log = 1;   /* 默认开启 */
 }
 
 /* 按 key 填一个字段(字符串/数字)。返回 1 认识该 key */
@@ -199,6 +245,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         snprintf(c->send, sizeof(c->send), "%s", val);
     } else if (strcmp(key, "only-model") == 0) {
         snprintf(c->only_model, sizeof(c->only_model), "%s", val);
+    } else if (strcmp(key, "api-log") == 0) {
+        c->api_log = atoi(val);
     } else {
         return 0;
     }

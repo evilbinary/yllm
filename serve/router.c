@@ -528,7 +528,9 @@ int cmd_router(ServeConfig* cfg)
 
     if (cfg->send[0]) return run_client(&r, cfg->send);
     /* OpenAI 兼容 HTTP(可选) */
-    if (cfg->http_port > 0)
+    if (cfg->http_port > 0) {
+        router_http_set_api_log(cfg->api_log);
         router_http_start(&r, (uint16_t)cfg->http_port);
+    }
     return router_run(&r, sv_host, sv_port);
 }

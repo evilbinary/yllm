@@ -157,6 +157,8 @@ int cmd_hub(ServeConfig* cfg)
     HubCtxRt c2; c2.r = &rt; snprintf(c2.sv_host, sizeof(c2.sv_host), "%s", sv_host); c2.sv_port = sv_port;
     if (cfg->http_port > 0) {
         extern int router_http_start(Router* r, uint16_t http_port);
+        extern void router_http_set_api_log(int on);
+        router_http_set_api_log(cfg->api_log);
         router_http_start(&rt, (uint16_t)cfg->http_port);
     }
     ythread_create(&t1, sv_thread, &c1);

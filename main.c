@@ -406,6 +406,7 @@ int main(int argc, char** argv)
                    strcmp(argv[1], "ctl") == 0;
     if (is_serve) {
         config_load(&cfg, argc, argv, 2);
+        config_ensure_cache_dir(&cfg);   /* 启动即确保会话缓存目录存在 */
         ylog_open(cfg.log_file);
         if (cfg.no_console) ylog_set_console(0);
         if (cfg.log_level[0]) {

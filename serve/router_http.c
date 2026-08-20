@@ -22,6 +22,10 @@
 
 #define HTTP_MAX_BODY (1 << 20)
 
+/* API 请求/响应日志开关(默认开启; hub/router 按 --api-log 配置) */
+static int g_api_log = 1;
+void router_http_set_api_log(int on) { g_api_log = on; }
+
 typedef struct {
     Router* router;
     uint16_t port;
@@ -61,6 +65,7 @@ static void collect_on_token(const char* utf8, size_t len, void* ctx)
 /* 完整打印请求 body 到日志(绕过 4096 日志缓冲截断, 分块写) */
 static void ylog_body(const char* tag, const char* body)
 {
+    if (!g_api_log) return;
     if (!body) { ylog_info("%s body=NULL", tag); return; }
     size_t blen = strlen(body);
     ylog_info("%s body_len=%zu", tag, blen);
@@ -270,8 +275,9 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         sc.model = model;
         sc.n_tokens = 0;
         sc.include_usage = include_usage;
-        ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu",
-                  model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen);
+        if (g_api_log)
+            ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu",
+                      model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen);
         http_sse_begin(&rr, fd);
         int rc;
         if (sess_ok)
@@ -290,7 +296,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
             sse_on_done(&sc, "stop");
         }
         http_sse_done(&rr);
-        ylog_info("HTTP CHAT stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
+        if (g_api_log) ylog_info("HTTP CHAT stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
     } else {
         CollectCtx cc;
         cc.buf = collected;
@@ -331,8 +337,7 @@ rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
         HttpResponse rr;
         http_begin(&rr, fd, 200, "application/json");
         http_reply(&rr, json);
-        ylog_info("HTTP CHAT reply n_tokens=%d", cc.n_tokens);
-        ylog_body("HTTP CHAT reply-json", json);
+        if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP CHAT reply-json", json); }
         free(json);
     }
     if (pool) free(pool);
@@ -392,8 +397,9 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         sc.model = model;
         sc.n_tokens = 0;
         sc.include_usage = include_usage;
-        ylog_info("HTTP COMPLETIONS stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d plen=%zu",
-                  model, max_tokens, rtemp, rtop_p, include_usage, plen);
+        if (g_api_log)
+            ylog_info("HTTP COMPLETIONS stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d plen=%zu",
+                      model, max_tokens, rtemp, rtop_p, include_usage, plen);
         http_sse_begin(&rr, fd);
         int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p);
@@ -406,7 +412,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
             sse_on_done(&sc, "length");
         }
         http_sse_done(&rr);
-        ylog_info("HTTP COMPLETIONS stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
+        if (g_api_log) ylog_info("HTTP COMPLETIONS stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
     } else {
         CollectCtx cc;
         cc.buf = collected;
@@ -439,8 +445,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         HttpResponse rr;
         http_begin(&rr, fd, 200, "application/json");
         http_reply(&rr, json);
-        ylog_info("HTTP COMPLETIONS reply n_tokens=%d", cc.n_tokens);
-        ylog_body("HTTP COMPLETIONS reply-json", json);
+        if (g_api_log) { ylog_info("HTTP COMPLETIONS reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP COMPLETIONS reply-json", json); }
         free(json);
     }
     free(prompt);
@@ -486,11 +491,11 @@ static void handle_conn(int fd, Router* r)
         handle_models(fd, r);
     } else if (strcmp(req.method, "POST") == 0 &&
                strcmp(req.path, "/v1/chat/completions") == 0) {
-        ylog_body("HTTP CHAT", req.body);
+        if (g_api_log) ylog_body("HTTP CHAT", req.body);
         int stream = req.body && strstr(req.body, "\"stream\":true");
         handle_chat_completions(fd, r, req.body ? req.body : "", stream);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/completions") == 0) {
-        ylog_body("HTTP COMPLETIONS", req.body);
+        if (g_api_log) ylog_body("HTTP COMPLETIONS", req.body);
         int stream = req.body && strstr(req.body, "\"stream\":true");
         handle_completions(fd, r, req.body ? req.body : "", stream);
     } else {
