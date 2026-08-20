@@ -84,6 +84,7 @@ typedef struct {
     uint64_t seed;
     int budget_mb;
     int budget_auto;                /* --budget-auto: 按可用内存自动预算 */
+    char budget[CFG_STR_MAX];       /* 内存预算模式: "auto" | "<n>MB" | "<n>G" | "<n>KB" 等(合并 budget-mb/budget-auto) */
     int depth;
 
     /* 客户端模式(router --send) */
@@ -166,6 +167,33 @@ static inline void config_defaults(ServeConfig* c)
     c->api_log = 1;   /* 默认开启 */
 }
 
+/* 解析内存预算模式 → MB 数。
+ * "auto" / 空 → -1(自动); "1024MB" / "1024m" → 1024; "1.5G" → 1536; "512KB" → 0(舍入)。
+ * 无单位纯数字按 MB。 */
+static inline long config_budget_mb(const ServeConfig* c)
+{
+    if (c->budget[0]) {
+        const char* p = c->budget;
+        char* end = NULL;
+        double v = strtod(p, &end);
+        while (end && (*end == ' ' || *end == '\t')) end++;
+        if (end && end != p) {
+            double mb;
+            if (*end == 'g' || *end == 'G')      mb = v * 1024.0;
+            else if (*end == 'm' || *end == 'M') mb = v;
+            else if (*end == 'k' || *end == 'K') mb = v / 1024.0;
+            else if (*end == 't' || *end == 'T') mb = v * 1024.0 * 1024.0;
+            else                                 mb = v;   /* 无单位按 MB */
+            return (long)mb;
+        }
+        if (strncmp(p, "auto", 4) == 0) return -1;
+        return (long)v;   /* 兜底: 纯数字按 MB */
+    }
+    if (c->budget_auto) return -1;      /* 旧配置兼容 */
+    if (c->budget_mb > 0) return c->budget_mb;
+    return -1;
+}
+
 /* 按 key 填一个字段(字符串/数字)。返回 1 认识该 key */
 static inline int config_set(ServeConfig* c, const char* key, const char* val)
 {
@@ -242,6 +270,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->budget_mb = atoi(val);
     } else if (strcmp(key, "budget-auto") == 0) {
         c->budget_auto = atoi(val);
+    } else if (strcmp(key, "budget") == 0) {
+        snprintf(c->budget, sizeof(c->budget), "%s", val);
     } else if (strcmp(key, "depth") == 0) {
         c->depth = atoi(val);
     } else if (strcmp(key, "send") == 0) {

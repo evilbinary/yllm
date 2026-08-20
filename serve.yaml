@@ -24,7 +24,7 @@ server-port: 9420      # 模型0 server 端口
 rank-port-base: 9410   # 模型0 rank 推理口基址
 http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
 cache-dir: ./sessions   # 会话缓存落盘目录(空 = 纯内存; server 存 token 列表, rank 存 KV)
-budget-auto: 1             # 自动内存模式(按可用内存)
+budget: 1024MB            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n>KB(如 2048MB / 1.5G)
 
 # 拓扑
 sv-host: 127.0.0.1     # supervisor 地址(rank/server 心跳目标)

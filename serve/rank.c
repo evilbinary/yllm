@@ -768,8 +768,8 @@ int cmd_rank(ServeConfig* cfg)
         return 1;
     }
     char err[1024];
-    uint64_t budget = (uint64_t)cfg->budget_mb * 1024 * 1024;
-    if (cfg->budget_auto) budget = rank_auto_budget(cfg);
+    long budget_mb = config_budget_mb(cfg);   /* -1 = 自动 */
+    uint64_t budget = (uint64_t)(budget_mb < 0 ? (long)(rank_auto_budget(cfg) / (1024 * 1024)) : budget_mb) * 1024 * 1024;
     if (engine_init(&r.engine, cfg->model, budget, cfg->depth, err, sizeof(err)) != 0) {
         ylog_error("rank: engine init failed: %s", err);
         vocab_free(&r.vocab);
