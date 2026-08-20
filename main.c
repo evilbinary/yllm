@@ -415,7 +415,10 @@ int main(int argc, char** argv)
             else if (strcmp(cfg.log_level, "error") == 0) ylog_set_level(YLOG_ERROR);
             else ylog_set_level(YLOG_INFO);
         }
-        ylog_info("yllm start: %s", cfg.log_file);
+        if (strcmp(argv[1], "ctl") == 0)
+            ylog_info("yllm ctl %s: %s", (argc > 2 && argv[2]) ? argv[2] : "", cfg.log_file);
+        else
+            ylog_info("yllm %s start: %s", argv[1], cfg.log_file);
         int rc;
         if (strcmp(argv[1], "rank") == 0) rc = cmd_rank(&cfg);
         else if (strcmp(argv[1], "server") == 0) rc = cmd_server(&cfg);
