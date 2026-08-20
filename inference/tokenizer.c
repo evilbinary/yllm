@@ -899,6 +899,55 @@ static int chat_append_ids(Vocab* v, const char* text, uint32_t* ids, int max, i
     return 0;
 }
 
+/* 检测简化渲染器不支持的 jinja 构造(macro/set/namespace/异常/反向循环等)。
+ * 命中时若强行解析, macro 体会被当顶层语句执行, 输出 raise_exception 文本等乱码。 */
+static int chat_template_unsupported(const char* tpl)
+{
+    if (!tpl) return 1;
+    if (strstr(tpl, "macro") != NULL) return 1;
+    if (strstr(tpl, "namespace(") != NULL) return 1;
+    if (strstr(tpl, "raise_exception") != NULL) return 1;
+    if (strstr(tpl, "[::-1]") != NULL) return 1;
+    if (strstr(tpl, "loop.previtem") != NULL) return 1;
+    if (strstr(tpl, "loop.nextitem") != NULL) return 1;
+    return 0;
+}
+
+static int chat_vocab_has_token(const Vocab* v, const char* s)
+{
+    int id;
+    return vocab_bsearch_sorted(v, v->sorted, s, strlen(s), &id) == 0;
+}
+
+/* 内置通用 im_start 聊天模板(qwen 家族标准格式), 供复杂模板回退使用。
+ *   <|im_start|>role\ncontent<|im_end|>\n ... <|im_start|>assistant\n
+ * vocab 无 im_start/im_end 时退化为 "role: content" 纯文本。 */
+static void chat_render_generic(Vocab* v, const ChatMsg* msgs, int n_msgs,
+                                uint32_t* ids, int max, int* n_out)
+{
+    int im = chat_vocab_has_token(v, "<|im_start|>") && chat_vocab_has_token(v, "<|im_end|>");
+    int mi;
+    for (mi = 0; mi < n_msgs && *n_out < max; mi++) {
+        const char* role = msgs[mi].role && msgs[mi].role[0] ? msgs[mi].role : "user";
+        if (im) {
+            char head[520];
+            snprintf(head, sizeof(head), "<|im_start|>%s\n", role);
+            chat_append_ids(v, head, ids, max, n_out);
+            chat_append_ids(v, msgs[mi].content ? msgs[mi].content : "", ids, max, n_out);
+            chat_append_ids(v, "<|im_end|>\n", ids, max, n_out);
+        } else {
+            chat_append_ids(v, role, ids, max, n_out);
+            chat_append_ids(v, ": ", ids, max, n_out);
+            chat_append_ids(v, msgs[mi].content ? msgs[mi].content : "", ids, max, n_out);
+            chat_append_ids(v, "\n", ids, max, n_out);
+        }
+    }
+    if (im)
+        chat_append_ids(v, "<|im_start|>assistant\n", ids, max, n_out);
+    else
+        chat_append_ids(v, "assistant: ", ids, max, n_out);
+}
+
 /* 多消息模板渲染: roles[i]/contents[i] 组成对话历史, 渲染完整模板。
  * 返回渲染出的 token 数; 无模板返回 -1。 */
 int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* contents,
@@ -916,6 +965,12 @@ int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* 
 
     int n_out = 0;
     if (add_bos && v->bos >= 0 && n_out < max) ids[n_out++] = (uint32_t)v->bos;
+
+    if (chat_template_unsupported(v->chat_template)) {
+        chat_render_generic(v, msgs, n_msgs, ids, max, &n_out);
+        free(msgs);
+        return n_out;
+    }
 
     /* parse template into statements by scanning {% %} / {{ }} blocks */
     enum { ST_FOR, ST_IF, ST_ELIF, ST_ENDIF, ST_END_FOR, ST_EXPR, ST_IF_LAST, ST_NONE };
