@@ -243,7 +243,8 @@ NTHREADS ?= $(shell nproc 2>/dev/null || echo 4)
 RUN = OMP_NUM_THREADS=$(NTHREADS) $(BIN)
 RUN_AVX2 = OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2)
 
-$(MODEL_LLF): $(MODEL_GGUF) $(BIN)
+# llf 转换规则: 仅当 gguf 比 llf 新才转换(bin 用 order-only 依赖, 不触发重转)
+$(MODEL_LLF): $(MODEL_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(MODEL_GGUF) --out $(MODEL_LLF) --vocab $(MODEL_VOCAB) --seq 2048
 
@@ -270,15 +271,15 @@ Q3_GGUF   ?= models/Qwen3-8B-Q4_K_M.gguf
 Q3_LLF    ?= models/qwen3-8b.llf
 Q3_VOCAB  ?= models/qwen3.vocab.txt
 
-$(Q25_LLF): $(Q25_GGUF) $(BIN)
+$(Q25_LLF): $(Q25_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(Q25_GGUF) --out $(Q25_LLF) --vocab $(Q25_VOCAB) --seq 2048
 
-$(Q25_7B_LLF): $(Q25_7B_GGUF) $(BIN)
+$(Q25_7B_LLF): $(Q25_7B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(Q25_7B_GGUF) --out $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --seq 4096
 
-$(Q3_LLF): $(Q3_GGUF) $(BIN)
+$(Q3_LLF): $(Q3_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(Q3_GGUF) --out $(Q3_LLF) --vocab $(Q3_VOCAB) --seq 2048
 
@@ -315,23 +316,24 @@ chat-qwen3.8-27b: $(BIN) $(Q38_LLF)
 chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
 	$(RUN_AVX2) chat --model $(Q38_LLF) --vocab $(Q38_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-# ---- 指定模型的 serve 快捷目标(全部用 serve.yaml 同一 hub, 类似 chat-xxx) ----
-#   用 make server-qwen2.5-7b 一键拉起 hub(serve.yaml 同时服务全部模型, 端口自动错开)
-#   qwen38 的 rank 在远程, 需先远程手工起; 其余模型本机自动拉起
+# ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
+#   make server-qwen2.5-7b   # 只起 qwen2.5(本机 rank)
+#   make server-qwen38       # 只起 qwen38(远程 rank, 需先远程手工起)
+#   make server-tinyllama    # 只起 tinyllama(本机 rank)
 server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN_AVX2) hub --config serve.yaml > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
+	@nohup $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen38: $(BIN_AVX2) $(Q38_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN_AVX2) hub --config serve.yaml > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml); 用 make infer-qwen38 发请求 (HTTP 127.0.0.1:8000)"
+	@nohup $(BIN_AVX2) hub --config serve.yaml --model qwen38 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen38); 用 make infer-qwen38 发请求 (HTTP 127.0.0.1:8000)"
 
 server-tinyllama: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN_AVX2) hub --config serve.yaml > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
+	@nohup $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=tinyllama); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
 
 # 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 model-name)
 infer-qwen2.5-7b: $(BIN)

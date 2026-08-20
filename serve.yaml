@@ -45,7 +45,7 @@ lease-strategy: request
 #        ranks: 0 = 该模型 rank 由外部机器承担(分布式部署), 本机不拉起。
 # local: 本机拉起的段数(-1 未指定 = 全部; 0 = 全部外部; N = 前 N 段本地)。
 models:
-  - name: qwen38
+  - name: qwen3.8
     model: models/qwen3.8-27b.llf
     vocab: models/qwen3.vocab.txt
     ranks: 1           # 总段数(单 rank, 全部在远程: 远程单机 1.8 tok/s > 双机 0.89)

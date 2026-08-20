@@ -58,6 +58,17 @@ int cmd_hub(ServeConfig* cfg)
         return 1;
     }
 
+    /* --model/--only-model 按模型名筛选: 命中 models[].name 则只拉起该模型;
+     * 未命中时 --model 仍视为 llf 路径(单模型兼容)。 */
+    if (cfg->only_model[0]) {
+        config_filter_models(cfg, cfg->only_model);
+    } else if (cfg->model[0] && cfg->n_models > 1) {
+        int mi, hit = 0;
+        for (mi = 0; mi < cfg->n_models; mi++)
+            if (strcmp(cfg->models[mi].name, cfg->model) == 0) { hit = 1; break; }
+        if (hit) config_filter_models(cfg, cfg->model);
+    }
+
     /* supervisor */
     Supervisor sv;
     memset(&sv, 0, sizeof(sv));

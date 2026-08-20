@@ -578,6 +578,16 @@ int supervisor_run(Supervisor* s)
 
 int cmd_supervisor(ServeConfig* cfg)
 {
+    /* --only-model / --model <名字> 按模型名筛选(多模型 serve.yaml 只拉起指定模型) */
+    if (cfg->only_model[0]) {
+        config_filter_models(cfg, cfg->only_model);
+    } else if (cfg->model[0] && cfg->n_models > 1) {
+        int mi, hit = 0;
+        for (mi = 0; mi < cfg->n_models; mi++)
+            if (strcmp(cfg->models[mi].name, cfg->model) == 0) { hit = 1; break; }
+        if (hit) config_filter_models(cfg, cfg->model);
+    }
+
     Supervisor s;
     memset(&s, 0, sizeof(s));
     s.port = (uint16_t)cfg->sv_port;

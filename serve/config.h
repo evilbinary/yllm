@@ -81,6 +81,9 @@ typedef struct {
 
     /* 客户端模式(router --send) */
     char send[CFG_STR_MAX];
+
+    /* hub/supervisor 按模型名筛选(多模型 serve.yaml 只拉起指定模型; 逗号分隔多个) */
+    char only_model[CFG_STR_MAX];
 } ServeConfig;
 
 /* 填默认值 */
@@ -194,6 +197,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->depth = atoi(val);
     } else if (strcmp(key, "send") == 0) {
         snprintf(c->send, sizeof(c->send), "%s", val);
+    } else if (strcmp(key, "only-model") == 0) {
+        snprintf(c->only_model, sizeof(c->only_model), "%s", val);
     } else {
         return 0;
     }
@@ -348,6 +353,30 @@ static inline int cfg_model_stride(const ServeConfig* c)
     for (mi = 0; mi < c->n_models && mi < CFG_MAX_MODELS; mi++)
         if (c->models[mi].ranks > stride) stride = c->models[mi].ranks;
     return stride;
+}
+
+/* 按模型名筛选(models 列表只保留名字在逗号分隔列表中的; 命中 0 个则保持原样)。
+ * 供 hub / supervisor 用 --only-model 只拉起指定模型, 避免一次带起全部。 */
+static inline void config_filter_models(ServeConfig* c, const char* names)
+{
+    if (!names || !names[0] || c->n_models == 0) return;
+    ModelCfg kept[CFG_MAX_MODELS];
+    int nk = 0, mi;
+    for (mi = 0; mi < c->n_models; mi++) {
+        const char* p = names;
+        int hit = 0;
+        while (*p) {
+            const char* comma = strchr(p, ',');
+            size_t len = comma ? (size_t)(comma - p) : strlen(p);
+            if (len > 0 && strncmp(c->models[mi].name, p, len) == 0 &&
+                c->models[mi].name[len] == '\0') { hit = 1; break; }
+            p = comma ? comma + 1 : p + strlen(p);
+        }
+        if (hit) kept[nk++] = c->models[mi];
+    }
+    if (nk == 0) return; /* 没命中任何名字, 视为不筛选 */
+    c->n_models = nk;
+    for (mi = 0; mi < nk; mi++) c->models[mi] = kept[mi];
 }
 
 static inline void config_load(ServeConfig* c, int argc, char** argv, int start)
