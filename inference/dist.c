@@ -695,6 +695,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         dist_send_done(&dist);
         uint64_t t_end = ynow_ms();
         uint64_t t_dec = t_dec0 ? t_dec0 : t_end;
+        if (ngen > 0) ylog_raw_log("\n");   /* 生成的最后一个 token 后换行 */
         ylog_info("decode:  %d tokens in %.2f s (%.2f tok/s)", ngen,
                (double)(t_end - t_dec) / 1000.0,
                (double)ngen * 1000.0 / (double)(t_end - t_dec > 0 ? t_end - t_dec : 1));

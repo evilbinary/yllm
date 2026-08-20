@@ -375,6 +375,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     tim.n_decode = ngen;
     tim.decode_ms = ynow_ms() - t_dec0;
 
+    if (ngen > 0) ylog_raw_log("\n");   /* 生成的最后一个 token 后换行, 避免与统计日志挤在同一行 */
     ylog_info("decode:  %u tokens in %.2f s (%.2f tok/s)", ngen,
            (double)(ynow_ms() - t_dec0) / 1000.0,
            (double)ngen * 1000.0 / (double)(ynow_ms() - t_dec0 > 0 ? ynow_ms() - t_dec0 : 1));
