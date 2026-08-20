@@ -322,17 +322,17 @@ chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q38_LLF)
 #   make server-tinyllama    # 只起 tinyllama(本机 rank)
 server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen38: $(BIN_AVX2) $(Q38_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN_AVX2) hub --config serve.yaml --model qwen38 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen38 > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen38); 用 make infer-qwen38 发请求 (HTTP 127.0.0.1:8000)"
 
 server-tinyllama: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=tinyllama); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
 
 # 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 model-name)
