@@ -33,7 +33,7 @@ static void ysleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 #endif
-#include "../inference/log.h"
+#include "../inference/include/log.h"
 #include <stdio.h>
 #include <string.h>
 

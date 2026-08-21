@@ -1,13 +1,18 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.7 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.8 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
 | 路径 | 职责 |
 |------|------|
-| `inference/` | 引擎核 + `device_cpu` / `device_cuda` / `device_vulkan` + `vulkan_load` |
-| `inference/shaders/` | GLSL → SPIR-V（预编译进仓库） |
+| `inference/include/` | 公共头（`yllm.h` / `device.h` / …） |
+| `inference/core/` | 引擎核（engine / matvec / llf / …） |
+| `inference/convert/` | GGUF / Safetensors 转换 |
+| `inference/device/` | `device_cpu` / `device_cuda` / `device_vulkan` |
+| `inference/cuda/` | CUDA fwd + kernels |
+| `inference/vulkan/` | Vulkan load/compute/fwd |
+| `inference/vulkan/shaders/` | GLSL → SPIR-V（预编译进仓库） |
 | `platform/android/` | NDK CMake → `libyllm.so` + `yllm_gen` |
 | `platform/ios/` | 静态库 CMake + MoltenVK 说明 |
 | `platform/pc/` | 桌面入口（根 `Makefile`） |
@@ -23,10 +28,10 @@
   - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
     - `rmsnorm.spv`：块内 F32/F16 RMSNorm
     - `gemv_q4k.spv`：块内 Q4_K；**load 时整包常驻**（`resident=1`）
-    - **fused**：`rmsnorm+QKV`；整段 FFN `rmsnorm+gate+up+swiglu+down`（`swi=1`）；O 仍单次 gemv；attn/rope 仍 CPU
+    - **fused**：`rmsnorm+QKV`；整段 FFN；**attn_decode**（f32 KV 常驻，`attn=1`）；rope/bias/qk-norm/O 仍部分 CPU
   - 失败 → `DEV_MODE_VULKAN_HOST`
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
-  - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/shaders/`
+  - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/vulkan/shaders/`
 
 ## 3. 构建
 
@@ -35,7 +40,7 @@
 ```bash
 # 需 VULKAN_SDK（头文件）；运行时动态加载，无需链 vulkan-1.lib
 set VULKAN_SDK=...   # Windows
-# 改 .comp 后: glslc -fshader-stage=compute inference/shaders/rmsnorm.comp -o inference/shaders/rmsnorm.spv
+# 改 .comp 后: glslc -fshader-stage=compute inference/vulkan/shaders/rmsnorm.comp -o inference/vulkan/shaders/rmsnorm.spv
 make vulkan
 ./build/avx2-vulkan/yllm gen --device vulkan ... --temp 0
 ```
@@ -61,6 +66,6 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. rope / attn_decode compute；lm_head  
-2. 激活跨层常驻  
+1. GPU rope；O proj 与 attn 同 submit；lm_head  
+2. attn 并行化（当前每 head 单线程，长上下文会慢）  
 3. `adb` 冒烟；MoltenVK iOS

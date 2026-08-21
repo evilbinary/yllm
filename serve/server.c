@@ -17,8 +17,8 @@
 #include "node.h"
 #include "sock.h"
 #include "server.h"
-#include "../inference/yllm.h"
-#include "../inference/log.h"
+#include "../inference/include/yllm.h"
+#include "../inference/include/log.h"
 #include <time.h>
 #include <pthread.h>
 #include <stdint.h>

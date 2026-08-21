@@ -155,15 +155,25 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ylog_warn("vulkan: Q4_K resident upload failed; gemv falls back host-W");
                 ctx->wq_resident = 0;
             }
+            if (ctx->fuse_ready) {
+                char aerr[256];
+                const LlfHeader* h = &e->ws.model.h;
+                uint32_t kv_dim = h->n_kv_heads * h->head_dim;
+                if (vulkan_attn_setup(ctx, h->n_blocks, e->max_seq, kv_dim,
+                                      h->n_heads, h->n_kv_heads, h->head_dim,
+                                      aerr, sizeof(aerr)) != 0) {
+                    ylog_warn("vulkan: attn setup failed (%s)", aerr);
+                }
+            }
         }
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d fuse=%d swi=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d fuse=%d swi=%d attn=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
               ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident,
-              ctx->fuse_ready, ctx->swi_ready);
+              ctx->fuse_ready, ctx->swi_ready, ctx->attn_ready);
     return 0;
 }
 

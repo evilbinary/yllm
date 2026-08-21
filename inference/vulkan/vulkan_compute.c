@@ -1,6 +1,7 @@
 /* vulkan_compute.c — RMSNorm + Q4_K gemv SPIR-V dispatch */
 #include "vulkan_compute.h"
 #include "vulkan_api.h"
+#include "yllm.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,9 +94,10 @@ static uint32_t* read_spv(const char* path, size_t* out_nwords)
 static const char* find_spv_named(const char* name, char* buf, size_t bufn)
 {
     const char* prefixes[] = {
-        "inference/shaders/",
+        "inference/vulkan/shaders/",
+        "vulkan/shaders/",
         "shaders/",
-        "../inference/shaders/",
+        "../inference/vulkan/shaders/",
         NULL
     };
     int i;
@@ -778,4 +780,148 @@ int vulkan_fused_ffn(VulkanCtx* ctx,
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
     return map_read(ctx, ctx->mem_o0, out, xb);
+}
+
+typedef struct {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t kv_dim;
+    uint32_t max_seq;
+    uint32_t pos;
+    uint32_t k_slot;
+    uint32_t v_slot;
+} AttnPush;
+
+int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
+                      uint32_t kv_dim, uint32_t n_heads, uint32_t n_kv_heads,
+                      uint32_t head_dim, char* err, size_t errlen)
+{
+    if (!ctx || !ctx->device || ctx->host_shim) return -1;
+    if (!ctx->fuse_ready || !ctx->buf_o0 || !ctx->buf_o2) {
+        if (err && errlen) snprintf(err, errlen, "fuse buffers missing");
+        return -1;
+    }
+    ctx->n_blocks = n_blocks;
+    ctx->max_seq = max_seq;
+    ctx->kv_dim = kv_dim;
+    ctx->n_heads = n_heads;
+    ctx->n_kv_heads = n_kv_heads;
+    ctx->head_dim = head_dim;
+    ctx->kv_slots = 2u * n_blocks + 1u;
+    ctx->kv_bytes = (size_t)ctx->kv_slots * max_seq * kv_dim * 4;
+
+    VkBuffer bkv = VK_NULL_HANDLE;
+    VkDeviceMemory mkv = VK_NULL_HANDLE;
+    if (create_host_buffer(ctx, ctx->kv_bytes, &bkv, &mkv) != 0) {
+        if (err && errlen) snprintf(err, errlen, "kv buffer alloc %zu", ctx->kv_bytes);
+        return -1;
+    }
+    ctx->buf_kv = (void*)bkv;
+    ctx->mem_kv = (void*)mkv;
+    /* 清零 */
+    {
+        VulkanApi* a = vulkan_api();
+        void* p = NULL;
+        if (a->MapMemory((VkDevice)ctx->device, mkv, 0, ctx->kv_bytes, 0, &p) == VK_SUCCESS) {
+            memset(p, 0, ctx->kv_bytes);
+            a->UnmapMemory((VkDevice)ctx->device, mkv);
+        }
+    }
+
+    VkBuffer bufs[3] = { (VkBuffer)ctx->buf_o0, bkv, (VkBuffer)ctx->buf_o2 };
+    size_t ranges[3] = { ctx->y_bytes, ctx->kv_bytes, ctx->y_bytes };
+    VkShaderModule sh = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet dset = VK_NULL_HANDLE;
+    if (create_ssbo_pipeline(ctx, "attn_decode.spv", sizeof(AttnPush),
+                             &sh, &dsl, &pl, &pipe, &pool, &dset,
+                             bufs, ranges, err, errlen) != 0) {
+        VulkanApi* a = vulkan_api();
+        a->DestroyBuffer((VkDevice)ctx->device, bkv, NULL);
+        a->FreeMemory((VkDevice)ctx->device, mkv, NULL);
+        ctx->buf_kv = NULL;
+        ctx->mem_kv = NULL;
+        return -1;
+    }
+    ctx->attn_shader = (void*)sh;
+    ctx->attn_desc_layout = (void*)dsl;
+    ctx->attn_pipe_layout = (void*)pl;
+    ctx->attn_pipeline = (void*)pipe;
+    ctx->attn_desc_pool = (void*)pool;
+    ctx->attn_desc_set = (void*)dset;
+    ctx->attn_ready = 1;
+    ylog_info("vulkan: attn_decode ready heads=%u kv=%u seq=%u cache=%zuMB",
+              n_heads, n_kv_heads, max_seq, ctx->kv_bytes / (1024 * 1024));
+    return 0;
+}
+
+int vulkan_k_attn_decode(VulkanCtx* ctx,
+                         const float* q, const float* k, const float* v, float* att_out,
+                         uint32_t layer, uint32_t pos,
+                         uint16_t* host_k_row, uint16_t* host_v_row)
+{
+    if (!ctx || !ctx->attn_ready || !q || !k || !v || !att_out) return -1;
+    if (pos >= ctx->max_seq || layer > ctx->n_blocks) return -1;
+
+    uint32_t kv_dim = ctx->kv_dim;
+    uint32_t hidden = ctx->n_heads * ctx->head_dim;
+    size_t qbytes = (size_t)hidden * 4;
+    size_t rowb = (size_t)kv_dim * 4;
+    uint32_t k_slot = layer;
+    uint32_t v_slot = ctx->n_blocks + layer;
+    size_t k_off = ((size_t)k_slot * ctx->max_seq + pos) * kv_dim * 4;
+    size_t v_off = ((size_t)v_slot * ctx->max_seq + pos) * kv_dim * 4;
+
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    void* p = NULL;
+
+    if (map_copy(ctx, ctx->mem_o0, q, qbytes) != 0) return -1;
+
+    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, k_off, rowb, 0, &p) != VK_SUCCESS)
+        return -1;
+    memcpy(p, k, rowb);
+    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, v_off, rowb, 0, &p) != VK_SUCCESS)
+        return -1;
+    memcpy(p, v, rowb);
+    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+
+    if (host_k_row && host_v_row) {
+        uint32_t j;
+        for (j = 0; j < kv_dim; j++) {
+            host_k_row[j] = f32_to_f16(k[j]);
+            host_v_row[j] = f32_to_f16(v[j]);
+        }
+    }
+
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    a->BeginCommandBuffer(cmd, &bi);
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->attn_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)ctx->attn_desc_set;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->attn_pipe_layout, 0, 1, &ds, 0, NULL);
+    AttnPush push;
+    push.n_heads = ctx->n_heads;
+    push.n_kv_heads = ctx->n_kv_heads;
+    push.head_dim = ctx->head_dim;
+    push.kv_dim = ctx->kv_dim;
+    push.max_seq = ctx->max_seq;
+    push.pos = pos;
+    push.k_slot = k_slot;
+    push.v_slot = v_slot;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->attn_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, ctx->n_heads, 1, 1);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+    return map_read(ctx, ctx->mem_o2, att_out, qbytes);
 }

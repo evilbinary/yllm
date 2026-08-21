@@ -11,8 +11,8 @@
 #include "router.h"
 #include "json.h"
 #include "http.h"
-#include "../inference/yllm.h"
-#include "../inference/log.h"
+#include "../inference/include/yllm.h"
+#include "../inference/include/log.h"
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>

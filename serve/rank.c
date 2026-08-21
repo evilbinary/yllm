@@ -15,10 +15,10 @@
 #include "frame.h"
 #include "node.h"
 #include "sock.h"
-#include "../inference/yllm.h"
-#include "../inference/cache.h"
-#include "../inference/dist.h"
-#include "../inference/log.h"
+#include "../inference/include/yllm.h"
+#include "../inference/include/cache.h"
+#include "../inference/include/dist.h"
+#include "../inference/include/log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

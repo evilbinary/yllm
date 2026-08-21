@@ -18,12 +18,10 @@ typedef struct {
     void* cmd;
     void* fence;
 
-    /* 激活: x 输入, y = rmsnorm 输出兼 gemv 输入 */
     void* buf_x;
     void* buf_y;
     void* mem_x;
     void* mem_y;
-    /* gemv 多路输出(Q/K/V 或 gate/up/tmp) */
     void* buf_o0;
     void* buf_o1;
     void* buf_o2;
@@ -46,10 +44,10 @@ typedef struct {
 
     void* gemv_desc_pool;
     void* gemv_desc_layout;
-    void* gemv_desc_set;    /* x=buf_x y=buf_y — 单次 gemv/自检 */
-    void* gemv_ds0;         /* x=buf_y y=buf_o0 */
-    void* gemv_ds1;         /* x=buf_y y=buf_o1 */
-    void* gemv_ds2;         /* x=buf_y y=buf_o2 */
+    void* gemv_desc_set;
+    void* gemv_ds0;
+    void* gemv_ds1;
+    void* gemv_ds2;
     void* gemv_pipe_layout;
     void* gemv_pipeline;
     void* gemv_shader;
@@ -62,7 +60,6 @@ typedef struct {
     int gemv_ready;
     int fuse_ready;
 
-    /* SwiGLU: gate=o0, up=o1, out=buf_y */
     void* swi_desc_pool;
     void* swi_desc_layout;
     void* swi_desc_set;
@@ -70,6 +67,25 @@ typedef struct {
     void* swi_pipeline;
     void* swi_shader;
     int swi_ready;
+
+    /* RoPE / Attn — rope 暂 CPU; attn 用 GPU f32 KV */
+    void* attn_desc_pool;
+    void* attn_desc_layout;
+    void* attn_desc_set;
+    void* attn_pipe_layout;
+    void* attn_pipeline;
+    void* attn_shader;
+    void* buf_kv;
+    void* mem_kv;
+    size_t kv_bytes;
+    uint32_t kv_slots;
+    uint32_t max_seq;
+    uint32_t kv_dim;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t n_blocks;
+    int attn_ready;
 
     int compute_ready;
     uint32_t n_layers;

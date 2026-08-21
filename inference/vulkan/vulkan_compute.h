@@ -38,4 +38,15 @@ int vulkan_fused_ffn(VulkanCtx* ctx,
                      float* out, uint32_t inter,
                      uint64_t off_gate, uint64_t off_up, uint64_t off_down);
 
+/* rope 后: 写 GPU KV + attn decode → att_out[hidden]
+ * 同步写 host f16 行(可 NULL) */
+int vulkan_k_attn_decode(VulkanCtx* ctx,
+                         const float* q, const float* k, const float* v, float* att_out,
+                         uint32_t layer, uint32_t pos,
+                         uint16_t* host_k_row, uint16_t* host_v_row);
+
+int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
+                      uint32_t kv_dim, uint32_t n_heads, uint32_t n_kv_heads,
+                      uint32_t head_dim, char* err, size_t errlen);
+
 #endif

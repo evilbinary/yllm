@@ -12,8 +12,8 @@
 #include "supervisor.h"
 #include "router.h"
 #include "server.h"
-#include "../inference/yllm.h"
-#include "../inference/log.h"
+#include "../inference/include/yllm.h"
+#include "../inference/include/log.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>

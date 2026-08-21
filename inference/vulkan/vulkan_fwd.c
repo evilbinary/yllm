@@ -279,32 +279,40 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         else
             rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
     }
-    for (j = 0; j < kv_dim; j++) {
-        kcache[kvp + j] = f32_to_f16(k[j]);
-        vcache[kvp + j] = f32_to_f16(v[j]);
-    }
 
-    float* att = e->att;
-    float inv_d = 1.0f / sqrtf((float)h->head_dim);
-    #pragma omp parallel for schedule(static)
-    for (hh = 0; hh < h->n_heads; hh++) {
-        float* att_h = att + (size_t)hh * e->max_seq;
-        uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
-        const float* qh = q + (size_t)hh * h->head_dim;
-        uint32_t s, jj;
-        for (s = 0; s <= pos; s++) {
-            const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-            float acc = 0.0f;
-            for (jj = 0; jj < h->head_dim; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
-            att_h[s] = acc * inv_d;
+    int attn_ok = 0;
+    if (ctx && ctx->attn_ready) {
+        attn_ok = (vulkan_k_attn_decode(ctx, q, k, v, att_out, layer, pos,
+                                        kcache + kvp, vcache + kvp) == 0);
+    }
+    if (!attn_ok) {
+        uint32_t j2;
+        for (j2 = 0; j2 < kv_dim; j2++) {
+            kcache[kvp + j2] = f32_to_f16(k[j2]);
+            vcache[kvp + j2] = f32_to_f16(v[j2]);
         }
-        softmax(att_h, pos + 1);
-        float* out = att_out + (size_t)hh * h->head_dim;
-        memset(out, 0, (size_t)h->head_dim * 4);
-        for (s = 0; s <= pos; s++) {
-            const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-            float a = att_h[s];
-            for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+        float* att = e->att;
+        float inv_d = 1.0f / sqrtf((float)h->head_dim);
+        #pragma omp parallel for schedule(static)
+        for (hh = 0; hh < h->n_heads; hh++) {
+            float* att_h = att + (size_t)hh * e->max_seq;
+            uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
+            const float* qh = q + (size_t)hh * h->head_dim;
+            uint32_t s, jj;
+            for (s = 0; s <= pos; s++) {
+                const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
+                float acc = 0.0f;
+                for (jj = 0; jj < h->head_dim; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
+                att_h[s] = acc * inv_d;
+            }
+            softmax(att_h, pos + 1);
+            float* out = att_out + (size_t)hh * h->head_dim;
+            memset(out, 0, (size_t)h->head_dim * 4);
+            for (s = 0; s <= pos; s++) {
+                const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
+                float a = att_h[s];
+                for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+            }
         }
     }
     memcpy(x2, att_out, (size_t)hidden * 4);

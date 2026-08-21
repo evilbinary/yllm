@@ -1,0 +1,62 @@
+#version 450
+/* Decode attn: 每 WG 一个 Q head; KV 同缓冲不同 slot (f32) */
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KvBuf { float kv[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float outp[]; };
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint kv_dim;
+    uint max_seq;
+    uint pos;
+    uint k_slot;
+    uint v_slot;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+
+    uint kv_head = h * pc.n_kv_heads / pc.n_heads;
+    uint qoff = h * pc.head_dim;
+    float inv_d = inversesqrt(float(pc.head_dim));
+    uint tlen = pc.pos + 1u;
+
+    float m = -1e30;
+    for (uint s = 0u; s < tlen; s++) {
+        uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+        float acc = 0.0;
+        for (uint j = 0u; j < pc.head_dim; j++)
+            acc += q[qoff + j] * kv[koff + j];
+        acc *= inv_d;
+        if (acc > m) m = acc;
+    }
+
+    float sum = 0.0;
+    for (uint s = 0u; s < tlen; s++) {
+        uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+        float acc = 0.0;
+        for (uint j = 0u; j < pc.head_dim; j++)
+            acc += q[qoff + j] * kv[koff + j];
+        sum += exp(acc * inv_d - m);
+    }
+    float inv_sum = 1.0 / max(sum, 1e-20);
+
+    for (uint j = 0u; j < pc.head_dim; j++)
+        outp[qoff + j] = 0.0;
+
+    for (uint s = 0u; s < tlen; s++) {
+        uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+        uint voff = (pc.v_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+        float acc = 0.0;
+        for (uint j = 0u; j < pc.head_dim; j++)
+            acc += q[qoff + j] * kv[koff + j];
+        float a = exp(acc * inv_d - m) * inv_sum;
+        for (uint j = 0u; j < pc.head_dim; j++)
+            outp[qoff + j] += a * kv[voff + j];
+    }
+}

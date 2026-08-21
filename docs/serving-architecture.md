@@ -603,7 +603,7 @@ yllm/
 
 ### 3.6.3 帧协议分类
 
-- `inference/dist.c` 内部:rank 间激活帧(X/LOGITS/DONE),推理执行的一部分;
+- `inference/core/dist.c` 内部:rank 间激活帧(X/LOGITS/DONE),推理执行的一部分;
 - `serve/protocol.h`:服务层帧(PING/STAT/INFER/DRAIN/HEARTBEAT/SERVER\_ADD/DEL/UPDATE/QUERY\_SERVERS),rank/server/router/supervisor 共用。
 
 ## 3.7 服务层统一抽象(Node + 帧协议)
@@ -726,8 +726,8 @@ serve/
 | 位置                        | 改动                                                                                |
 | ------------------------- | --------------------------------------------------------------------------------- |
 | `main.c`                  | 新增 `cmd_rank` / `cmd_server` / `cmd_router`(复用 gen 的 engine/vocab 初始化),把生成拆成可复用函数 |
-| `inference/engine.c`      | `engine_generate(...)`(prompt→tokens→流式 cb),`cmd_gen` 与 `rank` 共用(已抽取)            |
-| `inference/dist.c`        | `dist_gen` 增加"循环服务"入口或拆分连接建立/推理;常驻复用 dist 连接                                      |
+| `inference/core/engine.c` | `engine_generate(...)`(prompt→tokens→流式 cb),`cmd_gen` 与 `rank` 共用(已抽取)            |
+| `inference/core/dist.c`   | `dist_gen` 增加"循环服务"入口或拆分连接建立/推理;常驻复用 dist 连接                                      |
 | `serve/sock.h`(已有)        | 传输层:connect / send\_n / recv\_n / recv\_line                                      |
 | `serve/frame.h`(新)        | 统一帧编解码:frame\_send / frame\_recv / payload / frame\_get                           |
 | `serve/node.h`(新)         | 统一节点结构:Node 身份/心跳/状态 + node\_heartbeat / node\_parse / node\_is\_dead             |

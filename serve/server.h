@@ -4,8 +4,8 @@
 #include <pthread.h>
 #include "node.h"
 #include "config.h"
-#include "../inference/yllm.h"
-#include "../inference/cache.h"
+#include "../inference/include/yllm.h"
+#include "../inference/include/cache.h"
 
 typedef struct {
     Node node;             /* 统一节点身份(type=server) */

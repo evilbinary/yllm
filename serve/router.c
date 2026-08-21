@@ -15,7 +15,7 @@
 #include "sock.h"
 #include "router.h"
 #include "router_http.h"
-#include "../inference/log.h"
+#include "../inference/include/log.h"
 #include <time.h>
 #include <stdint.h>
 

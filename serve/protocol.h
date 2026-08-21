@@ -1,7 +1,7 @@
 /* protocol.h — serve 层帧协议(rank / server / router 共用)
  *
  * 协议: 一行文本命令 + 可选二进制 payload, TCP 流式(以 \n 分帧)。
- * 风格与 inference/dist.c 的私有帧一致, 但这是服务层协议:
+ * 风格与 inference/core/dist.c 的私有帧一致, 但这是服务层协议:
  *   rank 对外的推理/管理帧、server↔router 的注册/心跳帧。
  *
  * 帧格式(全部以 \n 结尾的一行, payload 用长度前缀):

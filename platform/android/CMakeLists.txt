@@ -4,34 +4,39 @@ project(yllm_android C)
 
 set(YLLM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(INFER "${YLLM_ROOT}/inference")
+set(INFER_INC
+  ${INFER}/include
+  ${INFER}/cuda
+  ${INFER}/vulkan
+)
 
 option(YLLM_VULKAN "Build Vulkan device backend" OFF)
 
 set(YLLM_CORE_SRCS
-  ${INFER}/platform.c
-  ${INFER}/log.c
-  ${INFER}/llf.c
-  ${INFER}/convert.c
-  ${INFER}/convert_safetensors.c
-  ${INFER}/convert_gguf.c
-  ${INFER}/tokenizer.c
-  ${INFER}/matvec.c
-  ${INFER}/engine.c
-  ${INFER}/cache.c
-  ${INFER}/dist.c
-  ${INFER}/device_cpu.c
+  ${INFER}/core/platform.c
+  ${INFER}/core/log.c
+  ${INFER}/core/llf.c
+  ${INFER}/convert/convert.c
+  ${INFER}/convert/convert_safetensors.c
+  ${INFER}/convert/convert_gguf.c
+  ${INFER}/core/tokenizer.c
+  ${INFER}/core/matvec.c
+  ${INFER}/core/engine.c
+  ${INFER}/core/cache.c
+  ${INFER}/core/dist.c
+  ${INFER}/device/device_cpu.c
 )
 
 if(YLLM_VULKAN)
   list(APPEND YLLM_CORE_SRCS
-    ${INFER}/device_vulkan.c
-    ${INFER}/vulkan_load.c
-    ${INFER}/vulkan_fwd.c
-    ${INFER}/vulkan_compute.c)
+    ${INFER}/device/device_vulkan.c
+    ${INFER}/vulkan/vulkan_load.c
+    ${INFER}/vulkan/vulkan_fwd.c
+    ${INFER}/vulkan/vulkan_compute.c)
 endif()
 
 add_library(yllm SHARED ${YLLM_CORE_SRCS})
-target_include_directories(yllm PUBLIC ${INFER})
+target_include_directories(yllm PUBLIC ${INFER_INC})
 target_compile_definitions(yllm PRIVATE
   YLLM_BATCH_PREFILL=1
   YLLM_SESS_DEBUG=0
@@ -57,5 +62,5 @@ target_link_libraries(yllm ${LOG_LIB} m)
 add_executable(yllm_gen
   ${CMAKE_CURRENT_SOURCE_DIR}/gen_main.c
 )
-target_include_directories(yllm_gen PRIVATE ${INFER})
+target_include_directories(yllm_gen PRIVATE ${INFER_INC})
 target_link_libraries(yllm_gen yllm ${LOG_LIB})

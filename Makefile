@@ -17,8 +17,22 @@ CC         ?= cc
 LDFLAGS    ?=
 LIBS       :=
 
-SRC      := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/cache.c inference/dist.c inference/device_cpu.c
-TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/device_cpu.c
+# 公共头: inference/include; 后端私有头: cuda/ vulkan/
+INFER_INC := -Iinference/include -Iinference/cuda -Iinference/vulkan
+HDR_PUBLIC := inference/include/yllm.h inference/include/llf.h inference/include/convert.h \
+	inference/include/matvec.h inference/include/dist.h inference/include/device.h \
+	inference/include/log.h inference/include/cache.h
+
+SRC := \
+	inference/core/platform.c inference/core/log.c inference/core/llf.c \
+	inference/convert/convert.c inference/convert/convert_safetensors.c inference/convert/convert_gguf.c \
+	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
+	inference/core/cache.c inference/core/dist.c inference/device/device_cpu.c
+TEST_ENGINE_CORE := \
+	inference/core/platform.c inference/core/log.c inference/core/llf.c \
+	inference/convert/convert.c inference/convert/convert_safetensors.c inference/convert/convert_gguf.c \
+	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
+	inference/device/device_cpu.c
 
 # ---- CUDA 后端(可选) ----
 #   make cuda                              # 推荐: 独立目录 build/avx2-cuda
@@ -33,8 +47,8 @@ GPU ?= 0
 GPU_WEIGHTS ?= auto
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
 ifeq ($(YLLM_CUDA),1)
-  SRC += inference/device_cuda.c inference/cuda_fwd.c
-  TEST_ENGINE_CORE += inference/device_cuda.c inference/cuda_fwd.c
+  SRC += inference/device/device_cuda.c inference/cuda/cuda_fwd.c
+  TEST_ENGINE_CORE += inference/device/device_cuda.c inference/cuda/cuda_fwd.c
   ifeq ($(YLLM_CUDA_HOST),)
     ifeq ($(NVCC),)
       YLLM_CUDA_HOST := 1
@@ -44,8 +58,10 @@ ifeq ($(YLLM_CUDA),1)
   endif
 endif
 ifeq ($(YLLM_VULKAN),1)
-  SRC += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c inference/vulkan_compute.c
-  TEST_ENGINE_CORE += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c inference/vulkan_compute.c
+  SRC += inference/device/device_vulkan.c inference/vulkan/vulkan_load.c \
+	inference/vulkan/vulkan_fwd.c inference/vulkan/vulkan_compute.c
+  TEST_ENGINE_CORE += inference/device/device_vulkan.c inference/vulkan/vulkan_load.c \
+	inference/vulkan/vulkan_fwd.c inference/vulkan/vulkan_compute.c
 endif
 
 # 真 CUDA 时由 nvcc 编译的 .cu(host-shim 不编)
@@ -53,7 +69,7 @@ CUDA_CU_OBJ :=
 CUDA_CU_OBJ_AVX2 :=
 ifeq ($(YLLM_CUDA),1)
   ifneq ($(YLLM_CUDA_HOST),1)
-    CUDA_CU_SRC := inference/cuda_kernels.cu
+    CUDA_CU_SRC := inference/cuda/cuda_kernels.cu
   endif
 endif
 
@@ -164,118 +180,122 @@ $(BIN): $(OBJ)
 $(BIN_AVX2): $(OBJ_AVX2)
 	$(CC) $(CFLAGS_AVX2) -o $@ $(OBJ_AVX2) $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h inference/device.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -c -o $@ $<
+$(OBJDIR)/%.o: inference/%.c $(HDR_PUBLIC) | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -c -o $@ $<
 
 ifneq ($(CUDA_CU_SRC),)
-$(OBJDIR)/%.o: inference/%.cu inference/cuda_kernels.h | $(OBJDIR)
-	$(NVCC) -O2 -std=c++14 -Xcompiler -fPIC -Iinference -c -o $@ $<
+$(OBJDIR)/%.o: inference/%.cu inference/cuda/cuda_kernels.h | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(NVCC) -O2 -std=c++14 -Xcompiler -fPIC $(INFER_INC) -c -o $@ $<
 endif
 
-$(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/main.o: main.c $(HDR_PUBLIC) serve/rank.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/ctl.o: serve/ctl.c serve/ctl.h serve/protocol.h serve/frame.h serve/sock.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
-$(OBJDIR)/sync.o: serve/sync.c serve/sync.h serve/frame.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/ctl.o: serve/ctl.c serve/ctl.h serve/protocol.h serve/frame.h serve/sock.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
+$(OBJDIR)/sync.o: serve/sync.c serve/sync.h serve/frame.h serve/sock.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h $(HDR_PUBLIC) | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h inference/device.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
+$(OBJDIR_AVX2)/%.o: inference/%.c $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -c -o $@ $<
 
 ifneq ($(CUDA_CU_SRC),)
-$(OBJDIR_AVX2)/%.o: inference/%.cu inference/cuda_kernels.h | $(OBJDIR_AVX2)
-	$(NVCC) -O2 -std=c++14 -Xcompiler "-fPIC $(filter -mavx2 -mfma -mf16c,$(CFLAGS_AVX2))" -Iinference -c -o $@ $<
+$(OBJDIR_AVX2)/%.o: inference/%.cu inference/cuda/cuda_kernels.h | $(OBJDIR_AVX2)
+	@mkdir -p $(dir $@)
+	$(NVCC) -O2 -std=c++14 -Xcompiler "-fPIC $(filter -mavx2 -mfma -mf16c,$(CFLAGS_AVX2))" $(INFER_INC) -c -o $@ $<
 endif
 
-$(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/main.o: main.c $(HDR_PUBLIC) serve/rank.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/rank.o: serve/rank.c serve/protocol.h serve/rank.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/server.o: serve/server.c serve/protocol.h serve/server.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/ctl.o: serve/ctl.c serve/ctl.h serve/protocol.h serve/frame.h serve/sock.h serve/config.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
-$(OBJDIR_AVX2)/sync.o: serve/sync.c serve/sync.h serve/frame.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/ctl.o: serve/ctl.c serve/ctl.h serve/protocol.h serve/frame.h serve/sock.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/sync.o: serve/sync.c serve/sync.h serve/frame.h serve/sock.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h inference/yllm.h inference/log.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
+$(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h serve/json.h serve/http.h serve/sock.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
 # ---- 测试(标量 + AVX2 两套) ----
 TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c tests/test_prefill_batch.c tests/test_cache.c
 
-$(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/platform.c inference/llf.c inference/matvec.c | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -Itests -o $@ $< inference/platform.c inference/llf.c inference/matvec.c $(LDFLAGS) $(LIBS)
+$(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/core/platform.c inference/core/llf.c inference/core/matvec.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Itests -o $@ $< inference/core/platform.c inference/core/llf.c inference/core/matvec.c $(LDFLAGS) $(LIBS)
 
-$(OBJDIR)/test_tokenizer.exe: tests/test_tokenizer.c inference/platform.c inference/llf.c inference/tokenizer.c | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+$(OBJDIR)/test_tokenizer.exe: tests/test_tokenizer.c inference/core/platform.c inference/core/llf.c inference/core/tokenizer.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-$(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/platform.c inference/llf.c inference/matvec.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -Itests -o $@ $< inference/platform.c inference/llf.c inference/matvec.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/core/platform.c inference/core/llf.c inference/core/matvec.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Itests -o $@ $< inference/core/platform.c inference/core/llf.c inference/core/matvec.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c inference/platform.c inference/llf.c inference/tokenizer.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c inference/core/platform.c inference/core/llf.c inference/core/tokenizer.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-$(OBJDIR)/test_cache.exe: tests/test_cache.c inference/cache.c inference/platform.c | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+$(OBJDIR)/test_cache.exe: tests/test_cache.c inference/core/cache.c inference/core/platform.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR_AVX2)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR_AVX2)/test_cache.exe: tests/test_cache.c inference/cache.c inference/platform.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(OBJDIR_AVX2)/test_cache.exe: tests/test_cache.c inference/core/cache.c inference/core/platform.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 TEST_BIN     := $(TEST_SRC:tests/%.c=$(OBJDIR)/%.exe)
 TEST_BIN_AVX := $(TEST_SRC:tests/%.c=$(OBJDIR_AVX2)/%.exe)
@@ -570,8 +590,8 @@ endif
 # ---- 模型文件 dump 工具(LLF / GGUF / Safetensors) ----
 DUMP_BIN := $(OBJDIR)/llfdump
 
-$(DUMP_BIN): tools/dump.c inference/llf.c inference/platform.c inference/llf.h inference/yllm.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $^ $(LDFLAGS) $(LIBS)
+$(DUMP_BIN): tools/dump.c inference/core/llf.c inference/core/platform.c inference/include/llf.h inference/include/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 dump: $(DUMP_BIN)
 
@@ -612,11 +632,11 @@ DIST_SERVE_PORT ?= 9360
 DIST_MODEL  ?= models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
 DIST_VOCAB  ?= models/tinyllama.vocab.txt
 
-$(DIST_WORKER): serve/dist_worker.c serve/protocol.h inference/log.c inference/log.h inference/platform.c inference/yllm.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) -Iinference -o $@ $< inference/log.c inference/platform.c $(LDFLAGS) $(LIBS)
+$(DIST_WORKER): serve/dist_worker.c serve/protocol.h inference/core/log.c inference/include/log.h inference/core/platform.c inference/include/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $< inference/core/log.c inference/core/platform.c $(LDFLAGS) $(LIBS)
 
-$(DIST_WORKER_AVX2): serve/dist_worker.c inference/log.c inference/log.h inference/platform.c inference/yllm.h | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) -Iinference -o $@ $< inference/log.c inference/platform.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(DIST_WORKER_AVX2): serve/dist_worker.c inference/core/log.c inference/include/log.h inference/core/platform.c inference/include/yllm.h | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $< inference/core/log.c inference/core/platform.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 dist-worker: $(DIST_WORKER)
 dist-worker-avx2: $(DIST_WORKER_AVX2)

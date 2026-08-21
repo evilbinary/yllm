@@ -257,6 +257,8 @@ void vulkan_shutdown(VulkanCtx* ctx)
                  ctx->gemv_desc_pool, ctx->gemv_desc_layout);
     destroy_pipe(a, dev, ctx->swi_pipeline, ctx->swi_pipe_layout, ctx->swi_shader,
                  ctx->swi_desc_pool, ctx->swi_desc_layout);
+    destroy_pipe(a, dev, ctx->attn_pipeline, ctx->attn_pipe_layout, ctx->attn_shader,
+                 ctx->attn_desc_pool, ctx->attn_desc_layout);
     if (ctx->cmd_pool && a->DestroyCommandPool)
         a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
     if (ctx->fence && a->DestroyFence)
@@ -269,6 +271,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->buf_o2 && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_o2, NULL);
     if (ctx->buf_wn && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wn, NULL);
     if (ctx->buf_wq && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wq, NULL);
+    if (ctx->buf_kv && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_kv, NULL);
     if (ctx->mem_x && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_x, NULL);
     if (ctx->mem_y && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_y, NULL);
     if (ctx->mem_o0 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o0, NULL);
@@ -276,6 +279,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->mem_o2 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o2, NULL);
     if (ctx->mem_wn && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wn, NULL);
     if (ctx->mem_wq && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wq, NULL);
+    if (ctx->mem_kv && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_kv, NULL);
     free(ctx->host_w);
     free(ctx->wq_off);
 

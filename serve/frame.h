@@ -19,7 +19,7 @@
 
 #include "sock.h"
 #include "protocol.h"
-#include "../inference/log.h"
+#include "../inference/include/log.h"
 #include <stddef.h>
 
 #define FRAME_CMD_MAX 256

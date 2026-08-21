@@ -8,7 +8,7 @@
 #include "node.h"
 #include "config.h"
 #include "proclist.h"
-#include "../inference/log.h"
+#include "../inference/include/log.h"
 #include <stdio.h>
 #include <string.h>
 
