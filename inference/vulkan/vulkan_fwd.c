@@ -532,12 +532,30 @@ int vulkan_lm_head(Engine* e)
     uint32_t chunk = ctx->max_out;
     if (chunk == 0) chunk = hidden;
     if (chunk > vocab) chunk = vocab;
+    if (ctx->wq_stream) {
+        uint32_t by_wq = (uint32_t)(ctx->wq_bytes / row_bytes);
+        if (by_wq == 0) return -1;
+        if (chunk > by_wq) chunk = by_wq;
+        /* 覆盖当前层权; 下一 token 会重新 stream_layer */
+        ctx->stream_layer = (uint32_t)~0u;
+    }
 
     uint32_t rows = 0;
     while (rows < vocab) {
         uint32_t n = vocab - rows;
         if (n > chunk) n = chunk;
-        uint64_t off = ctx->lm_off + (uint64_t)rows * row_bytes;
+        uint64_t off;
+        if (ctx->wq_stream) {
+            if (!ctx->host_wq) return -1;
+            size_t nbytes = (size_t)n * row_bytes;
+            const uint8_t* src = ctx->host_wq + (size_t)ctx->lm_off + (size_t)rows * row_bytes;
+            if ((size_t)ctx->lm_off + (size_t)rows * row_bytes + nbytes > ctx->host_wq_bytes)
+                return -1;
+            if (vulkan_wq_upload_range(ctx, src, 0, nbytes) != 0) return -1;
+            off = 0;
+        } else {
+            off = ctx->lm_off + (uint64_t)rows * row_bytes;
+        }
         if (vulkan_k_gemv_q4k(ctx, e->logits + rows, e->x, n, hidden, off) != 0)
             return -1;
         rows += n;

@@ -12,6 +12,7 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                          char* err, size_t errlen);
 
 int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes);
+int vulkan_wq_upload_range(VulkanCtx* ctx, const void* src, size_t dst_off, size_t bytes);
 
 /* 按层把 host_wq[base..) 上传到 GPU wq[0..); 更新 stream_base */
 int vulkan_stream_layer(VulkanCtx* ctx, uint32_t layer);

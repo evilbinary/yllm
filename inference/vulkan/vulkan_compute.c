@@ -523,6 +523,27 @@ int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes)
     return 0;
 }
 
+int vulkan_wq_upload_range(VulkanCtx* ctx, const void* src, size_t dst_off, size_t bytes)
+{
+    if (!ctx || !ctx->mem_wq || !src || bytes == 0) return -1;
+    if (dst_off + bytes > ctx->wq_bytes) return -1;
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    const size_t chunk = 16u * 1024u * 1024u;
+    size_t done = 0;
+    while (done < bytes) {
+        size_t n = bytes - done;
+        if (n > chunk) n = chunk;
+        void* pw = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, dst_off + done, n, 0, &pw) != VK_SUCCESS)
+            return -1;
+        memcpy(pw, (const uint8_t*)src + done, n);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+        done += n;
+    }
+    return 0;
+}
+
 int vulkan_stream_layer(VulkanCtx* ctx, uint32_t layer)
 {
     if (!ctx || !ctx->wq_stream || !ctx->host_wq || !ctx->mem_wq) return -1;

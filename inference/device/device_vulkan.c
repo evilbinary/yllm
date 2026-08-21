@@ -214,10 +214,8 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
         ctx->host_wq_bytes = cursor;
         ctx->wq_resident = 1;
         ctx->stream_layer = (uint32_t)~0u;
-        if (ctx->lm_ready) {
-            ctx->lm_ready = 0;
-            ylog_info("vulkan: lm_head deferred (stream mode)");
-        }
+        if (ctx->lm_ready)
+            ylog_info("vulkan: lm_head Q4_K stream-chunked out=%u in=%u", ctx->lm_out, ctx->lm_in);
         ylog_info("vulkan: Q4_K stream host=%zuMB layer_gpu=%zuMB",
                   cursor / (1024 * 1024), ctx->wq_bytes / (1024 * 1024));
         return 0;
