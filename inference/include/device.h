@@ -69,6 +69,8 @@ void cuda_mark_x_host(Engine* e);
 int cuda_embed(Engine* e, uint32_t token);
 int cuda_final_norm(Engine* e);
 int cuda_lm_head(Engine* e);
+int vulkan_final_norm(Engine* e);
+int vulkan_lm_head(Engine* e);
 /* GPU 批 prefill; 失败返回 -1(调用方回退) */
 int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos);
 /* PP 中/末段: host 激活 xin[n×hidden] → 本段 GPU 层 → x_out 或 logits */

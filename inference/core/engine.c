@@ -1160,6 +1160,8 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     } else if (i == h->n_blocks + 1) {
         if (on_cuda && cuda_final_norm(e) == 0) {
             /* GPU final norm */
+        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_final_norm(e) == 0) {
+            /* Vulkan final norm */
         } else {
         if (e->device_mode == DEV_MODE_CUDA) {
             cuda_sync_x_to_host(e);
@@ -1173,6 +1175,8 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     } else {
         if (on_cuda && cuda_lm_head(e) == 0) {
             /* GPU lm_head */
+        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_lm_head(e) == 0) {
+            /* Vulkan lm_head */
         } else {
         if (e->device_mode == DEV_MODE_CUDA) {
             cuda_sync_x_to_host(e);

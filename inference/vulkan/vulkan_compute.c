@@ -2,6 +2,7 @@
 #include "vulkan_compute.h"
 #include "vulkan_api.h"
 #include "yllm.h"
+#include "matvec.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1070,13 +1071,16 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
     return map_read(ctx, ctx->mem_o2, att_out, qbytes);
 }
 
-/* 无 bias/qk-norm: rmsnorm+QKV+rope 一次 submit; 写 KV 行; attn(+O) 再 submit
- * Q 留在 o0, 不再读回/重传 */
+/* rmsnorm+QKV; 可选 bias/qk-norm(host 就地改 o*); rope; KV 行; attn(+O)
+ * Q 留在 o0 */
 int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
                                const float* x, const float* wn, uint32_t hidden, float eps,
                                float* out, uint32_t kv_dim,
                                uint64_t off_q, uint64_t off_k, uint64_t off_v, uint64_t off_o,
                                uint32_t layer, uint32_t pos, uint32_t rope_mode, float theta,
+                               const float* bq, const float* bk, const float* bv,
+                               const uint8_t* qnorm, uint32_t qnorm_dtype,
+                               const uint8_t* knorm, uint32_t knorm_dtype,
                                uint16_t* host_k_row, uint16_t* host_v_row)
 {
     if (!ctx || !ctx->fuse_ready || !ctx->wq_resident || !ctx->rope_ready ||
@@ -1102,6 +1106,7 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
     uint32_t v_slot = ctx->n_blocks + layer;
     size_t k_off = ((size_t)k_slot * ctx->max_seq + pos) * kv_dim * 4;
     size_t v_off = ((size_t)v_slot * ctx->max_seq + pos) * kv_dim * 4;
+    int need_post = (bq || bk || bv || qnorm || knorm) ? 1 : 0;
 
     if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
     if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
@@ -1120,11 +1125,56 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
     cmd_gemv(ctx, cmd, ctx->gemv_ds2, kv_dim, hidden, (uint32_t)off_v);
-    cmd_barrier_compute(cmd);
-    cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim, pos, rope_mode, theta);
-    cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim, pos, rope_mode, theta);
+    if (!need_post) {
+        cmd_barrier_compute(cmd);
+        cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim, pos, rope_mode, theta);
+        cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim, pos, rope_mode, theta);
+    }
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    if (need_post) {
+        void* p = NULL;
+        uint32_t j, hh;
+        if (bq || qnorm) {
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o0, 0, xb, 0, &p) != VK_SUCCESS)
+                return -1;
+            float* q = (float*)p;
+            if (bq) for (j = 0; j < hidden; j++) q[j] += bq[j];
+            if (qnorm) {
+                for (hh = 0; hh < ctx->n_heads; hh++)
+                    rmsnorm(q + (size_t)hh * ctx->head_dim, q + (size_t)hh * ctx->head_dim,
+                            qnorm, ctx->head_dim, eps, qnorm_dtype);
+            }
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0);
+        }
+        if (bk || knorm) {
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &p) != VK_SUCCESS)
+                return -1;
+            float* k = (float*)p;
+            if (bk) for (j = 0; j < kv_dim; j++) k[j] += bk[j];
+            if (knorm) {
+                for (hh = 0; hh < ctx->n_kv_heads; hh++)
+                    rmsnorm(k + (size_t)hh * ctx->head_dim, k + (size_t)hh * ctx->head_dim,
+                            knorm, ctx->head_dim, eps, knorm_dtype);
+            }
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
+        }
+        if (bv) {
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &p) != VK_SUCCESS)
+                return -1;
+            float* v = (float*)p;
+            for (j = 0; j < kv_dim; j++) v[j] += bv[j];
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
+        }
+
+        a->ResetCommandBuffer(cmd, 0);
+        a->BeginCommandBuffer(cmd, &bi);
+        cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim, pos, rope_mode, theta);
+        cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim, pos, rope_mode, theta);
+        a->EndCommandBuffer(cmd);
+        if (submit_and_wait(ctx, cmd) != 0) return -1;
+    }
 
     /* o1=K o2=V → GPU KV; 可选同步 host f16 */
     {

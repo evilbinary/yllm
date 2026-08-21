@@ -51,12 +51,15 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
                       uint32_t kv_dim, uint32_t n_heads, uint32_t n_kv_heads,
                       uint32_t head_dim, char* err, size_t errlen);
 
-/* 无 bias/qk-norm: QKV+rope 留 GPU → attn(+O); out 为 attn 或 O 结果 */
+/* rmsnorm+QKV; 可选 bias/qk-norm; rope; attn(+O)。out 为 O(需 off_o) 或 attn */
 int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
                                const float* x, const float* wn, uint32_t hidden, float eps,
                                float* out, uint32_t kv_dim,
                                uint64_t off_q, uint64_t off_k, uint64_t off_v, uint64_t off_o,
                                uint32_t layer, uint32_t pos, uint32_t rope_mode, float theta,
+                               const float* bq, const float* bk, const float* bv,
+                               const uint8_t* qnorm, uint32_t qnorm_dtype,
+                               const uint8_t* knorm, uint32_t knorm_dtype,
                                uint16_t* host_k_row, uint16_t* host_v_row);
 
 #endif

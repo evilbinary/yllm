@@ -209,10 +209,6 @@ static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
 {
     if (!ctx || !ctx->rope_ready || !ctx->attn_ready || !ctx->fuse_ready || !ctx->wq_resident)
         return -1;
-    if (mt[SLOT_QBIAS].size > 0 || mt[SLOT_KBIAS].size > 0 || mt[SLOT_VBIAS].size > 0)
-        return -1;
-    if (mt[SLOT_QNORM].size > 0 || mt[SLOT_KNORM].size > 0)
-        return -1;
     if (mt[SLOT_Q].dtype != DT_Q4K || mt[SLOT_K].dtype != DT_Q4K || mt[SLOT_V].dtype != DT_Q4K)
         return -1;
     if (load_norm_f32(ctx, base + mt[SLOT_NORM1].offset, hidden, mt[SLOT_NORM1].dtype) != 0)
@@ -220,15 +216,24 @@ static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
     uint64_t oq = wq_off(ctx, layer, SLOT_Q);
     uint64_t ok = wq_off(ctx, layer, SLOT_K);
     uint64_t ov = wq_off(ctx, layer, SLOT_V);
-    uint64_t oo = (uint64_t)~0ull;
     if (!ctx->attn_o_ready || mt[SLOT_O].dtype != DT_Q4K) return -1;
-    oo = wq_off(ctx, layer, SLOT_O);
+    uint64_t oo = wq_off(ctx, layer, SLOT_O);
     if (oq == (uint64_t)~0ull || ok == (uint64_t)~0ull || ov == (uint64_t)~0ull ||
         oo == (uint64_t)~0ull)
         return -1;
+
+    const float* bq = mt[SLOT_QBIAS].size > 0 ? (const float*)(base + mt[SLOT_QBIAS].offset) : NULL;
+    const float* bk = mt[SLOT_KBIAS].size > 0 ? (const float*)(base + mt[SLOT_KBIAS].offset) : NULL;
+    const float* bv = mt[SLOT_VBIAS].size > 0 ? (const float*)(base + mt[SLOT_VBIAS].offset) : NULL;
+    const uint8_t* qn = mt[SLOT_QNORM].size > 0 ? base + mt[SLOT_QNORM].offset : NULL;
+    const uint8_t* kn = mt[SLOT_KNORM].size > 0 ? base + mt[SLOT_KNORM].offset : NULL;
+
     return vulkan_fused_qkv_rope_attn(ctx, x, ctx->host_w, hidden, eps,
                                       out, kv_dim, oq, ok, ov, oo,
                                       layer, pos, rope_mode, theta,
+                                      bq, bk, bv,
+                                      qn, mt[SLOT_QNORM].dtype,
+                                      kn, mt[SLOT_KNORM].dtype,
                                       host_k_row, host_v_row);
 }
 
@@ -410,4 +415,48 @@ void vulkan_attach_fwd(Engine* e)
     engine_attach_cpu_fwd(e);
     if (e->device_mode == DEV_MODE_VULKAN)
         e->fwd_block = vulkan_fwd_block;
+}
+
+int vulkan_final_norm(Engine* e)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    if (!ctx || !ctx->compute_ready) return -1;
+    LlModel* m = &e->ws.model;
+    uint32_t layer = m->h.n_blocks + 1;
+    if (layer >= m->n_layers) return -1;
+    const uint8_t* base = (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
+    const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
+    uint32_t hidden = m->h.hidden;
+    float eps = ctx->norm_eps;
+    if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
+    if (vulkan_k_rmsnorm(ctx, e->x, e->x, ctx->host_w, hidden, eps) != 0) return -1;
+    return 0;
+}
+
+int vulkan_lm_head(Engine* e)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    if (!ctx || !ctx->gemv_ready || !ctx->lm_ready || !ctx->wq_resident) return -1;
+    if (ctx->lm_in != ctx->hidden || ctx->lm_out == 0) return -1;
+    if ((ctx->lm_in % 256) != 0) return -1;
+
+    uint32_t vocab = ctx->lm_out;
+    uint32_t hidden = ctx->lm_in;
+    size_t row_bytes = (size_t)(hidden / 256) * 144;
+    uint32_t chunk = ctx->max_out;
+    if (chunk == 0) chunk = hidden;
+    if (chunk > vocab) chunk = vocab;
+
+    uint32_t rows = 0;
+    while (rows < vocab) {
+        uint32_t n = vocab - rows;
+        if (n > chunk) n = chunk;
+        uint64_t off = ctx->lm_off + (uint64_t)rows * row_bytes;
+        if (vulkan_k_gemv_q4k(ctx, e->logits + rows, e->x, n, hidden, off) != 0)
+            return -1;
+        rows += n;
+    }
+    return 0;
 }

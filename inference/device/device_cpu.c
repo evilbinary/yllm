@@ -171,3 +171,16 @@ int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
     return -1;
 }
 #endif
+
+#ifndef YLLM_VULKAN
+int vulkan_final_norm(Engine* e)
+{
+    (void)e;
+    return -1;
+}
+int vulkan_lm_head(Engine* e)
+{
+    (void)e;
+    return -1;
+}
+#endif

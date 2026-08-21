@@ -98,6 +98,13 @@ typedef struct {
     void* rope_shader;
     int rope_ready;
 
+    /* lm_head: output 层 Q4_K 常驻偏移 */
+    uint64_t lm_off;
+    uint32_t lm_out; /* vocab */
+    uint32_t lm_in;  /* hidden */
+    int lm_ready;
+    float norm_eps;
+
     int compute_ready;
     uint32_t n_layers;
     uint32_t hidden;
