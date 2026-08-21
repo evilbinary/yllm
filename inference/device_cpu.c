@@ -13,6 +13,7 @@ static int cpu_load_weights(Engine* e, char* err, size_t errlen)
     e->w_dev = NULL;
     e->d_kv = e->kv;
     e->weights_ready = 1;
+    engine_attach_cpu_fwd(e);
     return 0;
 }
 

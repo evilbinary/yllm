@@ -170,6 +170,12 @@ void engine_free(Engine* e);
 int engine_bind_device(Engine* e, DeviceKind kind, int device_id, char* err, size_t errlen);
 /* 仅重新 load_weights(切层后刷新本段); 无 dev 时返回 -1 */
 int engine_load_weights(Engine* e, char* err, size_t errlen);
+/* 用显式 layer_base / kv 跑默认块前向(CPU 算子)。
+ * CUDA host-shim 的 load_weights 把权拷到 w_dev 后复用此函数校验/过渡。 */
+int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
+                        const uint8_t* layer_base, uint16_t* kv);
+/* 恢复 CPU fwd_block 指针(按 arch) */
+void engine_attach_cpu_fwd(Engine* e);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,
                          float* x_out, float* logits_out);

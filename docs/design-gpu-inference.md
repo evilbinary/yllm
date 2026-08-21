@@ -111,9 +111,9 @@ CLI / 配置：
 
 ```text
 inference/device.h
-inference/device_cpu.c      # P0：已实现
-inference/device_cuda.c     # P1：YLLM_CUDA=1
-inference/cuda_fwd.cu       # P1
+inference/device_cpu.c       # CPU: load_weights 空操作
+inference/device_cuda.c      # CUDA: load_weights H2D / host-shim 镜像
+inference/cuda_fwd.c         # 挂 fwd_block → engine_fwd_block_at(blob 权)
 docs/design-gpu-inference.md
 ```
 
@@ -121,10 +121,24 @@ docs/design-gpu-inference.md
 
 | 阶段 | 内容 |
 |------|------|
-| **P0（本提交）** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device`；文档 |
-| **P1** | CUDA `load_weights`（TinyLlama 全量 H2D）+ `cuda_fwd_block`（dequant + GEMM） |
-| **P2** | Prefill batch、7B、流式层、数值对齐测试 |
+| **P0** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device` |
+| **P1（进行中）** | `device_cuda` + `load_weights` 装本段权；`cuda_fwd` 挂 decode；无 toolkit 时 **host-shim**（权镜像 RAM + CPU 算子，可测通路径） |
+| **P2** | 真 GPU kernel / cublasLt、Prefill batch 上卡、数值对齐 |
 | **P3** | PP↔GPU、原生 Q4_K、FlashAttention（按需） |
+
+### P1 构建
+
+```bash
+# 推荐本机无 CUDA 工具链时(自动 host-shim):
+make avx2 YLLM_CUDA=1
+
+# 有 nvcc 时默认尝试真 CUDA(仍需 headers; kernel 未完前可强制 shim):
+make avx2 YLLM_CUDA=1 YLLM_CUDA_HOST=1
+
+yllm gen --model ... --device cuda   # host-shim 下可跑通
+```
+
+`load_weights`：将 `[layer_begin, layer_end)` 权拷到连续 blob；`engine_fwd_block_at` 从 blob 读权。ARCH_QWEN35 暂拒 CUDA。
 
 ## 11. 与 mmap 流式文档的关系
 

@@ -38,6 +38,9 @@ int device_kind_parse(const char* s, DeviceKind* out);
 /* 创建后端。CUDA 未编译进本二进制时返回 NULL 并写 err。 */
 Device* device_create(DeviceKind kind, int device_id, char* err, size_t errlen);
 
+/* 设备权 blob 内一层基址(仅 DEV_CUDA load_weights 后有效; 否则 NULL) */
+const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer);
+
 /* 仅 free(Device*); 设备资源须先 free_dev */
 void device_destroy(Device* d);
 

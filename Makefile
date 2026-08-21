@@ -16,6 +16,24 @@ LIBS       :=
 SRC      := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/cache.c inference/dist.c inference/device_cpu.c
 TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/device_cpu.c
 
+# ---- CUDA 后端(可选) ----
+#   make avx2 YLLM_CUDA=1              # 无 nvcc 时自动 host-shim(权镜像+CPU 算)
+#   make avx2 YLLM_CUDA=1 YLLM_CUDA_HOST=0  # 强制真 CUDA(需 CUDA toolkit)
+YLLM_CUDA ?= 0
+YLLM_CUDA_HOST ?=
+NVCC ?= $(shell command -v nvcc 2>/dev/null)
+ifeq ($(YLLM_CUDA),1)
+  SRC += inference/device_cuda.c inference/cuda_fwd.c
+  TEST_ENGINE_CORE += inference/device_cuda.c inference/cuda_fwd.c
+  ifeq ($(YLLM_CUDA_HOST),)
+    ifeq ($(NVCC),)
+      YLLM_CUDA_HOST := 1
+    else
+      YLLM_CUDA_HOST := 0
+    endif
+  endif
+endif
+
 # ---- OS 检测 (Windows: MSYS2/MinGW 的 uname 会带 MINGW/MSYS, 也归为 Windows) ----
 ifneq ($(OS),Windows_NT)
 UNAME_S := $(shell uname -s 2>/dev/null)
@@ -62,6 +80,14 @@ BATCH_PREFILL ?= 1
 # 会话数据包调试: make YLLM_SESS_DEBUG=1 开启(0 默认关闭)
 YLLM_SESS_DEBUG ?= 0
 CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) -DYLLM_SESS_DEBUG=$(YLLM_SESS_DEBUG) $(PLATDEF) $(OMPFLAG)
+ifeq ($(YLLM_CUDA),1)
+  ifeq ($(YLLM_CUDA_HOST),1)
+    CFLAGS_BASE += -DYLLM_CUDA=1 -DYLLM_CUDA_HOST=1
+  else
+    CFLAGS_BASE += -DYLLM_CUDA=1
+    LIBS += -lcudart
+  endif
+endif
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o $(OBJDIR)/status.o $(OBJDIR)/ctl.o $(OBJDIR)/sync.o

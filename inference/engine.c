@@ -337,13 +337,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     }
     /* 层前向分派: 按架构挂实现(一次) */
     e->arch = m->h.arch;
-    if (m->h.arch == ARCH_QWEN35) {
-        e->fwd_block = fwd_block_qwen35;
-        e->fwd_block_batch = fwd_block_qwen35_batch;
-    } else {
-        e->fwd_block = forward_block_default;
-        e->fwd_block_batch = forward_block_batch_default;
-    }
+    engine_attach_cpu_fwd(e);
     /* 默认 CPU 设备: load_weights 空操作, 后续可 engine_bind_device(CUDA) */
     if (engine_bind_device(e, DEV_CPU, 0, err, errlen) != 0) {
         engine_free(e);
@@ -962,10 +956,16 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
 
 static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos)
 {
+    const uint8_t* base = (const uint8_t*)e->ws.map.base + e->ws.model.dir[layer].offset;
+    return engine_fwd_block_at(e, layer, pos, base, e->kv);
+}
+
+int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
+                        const uint8_t* base, uint16_t* kv)
+{
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
-    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
     uint32_t hidden = h->hidden;
     uint32_t kv_dim = h->n_kv_heads * h->head_dim;
     float eps;
@@ -1018,8 +1018,8 @@ static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos)
                     base + mt[SLOT_KNORM].offset, h->head_dim, eps, mt[SLOT_KNORM].dtype);
     }
 
-    uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
-    uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
+    uint16_t* kcache = kv + (size_t)layer * e->max_seq * kv_dim;
+    uint16_t* vcache = kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh;
     for (hh = 0; hh < h->n_heads; hh++) {
@@ -1077,6 +1077,17 @@ static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos)
     matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
     return 0;
+}
+
+void engine_attach_cpu_fwd(Engine* e)
+{
+    if (e->arch == ARCH_QWEN35) {
+        e->fwd_block = fwd_block_qwen35;
+        e->fwd_block_batch = fwd_block_qwen35_batch;
+    } else {
+        e->fwd_block = forward_block_default;
+        e->fwd_block_batch = forward_block_batch_default;
+    }
 }
 
 /* 单层前向(含 embed / block / final norm / head 分派) */
