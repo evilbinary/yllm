@@ -86,6 +86,7 @@ typedef struct {
     int depth;
     char device[32];        /* cpu | cuda(见 docs/design-gpu-inference.md) */
     int gpu;                /* CUDA device index(默认 0) */
+    char gpu_weights[16];   /* auto | q4k | fp16(CUDA 线性权上卡格式) */
 
     /* 客户端模式(router --send) */
     char send[CFG_STR_MAX];
@@ -166,6 +167,7 @@ static inline void config_defaults(ServeConfig* c)
     c->depth = 2;
     snprintf(c->device, sizeof(c->device), "cpu");
     c->gpu = 0;
+    snprintf(c->gpu_weights, sizeof(c->gpu_weights), "auto");
     c->api_log = 1;   /* 默认开启 */
 }
 
@@ -269,6 +271,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         snprintf(c->device, sizeof(c->device), "%s", val);
     } else if (strcmp(key, "gpu") == 0) {
         c->gpu = atoi(val);
+    } else if (strcmp(key, "gpu-weights") == 0 || strcmp(key, "gpu_weights") == 0) {
+        snprintf(c->gpu_weights, sizeof(c->gpu_weights), "%s", val);
     } else if (strcmp(key, "send") == 0) {
         snprintf(c->send, sizeof(c->send), "%s", val);
     } else if (strcmp(key, "only-model") == 0) {

@@ -219,7 +219,8 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
                 }
                 ctx->dim_out[idx] = out;
                 ctx->dim_in[idx] = in;
-                if (mt->dtype == DT_Q4K) {
+                /* FP16 模式: 全部解量化; AUTO/Q4K: 仅 DT_Q4K 走原生 */
+                if (e->cuda_wmode != CUDA_W_FP16 && mt->dtype == DT_Q4K) {
                     if (in % 256 != 0) {
                         if (err && errlen)
                             snprintf(err, errlen, "Q4_K in%%256!=0 L%u S%u in=%u", i, s, in);
@@ -355,7 +356,9 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     e->device_mode = DEV_MODE_CUDA;
     cuda_attach_fwd(e);
     cuda_k_sync();
-    ylog_info("cuda: load_weights GPU q4=%.2f MB f16w=%.2f MB f32v=%.2f MB kv=%.2f MB pb=%u layers=[%u,%u) gpu=%d",
+    ylog_info("cuda: load_weights GPU mode=%s q4=%.2f MB f16w=%.2f MB f32v=%.2f MB kv=%.2f MB pb=%u layers=[%u,%u) gpu=%d",
+              e->cuda_wmode == CUDA_W_FP16 ? "fp16" :
+              (e->cuda_wmode == CUDA_W_Q4K ? "q4k" : "auto"),
               (double)n_q4 / 1048576.0, (double)n_f16 * 2 / 1048576.0, (double)n_f32 * 4 / 1048576.0,
               (double)ctx->kv_bytes / 1048576.0, ctx->pb_cap, begin, end, ctx->device_id);
     return 0;

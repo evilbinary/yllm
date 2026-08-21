@@ -131,13 +131,15 @@ docs/design-gpu-inference.md
 ```bash
 make cuda
 make gen-cuda CHAT_PROMPT=Hi CHAT_TOKENS=16
+# 权格式: GPU_WEIGHTS=fp16|q4k|auto (默认 auto=原生 Q4_K)
+# make gen-cuda GPU_WEIGHTS=fp16
 # 数值对齐: --temp 0 对比 --device cpu
 # 无 nvcc: 自动 host-shim; 强制 shim: make cuda YLLM_CUDA_HOST=1
 ```
 
 真 CUDA 产物：`build/avx2-cuda/yllm`（链 `-lcudart -lcublas`，编 `cuda_kernels.cu`）。
 
-`load_weights`（GPU）：线性槽优先 **原生 Q4_K** 上卡，其它解到 FP16；norm/bias F32；批 prefill 缓冲。ARCH_QWEN35 暂拒。
+`load_weights`（GPU）：`--gpu-weights auto|q4k|fp16`（默认 auto）。`auto`/`q4k`：`DT_Q4K` 原生上卡，其余解 FP16；`fp16`：全部线性权解量化（更快、更费显存）。ARCH_QWEN35 暂拒。
 
 ## 11. 与 mmap 流式文档的关系
 

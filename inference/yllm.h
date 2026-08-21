@@ -155,6 +155,7 @@ typedef struct Engine {
     void* w_dev;             /* 设备权重根/层表; CPU 为 NULL */
     int weights_ready;       /* load_weights 成功 */
     DeviceMode device_mode;  /* 实际前向路径; load_weights / bind 时置位 */
+    CudaWeightMode cuda_wmode; /* CUDA 线性权: auto|q4k|fp16; bind 前设置 */
 } Engine;
 
 typedef struct {

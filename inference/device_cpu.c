@@ -54,6 +54,26 @@ int device_kind_parse(const char* s, DeviceKind* out)
     return -1;
 }
 
+int cuda_weight_mode_parse(const char* s, CudaWeightMode* out)
+{
+    if (!s || !out) return -1;
+    if (strcmp(s, "auto") == 0 || strcmp(s, "AUTO") == 0) {
+        *out = CUDA_W_AUTO;
+        return 0;
+    }
+    if (strcmp(s, "q4k") == 0 || strcmp(s, "Q4K") == 0 ||
+        strcmp(s, "q4") == 0 || strcmp(s, "Q4") == 0) {
+        *out = CUDA_W_Q4K;
+        return 0;
+    }
+    if (strcmp(s, "fp16") == 0 || strcmp(s, "FP16") == 0 ||
+        strcmp(s, "f16") == 0 || strcmp(s, "F16") == 0) {
+        *out = CUDA_W_FP16;
+        return 0;
+    }
+    return -1;
+}
+
 Device* device_create(DeviceKind kind, int device_id, char* err, size_t errlen)
 {
     if (kind == DEV_CPU)

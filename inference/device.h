@@ -24,6 +24,13 @@ typedef enum {
     DEV_MODE_CUDA = 2        /* 真 CUDA kernel / cublas */
 } DeviceMode;
 
+/* CUDA 线性权上卡格式(bind 前设置 e->cuda_wmode) */
+typedef enum {
+    CUDA_W_AUTO = 0,         /* 默认: DT_Q4K 走原生, 其余解到 FP16 */
+    CUDA_W_Q4K = 1,          /* 同 AUTO(显式偏好原生 Q4_K) */
+    CUDA_W_FP16 = 2          /* 强制全部线性权解量化为 FP16(更快, 更费显存) */
+} CudaWeightMode;
+
 typedef struct Device {
     DeviceKind kind;
     int id;             /* CUDA device index; CPU 忽略 */
@@ -41,6 +48,8 @@ typedef struct Device {
 
 /* 解析 "cpu" / "cuda"(大小写不敏感); 未知返回 -1 */
 int device_kind_parse(const char* s, DeviceKind* out);
+/* 解析 "auto" / "q4k" / "fp16"; 未知返回 -1 */
+int cuda_weight_mode_parse(const char* s, CudaWeightMode* out);
 
 /* 创建后端。CUDA 未编译进本二进制时返回 NULL 并写 err。 */
 Device* device_create(DeviceKind kind, int device_id, char* err, size_t errlen);

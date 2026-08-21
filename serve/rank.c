@@ -697,7 +697,7 @@ int cmd_rank(ServeConfig* cfg)
     if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] "
-                        "[--device cpu|cuda] [--gpu N] [--config <yaml>]\n");
+                        "[--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--config <yaml>]\n");
         return 1;
     }
 
@@ -785,6 +785,13 @@ int cmd_rank(ServeConfig* cfg)
             vocab_free(&r.vocab);
             return 1;
         }
+        if (cfg->gpu_weights[0] &&
+            cuda_weight_mode_parse(cfg->gpu_weights, &r.engine.cuda_wmode) != 0) {
+            ylog_error("rank: bad --gpu-weights %s (want auto|q4k|fp16)", cfg->gpu_weights);
+            engine_free(&r.engine);
+            vocab_free(&r.vocab);
+            return 1;
+        }
         if (dk != DEV_CPU) {
             if (engine_bind_device(&r.engine, dk, cfg->gpu, err, sizeof(err)) != 0) {
                 ylog_error("rank: bind device %s gpu=%d failed: %s", cfg->device, cfg->gpu, err);
@@ -792,8 +799,10 @@ int cmd_rank(ServeConfig* cfg)
                 vocab_free(&r.vocab);
                 return 1;
             }
-            ylog_info("rank: device=%s gpu=%d weights_ready=%d",
-                      cfg->device[0] ? cfg->device : "cpu", cfg->gpu, r.engine.weights_ready);
+            ylog_info("rank: device=%s gpu=%d gpu-weights=%s weights_ready=%d",
+                      cfg->device[0] ? cfg->device : "cpu", cfg->gpu,
+                      cfg->gpu_weights[0] ? cfg->gpu_weights : "auto",
+                      r.engine.weights_ready);
         }
     }
 

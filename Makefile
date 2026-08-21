@@ -27,6 +27,7 @@ TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inferen
 YLLM_CUDA ?= 0
 YLLM_CUDA_HOST ?=
 GPU ?= 0
+GPU_WEIGHTS ?= auto
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
 ifeq ($(YLLM_CUDA),1)
   SRC += inference/device_cuda.c inference/cuda_fwd.c
@@ -332,11 +333,11 @@ RUN_CUDA = OMP_NUM_THREADS=$(NTHREADS) $(BIN_CUDA)
 
 gen-cuda: cuda $(MODEL_LLF)
 	$(RUN_CUDA) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
 
 chat-cuda: cuda $(MODEL_LLF)
 	$(RUN_CUDA) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf

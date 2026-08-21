@@ -207,9 +207,10 @@ static int cmd_gen(int argc, char** argv)
     int mtp = atoi(opt(a, n, "mtp", "0"));
     const char* device_s = opt(a, n, "device", "cpu");
     int gpu_id = atoi(opt(a, n, "gpu", "0"));
+    const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
 
     if (!m) {
-        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N]\n");
+        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16]\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -236,6 +237,12 @@ static int cmd_gen(int argc, char** argv)
         DeviceKind dk = DEV_CPU;
         if (device_kind_parse(device_s, &dk) != 0) {
             fprintf(stderr, "bad --device %s (want cpu|cuda)\n", device_s);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (cuda_weight_mode_parse(gpu_w_s, &e.cuda_wmode) != 0) {
+            fprintf(stderr, "bad --gpu-weights %s (want auto|q4k|fp16)\n", gpu_w_s);
             engine_free(&e);
             vocab_free(&v);
             return 1;
@@ -359,9 +366,10 @@ static int cmd_chat(int argc, char** argv)
     int mtp = atoi(opt(a, n, "mtp", "0"));
     const char* device_s = opt(a, n, "device", "cpu");
     int gpu_id = atoi(opt(a, n, "gpu", "0"));
+    const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -383,6 +391,12 @@ static int cmd_chat(int argc, char** argv)
         DeviceKind dk = DEV_CPU;
         if (device_kind_parse(device_s, &dk) != 0) {
             fprintf(stderr, "bad --device %s (want cpu|cuda)\n", device_s);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (cuda_weight_mode_parse(gpu_w_s, &e.cuda_wmode) != 0) {
+            fprintf(stderr, "bad --gpu-weights %s (want auto|q4k|fp16)\n", gpu_w_s);
             engine_free(&e);
             vocab_free(&v);
             return 1;
