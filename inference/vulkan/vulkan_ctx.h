@@ -41,6 +41,7 @@ typedef struct {
     void* mem_wn;
     size_t wn_bytes;
     float* host_w;
+    float* host_w2; /* 第二段 norm 权暂存 */
 
     void* gemv_desc_pool;
     void* gemv_desc_layout;
@@ -98,6 +99,39 @@ typedef struct {
     void* rope_shader;
     int rope_ready;
 
+    /* residual / bias / store_kv */
+    void* add_desc_pool;
+    void* add_desc_layout;
+    void* add_ds_xy; /* buf_x += buf_y */
+    void* add_ds_xo; /* buf_x += buf_o0 */
+    void* add_pipe_layout;
+    void* add_pipeline;
+    void* add_shader;
+    void* bias_desc_pool;
+    void* bias_desc_layout;
+    void* bias_ds_q;
+    void* bias_ds_k;
+    void* bias_ds_v;
+    void* bias_pipe_layout;
+    void* bias_pipeline;
+    void* bias_shader;
+    void* buf_bias;
+    void* mem_bias;
+    size_t bias_bytes;
+    void* skv_desc_pool;
+    void* skv_desc_layout;
+    void* skv_ds_k;
+    void* skv_ds_v;
+    void* skv_pipe_layout;
+    void* skv_pipeline;
+    void* skv_shader;
+    int add_ready;
+    int bias_ready;
+    int skv_ready;
+    int block_ready; /* 整层 fused 可用 */
+
+    int x_on_dev; /* buf_x 为权威激活 */
+
     /* lm_head: Q4_K 常驻偏移(Q6_K 等走 CPU) */
     uint64_t lm_off;
     uint32_t lm_out;
@@ -105,6 +139,14 @@ typedef struct {
     uint32_t lm_dtype;
     int lm_ready;
     float norm_eps;
+
+    /* 流式权: 大模型按层上传; 亦规避 maxStorageBufferRange */
+    uint8_t* host_wq;
+    size_t host_wq_bytes;
+    size_t layer_wq_max;
+    int wq_stream;
+    uint32_t stream_layer; /* 当前已上传层, ~0=无 */
+    uint64_t stream_base;  /* host_wq 中本层起点, GPU 上相对 off=abs-base */
 
     int compute_ready;
     uint32_t n_layers;

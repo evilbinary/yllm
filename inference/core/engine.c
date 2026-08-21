@@ -601,6 +601,15 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
         }
         return 0;
     }
+    /* Vulkan: 逐 token, 但层间激活常驻(fused_block) */
+    if (e->device_mode == DEV_MODE_VULKAN) {
+        int i;
+        for (i = 0; i < n; i++) {
+            if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
+                return -1;
+        }
+        return 0;
+    }
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -1138,12 +1147,14 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
         }
         cuda_mark_x_host(e); /* CPU embed → 下次 GPU 块从 e->x H2D */
+        vulkan_after_embed(e);
         }
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
         if (on_cuda) {
             e->fwd_block(e, i, pos);
+        } else if (e->device_mode == DEV_MODE_VULKAN) {
+            e->fwd_block(e, i, pos);
         } else {
-            /* CPU 段: 先把 GPU 激活拉回(若刚跨过切分点) */
             if (e->device_mode == DEV_MODE_CUDA) {
                 cuda_sync_x_to_host(e);
                 cuda_mark_x_host(e);
@@ -1167,6 +1178,8 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
             cuda_sync_x_to_host(e);
             cuda_mark_x_host(e);
         }
+        if (e->device_mode == DEV_MODE_VULKAN)
+            vulkan_sync_x(e);
         float eps;
         memcpy(&eps, &h->norm_eps_bits, 4);
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
@@ -1182,6 +1195,8 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
             cuda_sync_x_to_host(e);
             cuda_mark_x_host(e);
         }
+        if (e->device_mode == DEV_MODE_VULKAN)
+            vulkan_sync_x(e);
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
         if (tm->ndim == 2 && tm->size >= (uint64_t)h->hidden * 4) {
 #if YLLM_TENSOR_STREAM

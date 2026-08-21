@@ -183,4 +183,12 @@ int vulkan_lm_head(Engine* e)
     (void)e;
     return -1;
 }
+void vulkan_after_embed(Engine* e)
+{
+    (void)e;
+}
+void vulkan_sync_x(Engine* e)
+{
+    (void)e;
+}
 #endif

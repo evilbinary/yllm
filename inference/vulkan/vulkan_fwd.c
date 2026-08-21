@@ -125,7 +125,14 @@ static int load_norm_f32(VulkanCtx* ctx, const uint8_t* wbytes, uint32_t n, uint
 static uint64_t wq_off(VulkanCtx* ctx, uint32_t layer, uint32_t slot)
 {
     if (!ctx || !ctx->wq_off) return (uint64_t)~0ull;
-    return ctx->wq_off[(size_t)layer * ctx->wq_nslot + slot];
+    uint64_t abs = ctx->wq_off[(size_t)layer * ctx->wq_nslot + slot];
+    if (abs == (uint64_t)~0ull) return abs;
+    if (ctx->wq_stream) {
+        if (ctx->stream_layer != layer) return (uint64_t)~0ull;
+        if (abs < ctx->stream_base) return (uint64_t)~0ull;
+        return abs - ctx->stream_base;
+    }
+    return abs;
 }
 
 static void vk_or_cpu_rmsnorm(VulkanCtx* ctx,
@@ -187,7 +194,8 @@ static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* out,
                          uint32_t hidden, uint32_t inter, float eps,
                          const uint8_t* base, const LlfTensorMeta* mt, uint32_t layer)
 {
-    if (!ctx || !ctx->fuse_ready || !ctx->swi_ready || !ctx->wq_resident) return -1;
+    if (!ctx || !ctx->fuse_ready || !ctx->swi_ready || !ctx->wq_resident)
+        return -1;
     if (mt[SLOT_GATE].dtype != DT_Q4K || mt[SLOT_UP].dtype != DT_Q4K ||
         mt[SLOT_DOWN].dtype != DT_Q4K)
         return -1;
@@ -201,13 +209,55 @@ static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* out,
     return vulkan_fused_ffn(ctx, x, ctx->host_w, hidden, eps, out, inter, og, ou, od);
 }
 
+static int try_fused_full_block(VulkanCtx* ctx, float* x, int upload_x,
+                                uint32_t hidden, uint32_t kv_dim, uint32_t inter,
+                                float eps, float theta, uint32_t rope_mode,
+                                uint32_t layer, uint32_t pos,
+                                const uint8_t* base, const LlfTensorMeta* mt,
+                                uint16_t* host_k_row, uint16_t* host_v_row,
+                                int sync_host)
+{
+    if (!ctx || !ctx->block_ready || !ctx->wq_resident) return -1;
+    if (!ctx->host_w || !ctx->host_w2) return -1;
+    if (mt[SLOT_QNORM].size > 0 || mt[SLOT_KNORM].size > 0) return -1;
+    if (mt[SLOT_Q].dtype != DT_Q4K || mt[SLOT_K].dtype != DT_Q4K || mt[SLOT_V].dtype != DT_Q4K ||
+        mt[SLOT_O].dtype != DT_Q4K || mt[SLOT_GATE].dtype != DT_Q4K ||
+        mt[SLOT_UP].dtype != DT_Q4K || mt[SLOT_DOWN].dtype != DT_Q4K)
+        return -1;
+    if (load_norm_f32(ctx, base + mt[SLOT_NORM1].offset, hidden, mt[SLOT_NORM1].dtype) != 0)
+        return -1;
+    memcpy(ctx->host_w2, ctx->host_w, (size_t)hidden * 4);
+    if (load_norm_f32(ctx, base + mt[SLOT_NORM2].offset, hidden, mt[SLOT_NORM2].dtype) != 0)
+        return -1;
+
+    uint64_t oq = wq_off(ctx, layer, SLOT_Q);
+    uint64_t ok = wq_off(ctx, layer, SLOT_K);
+    uint64_t ov = wq_off(ctx, layer, SLOT_V);
+    uint64_t oo = wq_off(ctx, layer, SLOT_O);
+    uint64_t og = wq_off(ctx, layer, SLOT_GATE);
+    uint64_t ou = wq_off(ctx, layer, SLOT_UP);
+    uint64_t od = wq_off(ctx, layer, SLOT_DOWN);
+    if (oq == (uint64_t)~0ull || ok == (uint64_t)~0ull || ov == (uint64_t)~0ull ||
+        oo == (uint64_t)~0ull || og == (uint64_t)~0ull || ou == (uint64_t)~0ull ||
+        od == (uint64_t)~0ull)
+        return -1;
+    const float* bq = mt[SLOT_QBIAS].size > 0 ? (const float*)(base + mt[SLOT_QBIAS].offset) : NULL;
+    const float* bk = mt[SLOT_KBIAS].size > 0 ? (const float*)(base + mt[SLOT_KBIAS].offset) : NULL;
+    const float* bv = mt[SLOT_VBIAS].size > 0 ? (const float*)(base + mt[SLOT_VBIAS].offset) : NULL;
+
+    return vulkan_fused_block(ctx, x, upload_x, ctx->host_w2, ctx->host_w,
+                              hidden, eps, theta, rope_mode,
+                              kv_dim, inter, oq, ok, ov, oo, og, ou, od,
+                              layer, pos, bq, bk, bv, host_k_row, host_v_row, sync_host);
+}
+
 static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
                                 uint32_t hidden, uint32_t kv_dim, float eps, float theta,
                                 uint32_t rope_mode, uint32_t layer, uint32_t pos,
                                 const uint8_t* base, const LlfTensorMeta* mt,
                                 uint16_t* host_k_row, uint16_t* host_v_row)
 {
-    if (!ctx || !ctx->rope_ready || !ctx->attn_ready || !ctx->fuse_ready || !ctx->wq_resident)
+    if (!ctx || !ctx->attn_ready || !ctx->fuse_ready || !ctx->wq_resident)
         return -1;
     if (mt[SLOT_Q].dtype != DT_Q4K || mt[SLOT_K].dtype != DT_Q4K || mt[SLOT_V].dtype != DT_Q4K)
         return -1;
@@ -265,8 +315,23 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh, j;
     uint32_t rope_mode = (h->arch == ARCH_QWEN) ? 1u : 0u;
+    int upload_x = ctx ? !ctx->x_on_dev : 1;
 
-    /* 快路径: QKV+rope+attn(+O) 少 host 往返 */
+    if (ctx && ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
+        return -1;
+
+    /* 快路径: 整层常驻激活(无 qk-norm) */
+    if (try_fused_full_block(ctx, x, upload_x, hidden, kv_dim, inter, eps, theta, rope_mode,
+                             layer, pos, base, mt, kcache + kvp, vcache + kvp,
+                             /* 层间不 sync; 末层由 final_norm/sync 拉回 */ 0) == 0) {
+        return 0;
+    }
+    /* 回退: 需 host x */
+    if (ctx && ctx->x_on_dev)
+        (void)vulkan_sync_x_to_host(ctx, x, hidden);
+    if (ctx) vulkan_mark_x_host(ctx);
+
+    /* 旧快路径: QKV+rope+attn(+O) */
     if (try_fused_attn_block(ctx, x, att_out, hidden, kv_dim, eps, theta, rope_mode,
                              layer, pos, base, mt, kcache + kvp, vcache + kvp) == 0) {
         for (j = 0; j < hidden; j++) x[j] += att_out[j];
@@ -417,6 +482,19 @@ void vulkan_attach_fwd(Engine* e)
         e->fwd_block = vulkan_fwd_block;
 }
 
+void vulkan_after_embed(Engine* e)
+{
+    if (e && e->device_mode == DEV_MODE_VULKAN && e->w_dev)
+        vulkan_mark_x_host((VulkanCtx*)e->w_dev);
+}
+
+void vulkan_sync_x(Engine* e)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    (void)vulkan_sync_x_to_host(ctx, e->x, e->ws.model.h.hidden);
+}
+
 int vulkan_final_norm(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
@@ -429,8 +507,11 @@ int vulkan_final_norm(Engine* e)
     const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
     uint32_t hidden = m->h.hidden;
     float eps = ctx->norm_eps;
+    if (ctx->x_on_dev)
+        (void)vulkan_sync_x_to_host(ctx, e->x, hidden);
     if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
     if (vulkan_k_rmsnorm(ctx, e->x, e->x, ctx->host_w, hidden, eps) != 0) return -1;
+    ctx->x_on_dev = 0;
     return 0;
 }
 
@@ -440,6 +521,8 @@ int vulkan_lm_head(Engine* e)
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->lm_ready || !ctx->gemv_ready || !ctx->wq_resident) return -1;
     if (ctx->lm_dtype != DT_Q4K) return -1;
+    if (ctx->x_on_dev)
+        (void)vulkan_sync_x_to_host(ctx, e->x, ctx->hidden);
     if (ctx->lm_in != ctx->hidden || ctx->lm_out == 0) return -1;
     if ((ctx->lm_in % 256) != 0) return -1;
 

@@ -33,6 +33,7 @@ typedef struct {
     uint32_t pos;
     uint32_t mode; /* 0=llama 1=qwen */
     float theta;
+    uint32_t _pad; /* 与 GLSL 20→24 对齐, 避免 theta 读脏 */
 } RopePush;
 
 typedef struct {
@@ -45,6 +46,20 @@ typedef struct {
     uint32_t k_slot;
     uint32_t v_slot;
 } AttnPush;
+
+typedef struct {
+    uint32_t n;
+} AddPush;
+
+typedef struct {
+    uint32_t n;
+    uint32_t bias_off;
+} BiasPush;
+
+typedef struct {
+    uint32_t n;
+    uint32_t dst_off;
+} StoreKvPush;
 
 static uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
                                  VkMemoryPropertyFlags props)
@@ -350,7 +365,8 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
         ctx->rms_desc_pool = (void*)pool;
         ctx->rms_desc_set = (void*)dset;
         ctx->host_w = (float*)malloc(ctx->wn_bytes);
-        if (!ctx->host_w) return -1;
+        ctx->host_w2 = (float*)malloc(ctx->wn_bytes);
+        if (!ctx->host_w || !ctx->host_w2) return -1;
         ctx->compute_ready = 1;
     }
 
@@ -415,7 +431,8 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                             memset(bis, 0, sizeof(bis));
                             memset(writes, 0, sizeof(writes));
                             VkBuffer trip[3] = { xb[si], yb[si], bw };
-                            size_t xrng = (si == 4) ? ctx->y_bytes : ctx->x_bytes;
+                            /* si0: x=buf_x(hidden); 其余 x=buf_y/o2, 须覆盖 inter(down gemv) */
+                            size_t xrng = (si == 0) ? ctx->x_bytes : ctx->y_bytes;
                             size_t rng[3] = { xrng, ctx->y_bytes, ctx->wq_bytes };
                             uint32_t b;
                             for (b = 0; b < 3; b++) {
@@ -488,13 +505,63 @@ int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes)
     if (bytes > ctx->wq_bytes) return -1;
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
-    void* pw = NULL;
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, 0, bytes, 0, &pw) != VK_SUCCESS)
-        return -1;
-    memcpy(pw, blob, bytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+    /* 分块 map+memcpy: 大块一次 Map 在部分 iGPU 上不可靠 */
+    const size_t chunk = 16u * 1024u * 1024u;
+    size_t off = 0;
+    while (off < bytes) {
+        size_t n = bytes - off;
+        if (n > chunk) n = chunk;
+        void* pw = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, off, n, 0, &pw) != VK_SUCCESS)
+            return -1;
+        memcpy(pw, (const uint8_t*)blob + off, n);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+        off += n;
+    }
     ctx->wq_resident = 1;
-    ylog_info("vulkan: Q4_K weights resident %zuMB", bytes / (1024 * 1024));
+    ylog_info("vulkan: Q4_K weights resident %zuMB (chunked)", bytes / (1024 * 1024));
+    return 0;
+}
+
+int vulkan_stream_layer(VulkanCtx* ctx, uint32_t layer)
+{
+    if (!ctx || !ctx->wq_stream || !ctx->host_wq || !ctx->mem_wq) return -1;
+    if (ctx->stream_layer == layer) return 0;
+    uint32_t s;
+    uint64_t lo = (uint64_t)~0ull, hi = 0;
+    for (s = 0; s < ctx->wq_nslot; s++) {
+        uint64_t off = ctx->wq_off[(size_t)layer * ctx->wq_nslot + s];
+        if (off == (uint64_t)~0ull) continue;
+        if (off < lo) lo = off;
+        /* 估每槽最大: 用到 layer_wq_max 覆盖 */
+        if (off > hi) hi = off;
+    }
+    if (lo == (uint64_t)~0ull) return -1;
+    size_t nbytes = ctx->layer_wq_max;
+    if (nbytes == 0) nbytes = ctx->wq_bytes;
+    if (lo + nbytes > ctx->host_wq_bytes)
+        nbytes = ctx->host_wq_bytes - (size_t)lo;
+    if (nbytes > ctx->wq_bytes) nbytes = ctx->wq_bytes;
+    /* 分块写到 GPU offset 0 */
+    {
+        const size_t chunk = 16u * 1024u * 1024u;
+        size_t done = 0;
+        VulkanApi* a = vulkan_api();
+        VkDevice dev = (VkDevice)ctx->device;
+        while (done < nbytes) {
+            size_t n = nbytes - done;
+            if (n > chunk) n = chunk;
+            void* pw = NULL;
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, done, n, 0, &pw) != VK_SUCCESS)
+                return -1;
+            memcpy(pw, ctx->host_wq + (size_t)lo + done, n);
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+            done += n;
+        }
+    }
+    ctx->stream_layer = layer;
+    ctx->stream_base = lo;
+    (void)hi;
     return 0;
 }
 
@@ -550,7 +617,12 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
 {
     if (!ctx || !ctx->gemv_ready || !y || !x) return -1;
     if (out == 0 || in == 0 || (in % 256) != 0) return -1;
-    if (in > ctx->max_in || out > ctx->max_out) return -1;
+    if (out > ctx->max_out) return -1;
+    /* in>max_in: FFN down, 输入走 buf_y(gemv_ds0), 输出 o0 */
+    int wide = (in > ctx->max_in);
+    if (wide) {
+        if (in > ctx->max_out || !ctx->gemv_ds0) return -1;
+    }
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
     if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
     if (w_byte_off > 0xffffffffull) return -1;
@@ -559,12 +631,15 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     VkDevice dev = (VkDevice)ctx->device;
     size_t xbytes = (size_t)in * 4;
     size_t ybytes = (size_t)out * 4;
+    void* xmem = wide ? ctx->mem_y : ctx->mem_x;
+    void* ymem = wide ? ctx->mem_o0 : ctx->mem_y;
+    void* dset = wide ? ctx->gemv_ds0 : ctx->gemv_desc_set;
     void* px = NULL; void* py = NULL;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, xbytes, 0, &px) != VK_SUCCESS)
+    if (a->MapMemory(dev, (VkDeviceMemory)xmem, 0, xbytes, 0, &px) != VK_SUCCESS)
         return -1;
     memcpy(px, x, xbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
+    a->UnmapMemory(dev, (VkDeviceMemory)xmem);
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     a->ResetCommandBuffer(cmd, 0);
@@ -573,7 +648,7 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     a->BeginCommandBuffer(cmd, &bi);
     a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->gemv_pipeline);
-    VkDescriptorSet ds = (VkDescriptorSet)ctx->gemv_desc_set;
+    VkDescriptorSet ds = (VkDescriptorSet)dset;
     a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                              (VkPipelineLayout)ctx->gemv_pipe_layout, 0, 1, &ds, 0, NULL);
     GemvPush push;
@@ -587,10 +662,10 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_y, 0, ybytes, 0, &py) != VK_SUCCESS)
+    if (a->MapMemory(dev, (VkDeviceMemory)ymem, 0, ybytes, 0, &py) != VK_SUCCESS)
         return -1;
     memcpy(y, py, ybytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
+    a->UnmapMemory(dev, (VkDeviceMemory)ymem);
     return 0;
 }
 
@@ -598,6 +673,8 @@ int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
                            const uint8_t* w, uint32_t out, uint32_t in)
 {
     if (!ctx || !w) return -1;
+    /* 常驻/流式权在 GPU wq[0..); 禁止把单矩阵盖到 offset 0 */
+    if (ctx->wq_resident) return -1;
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
     if (wbytes > ctx->wq_bytes) return -1;
     VulkanApi* a = vulkan_api();
@@ -765,6 +842,9 @@ static void cmd_swiglu(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n)
     a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
 }
 
+#if defined(__GNUC__)
+__attribute__((unused))
+#endif
 static void cmd_rope(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
                      uint32_t n_heads, uint32_t head_dim, uint32_t pos,
                      uint32_t mode, float theta)
@@ -775,6 +855,7 @@ static void cmd_rope(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
     a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                              (VkPipelineLayout)ctx->rope_pipe_layout, 0, 1, &ds, 0, NULL);
     RopePush push;
+    memset(&push, 0, sizeof(push));
     push.n_heads = n_heads;
     push.head_dim = head_dim;
     push.pos = pos;
@@ -845,6 +926,154 @@ int vulkan_fused_ffn(VulkanCtx* ctx,
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
     return map_read(ctx, ctx->mem_o0, out, xb);
+}
+
+static int alloc_multi_ds(VulkanCtx* ctx, const char* spv, size_t push_sz,
+                          uint32_t nsets, VkBuffer triples[][3], size_t ranges[][3],
+                          void** out_shader, void** out_dsl, void** out_pl, void** out_pipe,
+                          void** out_pool, void** out_sets)
+{
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    char err[256];
+    VkShaderModule sh = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkDescriptorPool pool0 = VK_NULL_HANDLE;
+    VkDescriptorSet dset0 = VK_NULL_HANDLE;
+    if (create_ssbo_pipeline(ctx, spv, push_sz, &sh, &dsl, &pl, &pipe, &pool0, &dset0,
+                             triples[0], ranges[0], err, sizeof(err)) != 0) {
+        ylog_warn("vulkan: %s failed (%s)", spv, err);
+        return -1;
+    }
+    a->DestroyDescriptorPool(dev, pool0, NULL);
+    VkDescriptorPoolSize dps = {0};
+    dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dps.descriptorCount = 3u * nsets;
+    VkDescriptorPoolCreateInfo dpi = {0};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.maxSets = nsets;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &dps;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (a->CreateDescriptorPool(dev, &dpi, NULL, &pool) != VK_SUCCESS) return -1;
+    VkDescriptorSetLayout* layouts = (VkDescriptorSetLayout*)malloc(sizeof(*layouts) * nsets);
+    VkDescriptorSet* sets = (VkDescriptorSet*)malloc(sizeof(*sets) * nsets);
+    if (!layouts || !sets) { free(layouts); free(sets); return -1; }
+    uint32_t i;
+    for (i = 0; i < nsets; i++) layouts[i] = dsl;
+    VkDescriptorSetAllocateInfo dai = {0};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = pool;
+    dai.descriptorSetCount = nsets;
+    dai.pSetLayouts = layouts;
+    if (a->AllocateDescriptorSets(dev, &dai, sets) != VK_SUCCESS) {
+        free(layouts); free(sets);
+        return -1;
+    }
+    for (i = 0; i < nsets; i++) {
+        VkDescriptorBufferInfo bis[3];
+        VkWriteDescriptorSet writes[3];
+        memset(bis, 0, sizeof(bis));
+        memset(writes, 0, sizeof(writes));
+        uint32_t b;
+        for (b = 0; b < 3; b++) {
+            bis[b].buffer = triples[i][b];
+            bis[b].range = ranges[i][b];
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstSet = sets[i];
+            writes[b].dstBinding = b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[b].pBufferInfo = &bis[b];
+        }
+        a->UpdateDescriptorSets(dev, 3, writes, 0, NULL);
+        out_sets[i] = (void*)sets[i];
+    }
+    free(layouts);
+    free(sets);
+    *out_shader = (void*)sh;
+    *out_dsl = (void*)dsl;
+    *out_pl = (void*)pl;
+    *out_pipe = (void*)pipe;
+    *out_pool = (void*)pool;
+    return 0;
+}
+
+static int setup_block_ops(VulkanCtx* ctx)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->buf_x || !ctx->buf_y || !ctx->buf_o0 || !ctx->buf_kv)
+        return -1;
+    VkBuffer bx = (VkBuffer)ctx->buf_x;
+    VkBuffer by = (VkBuffer)ctx->buf_y;
+    VkBuffer bo0 = (VkBuffer)ctx->buf_o0;
+    VkBuffer bo1 = (VkBuffer)ctx->buf_o1;
+    VkBuffer bo2 = (VkBuffer)ctx->buf_o2;
+    VkBuffer bkv = (VkBuffer)ctx->buf_kv;
+    size_t xb = ctx->x_bytes;
+    size_t yb = ctx->y_bytes;
+    size_t kvb = ctx->kv_bytes;
+
+    {
+        VkBuffer triples[2][3] = { { bx, by, bx }, { bx, bo0, bx } };
+        size_t ranges[2][3] = { { xb, yb, xb }, { xb, yb, xb } };
+        void* sets[2];
+        if (alloc_multi_ds(ctx, "add.spv", sizeof(AddPush), 2, triples, ranges,
+                           &ctx->add_shader, &ctx->add_desc_layout, &ctx->add_pipe_layout,
+                           &ctx->add_pipeline, &ctx->add_desc_pool, sets) != 0)
+            return -1;
+        ctx->add_ds_xy = sets[0];
+        ctx->add_ds_xo = sets[1];
+        ctx->add_ready = 1;
+    }
+
+    ctx->bias_bytes = (size_t)ctx->hidden * 4u * 3u;
+    if (ctx->max_out > ctx->hidden)
+        ctx->bias_bytes = (size_t)ctx->max_out * 4u * 3u;
+    {
+        VkBuffer bb = VK_NULL_HANDLE;
+        VkDeviceMemory mb = VK_NULL_HANDLE;
+        if (create_host_buffer(ctx, ctx->bias_bytes, &bb, &mb) != 0) return -1;
+        ctx->buf_bias = (void*)bb;
+        ctx->mem_bias = (void*)mb;
+        VkBuffer triples[3][3] = {
+            { bo0, bb, bb }, { bo1, bb, bb }, { bo2, bb, bb }
+        };
+        size_t ranges[3][3] = {
+            { yb, ctx->bias_bytes, ctx->bias_bytes },
+            { yb, ctx->bias_bytes, ctx->bias_bytes },
+            { yb, ctx->bias_bytes, ctx->bias_bytes }
+        };
+        void* sets[3];
+        if (alloc_multi_ds(ctx, "bias.spv", sizeof(BiasPush), 3, triples, ranges,
+                           &ctx->bias_shader, &ctx->bias_desc_layout, &ctx->bias_pipe_layout,
+                           &ctx->bias_pipeline, &ctx->bias_desc_pool, sets) != 0)
+            return -1;
+        ctx->bias_ds_q = sets[0];
+        ctx->bias_ds_k = sets[1];
+        ctx->bias_ds_v = sets[2];
+        ctx->bias_ready = 1;
+    }
+
+    {
+        VkBuffer triples[2][3] = { { bo1, bkv, bkv }, { bo2, bkv, bkv } };
+        size_t ranges[2][3] = { { yb, kvb, kvb }, { yb, kvb, kvb } };
+        void* sets[2];
+        if (alloc_multi_ds(ctx, "store_kv.spv", sizeof(StoreKvPush), 2, triples, ranges,
+                           &ctx->skv_shader, &ctx->skv_desc_layout, &ctx->skv_pipe_layout,
+                           &ctx->skv_pipeline, &ctx->skv_desc_pool, sets) != 0)
+            return -1;
+        ctx->skv_ds_k = sets[0];
+        ctx->skv_ds_v = sets[1];
+        ctx->skv_ready = 1;
+    }
+
+    ctx->block_ready = (ctx->add_ready && ctx->skv_ready && ctx->rope_ready &&
+                        ctx->attn_ready && ctx->swi_ready && ctx->attn_o_ready) ? 1 : 0;
+    ylog_info("vulkan: block_ops add=%d bias=%d skv=%d block=%d",
+              ctx->add_ready, ctx->bias_ready, ctx->skv_ready, ctx->block_ready);
+    return 0;
 }
 
 int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
@@ -982,6 +1211,7 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
             }
         }
     }
+    (void)setup_block_ops(ctx);
     return 0;
 }
 
@@ -1071,8 +1301,8 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
     return map_read(ctx, ctx->mem_o2, att_out, qbytes);
 }
 
-/* rmsnorm+QKV; 可选 bias/qk-norm(host 就地改 o*); rope; KV 行; attn(+O)
- * Q 留在 o0 */
+/* rmsnorm+QKV; 可选 bias/qk-norm; CPU RoPE; KV 行; attn(+O)
+ * Q 留在 o0。RoPE 走 host 与 engine 一致(GPU rope 在部分 iGPU 上 push/数值不稳)。 */
 int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
                                const float* x, const float* wn, uint32_t hidden, float eps,
                                float* out, uint32_t kv_dim,
@@ -1083,7 +1313,7 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
                                const uint8_t* knorm, uint32_t knorm_dtype,
                                uint16_t* host_k_row, uint16_t* host_v_row)
 {
-    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident || !ctx->rope_ready ||
+    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident ||
         !ctx->attn_ready || !x || !wn || !out)
         return -1;
     if (hidden != ctx->n_heads * ctx->head_dim || kv_dim != ctx->kv_dim) return -1;
@@ -1106,7 +1336,6 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
     uint32_t v_slot = ctx->n_blocks + layer;
     size_t k_off = ((size_t)k_slot * ctx->max_seq + pos) * kv_dim * 4;
     size_t v_off = ((size_t)v_slot * ctx->max_seq + pos) * kv_dim * 4;
-    int need_post = (bq || bk || bv || qnorm || knorm) ? 1 : 0;
 
     if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
     if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
@@ -1125,41 +1354,47 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
     cmd_gemv(ctx, cmd, ctx->gemv_ds2, kv_dim, hidden, (uint32_t)off_v);
-    if (!need_post) {
-        cmd_barrier_compute(cmd);
-        cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim, pos, rope_mode, theta);
-        cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim, pos, rope_mode, theta);
-    }
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    if (need_post) {
+    /* bias / qk-norm / RoPE 在 host 就地改 o* */
+    {
         void* p = NULL;
         uint32_t j, hh;
-        if (bq || qnorm) {
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o0, 0, xb, 0, &p) != VK_SUCCESS)
-                return -1;
-            float* q = (float*)p;
-            if (bq) for (j = 0; j < hidden; j++) q[j] += bq[j];
-            if (qnorm) {
-                for (hh = 0; hh < ctx->n_heads; hh++)
-                    rmsnorm(q + (size_t)hh * ctx->head_dim, q + (size_t)hh * ctx->head_dim,
-                            qnorm, ctx->head_dim, eps, qnorm_dtype);
-            }
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0);
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o0, 0, xb, 0, &p) != VK_SUCCESS)
+            return -1;
+        float* q = (float*)p;
+        if (bq) for (j = 0; j < hidden; j++) q[j] += bq[j];
+        if (qnorm) {
+            for (hh = 0; hh < ctx->n_heads; hh++)
+                rmsnorm(q + (size_t)hh * ctx->head_dim, q + (size_t)hh * ctx->head_dim,
+                        qnorm, ctx->head_dim, eps, qnorm_dtype);
         }
-        if (bk || knorm) {
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &p) != VK_SUCCESS)
-                return -1;
-            float* k = (float*)p;
-            if (bk) for (j = 0; j < kv_dim; j++) k[j] += bk[j];
-            if (knorm) {
-                for (hh = 0; hh < ctx->n_kv_heads; hh++)
-                    rmsnorm(k + (size_t)hh * ctx->head_dim, k + (size_t)hh * ctx->head_dim,
-                            knorm, ctx->head_dim, eps, knorm_dtype);
-            }
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
+        for (hh = 0; hh < ctx->n_heads; hh++) {
+            if (rope_mode)
+                rope_inplace_qwen(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+            else
+                rope_inplace(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
         }
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0);
+
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &p) != VK_SUCCESS)
+            return -1;
+        float* k = (float*)p;
+        if (bk) for (j = 0; j < kv_dim; j++) k[j] += bk[j];
+        if (knorm) {
+            for (hh = 0; hh < ctx->n_kv_heads; hh++)
+                rmsnorm(k + (size_t)hh * ctx->head_dim, k + (size_t)hh * ctx->head_dim,
+                        knorm, ctx->head_dim, eps, knorm_dtype);
+        }
+        for (hh = 0; hh < ctx->n_kv_heads; hh++) {
+            if (rope_mode)
+                rope_inplace_qwen(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+            else
+                rope_inplace(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+        }
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
+
         if (bv) {
             if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &p) != VK_SUCCESS)
                 return -1;
@@ -1167,13 +1402,6 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
             for (j = 0; j < kv_dim; j++) v[j] += bv[j];
             a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
         }
-
-        a->ResetCommandBuffer(cmd, 0);
-        a->BeginCommandBuffer(cmd, &bi);
-        cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim, pos, rope_mode, theta);
-        cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim, pos, rope_mode, theta);
-        a->EndCommandBuffer(cmd);
-        if (submit_and_wait(ctx, cmd) != 0) return -1;
     }
 
     /* o1=K o2=V → GPU KV; 可选同步 host f16 */
@@ -1223,4 +1451,220 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
     if (fuse_o)
         return map_read(ctx, ctx->mem_y, out, xb);
     return map_read(ctx, ctx->mem_o2, out, xb);
+}
+
+static void cmd_add(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset, uint32_t n)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->add_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)dset;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->add_pipe_layout, 0, 1, &ds, 0, NULL);
+    AddPush push;
+    push.n = n;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->add_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
+}
+
+static void cmd_bias(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset, uint32_t n, uint32_t off)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->bias_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)dset;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->bias_pipe_layout, 0, 1, &ds, 0, NULL);
+    BiasPush push;
+    push.n = n;
+    push.bias_off = off;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->bias_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
+}
+
+static void cmd_store_kv(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
+                         uint32_t n, uint32_t dst_off)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->skv_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)dset;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->skv_pipe_layout, 0, 1, &ds, 0, NULL);
+    StoreKvPush push;
+    push.n = n;
+    push.dst_off = dst_off;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->skv_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
+}
+
+void vulkan_mark_x_host(VulkanCtx* ctx)
+{
+    if (ctx) ctx->x_on_dev = 0;
+}
+
+int vulkan_sync_x_to_host(VulkanCtx* ctx, float* host_x, uint32_t hidden)
+{
+    if (!ctx || !host_x || !ctx->mem_x) return -1;
+    if (!ctx->x_on_dev) return 0;
+    return map_read(ctx, ctx->mem_x, host_x, (size_t)hidden * 4);
+}
+
+/* 整层两次 submit: 激活留 buf_x。无 qk-norm。
+ * off_* 为 GPU 相对偏移(调用方已用 wq_off / stream 折算)。 */
+int vulkan_fused_block(VulkanCtx* ctx,
+                       float* host_x, int upload_x,
+                       const float* wn1, const float* wn2,
+                       uint32_t hidden, float eps, float theta, uint32_t rope_mode,
+                       uint32_t kv_dim, uint32_t inter,
+                       uint64_t off_q, uint64_t off_k, uint64_t off_v, uint64_t off_o,
+                       uint64_t off_g, uint64_t off_u, uint64_t off_d,
+                       uint32_t layer, uint32_t pos,
+                       const float* bq, const float* bk, const float* bv,
+                       uint16_t* host_k_row, uint16_t* host_v_row,
+                       int sync_host)
+{
+    if (!ctx || !ctx->block_ready || !ctx->wq_resident || !wn1 || !wn2)
+        return -1;
+    if (hidden != ctx->n_heads * ctx->head_dim || kv_dim != ctx->kv_dim) return -1;
+    if (hidden > ctx->max_in || inter > ctx->max_out || hidden > ctx->max_out) return -1;
+    if (pos >= ctx->max_seq || layer > ctx->n_blocks) return -1;
+    if (off_q > 0xffffffffull || off_k > 0xffffffffull || off_v > 0xffffffffull ||
+        off_o > 0xffffffffull || off_g > 0xffffffffull || off_u > 0xffffffffull ||
+        off_d > 0xffffffffull)
+        return -1;
+
+    /* 流式: 确保本层已上传; 勿再减 stream_base(调用方 off 已是相对) */
+    if (ctx->wq_stream) {
+        if (ctx->stream_layer != layer) {
+            if (vulkan_stream_layer(ctx, layer) != 0) return -1;
+        }
+    }
+
+    size_t xb = (size_t)hidden * 4;
+    size_t rowb = (size_t)kv_dim * 4;
+    if (upload_x || !ctx->x_on_dev) {
+        if (!host_x) return -1;
+        if (map_copy(ctx, ctx->mem_x, host_x, xb) != 0) return -1;
+    }
+    if (map_copy(ctx, ctx->mem_wn, wn1, xb) != 0) return -1;
+
+    /* 打包 bias 到 buf_bias: [0,h) q, [h,h+kv) k, [h+kv,...) v */
+    uint32_t bq_off = 0, bk_off = hidden, bv_off = hidden + kv_dim;
+    if (bq || bk || bv) {
+        if (!ctx->bias_ready) return -1;
+        void* p = NULL;
+        VulkanApi* a0 = vulkan_api();
+        if (a0->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)ctx->mem_bias,
+                          0, ctx->bias_bytes, 0, &p) != VK_SUCCESS)
+            return -1;
+        memset(p, 0, ctx->bias_bytes);
+        if (bq) memcpy((float*)p + bq_off, bq, xb);
+        if (bk) memcpy((float*)p + bk_off, bk, (size_t)kv_dim * 4);
+        if (bv) memcpy((float*)p + bv_off, bv, (size_t)kv_dim * 4);
+        a0->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)ctx->mem_bias);
+    }
+
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    a->ResetCommandBuffer(cmd, 0);
+    a->BeginCommandBuffer(cmd, &bi);
+
+    /* attn 半层: QKV (+bias); RoPE 走 host */
+    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds2, kv_dim, hidden, (uint32_t)off_v);
+    cmd_barrier_compute(cmd);
+    if (bq) cmd_bias(ctx, cmd, ctx->bias_ds_q, hidden, bq_off);
+    if (bk) cmd_bias(ctx, cmd, ctx->bias_ds_k, kv_dim, bk_off);
+    if (bv) cmd_bias(ctx, cmd, ctx->bias_ds_v, kv_dim, bv_off);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    /* CPU RoPE + 写 KV */
+    {
+        void* p = NULL;
+        uint32_t hh;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o0, 0, xb, 0, &p) != VK_SUCCESS)
+            return -1;
+        float* q = (float*)p;
+        for (hh = 0; hh < ctx->n_heads; hh++) {
+            if (rope_mode)
+                rope_inplace_qwen(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+            else
+                rope_inplace(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+        }
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0);
+
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &p) != VK_SUCCESS)
+            return -1;
+        float* k = (float*)p;
+        for (hh = 0; hh < ctx->n_kv_heads; hh++) {
+            if (rope_mode)
+                rope_inplace_qwen(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+            else
+                rope_inplace(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+        }
+        if (host_k_row) {
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) host_k_row[j] = f32_to_f16(k[j]);
+        }
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
+
+        if (host_v_row) {
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &p) != VK_SUCCESS)
+                return -1;
+            {
+                uint32_t j;
+                const float* vf = (const float*)p;
+                for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
+            }
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
+        }
+    }
+
+    if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
+
+    a->ResetCommandBuffer(cmd, 0);
+    a->BeginCommandBuffer(cmd, &bi);
+    {
+        uint32_t k_el = (uint32_t)(((size_t)layer * ctx->max_seq + pos) * kv_dim);
+        uint32_t v_el = (uint32_t)(((size_t)(ctx->n_blocks + layer) * ctx->max_seq + pos) * kv_dim);
+        cmd_store_kv(ctx, cmd, ctx->skv_ds_k, kv_dim, k_el);
+        cmd_store_kv(ctx, cmd, ctx->skv_ds_v, kv_dim, v_el);
+    }
+    cmd_barrier_compute(cmd);
+    cmd_attn(ctx, cmd, layer, pos);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds_xo, hidden, hidden, (uint32_t)off_o);
+    cmd_barrier_compute(cmd);
+    cmd_add(ctx, cmd, ctx->add_ds_xy, hidden);
+    cmd_barrier_compute(cmd);
+    /* FFN: wn 已是 wn2 */
+    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, inter, hidden, (uint32_t)off_g);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds1, inter, hidden, (uint32_t)off_u);
+    cmd_barrier_compute(cmd);
+    cmd_swiglu(ctx, cmd, inter);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, inter, (uint32_t)off_d);
+    cmd_barrier_compute(cmd);
+    cmd_add(ctx, cmd, ctx->add_ds_xo, hidden);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    ctx->x_on_dev = 1;
+
+    if (sync_host && host_x) {
+        if (map_read(ctx, ctx->mem_x, host_x, xb) != 0) return -1;
+    }
+    return 0;
 }

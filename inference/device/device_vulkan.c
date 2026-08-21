@@ -77,6 +77,29 @@ static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out
     }
 }
 
+static size_t max_block_q4k_bytes(const LlModel* m)
+{
+    size_t mx = 0;
+    uint32_t li, s;
+    for (li = 0; li < m->h.n_blocks; li++) {
+        uint32_t layer = li + 1;
+        if (layer >= m->n_layers) continue;
+        size_t layer_sz = 0;
+        uint32_t hidx = m->base_idx[layer];
+        uint32_t nt = m->dir[layer].n_tensors;
+        if (nt > BLOCK_TENSORS) nt = BLOCK_TENSORS;
+        for (s = 0; s < nt; s++) {
+            const LlfTensorMeta* mt = &m->metas[hidx + s];
+            if (mt->dtype != DT_Q4K || mt->size == 0) continue;
+            uint32_t o, i;
+            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            layer_sz += (size_t)o * ((size_t)(i / 256) * 144);
+        }
+        if (layer_sz > mx) mx = layer_sz;
+    }
+    return mx;
+}
+
 /* 打包块内 Q4_K → 连续 blob, 填 wq_off[layer*nslot+slot] */
 static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
 {
@@ -110,7 +133,8 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
             }
         }
     }
-    if (total == 0 || total > ctx->wq_bytes) {
+    if (total == 0) return -1;
+    if (!ctx->wq_stream && total > ctx->wq_bytes) {
         ylog_warn("vulkan: Q4_K pack size %zu vs buf %zu", total, ctx->wq_bytes);
         return -1;
     }
@@ -135,9 +159,9 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
             uint32_t o, i;
             if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
             size_t nbytes = (size_t)o * ((size_t)(i / 256) * 144);
-            if (nbytes != mt->size) {
-                /* size 字段为准 */
-                nbytes = (size_t)mt->size;
+            if (mt->size != 0 && mt->size != nbytes) {
+                ylog_warn("vulkan: Q4_K size mismatch slot=%u layer=%u calc=%zu meta=%llu; use calc",
+                          s, layer, nbytes, (unsigned long long)mt->size);
             }
             if (cursor + nbytes > total) {
                 free(blob);
@@ -185,6 +209,19 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
             }
         }
     }
+    if (ctx->wq_stream) {
+        ctx->host_wq = blob;
+        ctx->host_wq_bytes = cursor;
+        ctx->wq_resident = 1;
+        ctx->stream_layer = (uint32_t)~0u;
+        if (ctx->lm_ready) {
+            ctx->lm_ready = 0;
+            ylog_info("vulkan: lm_head deferred (stream mode)");
+        }
+        ylog_info("vulkan: Q4_K stream host=%zuMB layer_gpu=%zuMB",
+                  cursor / (1024 * 1024), ctx->wq_bytes / (1024 * 1024));
+        return 0;
+    }
     int rc = vulkan_wq_upload(ctx, blob, cursor);
     free(blob);
     if (rc == 0 && ctx->lm_ready)
@@ -212,8 +249,25 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
         uint32_t max_in = ctx->hidden, max_out = ctx->hidden;
         size_t total_wq = 0;
         scan_block_q4k(&e->ws.model, &max_in, &max_out, &total_wq);
+        /* 始终按层流式: 规避 iGPU maxStorageBufferRange, 并减少共享内存占用 */
+        ctx->wq_stream = 0;
+        ctx->layer_wq_max = 0;
+        ctx->stream_base = 0;
+        size_t gpu_wq = total_wq;
+        {
+            size_t layer_max = max_block_q4k_bytes(&e->ws.model);
+            if (layer_max == 0) layer_max = total_wq;
+            layer_max = (layer_max + 4095u) & ~(size_t)4095u;
+            /* 至少容纳 selftest 8 行 */
+            if (layer_max < 144 * 8) layer_max = 144 * 8;
+            ctx->wq_stream = 1;
+            ctx->layer_wq_max = layer_max;
+            gpu_wq = layer_max;
+            ylog_info("vulkan: weight stream on (total=%zuMB layer_gpu=%zuMB)",
+                      total_wq / (1024 * 1024), layer_max / (1024 * 1024));
+        }
         char cerr[256];
-        if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, total_wq,
+        if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, gpu_wq,
                                  e->ws.model.n_layers, BLOCK_TENSORS,
                                  cerr, sizeof(cerr)) != 0) {
             ylog_warn("vulkan: compute setup failed (%s); fwd stays CPU", cerr);
@@ -244,12 +298,12 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d lm=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d lm=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
-              ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident,
+              ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident, ctx->wq_stream,
               ctx->fuse_ready, ctx->swi_ready, ctx->attn_ready, ctx->attn_o_ready,
-              ctx->rope_ready, ctx->lm_ready);
+              ctx->rope_ready, ctx->block_ready, ctx->lm_ready);
     return 0;
 }
 

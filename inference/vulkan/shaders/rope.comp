@@ -13,6 +13,7 @@ layout(push_constant) uniform Push {
     uint pos;
     uint mode;
     float theta;
+    uint _pad;
 } pc;
 
 void main() {
