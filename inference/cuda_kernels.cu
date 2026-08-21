@@ -33,35 +33,51 @@ extern "C" void cuda_k_cublas_destroy(void* handle)
     if (handle) cublasDestroy((cublasHandle_t)handle);
 }
 
-__global__ void k_gemv_f32(float* y, const float* w, const float* x, uint32_t out, uint32_t in)
+__global__ void k_gemv_f16(float* y, const uint16_t* w, const float* x, uint32_t out, uint32_t in)
 {
     uint32_t o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= out) return;
-    const float* row = w + (size_t)o * in;
+    const uint16_t* row = w + (size_t)o * in;
     float acc = 0.0f;
-    for (uint32_t i = 0; i < in; i++) acc += row[i] * x[i];
+    for (uint32_t i = 0; i < in; i++)
+        acc += __half2float(__ushort_as_half(row[i])) * x[i];
     y[o] = acc;
 }
 
-extern "C" int cuda_k_gemv_f32(void* cublas, float* y, const float* w,
-                               const float* x, uint32_t out, uint32_t in, char* err, size_t errlen)
+__global__ void k_f32_to_f16(uint16_t* y, const float* x, uint32_t n)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half_as_ushort(__float2half(x[i]));
+}
+
+extern "C" int cuda_k_gemv_f16(void* cublas, float* y, const uint16_t* w,
+                               const float* x, uint16_t* xf16,
+                               uint32_t out, uint32_t in, char* err, size_t errlen)
 {
     if (!y || !w || !x || out == 0 || in == 0) {
         if (err && errlen) snprintf(err, errlen, "gemv bad args");
         return -1;
     }
-    if (cublas) {
+    if (cublas && xf16) {
         const float alpha = 1.0f, beta = 0.0f;
-        cublasStatus_t st = cublasSgemv((cublasHandle_t)cublas, CUBLAS_OP_T,
-                                        (int)in, (int)out, &alpha, w, (int)in,
-                                        x, 1, &beta, y, 1);
+        k_f32_to_f16<<<(in + 255) / 256, 256>>>(xf16, x, in);
+        /* W_rm[out,in] 作列主 (in x out), OP_T → y = W · x; 两侧 FP16, 累加 FP32 */
+        cublasStatus_t st = cublasGemmEx((cublasHandle_t)cublas,
+                                         CUBLAS_OP_T, CUBLAS_OP_N,
+                                         (int)out, 1, (int)in,
+                                         &alpha,
+                                         w, CUDA_R_16F, (int)in,
+                                         xf16, CUDA_R_16F, (int)in,
+                                         &beta,
+                                         y, CUDA_R_32F, (int)out,
+                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (st != CUBLAS_STATUS_SUCCESS) {
-            if (err && errlen) snprintf(err, errlen, "cublasSgemv %d", (int)st);
+            if (err && errlen) snprintf(err, errlen, "cublasGemmEx %d", (int)st);
             return -1;
         }
         return 0;
     }
-    k_gemv_f32<<<(out + 255) / 256, 256>>>(y, w, x, out, in);
+    k_gemv_f16<<<(out + 255) / 256, 256>>>(y, w, x, out, in);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         if (err && errlen) snprintf(err, errlen, "gemv launch: %s", cudaGetErrorString(e));
@@ -277,15 +293,16 @@ extern "C" void cuda_k_attn_decode(float* att_out, float* att_scores,
                                     pos, n_heads, n_kv_heads, head_dim, kv_dim, max_seq);
 }
 
-__global__ void k_embed_f32(float* y, const float* table, uint32_t token, uint32_t hidden)
+__global__ void k_embed_f16(float* y, const uint16_t* table, uint32_t token, uint32_t hidden)
 {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < hidden) y[i] = table[(size_t)token * hidden + i];
+    if (i < hidden)
+        y[i] = __half2float(__ushort_as_half(table[(size_t)token * hidden + i]));
 }
 
-extern "C" void cuda_k_embed_f32(float* y, const float* table, uint32_t token, uint32_t hidden)
+extern "C" void cuda_k_embed_f16(float* y, const uint16_t* table, uint32_t token, uint32_t hidden)
 {
-    k_embed_f32<<<(hidden + 255) / 256, 256>>>(y, table, token, hidden);
+    k_embed_f16<<<(hidden + 255) / 256, 256>>>(y, table, token, hidden);
 }
 
 extern "C" int cuda_k_memcpy_h2d(void* dst, const void* src, size_t n)

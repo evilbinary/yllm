@@ -136,7 +136,7 @@ static void cuda_ctx_clear(CudaCtx* ctx)
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (!ctx->host_shim) {
         if (ctx->w_blob) cudaFree(ctx->w_blob);
-        if (ctx->w_f32w) cudaFree(ctx->w_f32w);
+        if (ctx->w_f16) cudaFree(ctx->w_f16);
         if (ctx->w_f32) cudaFree(ctx->w_f32);
         if (ctx->kv_blob) cudaFree(ctx->kv_blob);
         if (ctx->d_x) cudaFree(ctx->d_x);
@@ -145,6 +145,7 @@ static void cuda_ctx_clear(CudaCtx* ctx)
         if (ctx->d_ffn) cudaFree(ctx->d_ffn);
         if (ctx->d_att) cudaFree(ctx->d_att);
         if (ctx->d_logits) cudaFree(ctx->d_logits);
+        if (ctx->d_xf16) cudaFree(ctx->d_xf16);
         if (ctx->cublas) cuda_k_cublas_destroy(ctx->cublas);
     } else
 #endif
@@ -223,11 +224,10 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
         }
     }
 
-    uint16_t* h_f16 = NULL;
-    float* h_w = (float*)malloc((size_t)n_f16 * 4);
+    uint16_t* h_f16 = (uint16_t*)malloc((size_t)n_f16 * 2);
     float* h_f32 = (float*)malloc((size_t)n_f32 * 4);
-    if ((n_f16 && !h_w) || (n_f32 && !h_f32)) {
-        free(h_w);
+    if ((n_f16 && !h_f16) || (n_f32 && !h_f32)) {
+        free(h_f16);
         free(h_f32);
         if (err && errlen) snprintf(err, errlen, "oom host dequant");
         return -1;
@@ -242,9 +242,9 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
             size_t idx = (size_t)i * nslot + s;
             if (ctx->off_f16[idx] != CUDA_OFF_NONE) {
                 uint32_t out = ctx->dim_out[idx], in = ctx->dim_in[idx];
-                if (dequant_mat_f32(h_w + ctx->off_f16[idx], lbase + mt->offset,
+                if (dequant_mat_f16(h_f16 + ctx->off_f16[idx], lbase + mt->offset,
                                     out, in, mt->dtype) != 0) {
-                    free(h_w); free(h_f32);
+                    free(h_f16); free(h_f32);
                     if (err && errlen)
                         snprintf(err, errlen, "dequant layer %u slot %u dtype %u", i, s, mt->dtype);
                     return -1;
@@ -266,15 +266,14 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
         }
     }
 
-    CUDA_OK(cudaMalloc((void**)&ctx->w_f32w, (size_t)n_f16 * 4), err, errlen);
+    CUDA_OK(cudaMalloc((void**)&ctx->w_f16, (size_t)n_f16 * 2), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->w_f32, (size_t)n_f32 * 4), err, errlen);
     if (n_f16)
-        CUDA_OK(cudaMemcpy(ctx->w_f32w, h_w, (size_t)n_f16 * 4, cudaMemcpyHostToDevice), err, errlen);
+        CUDA_OK(cudaMemcpy(ctx->w_f16, h_f16, (size_t)n_f16 * 2, cudaMemcpyHostToDevice), err, errlen);
     if (n_f32)
         CUDA_OK(cudaMemcpy(ctx->w_f32, h_f32, (size_t)n_f32 * 4, cudaMemcpyHostToDevice), err, errlen);
-    free(h_w);
+    free(h_f16);
     free(h_f32);
-    (void)h_f16;
     ctx->n_f16 = n_f16;
     ctx->n_f32 = n_f32;
 
@@ -301,17 +300,21 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     CUDA_OK(cudaMalloc((void**)&ctx->d_ffn, (size_t)2 * ctx->inter * 4), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_att, (size_t)e->max_seq * h->n_heads * 4), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_logits, (size_t)h->vocab * 4), err, errlen);
+    {
+        uint32_t xf = ctx->hidden > ctx->inter ? ctx->hidden : ctx->inter;
+        CUDA_OK(cudaMalloc((void**)&ctx->d_xf16, (size_t)xf * 2), err, errlen);
+    }
 
     if (cuda_k_cublas_create(&ctx->cublas, err, errlen) != 0) return -1;
 
-    ctx->gpu_compute = 1;
     e->w_dev = ctx;
     e->d_kv = ctx->kv_blob;
     e->weights_ready = 1;
+    e->device_mode = DEV_MODE_CUDA;
     cuda_attach_fwd(e);
     cuda_k_sync();
-    ylog_info("cuda: load_weights GPU f32w=%.2f MB f32v=%.2f MB kv=%.2f MB layers=[%u,%u) gpu=%d",
-              (double)n_f16 * 4 / 1048576.0, (double)n_f32 * 4 / 1048576.0,
+    ylog_info("cuda: load_weights GPU f16w=%.2f MB f32v=%.2f MB kv=%.2f MB layers=[%u,%u) gpu=%d",
+              (double)n_f16 * 2 / 1048576.0, (double)n_f32 * 4 / 1048576.0,
               (double)ctx->kv_bytes / 1048576.0, begin, end, ctx->device_id);
     return 0;
 }
@@ -351,10 +354,10 @@ static int load_weights_shim(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
         if (sz) memcpy(ctx->w_blob + cursor, map + m->dir[i].offset, (size_t)sz);
         cursor += sz;
     }
-    ctx->gpu_compute = 0;
     e->w_dev = ctx;
     e->d_kv = e->kv;
     e->weights_ready = 1;
+    e->device_mode = DEV_MODE_CUDA_HOST;
     cuda_attach_fwd(e);
     ylog_info("cuda: load_weights shim layers=[%u,%u) blob=%.2f MB",
               begin, end, (double)total / 1048576.0);
@@ -401,6 +404,7 @@ static void cuda_free_dev(Engine* e)
     e->w_dev = NULL;
     e->d_kv = NULL;
     e->weights_ready = 0;
+    e->device_mode = DEV_MODE_CPU;
 }
 
 const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer)
@@ -411,20 +415,16 @@ const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer)
     return ctx->w_blob + ctx->layer_off[layer];
 }
 
-int cuda_gpu_compute(const Engine* e)
-{
-    const CudaCtx* ctx = e && e->w_dev ? (const CudaCtx*)e->w_dev : NULL;
-    return ctx && ctx->gpu_compute;
-}
-
 void cuda_after_prefill(Engine* e, uint32_t n_pos)
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     CudaCtx* ctx = e && e->w_dev ? (CudaCtx*)e->w_dev : NULL;
-    if (!ctx || !ctx->gpu_compute || !ctx->kv_blob || !e->kv || n_pos == 0) return;
+    if (!e || e->device_mode != DEV_MODE_CUDA || !ctx || !ctx->kv_blob || !e->kv || n_pos == 0) return;
     (void)n_pos;
+    /* 仅当 prefill 走了 CPU batch 时需要; GPU 逐 token prefill 已写 d_kv */
     cuda_k_memcpy_h2d(ctx->kv_blob, e->kv, ctx->kv_bytes);
     cuda_k_memcpy_h2d(ctx->d_x, e->x, (size_t)ctx->hidden * 4);
+    ctx->x_on_dev = 1;
     cuda_k_sync();
 #else
     (void)e;
@@ -432,16 +432,16 @@ void cuda_after_prefill(Engine* e, uint32_t n_pos)
 #endif
 }
 
-const float* cuda_tensor_f32w(const Engine* e, uint32_t layer, uint32_t slot,
-                              uint32_t* out, uint32_t* in)
+const uint16_t* cuda_tensor_f16w(const Engine* e, uint32_t layer, uint32_t slot,
+                                 uint32_t* out, uint32_t* in)
 {
     const CudaCtx* ctx = e && e->w_dev ? (const CudaCtx*)e->w_dev : NULL;
-    if (!ctx || !ctx->w_f32w || !ctx->off_f16) return NULL;
+    if (!ctx || !ctx->w_f16 || !ctx->off_f16) return NULL;
     size_t idx = (size_t)layer * BLOCK_TENSORS_MTP + slot;
     if (layer >= ctx->n_layers || ctx->off_f16[idx] == CUDA_OFF_NONE) return NULL;
     if (out) *out = ctx->dim_out[idx];
     if (in) *in = ctx->dim_in[idx];
-    return ctx->w_f32w + ctx->off_f16[idx];
+    return ctx->w_f16 + ctx->off_f16[idx];
 }
 
 const float* cuda_tensor_f32(const Engine* e, uint32_t layer, uint32_t slot, uint32_t* n)
@@ -501,7 +501,7 @@ Device* device_create_cuda(int device_id, char* err, size_t errlen)
     if (host_shim)
         ylog_info("cuda: host-shim device (weights mirrored in RAM; CPU compute)");
     else
-        ylog_info("cuda: device=%d (FP32 weights + cublas/GEMV decode)", device_id);
+        ylog_info("cuda: device=%d (FP16 weights + GPU decode)", device_id);
     return d;
 #endif
 }

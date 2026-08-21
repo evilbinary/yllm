@@ -13,6 +13,7 @@ static int cpu_load_weights(Engine* e, char* err, size_t errlen)
     e->w_dev = NULL;
     e->d_kv = e->kv;
     e->weights_ready = 1;
+    e->device_mode = DEV_MODE_CPU;
     engine_attach_cpu_fwd(e);
     return 0;
 }
@@ -22,6 +23,7 @@ static void cpu_free_dev(Engine* e)
     e->w_dev = NULL;
     e->d_kv = NULL;
     e->weights_ready = 0;
+    e->device_mode = DEV_MODE_CPU;
 }
 
 static Device* device_create_cpu(int device_id)
@@ -85,15 +87,14 @@ const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer)
     (void)layer;
     return NULL;
 }
-int cuda_gpu_compute(const Engine* e)
-{
-    (void)e;
-    return 0;
-}
 void cuda_after_prefill(Engine* e, uint32_t n_pos)
 {
     (void)e;
     (void)n_pos;
+}
+void cuda_sync_x_to_host(Engine* e)
+{
+    (void)e;
 }
 int cuda_embed(Engine* e, uint32_t token)
 {

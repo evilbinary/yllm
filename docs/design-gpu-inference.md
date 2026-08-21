@@ -1,6 +1,6 @@
 # yllm GPU 推理设计方案
 
-版本：v0.2 ｜ 状态：P2 decode 落地中 ｜ 关联：`design-mmap-layer-streaming.md`（权重 mmap / 层流式）
+版本：v0.3 ｜ 状态：P3 权压 FP16 进行中 ｜ 关联：`design-mmap-layer-streaming.md`（权重 mmap / 层流式）
 
 ## 1. 目标与边界
 
@@ -51,24 +51,21 @@
 
 ```c
 typedef enum { DEV_CPU = 0, DEV_CUDA = 1 } DeviceKind;
+typedef enum {
+    DEV_MODE_CPU = 0,        /* 主机 mmap + CPU */
+    DEV_MODE_CUDA_HOST = 1,  /* --device cuda 但 host-shim */
+    DEV_MODE_CUDA = 2        /* 真 CUDA kernel / cublas */
+} DeviceMode;
 
-typedef struct Device {
-    DeviceKind kind;
-    int        id;       /* CUDA device index；CPU 忽略 */
-    void*      handle;   /* 后端私有状态 */
-
-    int  (*load_weights)(Engine* e, char* err, size_t errlen);
-    void (*free_dev)(Engine* e);
-    int  (*prefetch_layer)(Engine* e, uint32_t layer); /* 可 NULL */
-    void (*release_layer)(Engine* e, uint32_t layer);  /* 可 NULL */
-} Device;
-
-/* Engine 增量字段 */
-Device* dev;
-void*   d_kv;           /* 设备 KV；CPU 可别名 e->kv */
-void*   w_dev;          /* 设备权重根 / 层表 */
-int     weights_ready;  /* load_weights 成功后置 1 */
+/* Engine 增量 */
+Device*    dev;
+void*      d_kv;
+void*      w_dev;
+int        weights_ready;
+DeviceMode device_mode;   /* load_weights / bind 置位; 前向用此判断路径 */
 ```
+
+`DeviceKind` = 绑定的后端；`device_mode` = 实际怎么算。
 
 ## 5. `load_weights` 语义
 
@@ -112,9 +109,9 @@ CLI / 配置：
 ```text
 inference/device.h
 inference/device_cpu.c       # CPU: load_weights 空操作
-inference/device_cuda.c      # CUDA: shim 镜像 / GPU FP16 解量化上卡
-inference/cuda_fwd.c         # fwd_block: shim→CPU / GPU→cublas+kernels
-inference/cuda_kernels.cu    # rmsnorm/rope/attn/swiglu + cublasGemmEx
+inference/device_cuda.c      # CUDA: shim / GPU FP32 解量化上卡
+inference/cuda_fwd.c         # fwd_block + embed/norm/head; 激活常驻设备
+inference/cuda_kernels.cu    # rmsnorm/rope/attn/swiglu + cublasSgemv
 inference/cuda_kernels.h
 inference/cuda_ctx.h
 docs/design-gpu-inference.md
@@ -126,8 +123,8 @@ docs/design-gpu-inference.md
 |------|------|
 | **P0** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device` |
 | **P1** | `device_cuda` + raw blob `load_weights`；host-shim 可测通路径 |
-| **P2（进行中）** | Decode：线性权解量化 **FP32** 上卡 + **cublasSgemv** + 小 kernel；logits D2H；Prefill 仍 CPU/mmap，结束后 `cuda_after_prefill` H2D KV。与 CPU Q4 即时算存在可接受数值差（greedy 文本可能不同） |
-| **P3** | Prefill batch 上卡、原生 Q4_K、FlashAttention、PP↔GPU（按需） |
+| **P2** | Decode：线性权上卡 + cublas + 小 kernel；`device_mode`；激活常驻 `d_x`；GPU 逐 token prefill |
+| **P3（进行中）** | ✅ 权压 **FP16** + `cublasGemmEx`（半显存）；待：Prefill batch 上卡、原生 Q4_K、FlashAttention |
 
 ### 构建
 
@@ -140,7 +137,7 @@ make gen-cuda CHAT_PROMPT=Hi CHAT_TOKENS=16
 
 真 CUDA 产物：`build/avx2-cuda/yllm`（链 `-lcudart -lcublas`，编 `cuda_kernels.cu`）。
 
-`load_weights`（GPU）：`[layer_begin, layer_end)` 线性槽解到 **FP32**（对齐 CPU Q4 路径；TinyLlama ~4GB 显存）；norm/bias 上 F32；分配 `d_kv` 与激活。GEMV 用 `cublasSgemv`。ARCH_QWEN35 暂拒。后续可再压回 FP16 权。
+`load_weights`（GPU）：`[layer_begin, layer_end)` 线性槽解到 **FP16**；norm/bias F32；`d_kv` + 激活。前向用 `cublasGemmEx`（权 FP16 / 激活 FP32）。`device_mode` 区分 CPU / host-shim / 真 CUDA。ARCH_QWEN35 暂拒。
 
 ## 11. 与 mmap 流式文档的关系
 

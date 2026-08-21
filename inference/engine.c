@@ -363,6 +363,7 @@ int engine_bind_device(Engine* e, DeviceKind kind, int device_id, char* err, siz
         e->dev = NULL;
     }
     e->weights_ready = 0;
+    e->device_mode = DEV_MODE_CPU;
     e->w_dev = NULL;
     e->d_kv = NULL;
     e->dev = device_create(kind, device_id, err, errlen);
@@ -588,6 +589,15 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
 /* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
 int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
+    /* GPU decode 路径: 逐 token 走 device fwd, KV 直接写 d_kv, 避免 CPU batch 后再 H2D */
+    if (e->device_mode == DEV_MODE_CUDA) {
+        int i;
+        for (i = 0; i < n; i++) {
+            if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
+                return -1;
+        }
+        return 0;
+    }
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -1103,7 +1113,7 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     const LlfHeader* h = &m->h;
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
     if (i == 0) {
-        if (cuda_gpu_compute(e) && cuda_embed(e, token) == 0) {
+        if (e->device_mode == DEV_MODE_CUDA && cuda_embed(e, token) == 0) {
             /* GPU embed */
         } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
@@ -1119,13 +1129,14 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
         e->fwd_block(e, i, pos);
         if (e->mtp_h && i == (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
+            cuda_sync_x_to_host(e);
             memcpy(e->mtp_h, e->x, (size_t)h->hidden * 4);
             e->mtp_h_ready = 1;
         }
     } else if (e->mtp_layer && i == e->mtp_layer) {
         /* MTP 块不进主干, 仅 MTP 预测时使用 */
     } else if (i == h->n_blocks + 1) {
-        if (cuda_gpu_compute(e) && cuda_final_norm(e) == 0) {
+        if (e->device_mode == DEV_MODE_CUDA && cuda_final_norm(e) == 0) {
             /* GPU final norm */
         } else {
         float eps;
@@ -1134,7 +1145,7 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
         }
     } else {
-        if (cuda_gpu_compute(e) && cuda_lm_head(e) == 0) {
+        if (e->device_mode == DEV_MODE_CUDA && cuda_lm_head(e) == 0) {
             /* GPU lm_head */
         } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
@@ -1276,7 +1287,10 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
         }
         sched_release_budget(ws, i);
     }
-    if (x_out) memcpy(x_out, e->x, (size_t)h->hidden * 4);
+    if (x_out) {
+        cuda_sync_x_to_host(e);
+        memcpy(x_out, e->x, (size_t)h->hidden * 4);
+    }
     if (logits_out) memcpy(logits_out, e->logits, (size_t)h->vocab * 4);
     return 0;
 }
@@ -1563,8 +1577,9 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
             return -1;
         }
         engine_forward_prefill(e, prompt, nprompt, 0);
-        if (cuda_gpu_compute(e))
-            cuda_after_prefill(e, (uint32_t)nprompt);
+        /* GPU prefill 已写 d_kv; 仅 CPU batch prefill 需 after_prefill(现已不会走到) */
+        if (e->device_mode == DEV_MODE_CUDA)
+            cuda_sync_x_to_host(e);
         pos = (uint32_t)nprompt;
     }
 #else

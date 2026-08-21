@@ -154,6 +154,7 @@ typedef struct Engine {
     void* d_kv;              /* 设备 KV; CPU 下别名 kv */
     void* w_dev;             /* 设备权重根/层表; CPU 为 NULL */
     int weights_ready;       /* load_weights 成功 */
+    DeviceMode device_mode;  /* 实际前向路径; load_weights / bind 时置位 */
 } Engine;
 
 typedef struct {

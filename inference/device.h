@@ -17,6 +17,13 @@ typedef enum {
     DEV_CUDA = 1
 } DeviceKind;
 
+/* 实际推理路径(比 DeviceKind 细: CUDA 还分 shim / 真 GPU) */
+typedef enum {
+    DEV_MODE_CPU = 0,        /* 主机 mmap + CPU 算子 */
+    DEV_MODE_CUDA_HOST = 1,  /* --device cuda 但 host-shim(权镜像 RAM + CPU 算) */
+    DEV_MODE_CUDA = 2        /* 真 CUDA kernel / cublas */
+} DeviceMode;
+
 typedef struct Device {
     DeviceKind kind;
     int id;             /* CUDA device index; CPU 忽略 */
@@ -41,10 +48,10 @@ Device* device_create(DeviceKind kind, int device_id, char* err, size_t errlen);
 /* 设备权 blob 内一层基址(仅 DEV_CUDA load_weights 后有效; 否则 NULL) */
 const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer);
 
-/* 真 GPU decode 路径(FP16+cublas); host-shim 返回 0 */
-int cuda_gpu_compute(const Engine* e);
 /* prefill(CPU) 之后把 host KV/激活同步到设备 */
 void cuda_after_prefill(Engine* e, uint32_t n_pos);
+/* 若激活只在设备上, 拉回 e->x(MTP / x_out 等) */
+void cuda_sync_x_to_host(Engine* e);
 int cuda_embed(Engine* e, uint32_t token);
 int cuda_final_norm(Engine* e);
 int cuda_lm_head(Engine* e);
