@@ -1,6 +1,6 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.2 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.3 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
@@ -20,9 +20,10 @@
 ```
 
 - **vulkan**：动态加载 `vulkan-1.dll` / `libvulkan.so` / MoltenVK；创建 **compute 队列** `VkDevice`。
-  - 成功 → `DEV_MODE_VULKAN`（日志 `mode=native`）；前向仍暂挂 CPU（shader 未接入）。
+  - 成功 → `DEV_MODE_VULKAN`（`mode=native`）；`vulkan_compute` 加载 `rmsnorm.spv`，块内 F32/F16 RMSNorm 走 GPU（其余 matmul/attn 仍 CPU）。load 时自检 `max_abs_err`。
   - 失败 → `DEV_MODE_VULKAN_HOST`。
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`。
+  - SPIR-V 路径：cwd 相对 `inference/shaders/`，或 `YLLM_SHADER_DIR`。
 
 ## 3. 构建
 
@@ -31,6 +32,7 @@
 ```bash
 # 需 VULKAN_SDK（头文件）；运行时动态加载，无需链 vulkan-1.lib
 set VULKAN_SDK=...   # Windows
+# 改 .comp 后: glslc -fshader-stage=compute inference/shaders/rmsnorm.comp -o inference/shaders/rmsnorm.spv
 make vulkan
 ./build/avx2-vulkan/yllm gen --device vulkan ... --temp 0
 ```
@@ -48,7 +50,7 @@ cmake --build build/android -j
 # 产物: build/android/libyllm.so  build/android/yllm_gen
 ```
 
-可选 `-DYLLM_VULKAN=ON`。
+可选 `-DYLLM_VULKAN=ON`（需把 `vulkan_compute.c` / `.spv` 打进 APK assets）。
 
 ### iOS
 
@@ -56,6 +58,7 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. `vulkan_fwd`：权/激活 `VkBuffer` + dispatch `rmsnorm.spv` 等  
-2. Q4_K gemv compute  
-3. 设备 `adb` 冒烟（需真机 + 模型 push）
+1. Q4_K gemv compute（主算力）  
+2. 驻留 buffer / 少 H2D（当前每层 RMSNorm 同步 map 拷贝，decode 会偏慢）  
+3. 设备 `adb` 冒烟（需真机 + 模型 push）  
+4. MoltenVK iOS

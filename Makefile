@@ -44,8 +44,8 @@ ifeq ($(YLLM_CUDA),1)
   endif
 endif
 ifeq ($(YLLM_VULKAN),1)
-  SRC += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c
-  TEST_ENGINE_CORE += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c
+  SRC += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c inference/vulkan_compute.c
+  TEST_ENGINE_CORE += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c inference/vulkan_compute.c
 endif
 
 # 真 CUDA 时由 nvcc 编译的 .cu(host-shim 不编)

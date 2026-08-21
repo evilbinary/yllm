@@ -1,18 +1,20 @@
 /* device_vulkan.c — Vulkan 设备后端(Android / iOS·MoltenVK / PC)
  *
  * 启动时动态加载 loader 并创建 compute 设备; 失败则 host-shim(CPU fwd)。
- * 真 shader 前向见 vulkan_fwd(后续)。
+ * native: 加载 rmsnorm.spv, 块内 F32/F16 RMSNorm 走 GPU。
  */
 #include "device.h"
 #include "yllm.h"
 #include "log.h"
 #include "vulkan_ctx.h"
 #include "vulkan_load.h"
+#include "vulkan_compute.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 void vulkan_attach_fwd(Engine* e);
+int vulkan_selftest_rmsnorm(VulkanCtx* ctx);
 
 static int vk_load_weights(Engine* e, char* err, size_t errlen)
 {
@@ -27,10 +29,21 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     e->device_mode = ctx->host_shim ? DEV_MODE_VULKAN_HOST : DEV_MODE_VULKAN;
     ctx->n_layers = e->ws.model.n_layers;
     ctx->hidden = e->ws.model.h.hidden;
+
+    if (!ctx->host_shim) {
+        char cerr[256];
+        if (vulkan_compute_setup(ctx, ctx->hidden, NULL, cerr, sizeof(cerr)) != 0) {
+            ylog_warn("vulkan: compute setup failed (%s); fwd stays CPU", cerr);
+        } else if (vulkan_selftest_rmsnorm(ctx) != 0) {
+            ylog_warn("vulkan: rmsnorm selftest failed; GPU rmsnorm disabled");
+            ctx->compute_ready = 0;
+        }
+    }
+
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u compute=%d",
               ctx->host_shim ? "host-shim" : "native",
-              ctx->device_id, ctx->n_layers, ctx->hidden);
+              ctx->device_id, ctx->n_layers, ctx->hidden, ctx->compute_ready);
     return 0;
 }
 
@@ -74,7 +87,10 @@ Device* device_create_vulkan(int device_id, char* err, size_t errlen)
         if (vulkan_try_init(ctx, device_id, verr, sizeof(verr)) != 0) {
             ylog_warn("vulkan: native init failed (%s), falling back to host-shim", verr);
             ctx->host_shim = 1;
-            memset(&ctx->instance, 0, sizeof(void*) * 4);
+            ctx->instance = NULL;
+            ctx->phys = NULL;
+            ctx->device = NULL;
+            ctx->queue = NULL;
         } else {
             ylog_info("vulkan: native compute device ready");
         }

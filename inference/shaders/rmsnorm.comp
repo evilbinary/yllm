@@ -1,13 +1,33 @@
 #version 450
-/* 占位: 逐元素 y=x*w（非真 rmsnorm）。接入引擎前仅用于验证 glslc 流水线。 */
+/* RMSNorm: y = x * rsqrt(mean(x^2)+eps) * w ; 单 workgroup, 每线程跨步扫 n */
 layout(local_size_x = 256) in;
+
 layout(set = 0, binding = 0) readonly buffer InBuf { float x[]; };
 layout(set = 0, binding = 1) writeonly buffer OutBuf { float y[]; };
 layout(set = 0, binding = 2) readonly buffer WBuf { float w[]; };
-layout(push_constant) uniform Push { uint n; } pc;
+
+layout(push_constant) uniform Push {
+    uint n;
+    float eps;
+} pc;
+
+shared float sdata[256];
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i < pc.n)
-        y[i] = x[i] * w[i];
+    uint lid = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    for (uint i = lid; i < pc.n; i += 256u)
+        sum += x[i] * x[i];
+    sdata[lid] = sum;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s)
+            sdata[lid] += sdata[lid + s];
+        barrier();
+    }
+
+    float inv = inversesqrt(sdata[0] / float(pc.n) + pc.eps);
+    for (uint i = lid; i < pc.n; i += 256u)
+        y[i] = x[i] * inv * w[i];
 }

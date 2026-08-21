@@ -26,7 +26,8 @@ if(YLLM_VULKAN)
   list(APPEND YLLM_CORE_SRCS
     ${INFER}/device_vulkan.c
     ${INFER}/vulkan_load.c
-    ${INFER}/vulkan_fwd.c)
+    ${INFER}/vulkan_fwd.c
+    ${INFER}/vulkan_compute.c)
 endif()
 
 add_library(yllm SHARED ${YLLM_CORE_SRCS})
