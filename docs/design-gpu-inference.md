@@ -1,6 +1,6 @@
 # yllm GPU 推理设计方案
 
-版本：v0.1 ｜ 状态：落地中（P0 骨架） ｜ 关联：`design-mmap-layer-streaming.md`（权重 mmap / 层流式）
+版本：v0.2 ｜ 状态：P2 decode 落地中 ｜ 关联：`design-mmap-layer-streaming.md`（权重 mmap / 层流式）
 
 ## 1. 目标与边界
 
@@ -112,8 +112,11 @@ CLI / 配置：
 ```text
 inference/device.h
 inference/device_cpu.c       # CPU: load_weights 空操作
-inference/device_cuda.c      # CUDA: load_weights H2D / host-shim 镜像
-inference/cuda_fwd.c         # 挂 fwd_block → engine_fwd_block_at(blob 权)
+inference/device_cuda.c      # CUDA: shim 镜像 / GPU FP16 解量化上卡
+inference/cuda_fwd.c         # fwd_block: shim→CPU / GPU→cublas+kernels
+inference/cuda_kernels.cu    # rmsnorm/rope/attn/swiglu + cublasGemmEx
+inference/cuda_kernels.h
+inference/cuda_ctx.h
 docs/design-gpu-inference.md
 ```
 
@@ -122,23 +125,22 @@ docs/design-gpu-inference.md
 | 阶段 | 内容 |
 |------|------|
 | **P0** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device` |
-| **P1（进行中）** | `device_cuda` + `load_weights` 装本段权；`cuda_fwd` 挂 decode；无 toolkit 时 **host-shim**（权镜像 RAM + CPU 算子，可测通路径） |
-| **P2** | 真 GPU kernel / cublasLt、Prefill batch 上卡、数值对齐 |
-| **P3** | PP↔GPU、原生 Q4_K、FlashAttention（按需） |
+| **P1** | `device_cuda` + raw blob `load_weights`；host-shim 可测通路径 |
+| **P2（进行中）** | Decode：线性权解量化 **FP32** 上卡 + **cublasSgemv** + 小 kernel；logits D2H；Prefill 仍 CPU/mmap，结束后 `cuda_after_prefill` H2D KV。与 CPU Q4 即时算存在可接受数值差（greedy 文本可能不同） |
+| **P3** | Prefill batch 上卡、原生 Q4_K、FlashAttention、PP↔GPU（按需） |
 
-### P1 构建
+### 构建
 
 ```bash
-# 推荐(产物在 build/avx2-cuda/, 与纯 CPU avx2 隔离):
 make cuda
-make gen-cuda          # TinyLlama + --device cuda
-make chat-cuda
-
-# 覆盖: GPU=1 CHAT_TOKENS=16 CHAT_PROMPT='Hi' make gen-cuda
-# 无 nvcc 时自动 host-shim; 也可: make cuda YLLM_CUDA_HOST=1
+make gen-cuda CHAT_PROMPT=Hi CHAT_TOKENS=16
+# 数值对齐: --temp 0 对比 --device cpu
+# 无 nvcc: 自动 host-shim; 强制 shim: make cuda YLLM_CUDA_HOST=1
 ```
 
-`load_weights`：将 `[layer_begin, layer_end)` 权拷到连续 blob；`engine_fwd_block_at` 从 blob 读权。ARCH_QWEN35 暂拒 CUDA。
+真 CUDA 产物：`build/avx2-cuda/yllm`（链 `-lcudart -lcublas`，编 `cuda_kernels.cu`）。
+
+`load_weights`（GPU）：`[layer_begin, layer_end)` 线性槽解到 **FP32**（对齐 CPU Q4 路径；TinyLlama ~4GB 显存）；norm/bias 上 F32；分配 `d_kv` 与激活。GEMV 用 `cublasSgemv`。ARCH_QWEN35 暂拒。后续可再压回 FP16 权。
 
 ## 11. 与 mmap 流式文档的关系
 

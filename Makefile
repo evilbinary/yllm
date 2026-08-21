@@ -40,6 +40,15 @@ ifeq ($(YLLM_CUDA),1)
   endif
 endif
 
+# 真 CUDA 时由 nvcc 编译的 .cu(host-shim 不编)
+CUDA_CU_OBJ :=
+CUDA_CU_OBJ_AVX2 :=
+ifeq ($(YLLM_CUDA),1)
+  ifneq ($(YLLM_CUDA_HOST),1)
+    CUDA_CU_SRC := inference/cuda_kernels.cu
+  endif
+endif
+
 # ---- OS 检测 (Windows: MSYS2/MinGW 的 uname 会带 MINGW/MSYS, 也归为 Windows) ----
 ifneq ($(OS),Windows_NT)
 UNAME_S := $(shell uname -s 2>/dev/null)
@@ -91,12 +100,16 @@ ifeq ($(YLLM_CUDA),1)
     CFLAGS_BASE += -DYLLM_CUDA=1 -DYLLM_CUDA_HOST=1
   else
     CFLAGS_BASE += -DYLLM_CUDA=1
-    LIBS += -lcudart
+    LIBS += -lcudart -lcublas
   endif
 endif
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o $(OBJDIR)/status.o $(OBJDIR)/ctl.o $(OBJDIR)/sync.o
+ifneq ($(CUDA_CU_SRC),)
+  CUDA_CU_OBJ := $(CUDA_CU_SRC:inference/%.cu=$(OBJDIR)/%.o)
+  OBJ += $(CUDA_CU_OBJ)
+endif
 OBJ           := $(sort $(OBJ))
 
 # ---- AVX2 版本(仅 x86_64; 其余架构退化为标量, 保持 target 可用) ----
@@ -105,6 +118,10 @@ LDFLAGS_AVX2  :=
 OBJDIR_AVX2   := build/avx2
 BIN_AVX2      := build/avx2/yllm$(EXE)
 OBJ_AVX2      := $(SRC:inference/%.c=$(OBJDIR_AVX2)/%.o) $(OBJDIR_AVX2)/main.o $(OBJDIR_AVX2)/rank.o $(OBJDIR_AVX2)/server.o $(OBJDIR_AVX2)/router.o $(OBJDIR_AVX2)/supervisor.o $(OBJDIR_AVX2)/hub.o $(OBJDIR_AVX2)/router_http.o $(OBJDIR_AVX2)/status.o $(OBJDIR_AVX2)/ctl.o $(OBJDIR_AVX2)/sync.o
+ifneq ($(CUDA_CU_SRC),)
+  CUDA_CU_OBJ_AVX2 := $(CUDA_CU_SRC:inference/%.cu=$(OBJDIR_AVX2)/%.o)
+  OBJ_AVX2 += $(CUDA_CU_OBJ_AVX2)
+endif
 OBJ_AVX2      := $(sort $(OBJ_AVX2))
 ifeq ($(ARCH),x86_64)
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma -mf16c
@@ -126,6 +143,11 @@ $(BIN_AVX2): $(OBJ_AVX2)
 
 $(OBJDIR)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h inference/device.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -c -o $@ $<
+
+ifneq ($(CUDA_CU_SRC),)
+$(OBJDIR)/%.o: inference/%.cu inference/cuda_kernels.h | $(OBJDIR)
+	$(NVCC) -O2 -std=c++14 -Xcompiler -fPIC -Iinference -c -o $@ $<
+endif
 
 $(OBJDIR)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) -Iinference -Iserve -c -o $@ $<
@@ -158,6 +180,11 @@ $(OBJDIR)/router_http.o: serve/router_http.c serve/router_http.h serve/router.h 
 
 $(OBJDIR_AVX2)/%.o: inference/%.c inference/yllm.h inference/llf.h inference/convert.h inference/matvec.h inference/dist.h inference/device.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -c -o $@ $<
+
+ifneq ($(CUDA_CU_SRC),)
+$(OBJDIR_AVX2)/%.o: inference/%.cu inference/cuda_kernels.h | $(OBJDIR_AVX2)
+	$(NVCC) -O2 -std=c++14 -Xcompiler "-fPIC $(filter -mavx2 -mfma -mf16c,$(CFLAGS_AVX2))" -Iinference -c -o $@ $<
+endif
 
 $(OBJDIR_AVX2)/main.o: main.c inference/yllm.h inference/dist.h inference/log.h serve/rank.h | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) -Iinference -Iserve -c -o $@ $<
@@ -297,7 +324,7 @@ gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 # ---- CUDA: 独立目录构建 + 设备冒烟 ----
-# 有 nvcc → 真 CUDA runtime(managed 权 + CPU 算子过渡); 无 nvcc → host-shim
+# 有 nvcc → FP16 权 + cublas decode; 无 nvcc → host-shim
 cuda:
 	$(MAKE) avx2 YLLM_CUDA=1 OBJDIR_AVX2=$(OBJDIR_CUDA) BIN_AVX2=$(BIN_CUDA)
 

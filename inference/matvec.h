@@ -44,4 +44,9 @@ void swiglu(float* y, const float* gate, const float* up, uint32_t n);
 void q4k_block(float* y, const uint8_t* blk, uint32_t stride);
 float q6k_val(const uint8_t* blk, uint32_t e);
 
+/* 整矩阵解量化为 FP16 行主序 [out × in](CUDA load_weights 用) */
+int dequant_mat_f16(uint16_t* dst, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype);
+/* 整矩阵解量化为 FP32 行主序 */
+int dequant_mat_f32(float* dst, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype);
+
 #endif

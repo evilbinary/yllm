@@ -41,6 +41,14 @@ Device* device_create(DeviceKind kind, int device_id, char* err, size_t errlen);
 /* 设备权 blob 内一层基址(仅 DEV_CUDA load_weights 后有效; 否则 NULL) */
 const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer);
 
+/* 真 GPU decode 路径(FP16+cublas); host-shim 返回 0 */
+int cuda_gpu_compute(const Engine* e);
+/* prefill(CPU) 之后把 host KV/激活同步到设备 */
+void cuda_after_prefill(Engine* e, uint32_t n_pos);
+int cuda_embed(Engine* e, uint32_t token);
+int cuda_final_norm(Engine* e);
+int cuda_lm_head(Engine* e);
+
 /* 仅 free(Device*); 设备资源须先 free_dev */
 void device_destroy(Device* d);
 

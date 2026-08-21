@@ -1103,6 +1103,9 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     const LlfHeader* h = &m->h;
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
     if (i == 0) {
+        if (cuda_gpu_compute(e) && cuda_embed(e, token) == 0) {
+            /* GPU embed */
+        } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
         switch (tm->dtype) {
         case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
@@ -1111,6 +1114,7 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         case DT_Q5K: embed_q5k(e->x, base + tm->offset, token, h->hidden); break;
         case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
         default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
+        }
         }
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
         e->fwd_block(e, i, pos);
@@ -1121,11 +1125,18 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     } else if (e->mtp_layer && i == e->mtp_layer) {
         /* MTP 块不进主干, 仅 MTP 预测时使用 */
     } else if (i == h->n_blocks + 1) {
+        if (cuda_gpu_compute(e) && cuda_final_norm(e) == 0) {
+            /* GPU final norm */
+        } else {
         float eps;
         memcpy(&eps, &h->norm_eps_bits, 4);
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
         rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
+        }
     } else {
+        if (cuda_gpu_compute(e) && cuda_lm_head(e) == 0) {
+            /* GPU lm_head */
+        } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
         if (tm->ndim == 2 && tm->size >= (uint64_t)h->hidden * 4) {
 #if YLLM_TENSOR_STREAM
@@ -1166,6 +1177,7 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
             case DT_IQ4XS: matmul_iq4xs(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
             default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
             }
+        }
         }
     }
 }
@@ -1551,6 +1563,8 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
             return -1;
         }
         engine_forward_prefill(e, prompt, nprompt, 0);
+        if (cuda_gpu_compute(e))
+            cuda_after_prefill(e, (uint32_t)nprompt);
         pos = (uint32_t)nprompt;
     }
 #else

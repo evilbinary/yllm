@@ -388,6 +388,102 @@ void embed_q5k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
     }
 }
 
+int dequant_mat_f16(uint16_t* dst, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
+{
+    float* row = (float*)malloc((size_t)in * sizeof(float));
+    if (!row) return -1;
+    uint32_t oo;
+    uint32_t nb = in / 256;
+    for (oo = 0; oo < out; oo++) {
+        uint16_t* drow = dst + (size_t)oo * in;
+        if (dtype == DT_F16) {
+            memcpy(drow, (const uint16_t*)w + (size_t)oo * in, (size_t)in * 2);
+            continue;
+        }
+        if (dtype == DT_F32) {
+            f32_to_f16_buf((const float*)w + (size_t)oo * in, drow, in);
+            continue;
+        }
+        if (dtype == DT_BF16) {
+            uint32_t i;
+            const uint16_t* bp = (const uint16_t*)w + (size_t)oo * in;
+            for (i = 0; i < in; i++) row[i] = f16_to_f32(bf16_to_f16(bp[i]));
+            f32_to_f16_buf(row, drow, in);
+            continue;
+        }
+        if (in % 256 != 0) { free(row); return -1; }
+        uint32_t b;
+        if (dtype == DT_Q4K) {
+            const uint8_t* r = w + (size_t)oo * nb * 144;
+            for (b = 0; b < nb; b++) q4k_block(row + (size_t)b * 256, r + (size_t)b * 144, 0);
+        } else if (dtype == DT_Q6K) {
+            const uint8_t* r = w + (size_t)oo * nb * 210;
+            for (b = 0; b < nb; b++) q6k_block(row + (size_t)b * 256, r + (size_t)b * 210);
+        } else if (dtype == DT_Q5K) {
+            const uint8_t* r = w + (size_t)oo * nb * 176;
+            for (b = 0; b < nb; b++) q5k_block(row + (size_t)b * 256, r + (size_t)b * 176);
+        } else if (dtype == DT_IQ4XS) {
+            const uint8_t* r = w + (size_t)oo * nb * 144;
+            for (b = 0; b < nb; b++) {
+                const uint8_t* blk = r + (size_t)b * 144;
+                iq4xs_block(row + (size_t)b * 256, blk, f16_to_f32(((const uint16_t*)blk)[0]));
+            }
+        } else {
+            free(row);
+            return -1;
+        }
+        f32_to_f16_buf(row, drow, in);
+    }
+    free(row);
+    return 0;
+}
+
+int dequant_mat_f32(float* dst, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
+{
+    uint32_t oo;
+    uint32_t nb = in / 256;
+    for (oo = 0; oo < out; oo++) {
+        float* drow = dst + (size_t)oo * in;
+        if (dtype == DT_F32) {
+            memcpy(drow, (const float*)w + (size_t)oo * in, (size_t)in * 4);
+            continue;
+        }
+        if (dtype == DT_F16) {
+            const uint16_t* wp = (const uint16_t*)w + (size_t)oo * in;
+            uint32_t i;
+            for (i = 0; i < in; i++) drow[i] = f16_to_f32(wp[i]);
+            continue;
+        }
+        if (dtype == DT_BF16) {
+            const uint16_t* bp = (const uint16_t*)w + (size_t)oo * in;
+            uint32_t i;
+            for (i = 0; i < in; i++) drow[i] = f16_to_f32(bf16_to_f16(bp[i]));
+            continue;
+        }
+        if (in % 256 != 0) return -1;
+        uint32_t b;
+        if (dtype == DT_Q4K) {
+            const uint8_t* r = w + (size_t)oo * nb * 144;
+            for (b = 0; b < nb; b++) q4k_block(drow + (size_t)b * 256, r + (size_t)b * 144, 0);
+        } else if (dtype == DT_Q6K) {
+            const uint8_t* r = w + (size_t)oo * nb * 210;
+            for (b = 0; b < nb; b++) q6k_block(drow + (size_t)b * 256, r + (size_t)b * 210);
+        } else if (dtype == DT_Q5K) {
+            const uint8_t* r = w + (size_t)oo * nb * 176;
+            for (b = 0; b < nb; b++) q5k_block(drow + (size_t)b * 256, r + (size_t)b * 176);
+        } else if (dtype == DT_IQ4XS) {
+            const uint8_t* r = w + (size_t)oo * nb * 144;
+            for (b = 0; b < nb; b++) {
+                const uint8_t* blk = r + (size_t)b * 144;
+                iq4xs_block(drow + (size_t)b * 256, blk, f16_to_f32(((const uint16_t*)blk)[0]));
+            }
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out)
 {
     const float* wp = (const float*)w;

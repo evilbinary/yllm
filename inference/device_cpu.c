@@ -76,3 +76,39 @@ void device_destroy(Device* d)
 {
     free(d);
 }
+
+#ifndef YLLM_CUDA
+/* 无 CUDA 构建时的桩, 避免 engine 链接失败 */
+const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer)
+{
+    (void)e;
+    (void)layer;
+    return NULL;
+}
+int cuda_gpu_compute(const Engine* e)
+{
+    (void)e;
+    return 0;
+}
+void cuda_after_prefill(Engine* e, uint32_t n_pos)
+{
+    (void)e;
+    (void)n_pos;
+}
+int cuda_embed(Engine* e, uint32_t token)
+{
+    (void)e;
+    (void)token;
+    return -1;
+}
+int cuda_final_norm(Engine* e)
+{
+    (void)e;
+    return -1;
+}
+int cuda_lm_head(Engine* e)
+{
+    (void)e;
+    return -1;
+}
+#endif
