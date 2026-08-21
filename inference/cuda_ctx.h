@@ -29,6 +29,19 @@ typedef struct {
     uint64_t n_f16;             /* FP16 元素数 */
     uint64_t n_f32;
 
+    /* 流式上权: host 打包常驻; 设备缓冲 = 单层峰值; off_* 为当前驻留层的设备偏移 */
+    uint8_t* h_q4;
+    uint16_t* h_f16;
+    float* h_f32;
+    uint64_t* host_off_q4;
+    uint64_t* host_off_f16;
+    uint64_t* host_off_f32;
+    int stream_w;
+    uint32_t stream_layer;      /* 当前在设备上的层; ~0u = 无 */
+    uint64_t max_layer_q4;
+    uint64_t max_layer_f16;
+    uint64_t max_layer_f32;
+
     uint32_t n_layers;
     uint16_t* kv_blob;          /* device KV 或 shim 下 NULL */
     size_t kv_bytes;

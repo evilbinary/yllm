@@ -1108,6 +1108,14 @@ void engine_attach_cpu_fwd(Engine* e)
     }
 }
 
+/* 单层是否走 CUDA(含单进程 gpu_layer_end 混合切分) */
+static int layer_on_cuda(const Engine* e, uint32_t i)
+{
+    if (e->device_mode != DEV_MODE_CUDA) return 0;
+    if (!e->gpu_layer_end) return 1;
+    return i < e->gpu_layer_end;
+}
+
 /* 单层前向(含 embed / block / final norm / head 分派) */
 static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
 {
@@ -1115,9 +1123,10 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
+    int on_cuda = layer_on_cuda(e, i);
     if (i == 0) {
-        if (e->device_mode == DEV_MODE_CUDA && cuda_embed(e, token) == 0) {
-            /* GPU embed */
+        if (on_cuda && cuda_embed(e, token) == 0) {
+            /* GPU embed: d_x 已权威 */
         } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
         switch (tm->dtype) {
@@ -1128,9 +1137,19 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
         case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
         default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
         }
+        cuda_mark_x_host(e); /* CPU embed → 下次 GPU 块从 e->x H2D */
         }
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
-        e->fwd_block(e, i, pos);
+        if (on_cuda) {
+            e->fwd_block(e, i, pos);
+        } else {
+            /* CPU 段: 先把 GPU 激活拉回(若刚跨过切分点) */
+            if (e->device_mode == DEV_MODE_CUDA) {
+                cuda_sync_x_to_host(e);
+                cuda_mark_x_host(e);
+            }
+            engine_fwd_block_at(e, i, pos, base, e->kv);
+        }
         if (e->mtp_h && i == (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
             cuda_sync_x_to_host(e);
             memcpy(e->mtp_h, e->x, (size_t)h->hidden * 4);
@@ -1139,18 +1158,26 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     } else if (e->mtp_layer && i == e->mtp_layer) {
         /* MTP 块不进主干, 仅 MTP 预测时使用 */
     } else if (i == h->n_blocks + 1) {
-        if (e->device_mode == DEV_MODE_CUDA && cuda_final_norm(e) == 0) {
+        if (on_cuda && cuda_final_norm(e) == 0) {
             /* GPU final norm */
         } else {
+        if (e->device_mode == DEV_MODE_CUDA) {
+            cuda_sync_x_to_host(e);
+            cuda_mark_x_host(e);
+        }
         float eps;
         memcpy(&eps, &h->norm_eps_bits, 4);
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
         rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
         }
     } else {
-        if (e->device_mode == DEV_MODE_CUDA && cuda_lm_head(e) == 0) {
+        if (on_cuda && cuda_lm_head(e) == 0) {
             /* GPU lm_head */
         } else {
+        if (e->device_mode == DEV_MODE_CUDA) {
+            cuda_sync_x_to_host(e);
+            cuda_mark_x_host(e);
+        }
         const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
         if (tm->ndim == 2 && tm->size >= (uint64_t)h->hidden * 4) {
 #if YLLM_TENSOR_STREAM
@@ -1207,6 +1234,16 @@ void engine_set_layers(Engine* e, uint32_t begin, uint32_t end)
     e->layer_end = end;
 }
 
+void engine_set_gpu_layers(Engine* e, int n_blocks)
+{
+    if (!e || n_blocks < 0) return;
+    uint32_t nb = e->ws.model.h.n_blocks;
+    if ((uint32_t)n_blocks >= nb)
+        e->gpu_layer_end = 0; /* 全段走 device */
+    else
+        e->gpu_layer_end = 1u + (uint32_t)n_blocks; /* embed + n_blocks 个块 */
+}
+
 /* 分布式分片前向: 只处理 [layer_begin, layer_end) 区间。
  * need_embed=1 时先用 token 做 embed(rank0); e->x 须在调用前含输入(中段 rank 由
  * 上层 recv 填充)。x_out/logits_out 非空时分别拷贝输出激活/最终 logits。 */
@@ -1228,6 +1265,9 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
         /* embed 只在 prefill 用一次, 受限模式下算完即释放 */
         if (ws->budget > 0) ws_release(ws, 0);
 #endif
+    } else if (!need_embed) {
+        /* PP 中段等: 调用方已把激活写入 e->x, 设备侧可能仍是旧 d_x */
+        cuda_mark_x_host(e);
     }
     for (i = e->layer_begin; i < e->layer_end; i++) {
         if (i == 0) continue; /* embed 已在上方处理 */
@@ -1310,6 +1350,17 @@ int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32
     uint32_t hidden = h->hidden;
     uint32_t B = e->pb_cap ? e->pb_cap : 16;
     if (n < 1 || (uint32_t)n > B) return -1;
+    /* CUDA: fwd_block_batch 读 d_pb, 不能走 host e->pb 嵌入; 逐 token range 保正确 */
+    if (e->device_mode == DEV_MODE_CUDA) {
+        int i;
+        for (i = 0; i < n; i++) {
+            if (engine_forward_range(e, tokens[i], 1, pos + (uint32_t)i,
+                                     x_out ? x_out + (size_t)i * hidden : NULL,
+                                     NULL) != 0)
+                return -1;
+        }
+        return 0;
+    }
     if (e->layer_begin == 0) {
         uint32_t hidx0 = m->base_idx[0];
         const LlfTensorMeta* tm = &m->metas[hidx0];
@@ -1346,6 +1397,29 @@ int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32
 int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
                            float* x_out, float* logits_out)
 {
+    if (e->device_mode == DEV_MODE_CUDA) {
+        if (cuda_forward_batch_x(e, xin, n, pos, x_out, logits_out) == 0)
+            return 0;
+        /* 回退: 逐 token GPU/CPU 路径 */
+        uint32_t hidden = e->ws.model.h.hidden;
+        int i;
+        for (i = 0; i < n; i++) {
+            memcpy(e->x, xin + (size_t)i * hidden, (size_t)hidden * 4);
+            cuda_mark_x_host(e);
+            if (i + 1 == n && logits_out) {
+                if (engine_forward_range(e, 0, 0, pos + (uint32_t)i, NULL, logits_out) != 0)
+                    return -1;
+            } else if (x_out) {
+                if (engine_forward_range(e, 0, 0, pos + (uint32_t)i,
+                                        x_out + (size_t)i * hidden, NULL) != 0)
+                    return -1;
+            } else {
+                if (engine_forward_range(e, 0, 0, pos + (uint32_t)i, NULL, NULL) != 0)
+                    return -1;
+            }
+        }
+        return 0;
+    }
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;

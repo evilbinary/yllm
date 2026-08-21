@@ -28,6 +28,8 @@ budget: 1024MB            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n
 # device: cpu              # 推理设备: cpu | cuda(见 docs/design-gpu-inference.md)
 # gpu: 0                   # CUDA device index
 # gpu-weights: auto        # CUDA 线性权: auto|q4k(原生省显存) | fp16(解量化更快)
+# gpu-layers: -1           # 单进程混合: 前 N 个 transformer block(+embed) 在 GPU, 其余 CPU; -1=全 GPU
+# gpu-stream: 0            # 1=权常驻 host 打包, 按层 prefetch H2D(省显存、多 H2D)
 
 # 拓扑
 sv-host: 127.0.0.1     # supervisor 地址(rank/server 心跳目标)

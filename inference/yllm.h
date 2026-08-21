@@ -156,6 +156,11 @@ typedef struct Engine {
     int weights_ready;       /* load_weights 成功 */
     DeviceMode device_mode;  /* 实际前向路径; load_weights / bind 时置位 */
     CudaWeightMode cuda_wmode; /* CUDA 线性权: auto|q4k|fp16; bind 前设置 */
+    /* 单进程混合: 0 = 本段全在 device_mode 上; >0 = 层 [layer_begin, gpu_layer_end) 用 CUDA,
+     * [gpu_layer_end, layer_end) 用 CPU(须先 bind CUDA)。PP 多 rank 时一般保持 0。 */
+    uint32_t gpu_layer_end;
+    /* 1 = 权常驻 host 打包缓冲, 按层 H2D(prefetch_layer); 0 = load 时整段上卡 */
+    int cuda_stream_w;
 } Engine;
 
 typedef struct {
@@ -182,6 +187,8 @@ int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,
                          float* x_out, float* logits_out);
 void engine_set_layers(Engine* e, uint32_t begin, uint32_t end);
+/* 单进程混合: 前 n_blocks 个 transformer 块(+embed) 在 GPU; n_blocks>=模型块数则全 GPU(gpu_layer_end=0) */
+void engine_set_gpu_layers(Engine* e, int n_blocks);
 int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* rng, uint32_t* out);
 /* 批量 matmul(批量 prefill): y[B×out] = x[B×in] · W^T */
 void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in,

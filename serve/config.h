@@ -87,6 +87,8 @@ typedef struct {
     char device[32];        /* cpu | cuda(见 docs/design-gpu-inference.md) */
     int gpu;                /* CUDA device index(默认 0) */
     char gpu_weights[16];   /* auto | q4k | fp16(CUDA 线性权上卡格式) */
+    int gpu_layers;         /* -1=全 GPU; >=0 单进程混合: 前 N 个 block(+embed) 在 GPU */
+    int gpu_stream;         /* 1=权常驻 host, 按层 H2D(prefetch) */
 
     /* 客户端模式(router --send) */
     char send[CFG_STR_MAX];
@@ -168,6 +170,8 @@ static inline void config_defaults(ServeConfig* c)
     snprintf(c->device, sizeof(c->device), "cpu");
     c->gpu = 0;
     snprintf(c->gpu_weights, sizeof(c->gpu_weights), "auto");
+    c->gpu_layers = -1;
+    c->gpu_stream = 0;
     c->api_log = 1;   /* 默认开启 */
 }
 
@@ -273,6 +277,10 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->gpu = atoi(val);
     } else if (strcmp(key, "gpu-weights") == 0 || strcmp(key, "gpu_weights") == 0) {
         snprintf(c->gpu_weights, sizeof(c->gpu_weights), "%s", val);
+    } else if (strcmp(key, "gpu-layers") == 0 || strcmp(key, "gpu_layers") == 0) {
+        c->gpu_layers = atoi(val);
+    } else if (strcmp(key, "gpu-stream") == 0 || strcmp(key, "gpu_stream") == 0) {
+        c->gpu_stream = atoi(val);
     } else if (strcmp(key, "send") == 0) {
         snprintf(c->send, sizeof(c->send), "%s", val);
     } else if (strcmp(key, "only-model") == 0) {

@@ -1,6 +1,6 @@
 # yllm GPU 推理设计方案
 
-版本：v0.4 ｜ 状态：P3 核心项已落地 ｜ 关联：`design-mmap-layer-streaming.md`
+版本：v0.5 ｜ 状态：P3 + 混合路径已落地 ｜ 关联：`design-mmap-layer-streaming.md`
 
 ## 1. 目标与边界
 
@@ -10,6 +10,7 @@
 | 保留 LLF 量化权重（Q4_K 等） | Tensor Parallel |
 | Prefill B≤64 / Decode B=1 与现网一致 | OpenCL / Vulkan 双栈 |
 | 多卡复用现有 Pipeline Parallel（`dist.c`） | 立刻改 router / 会话协议 |
+| GPU↔CPU 混合（PP / 单进程层切 / 权流式） | 双缓冲异步 prefetch |
 
 **原则：** serve / dist / sample 仍只调 `engine_forward*`；设备细节关在 `Device` + `fwd_block(_batch)` 里。
 
@@ -24,125 +25,82 @@
 ┌───────────────────────▼─────────────────────────────────┐
 │  Device (cpu | cuda)                                    │
 │  - load_weights：本 rank 权重上设备（常驻或建流式通道）   │
-│  - prefetch_layer / release_layer（大模型可选）          │
+│  - prefetch_layer / release_layer（--gpu-stream）       │
 │  - 挂接 fwd_block / fwd_block_batch                     │
 │  - KV + activations 在设备上（CUDA）；CPU 即现有堆缓冲   │
 └─────────────────────────────────────────────────────────┘
 │  host: LLF mmap（只读视图仍保留）                        │
 ```
 
-插入点优先级：
-
-1. `Engine.fwd_block` / `fwd_block_batch` — 整层图上 GPU  
-2. `matvec` 内核族 — 先 `matmul` / `matmul_batch`  
-3. KV → 设备分配（与 mmap 流式文档一致：KV 不跟 mmap）
-
 ## 3. 命名约定
 
 | 符号 | 职责 |
 |------|------|
-| **`load_weights`** | 把本 Engine 要用的权准备到设备（常驻拷贝，或建双缓冲通道）。**不用** `upload_weights` |
-| `prefetch_layer` | （可选）算前预取下一层 |
-| `release_layer` | （可选）流式时释放上一层设备侧权重 |
-| `fwd_block` / `fwd_block_batch` | 算，不负责拷权重 |
+| **`load_weights`** | 把本 Engine 要用的权准备到设备（常驻拷贝，或建单层缓冲+host 打包）。**不用** `upload_weights` |
+| `prefetch_layer` | 流式：把一层权 H2D 到单层缓冲 |
+| `release_layer` | 流式：作废当前驻留层设备偏移 |
+| `fwd_block` / `fwd_block_batch` | 算，不负责拷权重（流式时入口先 prefetch） |
 | `engine_bind_device` | 创建/切换 Device，并调用 `load_weights` |
+| `cuda_mark_x_host` | host 已写 `e->x`：清 `x_on_dev`，下次 fwd 再 H2D（PP 收包必用） |
 
 ## 4. 重点数据结构
 
 ```c
 typedef enum { DEV_CPU = 0, DEV_CUDA = 1 } DeviceKind;
 typedef enum {
-    DEV_MODE_CPU = 0,        /* 主机 mmap + CPU */
-    DEV_MODE_CUDA_HOST = 1,  /* --device cuda 但 host-shim */
-    DEV_MODE_CUDA = 2        /* 真 CUDA kernel / cublas */
+    DEV_MODE_CPU = 0,
+    DEV_MODE_CUDA_HOST = 1,
+    DEV_MODE_CUDA = 2
 } DeviceMode;
 
-/* Engine 增量 */
 Device*    dev;
-void*      d_kv;
-void*      w_dev;
-int        weights_ready;
-DeviceMode device_mode;   /* load_weights / bind 置位; 前向用此判断路径 */
+DeviceMode device_mode;
+CudaWeightMode cuda_wmode;   /* auto|q4k|fp16 */
+uint32_t   gpu_layer_end;    /* 0=全段 device; >0 → [begin,end) 中仅 < gpu_layer_end 走 CUDA */
+int        cuda_stream_w;    /* 1=权 host 打包 + 按层 prefetch */
 ```
 
-`DeviceKind` = 绑定的后端；`device_mode` = 实际怎么算。
+## 5. 混合路径
 
-## 5. `load_weights` 语义
+### 5.1 PP：GPU rank + CPU rank
 
-- **时机：** `engine_init` 末尾默认绑 CPU 并调用；`dist_split_layers` 之后再调一次（本 rank 层区间已定）。  
-- **范围：** 只准备 `[layer_begin, layer_end)`。  
-- **CPU：** 空操作（或别名 host 指针），`weights_ready = 1`。  
-- **CUDA（后续）：** 按层 H2D；小模型全常驻；大模型可只建双缓冲，真正拷贝进 `prefetch_layer`。
+- 各 rank 独立 `--device`；`engine_forward_range` 末尾 `x_out` 经 `cuda_sync_x_to_host`。
+- **收激活后** `cuda_mark_x_host`（`dist` 写 `e->x` / `need_embed=0`），避免旧 `d_x` 被当成权威。
+- GPU 中/末段批路径：`cuda_forward_batch_x`（失败则逐 token 回退）。
 
-## 6. 初始化流水线
+### 5.2 单进程层切
 
-```text
-engine_init
-  └─ wmap_open / 分配 host kv·x·pb …
-  └─ 按 arch 挂 CPU fwd_block
-  └─ engine_bind_device(DEV_CPU) → load_weights
+- `--gpu-layers N`：embed + 前 N 个 transformer block 在 GPU，其后层 CPU（KV 按层分设备）。
+- `N >= n_blocks` 或省略 → 全 GPU（`gpu_layer_end=0`）。
+- `load_weights` 只上卡 `[layer_begin, gpu_layer_end)`；切点处 `sync_x` 再进 CPU 块。
 
-[可选] dist_split_layers → load_weights 再入（刷新本段）
+### 5.3 权流式（CPU 常驻 / GPU 算）
 
-[可选] engine_bind_device(DEV_CUDA, gpu_id) → load_weights
-        └─ 替换 fwd_block 为 CUDA 实现
-```
+- `--gpu-stream 1`：host 保留打包 Q4/F16/F32；设备只开**单层峰值**缓冲。
+- 每层 fwd 前 `prefetch_layer`；显存权 ≈ 一层，代价是层间同步 H2D。
 
-CLI / 配置：
+## 6. CLI / 配置
 
-- `--device cpu|cuda`（默认 `cpu`）  
-- `--gpu N`（默认 `0`）  
-- `serve.yaml`：顶层或模型级 `device` / `gpu`
+- `--device cpu|cuda`、`--gpu N`、`--gpu-weights auto|q4k|fp16`
+- `--gpu-layers N`、`--gpu-stream 0|1`
+- `serve.yaml`：同名键
 
-## 7. 前向与采样边界
-
-- 控制流：`engine_forward` / `engine_forward_prefill` **不改**；只换函数指针实现。  
-- 采样：lm_head 后 **logits D2H 一次**，仍走现有 `engine_sample`。  
-- 会话 KV 落盘：`.rN.kv` 格式不变；CUDA 路径 save/load 时 D2H / H2D。
-
-## 8. 多卡
-
-沿用 PP：一 rank 一进程一 GPU；激活帧 transport 后期由 TCP 换 peer copy。不上 TP。
-
-## 9. 文件布局
-
-```text
-inference/device.h
-inference/device_cpu.c       # CPU: load_weights 空操作
-inference/device_cuda.c      # CUDA: shim / GPU FP32 解量化上卡
-inference/cuda_fwd.c         # fwd_block + embed/norm/head; 激活常驻设备
-inference/cuda_kernels.cu    # rmsnorm/rope/attn/swiglu + cublasSgemv
-inference/cuda_kernels.h
-inference/cuda_ctx.h
-docs/design-gpu-inference.md
-```
-
-## 10. 分阶段
+## 7. 分阶段
 
 | 阶段 | 内容 |
 |------|------|
-| **P0** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device` |
-| **P1** | `device_cuda` + raw blob `load_weights`；host-shim 可测通路径 |
-| **P2** | Decode：线性权上卡 + cublas + 小 kernel；`device_mode`；激活常驻 `d_x`；GPU 逐 token prefill |
-| **P3（进行中）** | ✅ FP16 权；✅ GPU batch prefill；✅ 原生 Q4_K；✅ **Flash 风格 attn**（online-softmax，无 O(seq) score 缓冲） |
+| **P0–P2** | Device / host-shim / decode FP16·激活常驻 |
+| **P3** | ✅ Q4_K；✅ batch prefill；✅ flash-style attn |
+| **混合** | ✅ PP `x_on_dev`；✅ `--gpu-layers`；✅ `--gpu-stream` |
 
 ### 构建
 
 ```bash
 make cuda
 make gen-cuda CHAT_PROMPT=Hi CHAT_TOKENS=16
-# 权格式: GPU_WEIGHTS=fp16|q4k|auto (默认 auto=原生 Q4_K)
-# make gen-cuda GPU_WEIGHTS=fp16
-# 数值对齐: --temp 0 对比 --device cpu
-# 无 nvcc: 自动 host-shim; 强制 shim: make cuda YLLM_CUDA_HOST=1
+# GPU_WEIGHTS=fp16|q4k|auto
+# 混合例: --device cuda --gpu-layers 8
+# 流式例: --device cuda --gpu-stream 1
 ```
 
-真 CUDA 产物：`build/avx2-cuda/yllm`（链 `-lcudart -lcublas`，编 `cuda_kernels.cu`）。
-
-`load_weights`（GPU）：`--gpu-weights auto|q4k|fp16`（默认 auto）。`auto`/`q4k`：`DT_Q4K` 原生上卡，其余解 FP16；`fp16`：全部线性权解量化（更快、更费显存）。ARCH_QWEN35 暂拒。
-
-## 11. 与 mmap 流式文档的关系
-
-- Host mmap 仍是权重权威视图与冷启动手段。  
-- GPU 路径：`load_weights` 从 mmap 视图拷到设备（或双缓冲）；**KV 始终独立分配**（见 `design-mmap-layer-streaming.md` §3.4）。  
-- CPU `budget` / `ws_release` 逻辑在 `DEV_CPU` 下不变；`DEV_CUDA` 的显存水位另计（P1+）。
+真 CUDA：`build/avx2-cuda/yllm`。ARCH_QWEN35 暂拒。

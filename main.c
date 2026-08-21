@@ -208,9 +208,11 @@ static int cmd_gen(int argc, char** argv)
     const char* device_s = opt(a, n, "device", "cpu");
     int gpu_id = atoi(opt(a, n, "gpu", "0"));
     const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
+    const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
+    int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16]\n");
+        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1]\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -247,6 +249,9 @@ static int cmd_gen(int argc, char** argv)
             vocab_free(&v);
             return 1;
         }
+        if (gpu_layers_s)
+            engine_set_gpu_layers(&e, atoi(gpu_layers_s));
+        e.cuda_stream_w = gpu_stream ? 1 : 0;
         if (dk != DEV_CPU) {
             if (engine_bind_device(&e, dk, gpu_id, err, sizeof(err)) != 0) {
                 fprintf(stderr, "bind device failed: %s\n", err);
@@ -367,9 +372,11 @@ static int cmd_chat(int argc, char** argv)
     const char* device_s = opt(a, n, "device", "cpu");
     int gpu_id = atoi(opt(a, n, "gpu", "0"));
     const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
+    const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
+    int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -401,6 +408,9 @@ static int cmd_chat(int argc, char** argv)
             vocab_free(&v);
             return 1;
         }
+        if (gpu_layers_s)
+            engine_set_gpu_layers(&e, atoi(gpu_layers_s));
+        e.cuda_stream_w = gpu_stream ? 1 : 0;
         if (dk != DEV_CPU) {
             if (engine_bind_device(&e, dk, gpu_id, err, sizeof(err)) != 0) {
                 fprintf(stderr, "bind device failed: %s\n", err);

@@ -33,6 +33,14 @@ static int cuda_fwd_block_shim(Engine* e, uint32_t layer, uint32_t pos)
 }
 
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
+static int ensure_stream_layer(Engine* e, uint32_t layer)
+{
+    if (!e->dev || !e->dev->prefetch_layer) return 0;
+    CudaCtx* ctx = cuda_get_ctx(e);
+    if (!ctx || !ctx->stream_w) return 0;
+    return e->dev->prefetch_layer(e, layer);
+}
+
 static int gemv(Engine* e, CudaCtx* ctx, float* y, uint32_t layer, uint32_t slot,
                 const float* x, char* err, size_t errlen)
 {
@@ -87,6 +95,7 @@ static int cuda_fwd_block_gpu(Engine* e, uint32_t layer, uint32_t pos)
 {
     CudaCtx* ctx = cuda_get_ctx(e);
     if (!ctx || e->device_mode != DEV_MODE_CUDA) return -1;
+    if (ensure_stream_layer(e, layer) != 0) return -1;
     char err[256];
     uint32_t hidden = ctx->hidden;
     uint32_t kv_dim = ctx->kv_dim;
@@ -162,6 +171,7 @@ static int cuda_fwd_block_batch_gpu(Engine* e, uint32_t layer, uint32_t pos_star
 {
     CudaCtx* ctx = cuda_get_ctx(e);
     if (!ctx || e->device_mode != DEV_MODE_CUDA || B == 0 || B > ctx->pb_cap) return -1;
+    if (ensure_stream_layer(e, layer) != 0) return -1;
 
     char err[256];
     uint32_t hidden = ctx->hidden;
@@ -260,10 +270,21 @@ void cuda_sync_x_to_host(Engine* e)
 #endif
 }
 
+void cuda_mark_x_host(Engine* e)
+{
+#if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
+    CudaCtx* ctx = cuda_get_ctx(e);
+    if (ctx) ctx->x_on_dev = 0;
+#else
+    (void)e;
+#endif
+}
+
 int cuda_embed(Engine* e, uint32_t token)
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode != DEV_MODE_CUDA) return -1;
+    if (ensure_stream_layer(e, 0) != 0) return -1;
     CudaCtx* ctx = cuda_get_ctx(e);
     uint32_t out = 0, in = 0;
     const uint8_t* eq = cuda_tensor_q4k(e, 0, SLOT_EMBED, &out, &in);
@@ -290,6 +311,7 @@ int cuda_final_norm(Engine* e)
     if (e->device_mode != DEV_MODE_CUDA) return -1;
     CudaCtx* ctx = cuda_get_ctx(e);
     uint32_t layer = ctx->n_blocks + 1;
+    if (ensure_stream_layer(e, layer) != 0) return -1;
     uint32_t n = 0;
     const float* w = cuda_tensor_f32(e, layer, 0, &n);
     if (!w) return -1;
@@ -313,6 +335,7 @@ int cuda_lm_head(Engine* e)
     CudaCtx* ctx = cuda_get_ctx(e);
     char err[256];
     uint32_t layer = ctx->n_blocks + 2;
+    if (ensure_stream_layer(e, layer) != 0) return -1;
     uint32_t out = 0, in = 0;
     if (!ctx->x_on_dev) {
         if (cuda_k_memcpy_h2d(ctx->d_x, e->x, (size_t)ctx->hidden * 4) != 0) return -1;
@@ -341,6 +364,8 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode != DEV_MODE_CUDA || !tokens || n <= 0) return -1;
+    /* 单进程层切混合: 全 GPU 批路径不适用, 交回逐 token */
+    if (e->gpu_layer_end) return -1;
     CudaCtx* ctx = cuda_get_ctx(e);
     if (!ctx || !ctx->d_pb || ctx->pb_cap == 0) return -1;
 
@@ -349,24 +374,28 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     const uint16_t* emb = eq ? NULL : cuda_tensor_f16w(e, 0, SLOT_EMBED, &out, &in);
     if (!eq && !emb) return -1;
 
-    uint32_t trunk = ctx->n_blocks - (e->mtp_layer ? 1u : 0u);
-    int off = 0;
-    while (off < n) {
-        uint32_t nb = (uint32_t)(n - off);
-        if (nb > ctx->pb_cap) nb = ctx->pb_cap;
+        uint32_t trunk = ctx->n_blocks - (e->mtp_layer ? 1u : 0u);
+        uint32_t layer_lo = e->layer_begin ? e->layer_begin : 1;
+        uint32_t layer_hi = e->layer_end;
+        if (layer_hi > trunk + 1) layer_hi = trunk + 1;
+        int off = 0;
+        while (off < n) {
+            uint32_t nb = (uint32_t)(n - off);
+            if (nb > ctx->pb_cap) nb = ctx->pb_cap;
 
-        if (cuda_k_memcpy_h2d(ctx->d_tokens, tokens + off, (size_t)nb * sizeof(uint32_t)) != 0)
-            return -1;
-        if (eq)
-            cuda_k_embed_q4k_batch(ctx->d_pb, eq, ctx->d_tokens, nb, ctx->hidden);
-        else
-            cuda_k_embed_f16_batch(ctx->d_pb, emb, ctx->d_tokens, nb, ctx->hidden);
-
-        uint32_t layer;
-        for (layer = 1; layer <= trunk; layer++) {
-            if (cuda_fwd_block_batch_gpu(e, layer, (uint32_t)(start_pos + off), nb) != 0)
+            if (cuda_k_memcpy_h2d(ctx->d_tokens, tokens + off, (size_t)nb * sizeof(uint32_t)) != 0)
                 return -1;
-        }
+            if (eq)
+                cuda_k_embed_q4k_batch(ctx->d_pb, eq, ctx->d_tokens, nb, ctx->hidden);
+            else
+                cuda_k_embed_f16_batch(ctx->d_pb, emb, ctx->d_tokens, nb, ctx->hidden);
+
+            uint32_t layer;
+            for (layer = layer_lo; layer < layer_hi && layer <= trunk; layer++) {
+                if (layer == 0) continue;
+                if (cuda_fwd_block_batch_gpu(e, layer, (uint32_t)(start_pos + off), nb) != 0)
+                    return -1;
+            }
 
         if (e->mtp_h) {
             if (cuda_k_memcpy_d2h(e->mtp_h,
@@ -392,6 +421,56 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     (void)tokens;
     (void)n;
     (void)start_pos;
+    return -1;
+#endif
+}
+
+int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
+                         float* x_out, float* logits_out)
+{
+#if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
+    if (e->device_mode != DEV_MODE_CUDA || !xin || n < 1) return -1;
+    if (e->gpu_layer_end) return -1; /* 混合层切: 走逐 token 回退 */
+    CudaCtx* ctx = cuda_get_ctx(e);
+    if (!ctx || !ctx->d_pb || (uint32_t)n > ctx->pb_cap) return -1;
+
+    uint32_t hidden = ctx->hidden;
+    uint32_t nb = (uint32_t)n;
+    if (cuda_k_memcpy_h2d(ctx->d_pb, xin, (size_t)nb * hidden * 4) != 0) return -1;
+
+    uint32_t trunk = ctx->n_blocks - (e->mtp_layer ? 1u : 0u);
+    uint32_t layer;
+    uint32_t begin = e->layer_begin ? e->layer_begin : 1;
+    uint32_t end = e->layer_end;
+    if (end > trunk + 1) end = trunk + 1; /* 先跑块; norm/head 另处理 */
+    for (layer = begin; layer < end && layer <= trunk; layer++) {
+        if (layer == 0) continue;
+        if (cuda_fwd_block_batch_gpu(e, layer, pos, nb) != 0) return -1;
+    }
+
+    if (x_out) {
+        if (cuda_k_memcpy_d2h(x_out, ctx->d_pb, (size_t)nb * hidden * 4) != 0) return -1;
+    }
+
+    if (logits_out) {
+        /* 末段: 最后 token → final norm + lm_head */
+        if (e->layer_end <= ctx->n_blocks) return -1;
+        if (cuda_k_memcpy_d2d(ctx->d_x, ctx->d_pb + (size_t)(nb - 1) * hidden,
+                              (size_t)hidden * 4) != 0)
+            return -1;
+        ctx->x_on_dev = 1;
+        if (cuda_final_norm(e) != 0) return -1;
+        if (cuda_lm_head(e) != 0) return -1;
+        memcpy(logits_out, e->logits, (size_t)ctx->vocab * 4);
+    }
+    return 0;
+#else
+    (void)e;
+    (void)xin;
+    (void)n;
+    (void)pos;
+    (void)x_out;
+    (void)logits_out;
     return -1;
 #endif
 }

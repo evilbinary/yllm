@@ -61,11 +61,16 @@ const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer);
 void cuda_after_prefill(Engine* e, uint32_t n_pos);
 /* 若激活只在设备上, 拉回 e->x(MTP / x_out 等) */
 void cuda_sync_x_to_host(Engine* e);
+/* host 已写入 e->x / 激活缓冲: 标记 d_x 失效, 下次 fwd 再 H2D(PP 收包后必调) */
+void cuda_mark_x_host(Engine* e);
 int cuda_embed(Engine* e, uint32_t token);
 int cuda_final_norm(Engine* e);
 int cuda_lm_head(Engine* e);
 /* GPU 批 prefill; 失败返回 -1(调用方回退) */
 int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos);
+/* PP 中/末段: host 激活 xin[n×hidden] → 本段 GPU 层 → x_out 或 logits */
+int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
+                         float* x_out, float* logits_out);
 
 /* 仅 free(Device*); 设备资源须先 free_dev */
 void device_destroy(Device* d);

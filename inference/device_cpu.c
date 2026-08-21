@@ -116,6 +116,10 @@ void cuda_sync_x_to_host(Engine* e)
 {
     (void)e;
 }
+void cuda_mark_x_host(Engine* e)
+{
+    (void)e;
+}
 int cuda_embed(Engine* e, uint32_t token)
 {
     (void)e;
@@ -138,6 +142,17 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     (void)tokens;
     (void)n;
     (void)start_pos;
+    return -1;
+}
+int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
+                         float* x_out, float* logits_out)
+{
+    (void)e;
+    (void)xin;
+    (void)n;
+    (void)pos;
+    (void)x_out;
+    (void)logits_out;
     return -1;
 }
 #endif

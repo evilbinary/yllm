@@ -165,6 +165,12 @@ static void cuda_ctx_clear(CudaCtx* ctx)
     free(ctx->off_q4);
     free(ctx->off_f16);
     free(ctx->off_f32);
+    free(ctx->host_off_q4);
+    free(ctx->host_off_f16);
+    free(ctx->host_off_f32);
+    free(ctx->h_q4);
+    free(ctx->h_f16);
+    free(ctx->h_f32);
     free(ctx->dim_out);
     free(ctx->dim_in);
     memset(ctx, 0, sizeof(*ctx));
@@ -177,6 +183,8 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     const LlfHeader* h = &m->h;
     uint32_t begin = e->layer_begin;
     uint32_t end = e->layer_end;
+    /* 单进程混合: 只把 [begin, gpu_layer_end) 上卡, 其余走 mmap CPU */
+    if (e->gpu_layer_end && e->gpu_layer_end < end) end = e->gpu_layer_end;
     if (end > m->n_layers) end = m->n_layers;
     if (begin > end) begin = end;
 
@@ -292,24 +300,85 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
         }
     }
 
-    if (n_q4)
-        CUDA_OK(cudaMalloc((void**)&ctx->w_q4, (size_t)n_q4), err, errlen);
-    if (n_f16)
-        CUDA_OK(cudaMalloc((void**)&ctx->w_f16, (size_t)n_f16 * 2), err, errlen);
-    if (n_f32)
-        CUDA_OK(cudaMalloc((void**)&ctx->w_f32, (size_t)n_f32 * 4), err, errlen);
-    if (n_q4)
-        CUDA_OK(cudaMemcpy(ctx->w_q4, h_q4, (size_t)n_q4, cudaMemcpyHostToDevice), err, errlen);
-    if (n_f16)
-        CUDA_OK(cudaMemcpy(ctx->w_f16, h_f16, (size_t)n_f16 * 2, cudaMemcpyHostToDevice), err, errlen);
-    if (n_f32)
-        CUDA_OK(cudaMemcpy(ctx->w_f32, h_f32, (size_t)n_f32 * 4, cudaMemcpyHostToDevice), err, errlen);
-    free(h_q4);
-    free(h_f16);
-    free(h_f32);
-    ctx->n_q4 = n_q4;
-    ctx->n_f16 = n_f16;
-    ctx->n_f32 = n_f32;
+    ctx->stream_w = e->cuda_stream_w ? 1 : 0;
+    ctx->stream_layer = ~0u;
+    if (ctx->stream_w) {
+        /* 权常驻 host; 设备只开单层峰值缓冲, 由 prefetch_layer 上卡 */
+        size_t tab = (size_t)m->n_layers * nslot;
+        ctx->host_off_q4 = (uint64_t*)malloc(tab * sizeof(uint64_t));
+        ctx->host_off_f16 = (uint64_t*)malloc(tab * sizeof(uint64_t));
+        ctx->host_off_f32 = (uint64_t*)malloc(tab * sizeof(uint64_t));
+        if (!ctx->host_off_q4 || !ctx->host_off_f16 || !ctx->host_off_f32) {
+            free(h_q4); free(h_f16); free(h_f32);
+            if (err && errlen) snprintf(err, errlen, "oom host_off");
+            return -1;
+        }
+        memcpy(ctx->host_off_q4, ctx->off_q4, tab * sizeof(uint64_t));
+        memcpy(ctx->host_off_f16, ctx->off_f16, tab * sizeof(uint64_t));
+        memcpy(ctx->host_off_f32, ctx->off_f32, tab * sizeof(uint64_t));
+        for (i = 0; i < tab; i++) {
+            ctx->off_q4[i] = CUDA_OFF_NONE;
+            ctx->off_f16[i] = CUDA_OFF_NONE;
+            ctx->off_f32[i] = CUDA_OFF_NONE;
+        }
+        ctx->h_q4 = h_q4;
+        ctx->h_f16 = h_f16;
+        ctx->h_f32 = h_f32;
+        h_q4 = NULL;
+        h_f16 = NULL;
+        h_f32 = NULL;
+
+        uint64_t max_q4 = 0, max_f16 = 0, max_f32 = 0;
+        for (i = begin; i < end; i++) {
+            uint64_t lq = 0, lf = 0, l32 = 0;
+            uint32_t nt = slot_count(m, i);
+            for (s = 0; s < nt; s++) {
+                size_t idx = (size_t)i * nslot + s;
+                if (ctx->host_off_q4[idx] != CUDA_OFF_NONE) {
+                    uint32_t out = ctx->dim_out[idx], in = ctx->dim_in[idx];
+                    lq += (uint64_t)out * (in / 256) * 144;
+                } else if (ctx->host_off_f16[idx] != CUDA_OFF_NONE) {
+                    lf += (uint64_t)ctx->dim_out[idx] * ctx->dim_in[idx];
+                } else if (ctx->host_off_f32[idx] != CUDA_OFF_NONE) {
+                    l32 += ctx->dim_out[idx];
+                }
+            }
+            if (lq > max_q4) max_q4 = lq;
+            if (lf > max_f16) max_f16 = lf;
+            if (l32 > max_f32) max_f32 = l32;
+        }
+        ctx->max_layer_q4 = max_q4;
+        ctx->max_layer_f16 = max_f16;
+        ctx->max_layer_f32 = max_f32;
+        ctx->n_q4 = max_q4;
+        ctx->n_f16 = max_f16;
+        ctx->n_f32 = max_f32;
+        if (max_q4)
+            CUDA_OK(cudaMalloc((void**)&ctx->w_q4, (size_t)max_q4), err, errlen);
+        if (max_f16)
+            CUDA_OK(cudaMalloc((void**)&ctx->w_f16, (size_t)max_f16 * 2), err, errlen);
+        if (max_f32)
+            CUDA_OK(cudaMalloc((void**)&ctx->w_f32, (size_t)max_f32 * 4), err, errlen);
+    } else {
+        if (n_q4)
+            CUDA_OK(cudaMalloc((void**)&ctx->w_q4, (size_t)n_q4), err, errlen);
+        if (n_f16)
+            CUDA_OK(cudaMalloc((void**)&ctx->w_f16, (size_t)n_f16 * 2), err, errlen);
+        if (n_f32)
+            CUDA_OK(cudaMalloc((void**)&ctx->w_f32, (size_t)n_f32 * 4), err, errlen);
+        if (n_q4)
+            CUDA_OK(cudaMemcpy(ctx->w_q4, h_q4, (size_t)n_q4, cudaMemcpyHostToDevice), err, errlen);
+        if (n_f16)
+            CUDA_OK(cudaMemcpy(ctx->w_f16, h_f16, (size_t)n_f16 * 2, cudaMemcpyHostToDevice), err, errlen);
+        if (n_f32)
+            CUDA_OK(cudaMemcpy(ctx->w_f32, h_f32, (size_t)n_f32 * 4, cudaMemcpyHostToDevice), err, errlen);
+        free(h_q4);
+        free(h_f16);
+        free(h_f32);
+        ctx->n_q4 = n_q4;
+        ctx->n_f16 = n_f16;
+        ctx->n_f32 = n_f32;
+    }
 
     ctx->hidden = h->hidden;
     ctx->kv_dim = h->n_kv_heads * h->head_dim;
@@ -356,10 +425,11 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     e->device_mode = DEV_MODE_CUDA;
     cuda_attach_fwd(e);
     cuda_k_sync();
-    ylog_info("cuda: load_weights GPU mode=%s q4=%.2f MB f16w=%.2f MB f32v=%.2f MB kv=%.2f MB pb=%u layers=[%u,%u) gpu=%d",
+    ylog_info("cuda: load_weights GPU mode=%s%s q4=%.2f MB f16w=%.2f MB f32v=%.2f MB kv=%.2f MB pb=%u layers=[%u,%u) gpu=%d",
               e->cuda_wmode == CUDA_W_FP16 ? "fp16" :
               (e->cuda_wmode == CUDA_W_Q4K ? "q4k" : "auto"),
-              (double)n_q4 / 1048576.0, (double)n_f16 * 2 / 1048576.0, (double)n_f32 * 4 / 1048576.0,
+              ctx->stream_w ? "+stream" : "",
+              (double)ctx->n_q4 / 1048576.0, (double)ctx->n_f16 * 2 / 1048576.0, (double)ctx->n_f32 * 4 / 1048576.0,
               (double)ctx->kv_bytes / 1048576.0, ctx->pb_cap, begin, end, ctx->device_id);
     return 0;
 }
@@ -370,6 +440,7 @@ static int load_weights_shim(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     LlModel* m = &e->ws.model;
     uint32_t begin = e->layer_begin;
     uint32_t end = e->layer_end;
+    if (e->gpu_layer_end && e->gpu_layer_end < end) end = e->gpu_layer_end;
     if (end > m->n_layers) end = m->n_layers;
     if (begin > end) begin = end;
 
@@ -516,6 +587,87 @@ CudaCtx* cuda_get_ctx(Engine* e)
     return e && e->w_dev ? (CudaCtx*)e->w_dev : NULL;
 }
 
+#if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
+static void stream_invalidate_layer(CudaCtx* ctx, uint32_t layer)
+{
+    if (!ctx || layer >= ctx->n_layers || !ctx->off_q4) return;
+    uint32_t s;
+    for (s = 0; s < BLOCK_TENSORS_MTP; s++) {
+        size_t idx = (size_t)layer * BLOCK_TENSORS_MTP + s;
+        ctx->off_q4[idx] = CUDA_OFF_NONE;
+        ctx->off_f16[idx] = CUDA_OFF_NONE;
+        ctx->off_f32[idx] = CUDA_OFF_NONE;
+    }
+}
+
+static int cuda_prefetch_layer(Engine* e, uint32_t layer)
+{
+    CudaCtx* ctx = cuda_get_ctx(e);
+    if (!ctx || !ctx->stream_w) return 0;
+    if (layer >= ctx->n_layers) return -1;
+    if (ctx->stream_layer == layer) return 0;
+
+    if (ctx->stream_layer != ~0u)
+        stream_invalidate_layer(ctx, ctx->stream_layer);
+
+    uint64_t dq = 0, df = 0, d32 = 0;
+    uint32_t s;
+    for (s = 0; s < BLOCK_TENSORS_MTP; s++) {
+        size_t idx = (size_t)layer * BLOCK_TENSORS_MTP + s;
+        if (ctx->host_off_q4 && ctx->host_off_q4[idx] != CUDA_OFF_NONE) {
+            uint32_t out = ctx->dim_out[idx], in = ctx->dim_in[idx];
+            size_t nbytes = (size_t)out * (in / 256) * 144;
+            if (dq + nbytes > ctx->max_layer_q4) return -1;
+            if (cudaMemcpy(ctx->w_q4 + dq, ctx->h_q4 + ctx->host_off_q4[idx],
+                           nbytes, cudaMemcpyHostToDevice) != cudaSuccess)
+                return -1;
+            ctx->off_q4[idx] = dq;
+            dq += nbytes;
+        } else if (ctx->host_off_f16 && ctx->host_off_f16[idx] != CUDA_OFF_NONE) {
+            uint64_t ne = (uint64_t)ctx->dim_out[idx] * ctx->dim_in[idx];
+            if (df + ne > ctx->max_layer_f16) return -1;
+            if (cudaMemcpy(ctx->w_f16 + df, ctx->h_f16 + ctx->host_off_f16[idx],
+                           (size_t)ne * 2, cudaMemcpyHostToDevice) != cudaSuccess)
+                return -1;
+            ctx->off_f16[idx] = df;
+            df += ne;
+        } else if (ctx->host_off_f32 && ctx->host_off_f32[idx] != CUDA_OFF_NONE) {
+            uint32_t n = ctx->dim_out[idx];
+            if (d32 + n > ctx->max_layer_f32) return -1;
+            if (cudaMemcpy(ctx->w_f32 + d32, ctx->h_f32 + ctx->host_off_f32[idx],
+                           (size_t)n * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+                return -1;
+            ctx->off_f32[idx] = d32;
+            d32 += n;
+        }
+    }
+    ctx->stream_layer = layer;
+    return 0;
+}
+
+static void cuda_release_layer(Engine* e, uint32_t layer)
+{
+    CudaCtx* ctx = cuda_get_ctx(e);
+    if (!ctx || !ctx->stream_w) return;
+    if (ctx->stream_layer == layer) {
+        stream_invalidate_layer(ctx, layer);
+        ctx->stream_layer = ~0u;
+    }
+}
+#else
+static int cuda_prefetch_layer(Engine* e, uint32_t layer)
+{
+    (void)e;
+    (void)layer;
+    return 0;
+}
+static void cuda_release_layer(Engine* e, uint32_t layer)
+{
+    (void)e;
+    (void)layer;
+}
+#endif
+
 Device* device_create_cuda(int device_id, char* err, size_t errlen)
 {
 #ifndef YLLM_CUDA
@@ -553,8 +705,8 @@ Device* device_create_cuda(int device_id, char* err, size_t errlen)
     d->handle = ctx;
     d->load_weights = cuda_load_weights;
     d->free_dev = cuda_free_dev;
-    d->prefetch_layer = NULL;
-    d->release_layer = NULL;
+    d->prefetch_layer = cuda_prefetch_layer;
+    d->release_layer = cuda_release_layer;
     if (host_shim)
         ylog_info("cuda: host-shim device (weights mirrored in RAM; CPU compute)");
     else

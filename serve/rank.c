@@ -697,7 +697,8 @@ int cmd_rank(ServeConfig* cfg)
     if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] "
-                        "[--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--config <yaml>]\n");
+                        "[--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] "
+                        "[--gpu-layers N] [--gpu-stream 0|1] [--config <yaml>]\n");
         return 1;
     }
 
@@ -792,6 +793,9 @@ int cmd_rank(ServeConfig* cfg)
             vocab_free(&r.vocab);
             return 1;
         }
+        if (cfg->gpu_layers >= 0)
+            engine_set_gpu_layers(&r.engine, cfg->gpu_layers);
+        r.engine.cuda_stream_w = cfg->gpu_stream ? 1 : 0;
         if (dk != DEV_CPU) {
             if (engine_bind_device(&r.engine, dk, cfg->gpu, err, sizeof(err)) != 0) {
                 ylog_error("rank: bind device %s gpu=%d failed: %s", cfg->device, cfg->gpu, err);
@@ -799,9 +803,10 @@ int cmd_rank(ServeConfig* cfg)
                 vocab_free(&r.vocab);
                 return 1;
             }
-            ylog_info("rank: device=%s gpu=%d gpu-weights=%s weights_ready=%d",
+            ylog_info("rank: device=%s gpu=%d gpu-weights=%s gpu-layers=%d gpu-stream=%d weights_ready=%d",
                       cfg->device[0] ? cfg->device : "cpu", cfg->gpu,
                       cfg->gpu_weights[0] ? cfg->gpu_weights : "auto",
+                      cfg->gpu_layers, cfg->gpu_stream,
                       r.engine.weights_ready);
         }
     }
