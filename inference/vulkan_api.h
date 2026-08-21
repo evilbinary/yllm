@@ -42,6 +42,7 @@ typedef struct VulkanApi {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkQueueWaitIdle QueueWaitIdle;
     PFN_vkCreateFence CreateFence;

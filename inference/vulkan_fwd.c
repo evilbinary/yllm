@@ -106,6 +106,28 @@ int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
     return maxe < 1e-3f ? 0 : -1;
 }
 
+static int load_norm_f32(VulkanCtx* ctx, const uint8_t* wbytes, uint32_t n, uint32_t dtype)
+{
+    if (!ctx || !ctx->host_w || (size_t)n * 4 > ctx->wn_bytes) return -1;
+    if (dtype == DT_F32) {
+        memcpy(ctx->host_w, wbytes, (size_t)n * 4);
+        return 0;
+    }
+    if (dtype == DT_F16) {
+        uint32_t i;
+        const uint16_t* wh = (const uint16_t*)wbytes;
+        for (i = 0; i < n; i++) ctx->host_w[i] = f16_to_f32(wh[i]);
+        return 0;
+    }
+    return -1;
+}
+
+static uint64_t wq_off(VulkanCtx* ctx, uint32_t layer, uint32_t slot)
+{
+    if (!ctx || !ctx->wq_off) return (uint64_t)~0ull;
+    return ctx->wq_off[(size_t)layer * ctx->wq_nslot + slot];
+}
+
 static void vk_or_cpu_rmsnorm(VulkanCtx* ctx,
                               float* y, const float* x,
                               const uint8_t* wbytes, uint32_t n, float eps, uint32_t dtype)
@@ -132,8 +154,7 @@ static void vk_or_cpu_matmul(VulkanCtx* ctx, float* y, const float* x,
 {
     if (ctx && ctx->gemv_ready && dtype == DT_Q4K) {
         if (ctx->wq_resident && ctx->wq_off) {
-            size_t idx = (size_t)layer * ctx->wq_nslot + slot;
-            uint64_t off = ctx->wq_off[idx];
+            uint64_t off = wq_off(ctx, layer, slot);
             if (off != (uint64_t)~0ull &&
                 vulkan_k_gemv_q4k(ctx, y, x, out, in, off) == 0)
                 return;
@@ -142,6 +163,39 @@ static void vk_or_cpu_matmul(VulkanCtx* ctx, float* y, const float* x,
             return;
     }
     matmul(y, x, w, out, in, dtype);
+}
+
+static int try_fused_qkv(VulkanCtx* ctx, const float* x, float* q, float* k, float* v,
+                         uint32_t hidden, uint32_t kv_dim, float eps,
+                         const uint8_t* base, const LlfTensorMeta* mt, uint32_t layer)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident) return -1;
+    if (mt[SLOT_Q].dtype != DT_Q4K || mt[SLOT_K].dtype != DT_Q4K || mt[SLOT_V].dtype != DT_Q4K)
+        return -1;
+    if (load_norm_f32(ctx, base + mt[SLOT_NORM1].offset, hidden, mt[SLOT_NORM1].dtype) != 0)
+        return -1;
+    uint64_t oq = wq_off(ctx, layer, SLOT_Q);
+    uint64_t ok = wq_off(ctx, layer, SLOT_K);
+    uint64_t ov = wq_off(ctx, layer, SLOT_V);
+    if (oq == (uint64_t)~0ull || ok == (uint64_t)~0ull || ov == (uint64_t)~0ull)
+        return -1;
+    return vulkan_fused_norm_qkv(ctx, x, ctx->host_w, hidden, eps,
+                                 q, k, v, kv_dim, oq, ok, ov);
+}
+
+static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* gate, float* up,
+                         uint32_t hidden, uint32_t inter, float eps,
+                         const uint8_t* base, const LlfTensorMeta* mt, uint32_t layer)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident) return -1;
+    if (mt[SLOT_GATE].dtype != DT_Q4K || mt[SLOT_UP].dtype != DT_Q4K) return -1;
+    if (load_norm_f32(ctx, base + mt[SLOT_NORM2].offset, hidden, mt[SLOT_NORM2].dtype) != 0)
+        return -1;
+    uint64_t og = wq_off(ctx, layer, SLOT_GATE);
+    uint64_t ou = wq_off(ctx, layer, SLOT_UP);
+    if (og == (uint64_t)~0ull || ou == (uint64_t)~0ull) return -1;
+    return vulkan_fused_norm_gate_up(ctx, x, ctx->host_w, hidden, eps,
+                                     gate, up, inter, og, ou);
 }
 
 static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
@@ -168,14 +222,16 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     const LlfTensorMeta* mt = &m->metas[hidx];
     uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
 
-    vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM1].offset,
-                      hidden, eps, mt[SLOT_NORM1].dtype);
-    vk_or_cpu_matmul(ctx, q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype,
-                     layer, SLOT_Q);
-    vk_or_cpu_matmul(ctx, k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype,
-                     layer, SLOT_K);
-    vk_or_cpu_matmul(ctx, v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype,
-                     layer, SLOT_V);
+    if (try_fused_qkv(ctx, x, q, k, v, hidden, kv_dim, eps, base, mt, layer) != 0) {
+        vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM1].offset,
+                          hidden, eps, mt[SLOT_NORM1].dtype);
+        vk_or_cpu_matmul(ctx, q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype,
+                         layer, SLOT_Q);
+        vk_or_cpu_matmul(ctx, k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype,
+                         layer, SLOT_K);
+        vk_or_cpu_matmul(ctx, v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype,
+                         layer, SLOT_V);
+    }
     if (mt[SLOT_QBIAS].size > 0) {
         const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
         uint32_t j;
@@ -252,14 +308,17 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype,
                      layer, SLOT_O);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
-    vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM2].offset,
-                      hidden, eps, mt[SLOT_NORM2].dtype);
+
     float* fg = e->ffn;
     float* fu = e->ffn + inter;
-    vk_or_cpu_matmul(ctx, fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype,
-                     layer, SLOT_GATE);
-    vk_or_cpu_matmul(ctx, fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype,
-                     layer, SLOT_UP);
+    if (try_fused_ffn(ctx, x, fg, fu, hidden, inter, eps, base, mt, layer) != 0) {
+        vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM2].offset,
+                          hidden, eps, mt[SLOT_NORM2].dtype);
+        vk_or_cpu_matmul(ctx, fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype,
+                         layer, SLOT_GATE);
+        vk_or_cpu_matmul(ctx, fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype,
+                         layer, SLOT_UP);
+    }
     swiglu(x2, fg, fu, inter);
     vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype,
                      layer, SLOT_DOWN);

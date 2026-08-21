@@ -332,10 +332,18 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
         VkBuffer bw = VK_NULL_HANDLE;
         VkDeviceMemory mw = VK_NULL_HANDLE;
         char gerr[256];
-        if (create_host_buffer(ctx, ctx->wq_bytes, &bw, &mw) != 0) {
-            ylog_warn("vulkan: gemv W buffer alloc failed (%zu B)", ctx->wq_bytes);
+        VkBuffer bo0 = VK_NULL_HANDLE, bo1 = VK_NULL_HANDLE, bo2 = VK_NULL_HANDLE;
+        VkDeviceMemory mo0 = VK_NULL_HANDLE, mo1 = VK_NULL_HANDLE, mo2 = VK_NULL_HANDLE;
+        if (create_host_buffer(ctx, ctx->wq_bytes, &bw, &mw) != 0 ||
+            create_host_buffer(ctx, ctx->y_bytes, &bo0, &mo0) != 0 ||
+            create_host_buffer(ctx, ctx->y_bytes, &bo1, &mo1) != 0 ||
+            create_host_buffer(ctx, ctx->y_bytes, &bo2, &mo2) != 0) {
+            ylog_warn("vulkan: gemv buffers alloc failed");
         } else {
             ctx->buf_wq = (void*)bw; ctx->mem_wq = (void*)mw;
+            ctx->buf_o0 = (void*)bo0; ctx->mem_o0 = (void*)mo0;
+            ctx->buf_o1 = (void*)bo1; ctx->mem_o1 = (void*)mo1;
+            ctx->buf_o2 = (void*)bo2; ctx->mem_o2 = (void*)mo2;
             VkBuffer bufs[3] = { bx, by, bw };
             size_t ranges[3] = { ctx->x_bytes, ctx->y_bytes, ctx->wq_bytes };
             VkShaderModule sh = VK_NULL_HANDLE;
@@ -348,20 +356,68 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                                      &sh, &dsl, &pl, &pipe, &pool, &dset,
                                      bufs, ranges, gerr, sizeof(gerr)) != 0) {
                 ylog_warn("vulkan: gemv pipeline failed (%s)", gerr);
-                a->DestroyBuffer(dev, bw, NULL);
-                a->FreeMemory(dev, mw, NULL);
-                ctx->buf_wq = NULL;
-                ctx->mem_wq = NULL;
             } else {
-                ctx->gemv_shader = (void*)sh;
-                ctx->gemv_desc_layout = (void*)dsl;
-                ctx->gemv_pipe_layout = (void*)pl;
-                ctx->gemv_pipeline = (void*)pipe;
-                ctx->gemv_desc_pool = (void*)pool;
-                ctx->gemv_desc_set = (void*)dset;
-                ctx->gemv_ready = 1;
-                ylog_info("vulkan: gemv_q4k ready max_in=%u max_out=%u wq=%zuMB",
-                          max_in, max_out, ctx->wq_bytes / (1024 * 1024));
+                /* 扩容 pool: 再建 3 个 set (y→o0/o1/o2, x=buf_y) */
+                a->DestroyDescriptorPool(dev, pool, NULL);
+                VkDescriptorPoolSize dps = {0};
+                dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                dps.descriptorCount = 12;
+                VkDescriptorPoolCreateInfo dpi = {0};
+                dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                dpi.maxSets = 4;
+                dpi.poolSizeCount = 1;
+                dpi.pPoolSizes = &dps;
+                if (a->CreateDescriptorPool(dev, &dpi, NULL, &pool) != VK_SUCCESS) {
+                    ylog_warn("vulkan: gemv desc pool recreate failed");
+                } else {
+                    VkDescriptorSetLayout layouts[4] = { dsl, dsl, dsl, dsl };
+                    VkDescriptorSet sets[4];
+                    VkDescriptorSetAllocateInfo dai = {0};
+                    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                    dai.descriptorPool = pool;
+                    dai.descriptorSetCount = 4;
+                    dai.pSetLayouts = layouts;
+                    if (a->AllocateDescriptorSets(dev, &dai, sets) != VK_SUCCESS) {
+                        ylog_warn("vulkan: gemv desc sets alloc failed");
+                    } else {
+                        VkBuffer xb[4] = { bx, by, by, by };
+                        VkBuffer yb[4] = { by, bo0, bo1, bo2 };
+                        uint32_t si;
+                        for (si = 0; si < 4; si++) {
+                            VkDescriptorBufferInfo bis[3];
+                            VkWriteDescriptorSet writes[3];
+                            memset(bis, 0, sizeof(bis));
+                            memset(writes, 0, sizeof(writes));
+                            VkBuffer trip[3] = { xb[si], yb[si], bw };
+                            size_t rng[3] = { ctx->x_bytes, ctx->y_bytes, ctx->wq_bytes };
+                            uint32_t b;
+                            for (b = 0; b < 3; b++) {
+                                bis[b].buffer = trip[b];
+                                bis[b].range = rng[b];
+                                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                writes[b].dstSet = sets[si];
+                                writes[b].dstBinding = b;
+                                writes[b].descriptorCount = 1;
+                                writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                                writes[b].pBufferInfo = &bis[b];
+                            }
+                            a->UpdateDescriptorSets(dev, 3, writes, 0, NULL);
+                        }
+                        ctx->gemv_shader = (void*)sh;
+                        ctx->gemv_desc_layout = (void*)dsl;
+                        ctx->gemv_pipe_layout = (void*)pl;
+                        ctx->gemv_pipeline = (void*)pipe;
+                        ctx->gemv_desc_pool = (void*)pool;
+                        ctx->gemv_desc_set = (void*)sets[0];
+                        ctx->gemv_ds0 = (void*)sets[1];
+                        ctx->gemv_ds1 = (void*)sets[2];
+                        ctx->gemv_ds2 = (void*)sets[3];
+                        ctx->gemv_ready = 1;
+                        ctx->fuse_ready = 1;
+                        ylog_info("vulkan: gemv_q4k+fuse ready max_in=%u max_out=%u wq=%zuMB",
+                                  max_in, max_out, ctx->wq_bytes / (1024 * 1024));
+                    }
+                }
             }
         }
     }
@@ -494,4 +550,145 @@ int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
     memcpy(pw, w, wbytes);
     a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
     return vulkan_k_gemv_q4k(ctx, y, x, out, in, 0);
+}
+
+static void cmd_barrier_compute(VkCommandBuffer cmd)
+{
+    VulkanApi* a = vulkan_api();
+    VkMemoryBarrier mb = {0};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    a->CmdPipelineBarrier(cmd,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+static void cmd_rmsnorm(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n, float eps)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->rms_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)ctx->rms_desc_set;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->rms_pipe_layout, 0, 1, &ds, 0, NULL);
+    RmsPush push;
+    push.n = n;
+    push.eps = eps;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->rms_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, 1, 1, 1);
+}
+
+static void cmd_gemv(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
+                     uint32_t out, uint32_t in, uint32_t w_off)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->gemv_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)dset;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->gemv_pipe_layout, 0, 1, &ds, 0, NULL);
+    GemvPush push;
+    push.out_n = out;
+    push.in_n = in;
+    push.w_off = w_off;
+    push._pad = 0;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, out, 1, 1);
+}
+
+static int map_copy(VulkanCtx* ctx, void* mem, const void* src, size_t nbytes)
+{
+    VulkanApi* a = vulkan_api();
+    void* p = NULL;
+    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &p) != VK_SUCCESS)
+        return -1;
+    memcpy(p, src, nbytes);
+    a->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem);
+    return 0;
+}
+
+static int map_read(VulkanCtx* ctx, void* mem, void* dst, size_t nbytes)
+{
+    VulkanApi* a = vulkan_api();
+    void* p = NULL;
+    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &p) != VK_SUCCESS)
+        return -1;
+    memcpy(dst, p, nbytes);
+    a->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem);
+    return 0;
+}
+
+int vulkan_fused_norm_qkv(VulkanCtx* ctx,
+                          const float* x, const float* wn, uint32_t hidden, float eps,
+                          float* q, float* k, float* v, uint32_t kv_dim,
+                          uint64_t off_q, uint64_t off_k, uint64_t off_v)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident || !x || !wn || !q || !k || !v)
+        return -1;
+    if (hidden > ctx->max_in || hidden > ctx->max_out || kv_dim > ctx->max_out)
+        return -1;
+    if (off_q > 0xffffffffull || off_k > 0xffffffffull || off_v > 0xffffffffull)
+        return -1;
+
+    size_t xb = (size_t)hidden * 4;
+    size_t kb = (size_t)kv_dim * 4;
+    if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
+    if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
+
+    VulkanApi* a = vulkan_api();
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    a->BeginCommandBuffer(cmd, &bi);
+    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_barrier_compute(cmd);
+    /* Q/K/V 只读 buf_y, 写不同 o* — 可并行 dispatch */
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds2, kv_dim, hidden, (uint32_t)off_v);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    if (map_read(ctx, ctx->mem_o0, q, xb) != 0) return -1;
+    if (map_read(ctx, ctx->mem_o1, k, kb) != 0) return -1;
+    if (map_read(ctx, ctx->mem_o2, v, kb) != 0) return -1;
+    return 0;
+}
+
+int vulkan_fused_norm_gate_up(VulkanCtx* ctx,
+                              const float* x, const float* wn, uint32_t hidden, float eps,
+                              float* gate, float* up, uint32_t inter,
+                              uint64_t off_gate, uint64_t off_up)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident || !x || !wn || !gate || !up)
+        return -1;
+    if (hidden > ctx->max_in || inter > ctx->max_out) return -1;
+    if (off_gate > 0xffffffffull || off_up > 0xffffffffull) return -1;
+
+    size_t xb = (size_t)hidden * 4;
+    size_t ib = (size_t)inter * 4;
+    if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
+    if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
+
+    VulkanApi* a = vulkan_api();
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    a->BeginCommandBuffer(cmd, &bi);
+    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, inter, hidden, (uint32_t)off_gate);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds1, inter, hidden, (uint32_t)off_up);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    if (map_read(ctx, ctx->mem_o0, gate, ib) != 0) return -1;
+    if (map_read(ctx, ctx->mem_o1, up, ib) != 0) return -1;
+    return 0;
 }

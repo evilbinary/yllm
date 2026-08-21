@@ -97,6 +97,7 @@ static int load_device_fns(VkInstance inst, VkDevice dev)
     GD(CmdBindDescriptorSets);
     GD(CmdPushConstants);
     GD(CmdDispatch);
+    GD(CmdPipelineBarrier);
     GD(QueueSubmit);
     GD(QueueWaitIdle);
     GD(CreateFence);
@@ -261,10 +262,16 @@ void vulkan_shutdown(VulkanCtx* ctx)
 
     if (ctx->buf_x && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_x, NULL);
     if (ctx->buf_y && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_y, NULL);
+    if (ctx->buf_o0 && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_o0, NULL);
+    if (ctx->buf_o1 && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_o1, NULL);
+    if (ctx->buf_o2 && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_o2, NULL);
     if (ctx->buf_wn && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wn, NULL);
     if (ctx->buf_wq && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wq, NULL);
     if (ctx->mem_x && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_x, NULL);
     if (ctx->mem_y && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_y, NULL);
+    if (ctx->mem_o0 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o0, NULL);
+    if (ctx->mem_o1 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o1, NULL);
+    if (ctx->mem_o2 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o2, NULL);
     if (ctx->mem_wn && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wn, NULL);
     if (ctx->mem_wq && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wq, NULL);
     free(ctx->host_w);

@@ -18,10 +18,18 @@ typedef struct {
     void* cmd;
     void* fence;
 
+    /* 激活: x 输入, y = rmsnorm 输出兼 gemv 输入 */
     void* buf_x;
     void* buf_y;
     void* mem_x;
     void* mem_y;
+    /* gemv 多路输出(Q/K/V 或 gate/up/tmp) */
+    void* buf_o0;
+    void* buf_o1;
+    void* buf_o2;
+    void* mem_o0;
+    void* mem_o1;
+    void* mem_o2;
     size_t x_bytes;
     size_t y_bytes;
 
@@ -38,17 +46,21 @@ typedef struct {
 
     void* gemv_desc_pool;
     void* gemv_desc_layout;
-    void* gemv_desc_set;
+    void* gemv_desc_set;    /* x=buf_x y=buf_y — 单次 gemv/自检 */
+    void* gemv_ds0;         /* x=buf_y y=buf_o0 */
+    void* gemv_ds1;         /* x=buf_y y=buf_o1 */
+    void* gemv_ds2;         /* x=buf_y y=buf_o2 */
     void* gemv_pipe_layout;
     void* gemv_pipeline;
     void* gemv_shader;
     void* buf_wq;
     void* mem_wq;
-    size_t wq_bytes;        /* 常驻 Q4_K 总字节 */
-    uint64_t* wq_off;       /* [layer*nslot + slot], UINT64_MAX=无 */
+    size_t wq_bytes;
+    uint64_t* wq_off;
     uint32_t wq_nslot;
-    int wq_resident;        /* 1 = 权已上传, gemv 不再 H2D W */
+    int wq_resident;
     int gemv_ready;
+    int fuse_ready;
 
     int compute_ready;
     uint32_t n_layers;
