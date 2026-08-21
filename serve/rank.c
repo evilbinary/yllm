@@ -697,7 +697,7 @@ int cmd_rank(ServeConfig* cfg)
     if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] "
-                        "[--config <yaml>]\n");
+                        "[--device cpu|cuda] [--gpu N] [--config <yaml>]\n");
         return 1;
     }
 
@@ -776,6 +776,27 @@ int cmd_rank(ServeConfig* cfg)
         return 1;
     }
 
+    /* 设备绑定: 默认 cpu; --device cuda 需 YLLM_CUDA=1 构建 */
+    {
+        DeviceKind dk = DEV_CPU;
+        if (cfg->device[0] && device_kind_parse(cfg->device, &dk) != 0) {
+            ylog_error("rank: bad --device %s (want cpu|cuda)", cfg->device);
+            engine_free(&r.engine);
+            vocab_free(&r.vocab);
+            return 1;
+        }
+        if (dk != DEV_CPU) {
+            if (engine_bind_device(&r.engine, dk, cfg->gpu, err, sizeof(err)) != 0) {
+                ylog_error("rank: bind device %s gpu=%d failed: %s", cfg->device, cfg->gpu, err);
+                engine_free(&r.engine);
+                vocab_free(&r.vocab);
+                return 1;
+            }
+            ylog_info("rank: device=%s gpu=%d weights_ready=%d",
+                      cfg->device[0] ? cfg->device : "cpu", cfg->gpu, r.engine.weights_ready);
+        }
+    }
+
     /* 多段协作: 协作口基址 = serve 基准(自己的 --port - 段号) + 偏移, 全组统一;
      * 成员地址: worker 段来自命令(--peers, sv 自动下发); rank0 以 INFER 数据为准(启动时的兜底) */
     r.dist_rank = cfg->rank_idx;
@@ -788,6 +809,13 @@ int cmd_rank(ServeConfig* cfg)
     if (r.dist_ranks > 1) {
         if (dist_split_layers(&r.engine, r.dist_rank, r.dist_ranks) != 0) {
             ylog_error("rank: dist_split_layers failed (seg %d/%d)", r.dist_rank, r.dist_ranks);
+            engine_free(&r.engine);
+            vocab_free(&r.vocab);
+            return 1;
+        }
+        /* 层段确定后重新 load_weights(CUDA 只装本段; CPU 为空操作) */
+        if (engine_load_weights(&r.engine, err, sizeof(err)) != 0) {
+            ylog_error("rank: load_weights after split failed: %s", err);
             engine_free(&r.engine);
             vocab_free(&r.vocab);
             return 1;

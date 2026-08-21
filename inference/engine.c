@@ -344,12 +344,64 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         e->fwd_block = forward_block_default;
         e->fwd_block_batch = forward_block_batch_default;
     }
+    /* 默认 CPU 设备: load_weights 空操作, 后续可 engine_bind_device(CUDA) */
+    if (engine_bind_device(e, DEV_CPU, 0, err, errlen) != 0) {
+        engine_free(e);
+        return -1;
+    }
     return 0;
+}
+
+int engine_bind_device(Engine* e, DeviceKind kind, int device_id, char* err, size_t errlen)
+{
+    if (!e) {
+        if (err && errlen) snprintf(err, errlen, "null engine");
+        return -1;
+    }
+    if (e->dev) {
+        if (e->dev->free_dev) e->dev->free_dev(e);
+        device_destroy(e->dev);
+        e->dev = NULL;
+    }
+    e->weights_ready = 0;
+    e->w_dev = NULL;
+    e->d_kv = NULL;
+    e->dev = device_create(kind, device_id, err, errlen);
+    if (!e->dev) return -1;
+    if (!e->dev->load_weights) {
+        if (err && errlen) snprintf(err, errlen, "device missing load_weights");
+        device_destroy(e->dev);
+        e->dev = NULL;
+        return -1;
+    }
+    if (e->dev->load_weights(e, err, errlen) != 0) {
+        if (e->dev->free_dev) e->dev->free_dev(e);
+        device_destroy(e->dev);
+        e->dev = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int engine_load_weights(Engine* e, char* err, size_t errlen)
+{
+    if (!e || !e->dev || !e->dev->load_weights) {
+        if (err && errlen) snprintf(err, errlen, "no device / load_weights");
+        return -1;
+    }
+    e->weights_ready = 0;
+    return e->dev->load_weights(e, err, errlen);
 }
 
 void engine_free(Engine* e)
 {
-    Worker* w = (Worker*)e->ws.worker;
+    Worker* w;
+    if (e->dev) {
+        if (e->dev->free_dev) e->dev->free_dev(e);
+        device_destroy(e->dev);
+        e->dev = NULL;
+    }
+    w = (Worker*)e->ws.worker;
     if (w) {
         w->stop = 1;
         if (e->ws.worker_th) ythread_join(&e->ws.worker_th);

@@ -205,9 +205,11 @@ static int cmd_gen(int argc, char** argv)
     int dist_fp16 = atoi(opt(a, n, "dist-fp16", "0"));
     const char* dist_addrs = opt(a, n, "dist-addrs", NULL);
     int mtp = atoi(opt(a, n, "mtp", "0"));
+    const char* device_s = opt(a, n, "device", "cpu");
+    int gpu_id = atoi(opt(a, n, "gpu", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N]\n");
+        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N]\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -230,12 +232,35 @@ static int cmd_gen(int argc, char** argv)
         vocab_free(&v);
         return 1;
     }
+    {
+        DeviceKind dk = DEV_CPU;
+        if (device_kind_parse(device_s, &dk) != 0) {
+            fprintf(stderr, "bad --device %s (want cpu|cuda)\n", device_s);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (dk != DEV_CPU) {
+            if (engine_bind_device(&e, dk, gpu_id, err, sizeof(err)) != 0) {
+                fprintf(stderr, "bind device failed: %s\n", err);
+                engine_free(&e);
+                vocab_free(&v);
+                return 1;
+            }
+        }
+    }
     e.mtp_enable = mtp && e.mtp_eh_slot;
     if (mtp && !e.mtp_eh_slot)
         fprintf(stderr, "warning: --mtp requested but model has no MTP weights\n");
     /* 分布式分片: 按字节均衡切层 */
     if (ranks > 1) {
         if (dist_split_layers(&e, rank, ranks) != 0) {
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (engine_load_weights(&e, err, sizeof(err)) != 0) {
+            fprintf(stderr, "load_weights after split failed: %s\n", err);
             engine_free(&e);
             vocab_free(&v);
             return 1;
@@ -332,9 +357,11 @@ static int cmd_chat(int argc, char** argv)
     int no_template = atoi(opt(a, n, "no-template", "0"));
     int no_bos = atoi(opt(a, n, "no-bos", "0"));
     int mtp = atoi(opt(a, n, "mtp", "0"));
+    const char* device_s = opt(a, n, "device", "cpu");
+    int gpu_id = atoi(opt(a, n, "gpu", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -351,6 +378,23 @@ static int cmd_chat(int argc, char** argv)
         fprintf(stderr, "engine init failed: %s\n", err);
         vocab_free(&v);
         return 1;
+    }
+    {
+        DeviceKind dk = DEV_CPU;
+        if (device_kind_parse(device_s, &dk) != 0) {
+            fprintf(stderr, "bad --device %s (want cpu|cuda)\n", device_s);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (dk != DEV_CPU) {
+            if (engine_bind_device(&e, dk, gpu_id, err, sizeof(err)) != 0) {
+                fprintf(stderr, "bind device failed: %s\n", err);
+                engine_free(&e);
+                vocab_free(&v);
+                return 1;
+            }
+        }
     }
     e.mtp_enable = mtp && e.mtp_eh_slot;
     if (mtp && !e.mtp_eh_slot)

@@ -25,6 +25,8 @@ rank-port-base: 9410   # 模型0 rank 推理口基址
 http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
 cache-dir: ./sessions   # 会话缓存落盘目录(空 = 纯内存; server 存 token 列表, rank 存 KV)
 budget: 1024MB            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n>KB(如 2048MB / 1.5G)
+# device: cpu              # 推理设备: cpu | cuda(见 docs/design-gpu-inference.md)
+# gpu: 0                   # CUDA device index
 
 # 拓扑
 sv-host: 127.0.0.1     # supervisor 地址(rank/server 心跳目标)

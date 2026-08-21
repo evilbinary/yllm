@@ -84,6 +84,8 @@ typedef struct {
     uint64_t seed;
     int64_t budget;         /* rank KV 内存预算(MB; -1 = auto)。解析时由 "auto"/"1024MB"/"1.5G" 转成 */
     int depth;
+    char device[32];        /* cpu | cuda(见 docs/design-gpu-inference.md) */
+    int gpu;                /* CUDA device index(默认 0) */
 
     /* 客户端模式(router --send) */
     char send[CFG_STR_MAX];
@@ -162,6 +164,8 @@ static inline void config_defaults(ServeConfig* c)
     c->seed = 42;
     c->budget = -1;   /* 默认自动 */
     c->depth = 2;
+    snprintf(c->device, sizeof(c->device), "cpu");
+    c->gpu = 0;
     c->api_log = 1;   /* 默认开启 */
 }
 
@@ -261,6 +265,10 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->budget = config_budget_parse(val);
     } else if (strcmp(key, "depth") == 0) {
         c->depth = atoi(val);
+    } else if (strcmp(key, "device") == 0) {
+        snprintf(c->device, sizeof(c->device), "%s", val);
+    } else if (strcmp(key, "gpu") == 0) {
+        c->gpu = atoi(val);
     } else if (strcmp(key, "send") == 0) {
         snprintf(c->send, sizeof(c->send), "%s", val);
     } else if (strcmp(key, "only-model") == 0) {

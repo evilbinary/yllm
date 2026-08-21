@@ -2,6 +2,7 @@
 #define YLLM_H
 
 #include "llf.h"
+#include "device.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -148,6 +149,11 @@ typedef struct Engine {
     float* mtp_logits;       /* [vocab] MTP 预测 logits */
     int mtp_enable;          /* 运行期开关: 1 = speculative decoding */
     int mtp_h_ready;         /* mtp_h 已由最近一次主干前向刷新 */
+    /* 设备后端(docs/design-gpu-inference.md): 默认 CPU; CUDA 经 engine_bind_device */
+    Device* dev;
+    void* d_kv;              /* 设备 KV; CPU 下别名 kv */
+    void* w_dev;             /* 设备权重根/层表; CPU 为 NULL */
+    int weights_ready;       /* load_weights 成功 */
 } Engine;
 
 typedef struct {
@@ -159,6 +165,11 @@ typedef struct {
 
 int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, char* err, size_t errlen);
 void engine_free(Engine* e);
+/* 绑定/切换设备并调用 load_weights。engine_init 末尾已绑 DEV_CPU。
+ * dist_split_layers 后应再 load_weights(或再次 bind)以匹配本 rank 层段。 */
+int engine_bind_device(Engine* e, DeviceKind kind, int device_id, char* err, size_t errlen);
+/* 仅重新 load_weights(切层后刷新本段); 无 dev 时返回 -1 */
+int engine_load_weights(Engine* e, char* err, size_t errlen);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,
                          float* x_out, float* logits_out);
