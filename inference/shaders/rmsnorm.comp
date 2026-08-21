@@ -19,11 +19,13 @@ void main() {
     for (uint i = lid; i < pc.n; i += 256u)
         sum += x[i] * x[i];
     sdata[lid] = sum;
+    memoryBarrierShared();
     barrier();
 
     for (uint s = 128u; s > 0u; s >>= 1u) {
         if (lid < s)
             sdata[lid] += sdata[lid + s];
+        memoryBarrierShared();
         barrier();
     }
 

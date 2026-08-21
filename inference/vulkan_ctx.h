@@ -14,29 +14,48 @@ typedef struct {
     void* queue;
     uint32_t queue_family;
 
-    /* compute 资源(rmsnorm) */
+    /* 共享 cmd */
     void* cmd_pool;
     void* cmd;
     void* fence;
-    void* desc_pool;
-    void* desc_layout;
-    void* desc_set;
-    void* pipe_layout;
-    void* pipeline;
-    void* shader;
 
+    /* 激活缓冲(按 max_in / max_out) */
     void* buf_x;
     void* buf_y;
-    void* buf_w;
     void* mem_x;
     void* mem_y;
-    void* mem_w;
-    size_t buf_bytes;       /* hidden * 4 容量 */
+    size_t x_bytes;
+    size_t y_bytes;
 
+    /* RMSNorm */
+    void* rms_desc_pool;
+    void* rms_desc_layout;
+    void* rms_desc_set;
+    void* rms_pipe_layout;
+    void* rms_pipeline;
+    void* rms_shader;
+    void* buf_wn;
+    void* mem_wn;
+    size_t wn_bytes;
     float* host_w;          /* F16→F32 权 scratch */
-    int compute_ready;      /* 1 = rmsnorm pipeline 可用 */
+
+    /* Q4_K gemv */
+    void* gemv_desc_pool;
+    void* gemv_desc_layout;
+    void* gemv_desc_set;
+    void* gemv_pipe_layout;
+    void* gemv_pipeline;
+    void* gemv_shader;
+    void* buf_wq;
+    void* mem_wq;
+    size_t wq_bytes;
+    int gemv_ready;
+
+    int compute_ready;      /* rmsnorm 可用 */
     uint32_t n_layers;
     uint32_t hidden;
+    uint32_t max_in;
+    uint32_t max_out;
 } VulkanCtx;
 
 #endif

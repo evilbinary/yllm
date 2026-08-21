@@ -1,0 +1,87 @@
+#version 450
+/* Q4_K gemv: y[o] = row_o · x ; 每 workgroup 一行, local 归约 */
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer InX { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer OutY { float y[]; };
+layout(set = 0, binding = 2) readonly buffer InW { uint w[]; }; /* 按字节访问 */
+
+layout(push_constant) uniform Push {
+    uint out_n;
+    uint in_n;
+} pc;
+
+uint load_u8(uint off)
+{
+    uint word = w[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+float load_f16(uint off)
+{
+    uint lo = load_u8(off);
+    uint hi = load_u8(off + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void scale_min(uint g, uint scp, out uint sc, out uint mn)
+{
+    if (g < 4u) {
+        sc = load_u8(scp + g) & 63u;
+        mn = load_u8(scp + g + 4u) & 63u;
+    } else {
+        sc = (load_u8(scp + g + 4u) & 15u) | ((load_u8(scp + g - 4u) >> 6u) << 4u);
+        mn = (load_u8(scp + g + 4u) >> 4u) | ((load_u8(scp + g) >> 6u) << 4u);
+    }
+}
+
+float q4k_dot256(uint blk, uint xoff)
+{
+    float d = load_f16(blk);
+    float dmin = load_f16(blk + 2u);
+    uint scp = blk + 4u;
+    uint qs = blk + 16u;
+    float acc = 0.0;
+    for (uint g = 0u; g < 8u; g++) {
+        uint sc, mn;
+        scale_min(g, scp, sc, mn);
+        float d1 = d * float(sc);
+        float m1 = dmin * float(mn);
+        uint q = qs + (g >> 1u) * 32u;
+        uint xbase = xoff + g * 32u;
+        for (uint e = 0u; e < 32u; e++) {
+            uint nib = load_u8(q + e);
+            nib = ((g & 1u) != 0u) ? (nib >> 4u) : (nib & 15u);
+            acc += x[xbase + e] * (d1 * float(nib) - m1);
+        }
+    }
+    return acc;
+}
+
+shared float sh[64];
+
+void main()
+{
+    uint o = gl_WorkGroupID.x;
+    if (o >= pc.out_n) return;
+
+    uint nb = pc.in_n / 256u;
+    uint rowb = nb * 144u;
+    uint row = o * rowb;
+    float acc = 0.0;
+    for (uint b = gl_LocalInvocationID.x; b < nb; b += 64u)
+        acc += q4k_dot256(row + b * 144u, b * 256u);
+
+    uint lid = gl_LocalInvocationID.x;
+    sh[lid] = acc;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lid < s)
+            sh[lid] += sh[lid + s];
+        memoryBarrierShared();
+        barrier();
+    }
+    if (lid == 0u)
+        y[o] = sh[0];
+}

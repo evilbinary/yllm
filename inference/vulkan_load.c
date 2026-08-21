@@ -227,6 +227,21 @@ int vulkan_try_init(VulkanCtx* ctx, int device_id, char* err, size_t errlen)
     return 0;
 }
 
+static void destroy_pipe(VulkanApi* a, VkDevice dev,
+                         void* pipe, void* layout, void* shader,
+                         void* pool, void* dsl)
+{
+    if (pipe && a->DestroyPipeline) a->DestroyPipeline(dev, (VkPipeline)pipe, NULL);
+    if (layout && a->DestroyPipelineLayout)
+        a->DestroyPipelineLayout(dev, (VkPipelineLayout)layout, NULL);
+    if (shader && a->DestroyShaderModule)
+        a->DestroyShaderModule(dev, (VkShaderModule)shader, NULL);
+    if (pool && a->DestroyDescriptorPool)
+        a->DestroyDescriptorPool(dev, (VkDescriptorPool)pool, NULL);
+    if (dsl && a->DestroyDescriptorSetLayout)
+        a->DestroyDescriptorSetLayout(dev, (VkDescriptorSetLayout)dsl, NULL);
+}
+
 void vulkan_shutdown(VulkanCtx* ctx)
 {
     if (!ctx || ctx->host_shim) return;
@@ -235,16 +250,10 @@ void vulkan_shutdown(VulkanCtx* ctx)
     VkInstance inst = (VkInstance)ctx->instance;
     if (!dev) return;
 
-    if (ctx->pipeline && a->DestroyPipeline)
-        a->DestroyPipeline(dev, (VkPipeline)ctx->pipeline, NULL);
-    if (ctx->pipe_layout && a->DestroyPipelineLayout)
-        a->DestroyPipelineLayout(dev, (VkPipelineLayout)ctx->pipe_layout, NULL);
-    if (ctx->shader && a->DestroyShaderModule)
-        a->DestroyShaderModule(dev, (VkShaderModule)ctx->shader, NULL);
-    if (ctx->desc_pool && a->DestroyDescriptorPool)
-        a->DestroyDescriptorPool(dev, (VkDescriptorPool)ctx->desc_pool, NULL);
-    if (ctx->desc_layout && a->DestroyDescriptorSetLayout)
-        a->DestroyDescriptorSetLayout(dev, (VkDescriptorSetLayout)ctx->desc_layout, NULL);
+    destroy_pipe(a, dev, ctx->rms_pipeline, ctx->rms_pipe_layout, ctx->rms_shader,
+                 ctx->rms_desc_pool, ctx->rms_desc_layout);
+    destroy_pipe(a, dev, ctx->gemv_pipeline, ctx->gemv_pipe_layout, ctx->gemv_shader,
+                 ctx->gemv_desc_pool, ctx->gemv_desc_layout);
     if (ctx->cmd_pool && a->DestroyCommandPool)
         a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
     if (ctx->fence && a->DestroyFence)
@@ -252,10 +261,12 @@ void vulkan_shutdown(VulkanCtx* ctx)
 
     if (ctx->buf_x && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_x, NULL);
     if (ctx->buf_y && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_y, NULL);
-    if (ctx->buf_w && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_w, NULL);
+    if (ctx->buf_wn && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wn, NULL);
+    if (ctx->buf_wq && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wq, NULL);
     if (ctx->mem_x && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_x, NULL);
     if (ctx->mem_y && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_y, NULL);
-    if (ctx->mem_w && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_w, NULL);
+    if (ctx->mem_wn && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wn, NULL);
+    if (ctx->mem_wq && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wq, NULL);
     free(ctx->host_w);
 
     if (a->DestroyDevice) a->DestroyDevice(dev, NULL);

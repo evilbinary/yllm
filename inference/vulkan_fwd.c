@@ -48,11 +48,70 @@ int vulkan_selftest_rmsnorm(VulkanCtx* ctx)
     return maxe < 1e-3f ? 0 : -1;
 }
 
+/* 合成一小块 Q4_K 与 CPU matmul_q4k 对比 */
+int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
+{
+    if (!ctx || !ctx->gemv_ready) return -1;
+    uint32_t in = 256;
+    uint32_t out = 8;
+    if (in > ctx->max_in || out > ctx->max_out) return -1;
+    size_t wbytes = (size_t)out * 144;
+    if (wbytes > ctx->wq_bytes) return -1;
+
+    float* x = (float*)malloc((size_t)in * 4);
+    float* yg = (float*)malloc((size_t)out * 4);
+    float* yc = (float*)malloc((size_t)out * 4);
+    uint8_t* w = (uint8_t*)calloc(1, wbytes);
+    if (!x || !yg || !yc || !w) {
+        free(x); free(yg); free(yc); free(w);
+        return -1;
+    }
+    uint32_t i;
+    for (i = 0; i < in; i++)
+        x[i] = 0.02f * (float)((int)(i % 17) - 8);
+    /* 每行一块: d=1, dmin=0, scales=1, qs 填递增 nibble */
+    for (i = 0; i < out; i++) {
+        uint8_t* blk = w + (size_t)i * 144;
+        ((uint16_t*)blk)[0] = 0x3c00; /* f16 1.0 */
+        ((uint16_t*)blk)[1] = 0x0000; /* f16 0.0 */
+        memset(blk + 4, 0x01, 12);    /* sc/min 低 6bit ≈1 */
+        uint32_t e;
+        for (e = 0; e < 128; e++)
+            blk[16 + e] = (uint8_t)((e & 0xF) | (((e + 3) & 0xF) << 4));
+    }
+    if (vulkan_k_gemv_q4k(ctx, yg, x, w, out, in) != 0) {
+        free(x); free(yg); free(yc); free(w);
+        return -1;
+    }
+    /* 参考用反量化+点积(勿用 AVX Q8 路径, 会引入额外量化误差) */
+    {
+        float deq[256];
+        uint32_t o, j;
+        for (o = 0; o < out; o++) {
+            float acc = 0.0f;
+            const uint8_t* row = w + (size_t)o * 144;
+            q4k_block(deq, row, 0);
+            for (j = 0; j < 256; j++) acc += x[j] * deq[j];
+            yc[o] = acc;
+        }
+    }
+    float maxe = 0.0f;
+    for (i = 0; i < out; i++) {
+        float d = fabsf(yg[i] - yc[i]);
+        if (d > maxe) maxe = d;
+    }
+    free(x); free(yg); free(yc); free(w);
+    ylog_info("vulkan: gemv_q4k selftest max_abs_err=%.6g (out=%u in=%u)",
+              (double)maxe, out, in);
+    return maxe < 1e-3f ? 0 : -1;
+}
+
 static void vk_or_cpu_rmsnorm(VulkanCtx* ctx,
                               float* y, const float* x,
                               const uint8_t* wbytes, uint32_t n, float eps, uint32_t dtype)
 {
-    if (ctx && ctx->compute_ready && (size_t)n * 4 <= ctx->buf_bytes) {
+    if (ctx && ctx->compute_ready && (size_t)n * 4 <= ctx->x_bytes &&
+        (size_t)n * 4 <= ctx->wn_bytes) {
         if (dtype == DT_F32) {
             if (vulkan_k_rmsnorm(ctx, y, x, (const float*)wbytes, n, eps) == 0)
                 return;
@@ -65,6 +124,15 @@ static void vk_or_cpu_rmsnorm(VulkanCtx* ctx,
         }
     }
     rmsnorm(y, x, wbytes, n, eps, dtype);
+}
+
+static void vk_or_cpu_matmul(VulkanCtx* ctx, float* y, const float* x,
+                             const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
+{
+    if (ctx && ctx->gemv_ready && dtype == DT_Q4K &&
+        vulkan_k_gemv_q4k(ctx, y, x, w, out, in) == 0)
+        return;
+    matmul(y, x, w, out, in, dtype);
 }
 
 static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
@@ -93,9 +161,9 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 
     vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM1].offset,
                       hidden, eps, mt[SLOT_NORM1].dtype);
-    matmul(q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype);
-    matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
-    matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+    vk_or_cpu_matmul(ctx, q, x2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype);
+    vk_or_cpu_matmul(ctx, k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
+    vk_or_cpu_matmul(ctx, v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
     if (mt[SLOT_QBIAS].size > 0) {
         const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
         uint32_t j;
@@ -169,16 +237,16 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         }
     }
     memcpy(x2, att_out, (size_t)hidden * 4);
-    matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype);
+    vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
     vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM2].offset,
                       hidden, eps, mt[SLOT_NORM2].dtype);
     float* fg = e->ffn;
     float* fu = e->ffn + inter;
-    matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
-    matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+    vk_or_cpu_matmul(ctx, fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+    vk_or_cpu_matmul(ctx, fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
     swiglu(x2, fg, fu, inter);
-    matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
+    vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
     return 0;
 }

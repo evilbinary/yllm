@@ -1,6 +1,6 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.3 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.4 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
@@ -20,10 +20,13 @@
 ```
 
 - **vulkan**：动态加载 `vulkan-1.dll` / `libvulkan.so` / MoltenVK；创建 **compute 队列** `VkDevice`。
-  - 成功 → `DEV_MODE_VULKAN`（`mode=native`）；`vulkan_compute` 加载 `rmsnorm.spv`，块内 F32/F16 RMSNorm 走 GPU（其余 matmul/attn 仍 CPU）。load 时自检 `max_abs_err`。
-  - 失败 → `DEV_MODE_VULKAN_HOST`。
-  - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`。
-  - SPIR-V 路径：cwd 相对 `inference/shaders/`，或 `YLLM_SHADER_DIR`。
+  - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
+    - `rmsnorm.spv`：块内 F32/F16 RMSNorm
+    - `gemv_q4k.spv`：块内 Q4_K matmul（每次仍 H2D 拷权，未做驻留）
+    - load 时自检；`rms=1 gemv=1` 表示两路可用
+  - 失败 → `DEV_MODE_VULKAN_HOST`
+  - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
+  - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/shaders/`
 
 ## 3. 构建
 
@@ -58,7 +61,7 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. Q4_K gemv compute（主算力）  
-2. 驻留 buffer / 少 H2D（当前每层 RMSNorm 同步 map 拷贝，decode 会偏慢）  
-3. 设备 `adb` 冒烟（需真机 + 模型 push）  
+1. 权重/激活驻留 VkBuffer（去掉每层 H2D，否则 UHD 上 decode 会慢于 CPU）  
+2. attn / swiglu / rope compute；lm_head gemv  
+3. 设备 `adb` 冒烟  
 4. MoltenVK iOS
