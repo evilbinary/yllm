@@ -26,6 +26,25 @@ typedef struct {
     uint32_t n;
 } SwiPush;
 
+typedef struct {
+    uint32_t n_heads;
+    uint32_t head_dim;
+    uint32_t pos;
+    uint32_t mode; /* 0=llama 1=qwen */
+    float theta;
+} RopePush;
+
+typedef struct {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t kv_dim;
+    uint32_t max_seq;
+    uint32_t pos;
+    uint32_t k_slot;
+    uint32_t v_slot;
+} AttnPush;
+
 static uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
                                  VkMemoryPropertyFlags props)
 {
@@ -745,6 +764,48 @@ static void cmd_swiglu(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n)
     a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
 }
 
+static void cmd_rope(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
+                     uint32_t n_heads, uint32_t head_dim, uint32_t pos,
+                     uint32_t mode, float theta)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->rope_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)dset;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->rope_pipe_layout, 0, 1, &ds, 0, NULL);
+    RopePush push;
+    push.n_heads = n_heads;
+    push.head_dim = head_dim;
+    push.pos = pos;
+    push.mode = mode;
+    push.theta = theta;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->rope_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, n_heads, 1, 1);
+}
+
+static void cmd_attn(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t layer, uint32_t pos)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->attn_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)ctx->attn_desc_set;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->attn_pipe_layout, 0, 1, &ds, 0, NULL);
+    AttnPush push;
+    push.n_heads = ctx->n_heads;
+    push.n_kv_heads = ctx->n_kv_heads;
+    push.head_dim = ctx->head_dim;
+    push.kv_dim = ctx->kv_dim;
+    push.max_seq = ctx->max_seq;
+    push.pos = pos;
+    push.k_slot = layer;
+    push.v_slot = ctx->n_blocks + layer;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->attn_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, ctx->n_heads, 1, 1);
+}
+
+
 int vulkan_fused_ffn(VulkanCtx* ctx,
                      const float* x, const float* wn, uint32_t hidden, float eps,
                      float* out, uint32_t inter,
@@ -784,17 +845,6 @@ int vulkan_fused_ffn(VulkanCtx* ctx,
     if (submit_and_wait(ctx, cmd) != 0) return -1;
     return map_read(ctx, ctx->mem_o0, out, xb);
 }
-
-typedef struct {
-    uint32_t n_heads;
-    uint32_t n_kv_heads;
-    uint32_t head_dim;
-    uint32_t kv_dim;
-    uint32_t max_seq;
-    uint32_t pos;
-    uint32_t k_slot;
-    uint32_t v_slot;
-} AttnPush;
 
 int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
                       uint32_t kv_dim, uint32_t n_heads, uint32_t n_kv_heads,
@@ -859,6 +909,78 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
     ctx->attn_ready = 1;
     ylog_info("vulkan: attn_decode ready heads=%u kv=%u seq=%u cache=%zuMB",
               n_heads, n_kv_heads, max_seq, ctx->kv_bytes / (1024 * 1024));
+
+    /* RoPE: binding0 = o0/o1; binding1/2 占位 */
+    {
+        char rerr[256];
+        VulkanApi* a = vulkan_api();
+        VkDevice dev = (VkDevice)ctx->device;
+        VkBuffer o0 = (VkBuffer)ctx->buf_o0;
+        VkBuffer o1 = (VkBuffer)ctx->buf_o1;
+        VkBuffer rbufs[3] = { o0, o0, o0 };
+        size_t rranges[3] = { ctx->y_bytes, ctx->y_bytes, ctx->y_bytes };
+        VkShaderModule rsh = VK_NULL_HANDLE;
+        VkDescriptorSetLayout rdsl = VK_NULL_HANDLE;
+        VkPipelineLayout rpl = VK_NULL_HANDLE;
+        VkPipeline rpipe = VK_NULL_HANDLE;
+        VkDescriptorPool rpool = VK_NULL_HANDLE;
+        VkDescriptorSet rdset = VK_NULL_HANDLE;
+        if (create_ssbo_pipeline(ctx, "rope.spv", sizeof(RopePush),
+                                 &rsh, &rdsl, &rpl, &rpipe, &rpool, &rdset,
+                                 rbufs, rranges, rerr, sizeof(rerr)) != 0) {
+            ylog_warn("vulkan: rope pipeline failed (%s)", rerr);
+        } else {
+            a->DestroyDescriptorPool(dev, rpool, NULL);
+            VkDescriptorPoolSize dps = {0};
+            dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            dps.descriptorCount = 6;
+            VkDescriptorPoolCreateInfo dpi = {0};
+            dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            dpi.maxSets = 2;
+            dpi.poolSizeCount = 1;
+            dpi.pPoolSizes = &dps;
+            if (a->CreateDescriptorPool(dev, &dpi, NULL, &rpool) == VK_SUCCESS) {
+                VkDescriptorSetLayout layouts[2] = { rdsl, rdsl };
+                VkDescriptorSet sets[2];
+                VkDescriptorSetAllocateInfo dai = {0};
+                dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                dai.descriptorPool = rpool;
+                dai.descriptorSetCount = 2;
+                dai.pSetLayouts = layouts;
+                if (a->AllocateDescriptorSets(dev, &dai, sets) == VK_SUCCESS) {
+                    VkBuffer xb[2] = { o0, o1 };
+                    uint32_t si;
+                    for (si = 0; si < 2; si++) {
+                        VkDescriptorBufferInfo bis[3];
+                        VkWriteDescriptorSet writes[3];
+                        memset(bis, 0, sizeof(bis));
+                        memset(writes, 0, sizeof(writes));
+                        uint32_t b;
+                        for (b = 0; b < 3; b++) {
+                            bis[b].buffer = (b == 0) ? xb[si] : xb[si];
+                            bis[b].range = ctx->y_bytes;
+                            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                            writes[b].dstSet = sets[si];
+                            writes[b].dstBinding = b;
+                            writes[b].descriptorCount = 1;
+                            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                            writes[b].pBufferInfo = &bis[b];
+                        }
+                        a->UpdateDescriptorSets(dev, 3, writes, 0, NULL);
+                    }
+                    ctx->rope_shader = (void*)rsh;
+                    ctx->rope_desc_layout = (void*)rdsl;
+                    ctx->rope_pipe_layout = (void*)rpl;
+                    ctx->rope_pipeline = (void*)rpipe;
+                    ctx->rope_desc_pool = (void*)rpool;
+                    ctx->rope_ds_q = (void*)sets[0];
+                    ctx->rope_ds_k = (void*)sets[1];
+                    ctx->rope_ready = 1;
+                    ylog_info("vulkan: rope ready");
+                }
+            }
+        }
+    }
     return 0;
 }
 
@@ -946,4 +1068,109 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
     if (fuse_o)
         return map_read(ctx, ctx->mem_y, att_out, qbytes);
     return map_read(ctx, ctx->mem_o2, att_out, qbytes);
+}
+
+/* 无 bias/qk-norm: rmsnorm+QKV+rope 一次 submit; 写 KV 行; attn(+O) 再 submit
+ * Q 留在 o0, 不再读回/重传 */
+int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
+                               const float* x, const float* wn, uint32_t hidden, float eps,
+                               float* out, uint32_t kv_dim,
+                               uint64_t off_q, uint64_t off_k, uint64_t off_v, uint64_t off_o,
+                               uint32_t layer, uint32_t pos, uint32_t rope_mode, float theta,
+                               uint16_t* host_k_row, uint16_t* host_v_row)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident || !ctx->rope_ready ||
+        !ctx->attn_ready || !x || !wn || !out)
+        return -1;
+    if (hidden != ctx->n_heads * ctx->head_dim || kv_dim != ctx->kv_dim) return -1;
+    if (hidden > ctx->max_in || hidden > ctx->max_out || kv_dim > ctx->max_out) return -1;
+    if (pos >= ctx->max_seq || layer > ctx->n_blocks) return -1;
+    if (off_q > 0xffffffffull || off_k > 0xffffffffull || off_v > 0xffffffffull)
+        return -1;
+
+    int fuse_o = (off_o != (uint64_t)~0ull);
+    if (fuse_o) {
+        if (!ctx->attn_o_ready || !ctx->gemv_ds_xo) return -1;
+        if (off_o > 0xffffffffull) return -1;
+        size_t wbytes = (size_t)hidden * ((size_t)(hidden / 256) * 144);
+        if ((hidden % 256) != 0 || off_o + wbytes > ctx->wq_bytes) return -1;
+    }
+
+    size_t xb = (size_t)hidden * 4;
+    size_t rowb = (size_t)kv_dim * 4;
+    uint32_t k_slot = layer;
+    uint32_t v_slot = ctx->n_blocks + layer;
+    size_t k_off = ((size_t)k_slot * ctx->max_seq + pos) * kv_dim * 4;
+    size_t v_off = ((size_t)v_slot * ctx->max_seq + pos) * kv_dim * 4;
+
+    if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
+    if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
+
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    a->ResetCommandBuffer(cmd, 0);
+    a->BeginCommandBuffer(cmd, &bi);
+    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds2, kv_dim, hidden, (uint32_t)off_v);
+    cmd_barrier_compute(cmd);
+    cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim, pos, rope_mode, theta);
+    cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim, pos, rope_mode, theta);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    /* o1=K o2=V → GPU KV; 可选同步 host f16 */
+    {
+        void* src = NULL;
+        void* dst = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &src) != VK_SUCCESS)
+            return -1;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, k_off, rowb, 0, &dst) != VK_SUCCESS) {
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
+            return -1;
+        }
+        memcpy(dst, src, rowb);
+        if (host_k_row) {
+            uint32_t j;
+            const float* kf = (const float*)src;
+            for (j = 0; j < kv_dim; j++) host_k_row[j] = f32_to_f16(kf[j]);
+        }
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
+
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &src) != VK_SUCCESS)
+            return -1;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, v_off, rowb, 0, &dst) != VK_SUCCESS) {
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
+            return -1;
+        }
+        memcpy(dst, src, rowb);
+        if (host_v_row) {
+            uint32_t j;
+            const float* vf = (const float*)src;
+            for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
+        }
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
+    }
+
+    a->ResetCommandBuffer(cmd, 0);
+    a->BeginCommandBuffer(cmd, &bi);
+    cmd_attn(ctx, cmd, layer, pos);
+    if (fuse_o) {
+        cmd_barrier_compute(cmd);
+        cmd_gemv(ctx, cmd, ctx->gemv_ds_xo, hidden, hidden, (uint32_t)off_o);
+    }
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+    if (fuse_o)
+        return map_read(ctx, ctx->mem_y, out, xb);
+    return map_read(ctx, ctx->mem_o2, out, xb);
 }

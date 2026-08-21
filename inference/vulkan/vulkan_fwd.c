@@ -201,6 +201,37 @@ static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* out,
     return vulkan_fused_ffn(ctx, x, ctx->host_w, hidden, eps, out, inter, og, ou, od);
 }
 
+static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
+                                uint32_t hidden, uint32_t kv_dim, float eps, float theta,
+                                uint32_t rope_mode, uint32_t layer, uint32_t pos,
+                                const uint8_t* base, const LlfTensorMeta* mt,
+                                uint16_t* host_k_row, uint16_t* host_v_row)
+{
+    if (!ctx || !ctx->rope_ready || !ctx->attn_ready || !ctx->fuse_ready || !ctx->wq_resident)
+        return -1;
+    if (mt[SLOT_QBIAS].size > 0 || mt[SLOT_KBIAS].size > 0 || mt[SLOT_VBIAS].size > 0)
+        return -1;
+    if (mt[SLOT_QNORM].size > 0 || mt[SLOT_KNORM].size > 0)
+        return -1;
+    if (mt[SLOT_Q].dtype != DT_Q4K || mt[SLOT_K].dtype != DT_Q4K || mt[SLOT_V].dtype != DT_Q4K)
+        return -1;
+    if (load_norm_f32(ctx, base + mt[SLOT_NORM1].offset, hidden, mt[SLOT_NORM1].dtype) != 0)
+        return -1;
+    uint64_t oq = wq_off(ctx, layer, SLOT_Q);
+    uint64_t ok = wq_off(ctx, layer, SLOT_K);
+    uint64_t ov = wq_off(ctx, layer, SLOT_V);
+    uint64_t oo = (uint64_t)~0ull;
+    if (!ctx->attn_o_ready || mt[SLOT_O].dtype != DT_Q4K) return -1;
+    oo = wq_off(ctx, layer, SLOT_O);
+    if (oq == (uint64_t)~0ull || ok == (uint64_t)~0ull || ov == (uint64_t)~0ull ||
+        oo == (uint64_t)~0ull)
+        return -1;
+    return vulkan_fused_qkv_rope_attn(ctx, x, ctx->host_w, hidden, eps,
+                                      out, kv_dim, oq, ok, ov, oo,
+                                      layer, pos, rope_mode, theta,
+                                      host_k_row, host_v_row);
+}
+
 static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
@@ -224,6 +255,36 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     uint32_t hidx = m->base_idx[layer];
     const LlfTensorMeta* mt = &m->metas[hidx];
     uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
+    uint16_t* kcache = kv + (size_t)layer * e->max_seq * kv_dim;
+    uint16_t* vcache = kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
+    uint64_t kvp = (uint64_t)pos * kv_dim;
+    uint32_t hh, j;
+    uint32_t rope_mode = (h->arch == ARCH_QWEN) ? 1u : 0u;
+
+    /* 快路径: QKV+rope+attn(+O) 少 host 往返 */
+    if (try_fused_attn_block(ctx, x, att_out, hidden, kv_dim, eps, theta, rope_mode,
+                             layer, pos, base, mt, kcache + kvp, vcache + kvp) == 0) {
+        for (j = 0; j < hidden; j++) x[j] += att_out[j];
+        if (try_fused_ffn(ctx, x, att_out, hidden, inter, eps, base, mt, layer) == 0) {
+            for (j = 0; j < hidden; j++) x[j] += att_out[j];
+            return 0;
+        }
+        {
+            float* fg = e->ffn;
+            float* fu = e->ffn + inter;
+            vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM2].offset,
+                              hidden, eps, mt[SLOT_NORM2].dtype);
+            vk_or_cpu_matmul(ctx, fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype,
+                             layer, SLOT_GATE);
+            vk_or_cpu_matmul(ctx, fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype,
+                             layer, SLOT_UP);
+            swiglu(x2, fg, fu, inter);
+            vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype,
+                             layer, SLOT_DOWN);
+            for (j = 0; j < hidden; j++) x[j] += att_out[j];
+        }
+        return 0;
+    }
 
     if (try_fused_qkv(ctx, x, q, k, v, hidden, kv_dim, eps, base, mt, layer) != 0) {
         vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM1].offset,
@@ -237,44 +298,35 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     }
     if (mt[SLOT_QBIAS].size > 0) {
         const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
-        uint32_t j;
         for (j = 0; j < hidden; j++) q[j] += bq[j];
     }
     if (mt[SLOT_KBIAS].size > 0) {
         const float* bk = (const float*)(base + mt[SLOT_KBIAS].offset);
-        uint32_t j;
         for (j = 0; j < kv_dim; j++) k[j] += bk[j];
     }
     if (mt[SLOT_VBIAS].size > 0) {
         const float* bv = (const float*)(base + mt[SLOT_VBIAS].offset);
-        uint32_t j;
         for (j = 0; j < kv_dim; j++) v[j] += bv[j];
     }
     if (mt[SLOT_QNORM].size > 0) {
-        uint32_t hh;
         for (hh = 0; hh < h->n_heads; hh++)
             rmsnorm(q + (size_t)hh * h->head_dim, q + (size_t)hh * h->head_dim,
                     base + mt[SLOT_QNORM].offset, h->head_dim, eps, mt[SLOT_QNORM].dtype);
     }
     if (mt[SLOT_KNORM].size > 0) {
-        uint32_t hh;
         for (hh = 0; hh < h->n_kv_heads; hh++)
             rmsnorm(k + (size_t)hh * h->head_dim, k + (size_t)hh * h->head_dim,
                     base + mt[SLOT_KNORM].offset, h->head_dim, eps, mt[SLOT_KNORM].dtype);
     }
 
-    uint16_t* kcache = kv + (size_t)layer * e->max_seq * kv_dim;
-    uint16_t* vcache = kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
-    uint64_t kvp = (uint64_t)pos * kv_dim;
-    uint32_t hh, j;
     for (hh = 0; hh < h->n_heads; hh++) {
-        if (h->arch == ARCH_QWEN)
+        if (rope_mode)
             rope_inplace_qwen(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
         else
             rope_inplace(q + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
     }
     for (hh = 0; hh < h->n_kv_heads; hh++) {
-        if (h->arch == ARCH_QWEN)
+        if (rope_mode)
             rope_inplace_qwen(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
         else
             rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
@@ -316,12 +368,12 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
                 att_h[s] = acc * inv_d;
             }
             softmax(att_h, pos + 1);
-            float* out = att_out + (size_t)hh * h->head_dim;
-            memset(out, 0, (size_t)h->head_dim * 4);
+            float* outh = att_out + (size_t)hh * h->head_dim;
+            memset(outh, 0, (size_t)h->head_dim * 4);
             for (s = 0; s <= pos; s++) {
                 const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
                 float a = att_h[s];
-                for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+                for (jj = 0; jj < h->head_dim; jj++) outh[jj] += a * f16_to_f32(vh[jj]);
             }
         }
     }

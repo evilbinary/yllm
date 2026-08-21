@@ -5,6 +5,7 @@
 #   make cuda       AVX2 + CUDA 后端(产物在 build/avx2-cuda/, 与 avx2 隔离)
 #   make vulkan     AVX2 + Vulkan 后端(产物在 build/avx2-vulkan/; P0 host-shim)
 #   make gen-cuda / chat-cuda   用 --device cuda 冒烟
+#   make gen-vulkan / chat-vulkan / chat-*-avx2-vulkan
 #   make test       运行测试
 #   make clean
 #
@@ -391,6 +392,14 @@ gen-vulkan: vulkan $(MODEL_LLF)
 	$(RUN_VULKAN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
+chat-vulkan: vulkan $(MODEL_LLF)
+	$(RUN_VULKAN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
+# 与 chat-avx2 / gen-avx2 对称的命名(产物仍为 build/avx2-vulkan)
+chat-avx2-vulkan: chat-vulkan
+gen-avx2-vulkan: gen-vulkan
+
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 Q25_LLF   ?= models/qwen2.5-1.5b.llf
@@ -420,11 +429,19 @@ chat-qwen2.5-1.5b: $(BIN) $(Q25_LLF)
 chat-qwen2.5-1.5b-avx2: $(BIN_AVX2) $(Q25_LLF)
 	$(RUN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+chat-qwen2.5-1.5b-avx2-vulkan: vulkan $(Q25_LLF)
+	$(RUN_VULKAN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 chat-qwen3-8b: $(BIN) $(Q3_8B_LLF)
 	$(RUN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_8B_LLF)
 	$(RUN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3-8b-avx2-vulkan: vulkan $(Q3_8B_LLF)
+	$(RUN_VULKAN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
 Q3_27B_GGUF  ?= models/Qwen3.8-27B-Q4_K_M.gguf
@@ -441,11 +458,19 @@ gen-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
 gen-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
 	$(RUN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+gen-qwen3.8-27b-avx2-vulkan: vulkan $(Q3_27B_LLF)
+	$(RUN_VULKAN) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 chat-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
 	$(RUN) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
 chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
 	$(RUN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3.8-27b-avx2-vulkan: vulkan $(Q3_27B_LLF)
+	$(RUN_VULKAN) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
 #   make server-qwen2.5-7b   # 只起 qwen2.5(本机 rank)
@@ -673,4 +698,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda vulkan clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama

@@ -1,0 +1,41 @@
+#version 450
+/* RoPE in-place: buf 为 n_heads × head_dim
+ * mode 0 = llama pair(2j,2j+1); 1 = qwen (j, j+half) */
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer X { float v[]; };
+layout(set = 0, binding = 1) readonly buffer _Unused1 { float _u1[]; };
+layout(set = 0, binding = 2) readonly buffer _Unused2 { float _u2[]; };
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+    uint head_dim;
+    uint pos;
+    uint mode;
+    float theta;
+} pc;
+
+void main() {
+    uint hid = gl_WorkGroupID.x;
+    if (hid >= pc.n_heads) return;
+    uint half_d = pc.head_dim / 2u;
+    uint base = hid * pc.head_dim;
+    for (uint j = gl_LocalInvocationID.x; j < half_d; j += 64u) {
+        float freq = pow(pc.theta, -2.0 * float(j) / float(pc.head_dim));
+        float ang = freq * float(pc.pos);
+        float c = cos(ang);
+        float s = sin(ang);
+        uint ia, ib;
+        if (pc.mode == 0u) {
+            ia = base + 2u * j;
+            ib = base + 2u * j + 1u;
+        } else {
+            ia = base + j;
+            ib = base + j + half_d;
+        }
+        float a = v[ia];
+        float b = v[ib];
+        v[ia] = a * c - b * s;
+        v[ib] = a * s + b * c;
+    }
+}

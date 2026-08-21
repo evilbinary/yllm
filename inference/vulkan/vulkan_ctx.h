@@ -89,6 +89,15 @@ typedef struct {
     int attn_ready;
     int attn_o_ready; /* gemv_ds_xo 可用 */
 
+    void* rope_desc_pool;
+    void* rope_desc_layout;
+    void* rope_ds_q; /* o0 */
+    void* rope_ds_k; /* o1 */
+    void* rope_pipe_layout;
+    void* rope_pipeline;
+    void* rope_shader;
+    int rope_ready;
+
     int compute_ready;
     uint32_t n_layers;
     uint32_t hidden;
