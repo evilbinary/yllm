@@ -21,6 +21,10 @@ typedef struct {
     uint32_t _pad;
 } GemvPush;
 
+typedef struct {
+    uint32_t n;
+} SwiPush;
+
 static uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
                                  VkMemoryPropertyFlags props)
 {
@@ -421,6 +425,35 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
             }
         }
     }
+
+    /* SwiGLU: gate=o0 up=o1 out=buf_y */
+    if (ctx->fuse_ready && ctx->buf_o0 && ctx->buf_o1 && ctx->buf_y) {
+        char serr[256];
+        VkBuffer bufs[3] = {
+            (VkBuffer)ctx->buf_o0, (VkBuffer)ctx->buf_o1, (VkBuffer)ctx->buf_y
+        };
+        size_t ranges[3] = { ctx->y_bytes, ctx->y_bytes, ctx->y_bytes };
+        VkShaderModule sh = VK_NULL_HANDLE;
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        VkPipelineLayout pl = VK_NULL_HANDLE;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet dset = VK_NULL_HANDLE;
+        if (create_ssbo_pipeline(ctx, "swiglu.spv", sizeof(SwiPush),
+                                 &sh, &dsl, &pl, &pipe, &pool, &dset,
+                                 bufs, ranges, serr, sizeof(serr)) != 0) {
+            ylog_warn("vulkan: swiglu pipeline failed (%s)", serr);
+        } else {
+            ctx->swi_shader = (void*)sh;
+            ctx->swi_desc_layout = (void*)dsl;
+            ctx->swi_pipe_layout = (void*)pl;
+            ctx->swi_pipeline = (void*)pipe;
+            ctx->swi_desc_pool = (void*)pool;
+            ctx->swi_desc_set = (void*)dset;
+            ctx->swi_ready = 1;
+            ylog_info("vulkan: swiglu ready");
+        }
+    }
     return 0;
 }
 
@@ -691,4 +724,58 @@ int vulkan_fused_norm_gate_up(VulkanCtx* ctx,
     if (map_read(ctx, ctx->mem_o0, gate, ib) != 0) return -1;
     if (map_read(ctx, ctx->mem_o1, up, ib) != 0) return -1;
     return 0;
+}
+
+static void cmd_swiglu(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n)
+{
+    VulkanApi* a = vulkan_api();
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->swi_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)ctx->swi_desc_set;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->swi_pipe_layout, 0, 1, &ds, 0, NULL);
+    SwiPush push;
+    push.n = n;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->swi_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
+}
+
+int vulkan_fused_ffn(VulkanCtx* ctx,
+                     const float* x, const float* wn, uint32_t hidden, float eps,
+                     float* out, uint32_t inter,
+                     uint64_t off_gate, uint64_t off_up, uint64_t off_down)
+{
+    if (!ctx || !ctx->fuse_ready || !ctx->swi_ready || !ctx->wq_resident ||
+        !x || !wn || !out)
+        return -1;
+    if (hidden > ctx->max_in || inter > ctx->max_out || hidden > ctx->max_out)
+        return -1;
+    if (off_gate > 0xffffffffull || off_up > 0xffffffffull || off_down > 0xffffffffull)
+        return -1;
+
+    size_t xb = (size_t)hidden * 4;
+    if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
+    if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
+
+    VulkanApi* a = vulkan_api();
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    a->BeginCommandBuffer(cmd, &bi);
+
+    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_barrier_compute(cmd);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, inter, hidden, (uint32_t)off_gate);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds1, inter, hidden, (uint32_t)off_up);
+    cmd_barrier_compute(cmd);
+    cmd_swiglu(ctx, cmd, inter);
+    cmd_barrier_compute(cmd);
+    /* swiglu → buf_y; down: x=buf_y → o0 */
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, inter, (uint32_t)off_down);
+
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+    return map_read(ctx, ctx->mem_o0, out, xb);
 }

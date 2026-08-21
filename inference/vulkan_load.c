@@ -255,6 +255,8 @@ void vulkan_shutdown(VulkanCtx* ctx)
                  ctx->rms_desc_pool, ctx->rms_desc_layout);
     destroy_pipe(a, dev, ctx->gemv_pipeline, ctx->gemv_pipe_layout, ctx->gemv_shader,
                  ctx->gemv_desc_pool, ctx->gemv_desc_layout);
+    destroy_pipe(a, dev, ctx->swi_pipeline, ctx->swi_pipe_layout, ctx->swi_shader,
+                 ctx->swi_desc_pool, ctx->swi_desc_layout);
     if (ctx->cmd_pool && a->DestroyCommandPool)
         a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
     if (ctx->fence && a->DestroyFence)

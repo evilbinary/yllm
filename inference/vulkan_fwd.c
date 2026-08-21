@@ -183,19 +183,22 @@ static int try_fused_qkv(VulkanCtx* ctx, const float* x, float* q, float* k, flo
                                  q, k, v, kv_dim, oq, ok, ov);
 }
 
-static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* gate, float* up,
+static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* out,
                          uint32_t hidden, uint32_t inter, float eps,
                          const uint8_t* base, const LlfTensorMeta* mt, uint32_t layer)
 {
-    if (!ctx || !ctx->fuse_ready || !ctx->wq_resident) return -1;
-    if (mt[SLOT_GATE].dtype != DT_Q4K || mt[SLOT_UP].dtype != DT_Q4K) return -1;
+    if (!ctx || !ctx->fuse_ready || !ctx->swi_ready || !ctx->wq_resident) return -1;
+    if (mt[SLOT_GATE].dtype != DT_Q4K || mt[SLOT_UP].dtype != DT_Q4K ||
+        mt[SLOT_DOWN].dtype != DT_Q4K)
+        return -1;
     if (load_norm_f32(ctx, base + mt[SLOT_NORM2].offset, hidden, mt[SLOT_NORM2].dtype) != 0)
         return -1;
     uint64_t og = wq_off(ctx, layer, SLOT_GATE);
     uint64_t ou = wq_off(ctx, layer, SLOT_UP);
-    if (og == (uint64_t)~0ull || ou == (uint64_t)~0ull) return -1;
-    return vulkan_fused_norm_gate_up(ctx, x, ctx->host_w, hidden, eps,
-                                     gate, up, inter, og, ou);
+    uint64_t od = wq_off(ctx, layer, SLOT_DOWN);
+    if (og == (uint64_t)~0ull || ou == (uint64_t)~0ull || od == (uint64_t)~0ull)
+        return -1;
+    return vulkan_fused_ffn(ctx, x, ctx->host_w, hidden, eps, out, inter, og, ou, od);
 }
 
 static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
@@ -309,20 +312,24 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
                      layer, SLOT_O);
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
 
-    float* fg = e->ffn;
-    float* fu = e->ffn + inter;
-    if (try_fused_ffn(ctx, x, fg, fu, hidden, inter, eps, base, mt, layer) != 0) {
+    if (try_fused_ffn(ctx, x, att_out, hidden, inter, eps, base, mt, layer) == 0) {
+        for (j = 0; j < hidden; j++) x[j] += att_out[j];
+        return 0;
+    }
+    {
+        float* fg = e->ffn;
+        float* fu = e->ffn + inter;
         vk_or_cpu_rmsnorm(ctx, x2, x, base + mt[SLOT_NORM2].offset,
                           hidden, eps, mt[SLOT_NORM2].dtype);
         vk_or_cpu_matmul(ctx, fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype,
                          layer, SLOT_GATE);
         vk_or_cpu_matmul(ctx, fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype,
                          layer, SLOT_UP);
+        swiglu(x2, fg, fu, inter);
+        vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype,
+                         layer, SLOT_DOWN);
+        for (j = 0; j < hidden; j++) x[j] += att_out[j];
     }
-    swiglu(x2, fg, fu, inter);
-    vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype,
-                     layer, SLOT_DOWN);
-    for (j = 0; j < hidden; j++) x[j] += att_out[j];
     return 0;
 }
 

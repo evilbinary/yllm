@@ -62,6 +62,15 @@ typedef struct {
     int gemv_ready;
     int fuse_ready;
 
+    /* SwiGLU: gate=o0, up=o1, out=buf_y */
+    void* swi_desc_pool;
+    void* swi_desc_layout;
+    void* swi_desc_set;
+    void* swi_pipe_layout;
+    void* swi_pipeline;
+    void* swi_shader;
+    int swi_ready;
+
     int compute_ready;
     uint32_t n_layers;
     uint32_t hidden;

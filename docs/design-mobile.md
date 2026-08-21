@@ -1,6 +1,6 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.6 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.7 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
@@ -23,7 +23,7 @@
   - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
     - `rmsnorm.spv`：块内 F32/F16 RMSNorm
     - `gemv_q4k.spv`：块内 Q4_K；**load 时整包常驻**（`resident=1`）
-    - **fused**：`rmsnorm+QKV`、`rmsnorm+gate+up` 各一次 submit（`fuse=1`）；O/down 仍单次 gemv；attn/swiglu/rope 仍 CPU
+    - **fused**：`rmsnorm+QKV`；整段 FFN `rmsnorm+gate+up+swiglu+down`（`swi=1`）；O 仍单次 gemv；attn/rope 仍 CPU
   - 失败 → `DEV_MODE_VULKAN_HOST`
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
   - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/shaders/`
@@ -61,6 +61,6 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. attn / swiglu / rope compute；lm_head  
-2. 进一步减少 map（常驻激活跨层）  
+1. rope / attn_decode compute；lm_head  
+2. 激活跨层常驻  
 3. `adb` 冒烟；MoltenVK iOS

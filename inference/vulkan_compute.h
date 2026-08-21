@@ -26,10 +26,16 @@ int vulkan_fused_norm_qkv(VulkanCtx* ctx,
                           float* q, float* k, float* v, uint32_t kv_dim,
                           uint64_t off_q, uint64_t off_k, uint64_t off_v);
 
-/* 一次 submit: rmsnorm(x)+gate+up → host */
+/* 一次 submit: rmsnorm+gate+up → host (无 swiglu 时回退) */
 int vulkan_fused_norm_gate_up(VulkanCtx* ctx,
                               const float* x, const float* wn, uint32_t hidden, float eps,
                               float* gate, float* up, uint32_t inter,
                               uint64_t off_gate, uint64_t off_up);
+
+/* 一次 submit: rmsnorm+gate+up+swiglu+down → host out[hidden] */
+int vulkan_fused_ffn(VulkanCtx* ctx,
+                     const float* x, const float* wn, uint32_t hidden, float eps,
+                     float* out, uint32_t inter,
+                     uint64_t off_gate, uint64_t off_up, uint64_t off_down);
 
 #endif
