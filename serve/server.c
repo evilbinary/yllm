@@ -38,7 +38,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
 {
     int fd = sock_connect(s->leader_host, s->leader_port, 5);
     if (fd < 0) {
-        sock_send_line(client_fd, "ERR server: cannot connect leader %s:%u",
+        sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader %s:%u",
                        s->leader_host, s->leader_port);
         return;
     }
@@ -56,7 +56,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
     long nbytes = frame_payload_len(&f);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
-        if (!pb) { sock_close(fd); sock_send_line(client_fd, "ERR server: oom"); return; }
+        if (!pb) { sock_close(fd); sock_send_line(client_fd, PROTO_ERROR " server: oom"); return; }
         if (sock_recv_n(client_fd, pb, (size_t)nbytes) != 0) {
             free(pb); sock_close(fd); return;
         }
@@ -64,7 +64,7 @@ static void forward_infer(int client_fd, Server* s, const char* args)
         free(pb);
     }
 
-    /* 透传响应(T 帧 + DONE): select 等待可读再 recv
+    /* 透传响应(T 帧 + DONE/ERR): select 等待可读再 recv
      * (Windows 上 SO_RCVTIMEO 阻塞 recv 在数据未到时可能立即返回 EOF) */
     char out[SRV_MAX_LINE];
     int done = 0;
@@ -72,15 +72,15 @@ static void forward_infer(int client_fd, Server* s, const char* args)
         int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
         if (sel <= 0) {
             ylog_warn("server: leader %s:%u no response (rc=%d)", s->leader_host, s->leader_port, sel);
-            sock_send_line(client_fd, "ERR server: leader timeout"); break;
+            sock_send_line(client_fd, PROTO_ERROR " server: leader timeout"); break;
         }
         int n = sock_recv_line(fd, out, sizeof(out));
         if (n < 0) {
             ylog_warn("server: recv from leader %s:%u disconnected", s->leader_host, s->leader_port);
-            sock_send_line(client_fd, "ERR server: leader disconnected"); break;
+            sock_send_line(client_fd, PROTO_ERROR " server: leader disconnected"); break;
         }
         sock_send_line(client_fd, "%s", out);
-        if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
+        if (strncmp(out, PROTO_DONE, 4) == 0 || proto_is_error(out)) done = 1;
         else if (strncmp(out, "T ", 2) == 0) {
             size_t tlen = 0;
             char* payload = frame_t_payload(fd, out, sizeof(out), &tlen);
@@ -119,7 +119,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     long nbytes = 0;
     char key[64] = "";
     if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
-        sock_send_line(client_fd, "ERR bad INFER_SESS args");
+        sock_send_line(client_fd, PROTO_ERROR " bad INFER_SESS args");
         return;
     }
     const char* kv = strstr(args, "key=");
@@ -130,10 +130,10 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         memcpy(key, kv, kl);
         key[kl] = '\0';
     }
-    if (!s->sess_vocab_ok) { sock_send_line(client_fd, "ERR server: session vocab not loaded"); return; }
+    if (!s->sess_vocab_ok) { sock_send_line(client_fd, PROTO_ERROR " server: session vocab not loaded"); return; }
 
     char* msg = (char*)malloc((size_t)nbytes + 1);
-    if (!msg) { sock_send_line(client_fd, "ERR server: oom"); return; }
+    if (!msg) { sock_send_line(client_fd, PROTO_ERROR " server: oom"); return; }
     if (sock_recv_n(client_fd, msg, (size_t)nbytes) != 0) { free(msg); return; }
     msg[nbytes] = '\0';
 
@@ -162,7 +162,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     if (n <= 0) {
         free(tokens);
         pthread_mutex_unlock(&s->sess_lock);
-        sock_send_line(client_fd, "ERR server: render failed");
+        sock_send_line(client_fd, PROTO_ERROR " server: render failed");
         return;
     }
     sess_commit(sv, tokens, (uint32_t)n);
@@ -172,7 +172,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     int retry = 0;
     for (;;) {
         int fd = sock_connect(s->leader_host, s->leader_port, 5);
-        if (fd < 0) { free(tokens); sock_send_line(client_fd, "ERR server: cannot connect leader"); return; }
+        if (fd < 0) { free(tokens); sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader"); return; }
         sock_set_timeout(fd, (int)(srv_timeout_ms() / 1000));
         uint32_t sr = sent ? 0 : resume;
         const uint32_t* st = tokens;
@@ -229,17 +229,18 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         int done = 0, rc = 0;
         while (!done) {
 int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
-            if (sel <= 0) { sock_send_line(client_fd, "ERR server: leader timeout"); rc = -1; break; }
+            if (sel <= 0) { sock_send_line(client_fd, PROTO_ERROR " server: leader timeout"); rc = -1; break; }
             int nn = sock_recv_line(fd, out, sizeof(out));
             if (nn < 0) { rc = -1; break; }
-            if (strncmp(out, "ERR", 3) == 0) {
+            if (proto_is_error(out)) {
                 if (!sent) { sock_close(fd); sent = 1; rc = -2; break; }  /* 全量重试 */
                 if (retry < 5) {
                     /* 生成前失败(未产出 token): 退避重试, 等 worker 段就绪 */
                     sock_close(fd);
                     retry++;
                     rc = -2;
-                    ylog_warn("server: sess %s backend reject (%s), retry %d/5", key, out + 4, retry);
+                    ylog_warn("server: sess %s backend reject (%s), retry %d/5",
+                              key, proto_error_msg(out), retry);
                     sock_sleep_ms(1000 * retry);
                     break;
                 }
@@ -360,7 +361,7 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         int ok = 1;
         if (request_lease && server_lease(s) != 0) {
             ylog_warn("server: sess lease failed (no free rank), reject");
-            sock_send_line(fd, "ERR server: no rank leased");
+            sock_send_line(fd, PROTO_ERROR " server: no rank leased");
             ok = 0;
         }
         if (ok) {
@@ -380,7 +381,7 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         int ok = 1;
         if (request_lease && server_lease(s) != 0) {
             ylog_warn("server: lease failed (no free rank), reject");
-            sock_send_line(fd, "ERR server: no rank leased");
+            sock_send_line(fd, PROTO_ERROR " server: no rank leased");
             ok = 0;
         }
         if (ok) forward_infer(fd, s, args);
@@ -405,7 +406,7 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         frame_send(fd, "OK", NULL);
         s->quit = 1;
     } else {
-        frame_send(fd, "ERR", "unknown cmd");
+        frame_send(fd, PROTO_ERROR, "unknown cmd");
     }
 }
 

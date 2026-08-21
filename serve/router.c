@@ -206,14 +206,24 @@ static RtServer* pick_server(Router* r, const char* model)
     return best;
 }
 
+/* 把后端 ERR 帧正文写入 err(可空); 无正文时用 fallback */
+static void router_set_err(char* err, size_t errlen, const char* line, const char* fallback)
+{
+    if (!err || errlen == 0) return;
+    const char* msg = line ? proto_error_msg(line) : "";
+    if (!msg[0]) msg = fallback ? fallback : "backend error";
+    snprintf(err, errlen, "%s", msg);
+}
+
 /* 客户端 INFER: 解析 <model> <max_tokens> <n_bytes>\n + prompt */
 /* 通用 INFER 转发: 路由到 server → 转发给 leader rank → 逐 token 回调。
  * on_token(token utf8, ctx) 每生成一个 token 回调一次; 返回 0 成功, -1 失败 */
 int router_infer(Router* r, const char* model, int max_tokens,
                  const char* prompt, size_t plen,
                  void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
-                 float temp, float top_p)
+                 float temp, float top_p, char* err, size_t errlen)
 {
+    if (err && errlen) err[0] = '\0';
     RtServer* s = pick_server(r, model);
     if (!s) {
         if (!router_model_known(r, model)) {
@@ -225,10 +235,18 @@ int router_infer(Router* r, const char* model, int max_tokens,
             sock_sleep_ms(500);
             s = pick_server(r, model);
         }
-        if (!s) { ylog_warn("router_infer: no ready server for %s", model); return -1; }
+        if (!s) {
+            ylog_warn("router_infer: no ready server for %s", model);
+            router_set_err(err, errlen, NULL, "no ready server");
+            return -1;
+        }
     }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
-    if (sfd < 0) { ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
+    if (sfd < 0) {
+        ylog_warn("router_infer: connect %s:%u fail", s->leader_host, s->leader_port);
+        router_set_err(err, errlen, NULL, "cannot connect server");
+        return -1;
+    }
     char args[192];
     snprintf(args, sizeof(args), "%d %zu temp=%.6g top_p=%.6g", max_tokens, plen, temp, top_p);
     frame_send_payload(sfd, PROTO_INFER, args, prompt, plen);
@@ -241,9 +259,17 @@ int router_infer(Router* r, const char* model, int max_tokens,
     int done = 0;
     while (!done) {
         int n = sock_recv_line(sfd, out, sizeof(out));
-        if (n < 0) { rc = -1; break; }
+        if (n < 0) {
+            router_set_err(err, errlen, NULL, "backend timeout/disconnect");
+            rc = -1;
+            break;
+        }
         if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
-        else if (strncmp(out, "T ", 2) == 0) {
+        else if (proto_is_error(out)) {
+            router_set_err(err, errlen, out, "backend error");
+            rc = -1;
+            done = 1;
+        } else if (strncmp(out, "T ", 2) == 0) {
             size_t tlen = 0;
             char* payload = frame_t_payload(sfd, out, sizeof(out), &tlen);
             if (!payload) { rc = -1; break; }
@@ -263,8 +289,10 @@ int router_infer(Router* r, const char* model, int max_tokens,
 int router_infer_sess(Router* r, const char* model, int max_tokens,
                       const char* sess_key, const char* new_msg, size_t msg_len,
                       void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
-                      float temp, float top_p, int* prompt_tokens)
+                      float temp, float top_p, int* prompt_tokens,
+                      char* err, size_t errlen)
 {
+    if (err && errlen) err[0] = '\0';
     RtServer* s = pick_server(r, model);
     if (!s) {
         if (!router_model_known(r, model)) {
@@ -276,10 +304,18 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
             sock_sleep_ms(500);
             s = pick_server(r, model);
         }
-        if (!s) { ylog_warn("router_infer_sess: no ready server for %s", model); return -1; }
+        if (!s) {
+            ylog_warn("router_infer_sess: no ready server for %s", model);
+            router_set_err(err, errlen, NULL, "no ready server");
+            return -1;
+        }
     }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
-    if (sfd < 0) { ylog_warn("router_infer_sess: connect %s:%u fail", s->leader_host, s->leader_port); return -1; }
+    if (sfd < 0) {
+        ylog_warn("router_infer_sess: connect %s:%u fail", s->leader_host, s->leader_port);
+        router_set_err(err, errlen, NULL, "cannot connect server");
+        return -1;
+    }
     char args[192];
     snprintf(args, sizeof(args), "%d %zu key=%s temp=%.6g top_p=%.6g",
              max_tokens, msg_len, sess_key, temp, top_p);
@@ -297,7 +333,11 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
     if (prompt_tokens) *prompt_tokens = 0;
     while (!done) {
         int n2 = sock_recv_line(sfd, out, sizeof(out));
-        if (n2 < 0) { rc = -1; break; }
+        if (n2 < 0) {
+            router_set_err(err, errlen, NULL, "backend timeout/disconnect");
+            rc = -1;
+            break;
+        }
         if (strncmp(out, PROTO_DONE, 4) == 0) {
             /* DONE <gen> <eos> <ms> [prompt_tokens]: 末尾字段为 server 追加的 prompt 数 */
             if (prompt_tokens) {
@@ -305,8 +345,11 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
                 if (sp) *prompt_tokens = atoi(sp + 1);
             }
             done = 1;
-        }
-        else if (strncmp(out, "TS ", 3) == 0) {
+        } else if (proto_is_error(out)) {
+            router_set_err(err, errlen, out, "backend error");
+            rc = -1;
+            done = 1;
+        } else if (strncmp(out, "TS ", 3) == 0) {
             size_t tlen = 0;
             sscanf(out + 3, "%zu", &tlen);
             if (tlen <= 0) { rc = -1; break; }
@@ -331,17 +374,17 @@ static void handle_client_infer(int fd, Router* r, const char *args)
     int max_tokens = 0;
     long nbytes = 0;
     if (sscanf(args, "%127s %d %ld", model, &max_tokens, &nbytes) != 3) {
-        sock_send_line(fd, "ERR bad INFER: usage <model> <max_tokens> <n_bytes>");
+        sock_send_line(fd, PROTO_ERROR " bad INFER: usage <model> <max_tokens> <n_bytes>");
         return;
     }
     RtServer* s = pick_server(r, model);
     if (!s) {
-        sock_send_line(fd, "ERR no ready server for model %s", model);
+        sock_send_line(fd, PROTO_ERROR " no ready server for model %s", model);
         return;
     }
     int sfd = sock_connect(s->leader_host, s->leader_port, 5);
     if (sfd < 0) {
-        sock_send_line(fd, "ERR cannot connect server %s", s->id);
+        sock_send_line(fd, PROTO_ERROR " cannot connect server %s", s->id);
         return;
     }
     /* 转发 INFER 头 + prompt(args 只含 max_tokens, nbytes 由 payload 函数追加) */
@@ -349,7 +392,7 @@ static void handle_client_infer(int fd, Router* r, const char *args)
     snprintf(infer_args, sizeof(infer_args), "%d", max_tokens);
     if (nbytes > 0) {
         char* pb = (char*)malloc((size_t)nbytes);
-        if (!pb) { sock_close(sfd); sock_send_line(fd, "ERR oom"); return; }
+        if (!pb) { sock_close(sfd); sock_send_line(fd, PROTO_ERROR " oom"); return; }
         if (sock_recv_n(fd, pb, (size_t)nbytes) != 0) { free(pb); sock_close(sfd); return; }
         frame_send_payload(sfd, PROTO_INFER, infer_args, pb, (size_t)nbytes);
         free(pb);
@@ -359,14 +402,14 @@ static void handle_client_infer(int fd, Router* r, const char *args)
     pthread_mutex_lock(&r->lock);
     s->inflight++;
     pthread_mutex_unlock(&r->lock);
-    /* 透传 T/DONE */
+    /* 透传 T / DONE / ERR */
     char out[RT_MAX_LINE];
     int done = 0;
     while (!done) {
         int n = sock_recv_line(sfd, out, sizeof(out));
-        if (n < 0) { sock_send_line(fd, "ERR server disconnected"); break; }
+        if (n < 0) { sock_send_line(fd, PROTO_ERROR " server disconnected"); break; }
         sock_send_line(fd, "%s", out);
-        if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
+        if (strncmp(out, PROTO_DONE, 4) == 0 || proto_is_error(out)) done = 1;
         else if (strncmp(out, "T ", 2) == 0) {
             size_t tlen = 0;
             char* payload = frame_t_payload(sfd, out, sizeof(out), &tlen);
@@ -435,7 +478,7 @@ static int run_client(Router* r, const char* send)
             }
         } else {
             printf("%s\n", out);
-            if (strncmp(out, PROTO_DONE, 4) == 0) done = 1;
+            if (strncmp(out, PROTO_DONE, 4) == 0 || proto_is_error(out)) done = 1;
         }
     }
     sock_close(fd);
@@ -474,7 +517,7 @@ static void* router_conn(void* arg)
                      r->n_servers, total);
             frame_send(fd, "OK", st);
         } else
-            frame_send(fd, "ERR", "unknown cmd");
+            frame_send(fd, PROTO_ERROR, "unknown cmd");
     }
     sock_close(fd);
     return NULL;

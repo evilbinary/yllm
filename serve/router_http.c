@@ -55,6 +55,39 @@ typedef struct {
     int n_tokens;        /* 收集到的 token 数(usage 统计用) */
 } CollectCtx;
 
+/* 把后端 ERR 正文转义进 JSON error.message(无正文时用 fallback) */
+static void http_infer_error_json(char* out, size_t outsz, const char* msg, const char* fallback)
+{
+    const char* src = (msg && msg[0]) ? msg : fallback;
+    size_t o = 0;
+    const char* prefix = "{\"error\":{\"message\":\"";
+    size_t pl = strlen(prefix);
+    if (pl >= outsz) { if (outsz) out[0] = '\0'; return; }
+    memcpy(out, prefix, pl);
+    o = pl;
+    for (; *src && o + 8 < outsz; src++) {
+        char c = *src;
+        if (c == '"' || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = c;
+        } else if (c == '\n') {
+            out[o++] = '\\';
+            out[o++] = 'n';
+        } else if (c == '\r') {
+            out[o++] = '\\';
+            out[o++] = 'r';
+        } else if ((unsigned char)c < 0x20) {
+            /* 跳过其他控制字符 */
+        } else {
+            out[o++] = c;
+        }
+    }
+    const char* suffix = "\"}}";
+    size_t sl = strlen(suffix);
+    if (o + sl >= outsz) o = outsz - sl - 1;
+    memcpy(out + o, suffix, sl + 1);
+}
+
 /* 收集回调: token 拼进 buffer(转义 JSON 特殊字符) */
 static void collect_on_token(const char* utf8, size_t len, void* ctx)
 {
@@ -332,23 +365,27 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                       model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen);
         http_sse_begin(&rr, fd);
         int rc;
+        char errbuf[256] = "";
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
                                    contents[n_msgs - 1], strlen(contents[n_msgs - 1]), sse_on_token, &sc,
-                                   rtemp, rtop_p, &sc.prompt_tokens);
+                                   rtemp, rtop_p, &sc.prompt_tokens, errbuf, sizeof(errbuf));
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
-                              rtemp, rtop_p);
+                              rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
             if (rc == -2)
                 http_sse_data(&rr, "{\"error\":{\"message\":\"model not found\"}}");
-            else
-                http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            else {
+                char ej[384];
+                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
+                http_sse_data(&rr, ej);
+            }
         } else {
             sse_on_done(&sc, "stop");
         }
         http_sse_done(&rr);
-        if (g_api_log) ylog_info("HTTP CHAT stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
+        if (g_api_log) ylog_info("HTTP CHAT stream done rc=%d n_tokens=%d err=%s", rc, sc.n_tokens, errbuf[0] ? errbuf : "-");
     } else {
         CollectCtx cc;
         cc.buf = collected;
@@ -358,21 +395,24 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         collected[0] = '\0';
         int ptoken = 0;
         int rc;
+        char errbuf[256] = "";
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
                                    contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc,
-                                   rtemp, rtop_p, &ptoken);
+                                   rtemp, rtop_p, &ptoken, errbuf, sizeof(errbuf));
         else
-rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
-                              rtemp, rtop_p);
+            rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
+                              rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
             HttpResponse rr;
             if (rc == -2) {
                 http_begin(&rr, fd, 404, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
             } else {
+                char ej[384];
+                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
                 http_begin(&rr, fd, 502, NULL);
-                http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+                http_reply(&rr, ej);
             }
             free(prompt);
             free(collected);
@@ -454,18 +494,22 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
             ylog_info("HTTP COMPLETIONS stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d plen=%zu",
                       model, max_tokens, rtemp, rtop_p, include_usage, plen);
         http_sse_begin(&rr, fd);
+        char errbuf[256] = "";
         int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
-                              rtemp, rtop_p);
+                              rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
             if (rc == -2)
                 http_sse_data(&rr, "{\"error\":{\"message\":\"model not found\"}}");
-            else
-                http_sse_data(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+            else {
+                char ej[384];
+                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
+                http_sse_data(&rr, ej);
+            }
         } else {
             sse_on_done(&sc, "length");
         }
         http_sse_done(&rr);
-        if (g_api_log) ylog_info("HTTP COMPLETIONS stream done rc=%d n_tokens=%d", rc, sc.n_tokens);
+        if (g_api_log) ylog_info("HTTP COMPLETIONS stream done rc=%d n_tokens=%d err=%s", rc, sc.n_tokens, errbuf[0] ? errbuf : "-");
     } else {
         CollectCtx cc;
         cc.buf = collected;
@@ -473,16 +517,19 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         cc.len = 0;
         cc.n_tokens = 0;
         collected[0] = '\0';
+        char errbuf[256] = "";
         int rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
-                              rtemp, rtop_p);
+                              rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
             HttpResponse rr;
             if (rc == -2) {
                 http_begin(&rr, fd, 404, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
             } else {
+                char ej[384];
+                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
                 http_begin(&rr, fd, 502, NULL);
-                http_reply(&rr, "{\"error\":{\"message\":\"inference failed: backend timeout/disconnect\"}}");
+                http_reply(&rr, ej);
             }
             free(prompt);
             free(collected);

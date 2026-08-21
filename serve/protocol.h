@@ -8,7 +8,7 @@
  *   CMD args...\n
  *   [CMD_PAYLOAD]: <n> 字节二进制紧跟在换行之后
  *
- * 错误统一回: ERR <msg>
+ * 错误统一回: ERR <msg>(宏 PROTO_ERROR)
  */
 
 #ifndef YLLM_SERVE_PROTOCOL_H
@@ -51,7 +51,7 @@
  * rank0 收到后按该数据组织组内协作; worker 段不接收 INFER。
  * 响应: 逐 token 流式回 T <len>\n<token utf8 bytes>...,
  *       结束回 DONE <gen_tokens> <eos=0|1> <ms>\n
- * 错误回 ERR <msg> */
+ * 错误回 ERR <msg>(PROTO_ERROR; 流式路径遇 ERR 即结束) */
 #define PROTO_INFER "INFER"
 #define PROTO_INFER_SESS "INFER_SESS"
 
@@ -130,6 +130,10 @@
  * 会话模式时 server 会在末尾追加 <prompt_tokens>(HTTP usage 统计用)。 */
 #define PROTO_DONE "DONE"
 
+/* ERR <msg>\n: 推理/管理失败。帧级发送时常带 v=<ver>, 正文见 proto_error_msg。
+ * 流式路径遇到 ERR 即结束(不得继续等 DONE)。 */
+#define PROTO_ERROR "ERR"
+
 /* ---- 通用解析辅助 ---- */
 
 #include <string.h>
@@ -148,6 +152,27 @@ static inline const char* proto_get(const char* line, const char* key)
         while (*p && *p != ' ') p++;
     }
     return NULL;
+}
+
+/* 是否为 ERR 帧(CMD 精确匹配 PROTO_ERROR) */
+static inline int proto_is_error(const char* line)
+{
+    size_t n = strlen(PROTO_ERROR);
+    return line && strncmp(line, PROTO_ERROR, n) == 0 &&
+           (line[n] == ' ' || line[n] == '\0' || line[n] == '\r');
+}
+
+/* ERR 消息正文: 跳过 "ERR" 与可选帧级 "v=<ver>" 前缀 */
+static inline const char* proto_error_msg(const char* line)
+{
+    if (!proto_is_error(line)) return line ? line : "";
+    const char* p = line + strlen(PROTO_ERROR);
+    while (*p == ' ') p++;
+    if (strncmp(p, "v=", 2) == 0) {
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+    }
+    return p;
 }
 
 #endif /* YLLM_SERVE_PROTOCOL_H */

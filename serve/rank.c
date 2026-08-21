@@ -281,12 +281,12 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
                 ylog_info("rank: session %s kv restored (%u tokens) from %s", key, loaded, path);
             } else {
                 ylog_warn("rank: session %s kv load failed/pos mismatch (%u vs %u)", key, loaded, resume);
-                send_line(fd, "ERR session kv not cached on this rank, resume must be 0");
+                send_line(fd, PROTO_ERROR " session kv not cached on this rank, resume must be 0");
                 return 0;
             }
         } else if (resume != 0) {
             ylog_warn("rank: sess key mismatch, resume must be 0");
-            send_line(fd, "ERR session not cached on this rank, resume must be 0");
+            send_line(fd, PROTO_ERROR " session not cached on this rank, resume must be 0");
             return 0;
         }
     }
@@ -297,12 +297,12 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
             r->cache_pos = 0;
         } else {
             ylog_warn("rank: resume mismatch: rank has %u, got %u", r->cache_pos, resume);
-            send_line(fd, "ERR resume mismatch: rank has %u, got %u", r->cache_pos, resume);
+            send_line(fd, PROTO_ERROR " resume mismatch: rank has %u, got %u", r->cache_pos, resume);
             return 0;
         }
     }
     if ((uint64_t)r->cache_pos + ndelta > r->engine.max_seq) {
-        send_line(fd, "ERR context full");
+        send_line(fd, PROTO_ERROR " context full");
         return 0;
     }
 
@@ -335,7 +335,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         node_heartbeat(&r->node);
         if (rc2 != 0) {
             /* 失败不得伪装成功: server 收到 ERR 后走全量重发/退避重试 */
-            send_line(fd, "ERR dist generate failed");
+            send_line(fd, PROTO_ERROR " dist generate failed");
             return 0;
         }
         send_line(fd, PROTO_DONE " %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
@@ -395,7 +395,7 @@ static int handle_infer(int fd, Rank* r, char* args)
     int max_tokens = 0;
     long nbytes = 0;
     if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
-        send_line(fd, "ERR bad INFER args");
+        send_line(fd, PROTO_ERROR " bad INFER args");
         return 0;
     }
     /* 组内 rank 信息随请求携带(server 从 sv 租用获得): 按数据办事 */
@@ -416,7 +416,7 @@ static int handle_infer(int fd, Rank* r, char* args)
     }
     /* 每请求独立缓冲(线程化后不可共享 r->ids) */
     char* pb = (char*)ymalloc((size_t)nbytes + 8192);
-    if (!pb) { send_line(fd, "ERR oom"); return 0; }
+    if (!pb) { send_line(fd, PROTO_ERROR " oom"); return 0; }
     if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); ylog_warn("rank: recv payload FAILED"); return -1; }
     pb[nbytes] = '\0';
     /* 会话模式: 带 key= 字段时 payload 为增量 token 二进制(server 已渲染, 不 tokenize) */
@@ -435,7 +435,7 @@ static int handle_infer(int fd, Rank* r, char* args)
 #if YLLM_SESS_DEBUG
             ylog_info("rank: sess INFER key=[%s] resume=%u nbytes=%ld", key, resume, nbytes);
 #endif
-            if (nbytes % 4 != 0) { free(pb); send_line(fd, "ERR session payload must be token bytes"); return 0; }
+            if (nbytes % 4 != 0) { free(pb); send_line(fd, PROTO_ERROR " session payload must be token bytes"); return 0; }
             uint32_t ndelta = (uint32_t)(nbytes / 4);
             int rc = handle_infer_cache(fd, r, key, (uint32_t)max_tokens, resume,
                                           (const uint32_t*)pb, ndelta);
@@ -445,14 +445,14 @@ static int handle_infer(int fd, Rank* r, char* args)
     }
     ylog_info("rank: payload=[%s]", pb);
     uint32_t* ids = (uint32_t*)ymalloc((size_t)nbytes + 8192 + 4096);
-    if (!ids) { free(pb); send_line(fd, "ERR oom"); return 0; }
+    if (!ids) { free(pb); send_line(fd, PROTO_ERROR " oom"); return 0; }
     int nprompt;
     if (vocab_has_template(&r->vocab))
         nprompt = vocab_chat_ids(&r->vocab, pb, ids, (int)nbytes + 8192, r->vocab.add_bos);
     else
         nprompt = vocab_encode(&r->vocab, pb, ids, (int)nbytes + 8192);
     free(pb);
-    if (nprompt < 0) { free(ids); send_line(fd, "ERR encode failed"); return 0; }
+    if (nprompt < 0) { free(ids); send_line(fd, PROTO_ERROR " encode failed"); return 0; }
 
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));
@@ -493,9 +493,9 @@ static int handle_infer(int fd, Rank* r, char* args)
     uint64_t ms = ynow_ms() - t0;
     if (rc != 0) {
         if (r->dist_ranks > 1)
-            send_line(fd, "ERR generate: dist pipeline failed");
+            send_line(fd, PROTO_ERROR " generate: dist pipeline failed");
         else
-            send_line(fd, "ERR generate: %s", err);
+            send_line(fd, PROTO_ERROR " generate: %s", err);
         return 0;
     }
     send_line(fd, PROTO_DONE " %u %d %llu", tc.n_tokens, 0, (unsigned long long)ms);
@@ -509,7 +509,7 @@ static int handle_frame(int fd, Rank* r, const Frame* f)
     if (strcmp(f->cmd, PROTO_INFER) == 0) return handle_infer(fd, r, (char*)f->args);
     if (strcmp(f->cmd, PROTO_DRAIN) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
     if (strcmp(f->cmd, PROTO_QUIT) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
-    send_line(fd, "ERR unknown cmd");
+    send_line(fd, PROTO_ERROR " unknown cmd");
     return 0;
 }
 
