@@ -129,13 +129,13 @@ docs/design-gpu-inference.md
 ### P1 构建
 
 ```bash
-# 推荐本机无 CUDA 工具链时(自动 host-shim):
-make avx2 YLLM_CUDA=1
+# 推荐(产物在 build/avx2-cuda/, 与纯 CPU avx2 隔离):
+make cuda
+make gen-cuda          # TinyLlama + --device cuda
+make chat-cuda
 
-# 有 nvcc 时默认尝试真 CUDA(仍需 headers; kernel 未完前可强制 shim):
-make avx2 YLLM_CUDA=1 YLLM_CUDA_HOST=1
-
-yllm gen --model ... --device cuda   # host-shim 下可跑通
+# 覆盖: GPU=1 CHAT_TOKENS=16 CHAT_PROMPT='Hi' make gen-cuda
+# 无 nvcc 时自动 host-shim; 也可: make cuda YLLM_CUDA_HOST=1
 ```
 
 `load_weights`：将 `[layer_begin, layer_end)` 权拷到连续 blob；`engine_fwd_block_at` 从 blob 读权。ARCH_QWEN35 暂拒 CUDA。

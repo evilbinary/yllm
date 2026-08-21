@@ -2,6 +2,8 @@
 #
 #   make            标量版本
 #   make avx2       x86_64 上的 AVX2 版本(其他架构退化为标量)
+#   make cuda       AVX2 + CUDA 后端(产物在 build/avx2-cuda/, 与 avx2 隔离)
+#   make gen-cuda / chat-cuda   用 --device cuda 冒烟
 #   make test       运行测试
 #   make clean
 #
@@ -17,10 +19,14 @@ SRC      := inference/platform.c inference/log.c inference/llf.c inference/conve
 TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inference/convert.c inference/convert_safetensors.c inference/convert_gguf.c inference/tokenizer.c inference/matvec.c inference/engine.c inference/device_cpu.c
 
 # ---- CUDA 后端(可选) ----
-#   make avx2 YLLM_CUDA=1              # 无 nvcc 时自动 host-shim(权镜像+CPU 算)
-#   make avx2 YLLM_CUDA=1 YLLM_CUDA_HOST=0  # 强制真 CUDA(需 CUDA toolkit)
+#   make cuda                              # 推荐: 独立目录 build/avx2-cuda
+#   make gen-cuda / chat-cuda              # 构建并 --device cuda 跑 TinyLlama
+#   make avx2 YLLM_CUDA=1                  # 旧写法(写入 build/avx2, 易与纯 CPU 产物混用)
+#   make cuda YLLM_CUDA_HOST=1             # 无 toolkit / 强制 host-shim
+#   make cuda YLLM_CUDA_HOST=0             # 强制真 CUDA runtime(需 libcudart)
 YLLM_CUDA ?= 0
 YLLM_CUDA_HOST ?=
+GPU ?= 0
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
 ifeq ($(YLLM_CUDA),1)
   SRC += inference/device_cuda.c inference/cuda_fwd.c
@@ -103,6 +109,10 @@ OBJ_AVX2      := $(sort $(OBJ_AVX2))
 ifeq ($(ARCH),x86_64)
 CFLAGS_AVX2   := $(CFLAGS_BASE) -mavx2 -mfma -mf16c
 endif
+
+# CUDA 独立产物(与 build/avx2 隔离, 避免 CPU/CUDA 目标混用同一 .o)
+OBJDIR_CUDA := build/avx2-cuda
+BIN_CUDA    := $(OBJDIR_CUDA)/yllm$(EXE)
 
 all: $(BIN)
 
@@ -285,6 +295,21 @@ chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
 
 gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+# ---- CUDA: 独立目录构建 + 设备冒烟 ----
+# 有 nvcc → 真 CUDA runtime(managed 权 + CPU 算子过渡); 无 nvcc → host-shim
+cuda:
+	$(MAKE) avx2 YLLM_CUDA=1 OBJDIR_AVX2=$(OBJDIR_CUDA) BIN_AVX2=$(BIN_CUDA)
+
+RUN_CUDA = OMP_NUM_THREADS=$(NTHREADS) $(BIN_CUDA)
+
+gen-cuda: cuda $(MODEL_LLF)
+	$(RUN_CUDA) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU)
+
+chat-cuda: cuda $(MODEL_LLF)
+	$(RUN_CUDA) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
@@ -568,4 +593,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
