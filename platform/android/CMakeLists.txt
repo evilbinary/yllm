@@ -23,7 +23,10 @@ set(YLLM_CORE_SRCS
 )
 
 if(YLLM_VULKAN)
-  list(APPEND YLLM_CORE_SRCS ${INFER}/device_vulkan.c)
+  list(APPEND YLLM_CORE_SRCS
+    ${INFER}/device_vulkan.c
+    ${INFER}/vulkan_load.c
+    ${INFER}/vulkan_fwd.c)
 endif()
 
 add_library(yllm SHARED ${YLLM_CORE_SRCS})
@@ -35,7 +38,11 @@ target_compile_definitions(yllm PRIVATE
 )
 if(YLLM_VULKAN)
   target_compile_definitions(yllm PRIVATE YLLM_VULKAN=1)
-  # 真 Vulkan loader 后续: find_library(vulkan); 现默认 host-shim
+  find_library(VULKAN_LIB vulkan)
+  # 动态 dlopen; 仍链 NDK vulkan 以便包内有符号可选
+  if(VULKAN_LIB)
+    target_link_libraries(yllm ${VULKAN_LIB})
+  endif()
 endif()
 
 # arm64: 允许编译器自动向量化; 显式 NEON 路径后续补 matvec

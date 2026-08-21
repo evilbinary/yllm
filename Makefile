@@ -44,8 +44,8 @@ ifeq ($(YLLM_CUDA),1)
   endif
 endif
 ifeq ($(YLLM_VULKAN),1)
-  SRC += inference/device_vulkan.c
-  TEST_ENGINE_CORE += inference/device_vulkan.c
+  SRC += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c
+  TEST_ENGINE_CORE += inference/device_vulkan.c inference/vulkan_load.c inference/vulkan_fwd.c
 endif
 
 # 真 CUDA 时由 nvcc 编译的 .cu(host-shim 不编)
@@ -113,7 +113,16 @@ ifeq ($(YLLM_CUDA),1)
 endif
 ifeq ($(YLLM_VULKAN),1)
   CFLAGS_BASE += -DYLLM_VULKAN=1
-  # 真 Vulkan loader 后续: LIBS += -lvulkan
+  ifeq ($(YLLM_VULKAN_HOST),1)
+    CFLAGS_BASE += -DYLLM_VULKAN_HOST=1
+  endif
+  # 头文件: VULKAN_SDK 或系统路径; 运行时动态加载 loader(无需链 vulkan-1.lib)
+  ifneq ($(VULKAN_SDK),)
+    CFLAGS_BASE += -I"$(VULKAN_SDK)/Include"
+  endif
+  ifneq ($(UNAME_S),Windows)
+    LIBS += -ldl
+  endif
 endif
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
@@ -352,7 +361,7 @@ chat-cuda: cuda $(MODEL_LLF)
 	$(RUN_CUDA) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
 
-# ---- Vulkan: 独立目录(P0 host-shim; 真 loader 后续) ----
+# ---- Vulkan: 独立目录; 默认尝试原生 VkDevice, YLLM_VULKAN_HOST=1 强制 shim ----
 vulkan:
 	$(MAKE) avx2 YLLM_VULKAN=1 OBJDIR_AVX2=$(OBJDIR_VULKAN) BIN_AVX2=$(BIN_VULKAN)
 

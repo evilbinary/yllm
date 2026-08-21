@@ -1,15 +1,18 @@
 /* device_vulkan.c — Vulkan 设备后端(Android / iOS·MoltenVK / PC)
  *
- * P0: host-shim — 与 CPU 相同算子路径, 验证 --device vulkan 绑定与打包。
- * 后续: VkBuffer 权/KV + compute shader(见 docs/design-mobile.md)。
+ * 启动时动态加载 loader 并创建 compute 设备; 失败则 host-shim(CPU fwd)。
+ * 真 shader 前向见 vulkan_fwd(后续)。
  */
 #include "device.h"
 #include "yllm.h"
 #include "log.h"
 #include "vulkan_ctx.h"
+#include "vulkan_load.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+void vulkan_attach_fwd(Engine* e);
 
 static int vk_load_weights(Engine* e, char* err, size_t errlen)
 {
@@ -18,24 +21,25 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
         if (err && errlen) snprintf(err, errlen, "null vulkan ctx");
         return -1;
     }
-    /* P0 host-shim: 权仍走 mmap; d_kv 别名 host KV */
     e->w_dev = ctx;
     e->d_kv = e->kv;
     e->weights_ready = 1;
     e->device_mode = ctx->host_shim ? DEV_MODE_VULKAN_HOST : DEV_MODE_VULKAN;
-    engine_attach_cpu_fwd(e);
     ctx->n_layers = e->ws.model.n_layers;
     ctx->hidden = e->ws.model.h.hidden;
-    ylog_info("vulkan: %s device_id=%d layers=%u (P0 host-shim CPU compute)",
+    vulkan_attach_fwd(e);
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u",
               ctx->host_shim ? "host-shim" : "native",
-              ctx->device_id, ctx->n_layers);
+              ctx->device_id, ctx->n_layers, ctx->hidden);
     return 0;
 }
 
 static void vk_free_dev(Engine* e)
 {
     if (e->dev && e->dev->handle) {
-        free(e->dev->handle);
+        VulkanCtx* ctx = (VulkanCtx*)e->dev->handle;
+        vulkan_shutdown(ctx);
+        free(ctx);
         e->dev->handle = NULL;
     }
     e->w_dev = NULL;
@@ -61,16 +65,28 @@ Device* device_create_vulkan(int device_id, char* err, size_t errlen)
         return NULL;
     }
     ctx->device_id = device_id;
-    /* 真 VkInstance 创建尚未落地: 一律 host-shim, 保证三端可链可跑 */
     ctx->host_shim = 1;
+#ifdef YLLM_VULKAN_HOST
+    ylog_info("vulkan: forced host-shim (YLLM_VULKAN_HOST=1)");
+#else
+    {
+        char verr[256];
+        if (vulkan_try_init(ctx, device_id, verr, sizeof(verr)) != 0) {
+            ylog_warn("vulkan: native init failed (%s), falling back to host-shim", verr);
+            ctx->host_shim = 1;
+            memset(&ctx->instance, 0, sizeof(void*) * 4);
+        } else {
+            ylog_info("vulkan: native compute device ready");
+        }
+    }
+#endif
     d->kind = DEV_VULKAN;
-    d->id = device_id;
+    d->id = ctx->device_id;
     d->handle = ctx;
     d->load_weights = vk_load_weights;
     d->free_dev = vk_free_dev;
     d->prefetch_layer = NULL;
     d->release_layer = NULL;
-    ylog_info("vulkan: created host-shim backend (shaders TBD)");
     return d;
 #endif
 }

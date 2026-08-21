@@ -2,6 +2,7 @@
 #include "matvec.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #ifdef _WIN32
 #include <malloc.h>
 #else
