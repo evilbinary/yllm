@@ -16,14 +16,17 @@ typedef struct {
     uint64_t* layer_off;
     uint64_t w_bytes;
 
-    /* 真 GPU: 线性权解量化为 FP16 上卡; norm/bias 仍 F32 */
-    uint16_t* w_f16;            /* device 线性权 (IEEE half) */
+    /* 真 GPU: Q4_K 原生上卡; 非 Q4 线性权解到 FP16; norm/bias F32 */
+    uint8_t* w_q4;              /* device Q4_K 字节包 */
+    uint16_t* w_f16;            /* device 线性权 (非 Q4 解量化) */
     float* w_f32;               /* device norm/bias */
-    uint64_t* off_f16;          /* host: 线性权元素偏移 */
+    uint64_t* off_q4;           /* host: Q4_K 字节偏移 */
+    uint64_t* off_f16;          /* host: FP16 元素偏移 */
     uint64_t* off_f32;
     uint32_t* dim_out;
     uint32_t* dim_in;
-    uint64_t n_f16;             /* 线性权元素数 */
+    uint64_t n_q4;              /* Q4_K 字节数 */
+    uint64_t n_f16;             /* FP16 元素数 */
     uint64_t n_f32;
 
     uint32_t n_layers;

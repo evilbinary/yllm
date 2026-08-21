@@ -124,6 +124,130 @@ extern "C" int cuda_k_gemm_f16(void* cublas, float* y, const uint16_t* w,
     return 0;
 }
 
+/* ---- Q4_K: 144B/block, 256 weights; d,min = f16; scales @+4; qs @+16 ---- */
+__device__ __forceinline__ void q4k_scale_min(int g, const uint8_t* scp, uint8_t* sc, uint8_t* mn)
+{
+    if (g < 4) {
+        *sc = scp[g] & 63;
+        *mn = scp[g + 4] & 63;
+    } else {
+        *sc = (uint8_t)((scp[g + 4] & 0xF) | ((scp[g - 4] >> 6) << 4));
+        *mn = (uint8_t)((scp[g + 4] >> 4) | ((scp[g] >> 6) << 4));
+    }
+}
+
+__device__ float q4k_dot256(const uint8_t* blk, const float* x)
+{
+    float d = __half2float(__ushort_as_half(((const uint16_t*)blk)[0]));
+    float dmin = __half2float(__ushort_as_half(((const uint16_t*)blk)[1]));
+    const uint8_t* scp = blk + 4;
+    const uint8_t* qs = blk + 16;
+    float acc = 0.0f;
+    for (int g = 0; g < 8; g++) {
+        uint8_t sc, mn;
+        q4k_scale_min(g, scp, &sc, &mn);
+        float d1 = d * (float)sc;
+        float m1 = dmin * (float)mn;
+        const uint8_t* q = qs + (g >> 1) * 32;
+        const float* xb = x + g * 32;
+        for (int e = 0; e < 32; e++) {
+            uint8_t nib = (g & 1) ? (q[e] >> 4) : (q[e] & 0xF);
+            acc += xb[e] * (d1 * (float)nib - m1);
+        }
+    }
+    return acc;
+}
+
+__global__ void k_gemv_q4k(float* y, const uint8_t* w, const float* x, uint32_t out, uint32_t in)
+{
+    uint32_t o = blockIdx.x;
+    if (o >= out) return;
+    uint32_t nb = in / 256;
+    const uint8_t* row = w + (size_t)o * nb * 144;
+    float acc = 0.0f;
+    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x)
+        acc += q4k_dot256(row + (size_t)b * 144, x + (size_t)b * 256);
+    __shared__ float sh[128];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[o] = sh[0];
+}
+
+extern "C" int cuda_k_gemv_q4k(float* y, const uint8_t* w, const float* x,
+                               uint32_t out, uint32_t in, char* err, size_t errlen)
+{
+    if (!y || !w || !x || out == 0 || in == 0 || (in % 256) != 0) {
+        if (err && errlen) snprintf(err, errlen, "gemv_q4k bad args");
+        return -1;
+    }
+    uint32_t nb = in / 256;
+    uint32_t t = nb < 128u ? nb : 128u;
+    if (t < 1) t = 1;
+    /* blockDim 须为 2 的幂以便归约 */
+    uint32_t p = 1;
+    while (p < t) p <<= 1;
+    if (p > 128) p = 128;
+    k_gemv_q4k<<<out, p>>>(y, w, x, out, in);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        if (err && errlen) snprintf(err, errlen, "gemv_q4k: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    return 0;
+}
+
+__global__ void k_gemm_q4k(float* y, const uint8_t* w, const float* x,
+                           uint32_t out, uint32_t in, uint32_t B)
+{
+    uint32_t o = blockIdx.x;
+    uint32_t btok = blockIdx.y;
+    if (o >= out || btok >= B) return;
+    uint32_t nb = in / 256;
+    const uint8_t* row = w + (size_t)o * nb * 144;
+    const float* xb = x + (size_t)btok * in;
+    float acc = 0.0f;
+    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x)
+        acc += q4k_dot256(row + (size_t)b * 144, xb + (size_t)b * 256);
+    __shared__ float sh[128];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        y[(size_t)btok * out + o] = sh[0];
+}
+
+extern "C" int cuda_k_gemm_q4k(float* y, const uint8_t* w, const float* x,
+                               uint32_t out, uint32_t in, uint32_t B, char* err, size_t errlen)
+{
+    if (!y || !w || !x || out == 0 || in == 0 || B == 0 || (in % 256) != 0) {
+        if (err && errlen) snprintf(err, errlen, "gemm_q4k bad args");
+        return -1;
+    }
+    if (B == 1)
+        return cuda_k_gemv_q4k(y, w, x, out, in, err, errlen);
+    uint32_t nb = in / 256;
+    uint32_t t = nb < 128u ? nb : 128u;
+    if (t < 1) t = 1;
+    uint32_t p = 1;
+    while (p < t) p <<= 1;
+    if (p > 128) p = 128;
+    dim3 grid(out, B);
+    k_gemm_q4k<<<grid, p>>>(y, w, x, out, in, B);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        if (err && errlen) snprintf(err, errlen, "gemm_q4k: %s", cudaGetErrorString(e));
+        return -1;
+    }
+    return 0;
+}
+
 __global__ void k_rmsnorm(float* y, const float* x, const float* w, uint32_t n, float eps)
 {
     float s = 0.0f;
@@ -545,6 +669,61 @@ extern "C" void cuda_k_embed_f16_batch(float* y, const uint16_t* table, const ui
 {
     dim3 grid((hidden + 255) / 256, B);
     k_embed_f16_batch<<<grid, 256>>>(y, table, tokens_dev, B, hidden);
+}
+
+__device__ void q4k_dequant256(float* y, const uint8_t* blk)
+{
+    float d = __half2float(__ushort_as_half(((const uint16_t*)blk)[0]));
+    float dmin = __half2float(__ushort_as_half(((const uint16_t*)blk)[1]));
+    const uint8_t* scp = blk + 4;
+    const uint8_t* qs = blk + 16;
+    for (int g = 0; g < 8; g++) {
+        uint8_t sc, mn;
+        q4k_scale_min(g, scp, &sc, &mn);
+        float d1 = d * (float)sc;
+        float m1 = dmin * (float)mn;
+        const uint8_t* q = qs + (g >> 1) * 32;
+        for (int e = 0; e < 32; e++) {
+            uint8_t nib = (g & 1) ? (q[e] >> 4) : (q[e] & 0xF);
+            y[g * 32 + e] = d1 * (float)nib - m1;
+        }
+    }
+}
+
+__global__ void k_embed_q4k(float* y, const uint8_t* table, uint32_t token, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    const uint8_t* row = table + (size_t)token * nb * 144;
+    for (uint32_t b = blockIdx.x; b < nb; b += gridDim.x)
+        q4k_dequant256(y + (size_t)b * 256, row + (size_t)b * 144);
+}
+
+extern "C" void cuda_k_embed_q4k(float* y, const uint8_t* table, uint32_t token, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    if (nb == 0) return;
+    k_embed_q4k<<<nb, 1>>>(y, table, token, hidden);
+}
+
+__global__ void k_embed_q4k_batch(float* y, const uint8_t* table, const uint32_t* tokens,
+                                  uint32_t B, uint32_t hidden)
+{
+    uint32_t btok = blockIdx.y;
+    uint32_t blk = blockIdx.x;
+    uint32_t nb = hidden / 256;
+    if (btok >= B || blk >= nb) return;
+    uint32_t token = tokens[btok];
+    const uint8_t* row = table + (size_t)token * nb * 144;
+    q4k_dequant256(y + (size_t)btok * hidden + (size_t)blk * 256, row + (size_t)blk * 144);
+}
+
+extern "C" void cuda_k_embed_q4k_batch(float* y, const uint8_t* table, const uint32_t* tokens_dev,
+                                       uint32_t B, uint32_t hidden)
+{
+    uint32_t nb = hidden / 256;
+    if (nb == 0 || B == 0) return;
+    dim3 grid(nb, B);
+    k_embed_q4k_batch<<<grid, 1>>>(y, table, tokens_dev, B, hidden);
 }
 
 extern "C" int cuda_k_memcpy_h2d(void* dst, const void* src, size_t n)

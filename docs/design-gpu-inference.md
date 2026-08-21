@@ -124,7 +124,7 @@ docs/design-gpu-inference.md
 | **P0** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device` |
 | **P1** | `device_cuda` + raw blob `load_weights`；host-shim 可测通路径 |
 | **P2** | Decode：线性权上卡 + cublas + 小 kernel；`device_mode`；激活常驻 `d_x`；GPU 逐 token prefill |
-| **P3（进行中）** | ✅ 权压 **FP16** + `cublasGemmEx`；✅ **GPU batch prefill**（B≤64 GEMM + 因果 attn）；待：原生 Q4_K、FlashAttention |
+| **P3（进行中）** | ✅ FP16 权；✅ GPU batch prefill；✅ **原生 Q4_K** 上卡；待：FlashAttention |
 
 ### 构建
 
@@ -137,7 +137,7 @@ make gen-cuda CHAT_PROMPT=Hi CHAT_TOKENS=16
 
 真 CUDA 产物：`build/avx2-cuda/yllm`（链 `-lcudart -lcublas`，编 `cuda_kernels.cu`）。
 
-`load_weights`（GPU）：线性槽 **FP16**；norm/bias F32；`d_kv` + decode/批 prefill 激活（`pb_cap`≤64）。前向：`cublasGemmEx`；prefill 走 `cuda_prefill`。ARCH_QWEN35 暂拒。
+`load_weights`（GPU）：线性槽优先 **原生 Q4_K** 上卡，其它解到 FP16；norm/bias F32；批 prefill 缓冲。ARCH_QWEN35 暂拒。
 
 ## 11. 与 mmap 流式文档的关系
 

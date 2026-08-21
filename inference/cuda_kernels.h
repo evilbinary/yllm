@@ -24,6 +24,12 @@ int cuda_k_gemm_f16(void* cublas, float* y, const uint16_t* w,
                     const float* x, uint16_t* xf16,
                     uint32_t out, uint32_t in, uint32_t B, char* err, size_t errlen);
 
+/* Q4_K 原生: W 按行 [out][nb*144], in%256==0 */
+int cuda_k_gemv_q4k(float* y, const uint8_t* w, const float* x,
+                    uint32_t out, uint32_t in, char* err, size_t errlen);
+int cuda_k_gemm_q4k(float* y, const uint8_t* w, const float* x,
+                    uint32_t out, uint32_t in, uint32_t B, char* err, size_t errlen);
+
 void cuda_k_rmsnorm(float* y, const float* x, const float* w, uint32_t n, float eps);
 void cuda_k_rmsnorm_batch(float* y, const float* x, const float* w, uint32_t n, float eps, uint32_t B);
 void cuda_k_add(float* y, const float* a, const float* b, uint32_t n);
@@ -58,6 +64,9 @@ void cuda_k_attn_prefill(float* att_out, float* att_scores,
 /* embed: 从 FP16 行表取 token 行 → FP32 */
 void cuda_k_embed_f16(float* y, const uint16_t* table, uint32_t token, uint32_t hidden);
 void cuda_k_embed_f16_batch(float* y, const uint16_t* table, const uint32_t* tokens_dev,
+                            uint32_t B, uint32_t hidden);
+void cuda_k_embed_q4k(float* y, const uint8_t* table, uint32_t token, uint32_t hidden);
+void cuda_k_embed_q4k_batch(float* y, const uint8_t* table, const uint32_t* tokens_dev,
                             uint32_t B, uint32_t hidden);
 
 int cuda_k_memcpy_h2d(void* dst, const void* src, size_t n);

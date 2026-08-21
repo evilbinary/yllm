@@ -17,6 +17,8 @@
 
 const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer);
 CudaCtx* cuda_get_ctx(Engine* e);
+const uint8_t* cuda_tensor_q4k(const Engine* e, uint32_t layer, uint32_t slot,
+                               uint32_t* out, uint32_t* in);
 const uint16_t* cuda_tensor_f16w(const Engine* e, uint32_t layer, uint32_t slot,
                                  uint32_t* out, uint32_t* in);
 const float* cuda_tensor_f32(const Engine* e, uint32_t layer, uint32_t slot, uint32_t* n);
@@ -35,9 +37,12 @@ static int gemv(Engine* e, CudaCtx* ctx, float* y, uint32_t layer, uint32_t slot
                 const float* x, char* err, size_t errlen)
 {
     uint32_t out = 0, in = 0;
+    const uint8_t* wq = cuda_tensor_q4k(e, layer, slot, &out, &in);
+    if (wq)
+        return cuda_k_gemv_q4k(y, wq, x, out, in, err, errlen);
     const uint16_t* w = cuda_tensor_f16w(e, layer, slot, &out, &in);
     if (!w) {
-        if (err && errlen) snprintf(err, errlen, "missing f16w L%u S%u", layer, slot);
+        if (err && errlen) snprintf(err, errlen, "missing w L%u S%u", layer, slot);
         return -1;
     }
     return cuda_k_gemv_f16(ctx->cublas, y, w, x, ctx->d_xf16, out, in, err, errlen);
@@ -47,9 +52,12 @@ static int gemm(Engine* e, CudaCtx* ctx, float* y, uint32_t layer, uint32_t slot
                 const float* x, uint32_t B, char* err, size_t errlen)
 {
     uint32_t out = 0, in = 0;
+    const uint8_t* wq = cuda_tensor_q4k(e, layer, slot, &out, &in);
+    if (wq)
+        return cuda_k_gemm_q4k(y, wq, x, out, in, B, err, errlen);
     const uint16_t* w = cuda_tensor_f16w(e, layer, slot, &out, &in);
     if (!w) {
-        if (err && errlen) snprintf(err, errlen, "missing f16w L%u S%u", layer, slot);
+        if (err && errlen) snprintf(err, errlen, "missing w L%u S%u", layer, slot);
         return -1;
     }
     return cuda_k_gemm_f16(ctx->cublas, y, w, x, ctx->d_xf16, out, in, B, err, errlen);
@@ -261,6 +269,12 @@ int cuda_embed(Engine* e, uint32_t token)
     if (e->device_mode != DEV_MODE_CUDA) return -1;
     CudaCtx* ctx = cuda_get_ctx(e);
     uint32_t out = 0, in = 0;
+    const uint8_t* eq = cuda_tensor_q4k(e, 0, SLOT_EMBED, &out, &in);
+    if (eq) {
+        cuda_k_embed_q4k(ctx->d_x, eq, token, ctx->hidden);
+        ctx->x_on_dev = 1;
+        return 0;
+    }
     const uint16_t* emb = cuda_tensor_f16w(e, 0, SLOT_EMBED, &out, &in);
     if (!emb) return -1;
     cuda_k_embed_f16(ctx->d_x, emb, token, ctx->hidden);
@@ -303,14 +317,20 @@ int cuda_lm_head(Engine* e)
     char err[256];
     uint32_t layer = ctx->n_blocks + 2;
     uint32_t out = 0, in = 0;
-    const uint16_t* w = cuda_tensor_f16w(e, layer, 0, &out, &in);
-    if (!w) return -1;
     if (!ctx->x_on_dev) {
         if (cuda_k_memcpy_h2d(ctx->d_x, e->x, (size_t)ctx->hidden * 4) != 0) return -1;
         ctx->x_on_dev = 1;
     }
-    if (cuda_k_gemv_f16(ctx->cublas, ctx->d_logits, w, ctx->d_x, ctx->d_xf16, out, in, err, sizeof(err)) != 0)
-        return -1;
+    const uint8_t* wq = cuda_tensor_q4k(e, layer, 0, &out, &in);
+    if (wq) {
+        if (cuda_k_gemv_q4k(ctx->d_logits, wq, ctx->d_x, out, in, err, sizeof(err)) != 0)
+            return -1;
+    } else {
+        const uint16_t* w = cuda_tensor_f16w(e, layer, 0, &out, &in);
+        if (!w) return -1;
+        if (cuda_k_gemv_f16(ctx->cublas, ctx->d_logits, w, ctx->d_x, ctx->d_xf16, out, in, err, sizeof(err)) != 0)
+            return -1;
+    }
     if (cuda_k_memcpy_d2h(e->logits, ctx->d_logits, (size_t)ctx->vocab * 4) != 0) return -1;
     cuda_sync_x_to_host(e);
     return 0;
@@ -328,8 +348,9 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     if (!ctx || !ctx->d_pb || ctx->pb_cap == 0) return -1;
 
     uint32_t out = 0, in = 0;
-    const uint16_t* emb = cuda_tensor_f16w(e, 0, SLOT_EMBED, &out, &in);
-    if (!emb) return -1;
+    const uint8_t* eq = cuda_tensor_q4k(e, 0, SLOT_EMBED, &out, &in);
+    const uint16_t* emb = eq ? NULL : cuda_tensor_f16w(e, 0, SLOT_EMBED, &out, &in);
+    if (!eq && !emb) return -1;
 
     uint32_t trunk = ctx->n_blocks - (e->mtp_layer ? 1u : 0u);
     int off = 0;
@@ -339,7 +360,10 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 
         if (cuda_k_memcpy_h2d(ctx->d_tokens, tokens + off, (size_t)nb * sizeof(uint32_t)) != 0)
             return -1;
-        cuda_k_embed_f16_batch(ctx->d_pb, emb, ctx->d_tokens, nb, ctx->hidden);
+        if (eq)
+            cuda_k_embed_q4k_batch(ctx->d_pb, eq, ctx->d_tokens, nb, ctx->hidden);
+        else
+            cuda_k_embed_f16_batch(ctx->d_pb, emb, ctx->d_tokens, nb, ctx->hidden);
 
         uint32_t layer;
         for (layer = 1; layer <= trunk; layer++) {
@@ -355,7 +379,6 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
             e->mtp_h_ready = 1;
         }
 
-        /* 最后一批: 末 token → d_x → final norm + lm_head */
         if (off + (int)nb == n) {
             if (cuda_k_memcpy_d2d(ctx->d_x, ctx->d_pb + (size_t)(nb - 1) * ctx->hidden,
                                   (size_t)ctx->hidden * 4) != 0)
