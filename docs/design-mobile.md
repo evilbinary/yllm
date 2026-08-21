@@ -1,6 +1,6 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.4 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.5 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
@@ -22,8 +22,8 @@
 - **vulkan**：动态加载 `vulkan-1.dll` / `libvulkan.so` / MoltenVK；创建 **compute 队列** `VkDevice`。
   - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
     - `rmsnorm.spv`：块内 F32/F16 RMSNorm
-    - `gemv_q4k.spv`：块内 Q4_K matmul（每次仍 H2D 拷权，未做驻留）
-    - load 时自检；`rms=1 gemv=1` 表示两路可用
+    - `gemv_q4k.spv`：块内 Q4_K；**load 时整包常驻**（`resident=1`，push `w_off`），不再每层 H2D 权
+    - 激活仍每算子 H2D/D2H（attn 仍 CPU）
   - 失败 → `DEV_MODE_VULKAN_HOST`
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
   - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/shaders/`
@@ -61,7 +61,6 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. 权重/激活驻留 VkBuffer（去掉每层 H2D，否则 UHD 上 decode 会慢于 CPU）  
-2. attn / swiglu / rope compute；lm_head gemv  
-3. 设备 `adb` 冒烟  
-4. MoltenVK iOS
+1. 激活常驻 + 同 cmd 串 rmsnorm→gemv（去掉反复 map/fence）  
+2. attn / swiglu / rope；lm_head  
+3. `adb` 冒烟；MoltenVK iOS

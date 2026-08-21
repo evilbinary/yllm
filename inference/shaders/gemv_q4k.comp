@@ -9,6 +9,7 @@ layout(set = 0, binding = 2) readonly buffer InW { uint w[]; }; /* 按字节访�
 layout(push_constant) uniform Push {
     uint out_n;
     uint in_n;
+    uint w_off; /* 权在 SSBO 中的字节偏移 */
 } pc;
 
 uint load_u8(uint off)
@@ -67,7 +68,7 @@ void main()
 
     uint nb = pc.in_n / 256u;
     uint rowb = nb * 144u;
-    uint row = o * rowb;
+    uint row = pc.w_off + o * rowb;
     float acc = 0.0;
     for (uint b = gl_LocalInvocationID.x; b < nb; b += 64u)
         acc += q4k_dot256(row + b * 144u, b * 256u);

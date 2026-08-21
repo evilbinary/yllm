@@ -29,18 +29,17 @@ static int tensor_out_in(const LlfTensorMeta* mt, uint32_t* out, uint32_t* in)
     return 0;
 }
 
-/* 仅扫 transformer 块内 Q4_K(不含 embed/lm_head) */
-static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out, size_t* max_wq)
+static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out,
+                           size_t* total_wq)
 {
     uint32_t hidden = m->h.hidden;
     *max_in = hidden;
     *max_out = hidden;
-    *max_wq = (size_t)hidden * ((size_t)(hidden / 256) * 144);
+    *total_wq = 0;
     uint32_t li;
-    for (li = 0; li < m->n_layers && li < m->h.n_blocks; li++) {
-        /* 块层通常目录 index = li+1(0=embed); 兼容 base_idx */
+    for (li = 0; li < m->h.n_blocks; li++) {
         uint32_t layer = li + 1;
-        if (layer >= m->n_layers) layer = li;
+        if (layer >= m->n_layers) continue;
         uint32_t hidx = m->base_idx[layer];
         uint32_t nt = m->dir[layer].n_tensors;
         if (nt > BLOCK_TENSORS) nt = BLOCK_TENSORS;
@@ -53,10 +52,71 @@ static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out
             if ((i % 256) != 0) continue;
             if (o > *max_out) *max_out = o;
             if (i > *max_in) *max_in = i;
-            size_t wb = (size_t)o * ((size_t)(i / 256) * 144);
-            if (wb > *max_wq) *max_wq = wb;
+            *total_wq += (size_t)o * ((size_t)(i / 256) * 144);
         }
     }
+}
+
+/* 打包块内 Q4_K → 连续 blob, 填 wq_off[layer*nslot+slot] */
+static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
+{
+    LlModel* m = &e->ws.model;
+    uint32_t nslot = ctx->wq_nslot;
+    size_t total = 0;
+    uint32_t li, s;
+
+    for (li = 0; li < m->h.n_blocks; li++) {
+        uint32_t layer = li + 1;
+        if (layer >= m->n_layers) continue;
+        uint32_t hidx = m->base_idx[layer];
+        uint32_t nt = m->dir[layer].n_tensors;
+        if (nt > nslot) nt = nslot;
+        for (s = 0; s < nt; s++) {
+            const LlfTensorMeta* mt = &m->metas[hidx + s];
+            if (mt->dtype != DT_Q4K || mt->size == 0) continue;
+            uint32_t o, i;
+            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            total += (size_t)o * ((size_t)(i / 256) * 144);
+        }
+    }
+    if (total == 0 || total > ctx->wq_bytes) {
+        ylog_warn("vulkan: Q4_K pack size %zu vs buf %zu", total, ctx->wq_bytes);
+        return -1;
+    }
+
+    uint8_t* blob = (uint8_t*)malloc(total);
+    if (!blob) return -1;
+    size_t cursor = 0;
+    for (li = 0; li < m->h.n_blocks; li++) {
+        uint32_t layer = li + 1;
+        if (layer >= m->n_layers) continue;
+        const uint8_t* base =
+            (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
+        uint32_t hidx = m->base_idx[layer];
+        uint32_t nt = m->dir[layer].n_tensors;
+        if (nt > nslot) nt = nslot;
+        for (s = 0; s < nt; s++) {
+            const LlfTensorMeta* mt = &m->metas[hidx + s];
+            if (mt->dtype != DT_Q4K || mt->size == 0) continue;
+            uint32_t o, i;
+            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            size_t nbytes = (size_t)o * ((size_t)(i / 256) * 144);
+            if (nbytes != mt->size) {
+                /* size 字段为准 */
+                nbytes = (size_t)mt->size;
+            }
+            if (cursor + nbytes > total) {
+                free(blob);
+                return -1;
+            }
+            memcpy(blob + cursor, base + mt->offset, nbytes);
+            ctx->wq_off[(size_t)layer * nslot + s] = cursor;
+            cursor += nbytes;
+        }
+    }
+    int rc = vulkan_wq_upload(ctx, blob, cursor);
+    free(blob);
+    return rc;
 }
 
 static int vk_load_weights(Engine* e, char* err, size_t errlen)
@@ -75,10 +135,11 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
 
     if (!ctx->host_shim) {
         uint32_t max_in = ctx->hidden, max_out = ctx->hidden;
-        size_t max_wq = 0;
-        scan_block_q4k(&e->ws.model, &max_in, &max_out, &max_wq);
+        size_t total_wq = 0;
+        scan_block_q4k(&e->ws.model, &max_in, &max_out, &total_wq);
         char cerr[256];
-        if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, max_wq,
+        if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, total_wq,
+                                 e->ws.model.n_layers, BLOCK_TENSORS,
                                  cerr, sizeof(cerr)) != 0) {
             ylog_warn("vulkan: compute setup failed (%s); fwd stays CPU", cerr);
         } else {
@@ -90,14 +151,18 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ylog_warn("vulkan: gemv_q4k selftest failed; GPU gemv disabled");
                 ctx->gemv_ready = 0;
             }
+            if (ctx->gemv_ready && pack_upload_q4k(e, ctx) != 0) {
+                ylog_warn("vulkan: Q4_K resident upload failed; gemv falls back host-W");
+                ctx->wq_resident = 0;
+            }
         }
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
-              ctx->compute_ready, ctx->gemv_ready);
+              ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident);
     return 0;
 }
 

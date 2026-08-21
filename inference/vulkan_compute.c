@@ -17,6 +17,8 @@ typedef struct {
 typedef struct {
     uint32_t out_n;
     uint32_t in_n;
+    uint32_t w_off;
+    uint32_t _pad;
 } GemvPush;
 
 static uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
@@ -234,7 +236,8 @@ static int submit_and_wait(VulkanCtx* ctx, VkCommandBuffer cmd)
 }
 
 int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
-                         uint32_t max_in, uint32_t max_out, size_t max_wq_bytes,
+                         uint32_t max_in, uint32_t max_out,
+                         size_t total_wq_bytes, uint32_t n_layers, uint32_t nslot,
                          char* err, size_t errlen)
 {
     if (!ctx || ctx->host_shim || !ctx->device) {
@@ -249,11 +252,25 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
     ctx->hidden = hidden;
     ctx->max_in = max_in;
     ctx->max_out = max_out;
+    ctx->n_layers = n_layers;
+    ctx->wq_nslot = nslot ? nslot : 24;
     ctx->x_bytes = (size_t)max_in * 4;
     ctx->y_bytes = (size_t)max_out * 4;
     ctx->wn_bytes = (size_t)hidden * 4;
-    if (max_wq_bytes < 144) max_wq_bytes = 144;
-    ctx->wq_bytes = max_wq_bytes;
+    /* 至少留 8 行自检空间 */
+    if (total_wq_bytes < 144 * 8) total_wq_bytes = 144 * 8;
+    /* 4 字节对齐(uint SSBO) */
+    total_wq_bytes = (total_wq_bytes + 3u) & ~(size_t)3u;
+    ctx->wq_bytes = total_wq_bytes;
+    ctx->wq_resident = 0;
+
+    size_t ntab = (size_t)n_layers * ctx->wq_nslot;
+    ctx->wq_off = (uint64_t*)malloc(ntab * sizeof(uint64_t));
+    if (!ctx->wq_off) return -1;
+    {
+        size_t i;
+        for (i = 0; i < ntab; i++) ctx->wq_off[i] = (uint64_t)~0ull;
+    }
 
     VkBuffer bx = VK_NULL_HANDLE, by = VK_NULL_HANDLE;
     VkDeviceMemory mx = VK_NULL_HANDLE, my = VK_NULL_HANDLE;
@@ -351,6 +368,22 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
     return 0;
 }
 
+int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes)
+{
+    if (!ctx || !ctx->gemv_ready || !blob || bytes == 0) return -1;
+    if (bytes > ctx->wq_bytes) return -1;
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    void* pw = NULL;
+    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, 0, bytes, 0, &pw) != VK_SUCCESS)
+        return -1;
+    memcpy(pw, blob, bytes);
+    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+    ctx->wq_resident = 1;
+    ylog_info("vulkan: Q4_K weights resident %zuMB", bytes / (1024 * 1024));
+    return 0;
+}
+
 int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
                      uint32_t n, float eps)
 {
@@ -398,29 +431,26 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
     return 0;
 }
 
-int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x, const uint8_t* w,
-                      uint32_t out, uint32_t in)
+int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
+                      uint32_t out, uint32_t in, uint64_t w_byte_off)
 {
-    if (!ctx || !ctx->gemv_ready || !y || !x || !w) return -1;
+    if (!ctx || !ctx->gemv_ready || !y || !x) return -1;
     if (out == 0 || in == 0 || (in % 256) != 0) return -1;
     if (in > ctx->max_in || out > ctx->max_out) return -1;
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
-    if (wbytes > ctx->wq_bytes) return -1;
+    if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
+    if (w_byte_off > 0xffffffffull) return -1;
 
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
     size_t xbytes = (size_t)in * 4;
     size_t ybytes = (size_t)out * 4;
-    void* px = NULL; void* py = NULL; void* pw = NULL;
+    void* px = NULL; void* py = NULL;
 
     if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, xbytes, 0, &px) != VK_SUCCESS)
         return -1;
     memcpy(px, x, xbytes);
     a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, 0, wbytes, 0, &pw) != VK_SUCCESS)
-        return -1;
-    memcpy(pw, w, wbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     a->ResetCommandBuffer(cmd, 0);
@@ -435,6 +465,8 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x, const uint8_t* w
     GemvPush push;
     push.out_n = out;
     push.in_n = in;
+    push.w_off = (uint32_t)w_byte_off;
+    push._pad = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, out, 1, 1);
@@ -446,4 +478,20 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x, const uint8_t* w
     memcpy(y, py, ybytes);
     a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
     return 0;
+}
+
+int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
+                           const uint8_t* w, uint32_t out, uint32_t in)
+{
+    if (!ctx || !w) return -1;
+    size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
+    if (wbytes > ctx->wq_bytes) return -1;
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    void* pw = NULL;
+    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, 0, wbytes, 0, &pw) != VK_SUCCESS)
+        return -1;
+    memcpy(pw, w, wbytes);
+    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+    return vulkan_k_gemv_q4k(ctx, y, x, out, in, 0);
 }

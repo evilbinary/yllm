@@ -268,6 +268,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->mem_wn && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wn, NULL);
     if (ctx->mem_wq && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wq, NULL);
     free(ctx->host_w);
+    free(ctx->wq_off);
 
     if (a->DestroyDevice) a->DestroyDevice(dev, NULL);
     if (inst && a->DestroyInstance) a->DestroyInstance(inst, NULL);
