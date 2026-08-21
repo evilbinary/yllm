@@ -14,6 +14,6 @@ glslc -fshader-stage=compute attn_decode.comp -o attn_decode.spv
 - `rmsnorm.comp` — 单 WG RMSNorm
 - `gemv_q4k.comp` — 每 WG 一行 Q4_K·x（144B/block）
 - `swiglu.comp` — silu(gate)*up
-- `attn_decode.comp` — 每 head 一个 WG 的 decode attn（f32 KV）
+- `attn_decode.comp` — 每 head 一个 WG、64 线程；score 共享缓存；可与 O gemv 同 submit
 
 运行时搜 `inference/vulkan/shaders/*.spv`，或设 `YLLM_SHADER_DIR`。

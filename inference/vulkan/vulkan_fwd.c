@@ -281,9 +281,19 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     }
 
     int attn_ok = 0;
+    int attn_fused_o = 0;
     if (ctx && ctx->attn_ready) {
+        uint64_t off_o = (uint64_t)~0ull;
+        if (ctx->attn_o_ready && ctx->wq_resident && mt[SLOT_O].dtype == DT_Q4K) {
+            uint64_t oo = wq_off(ctx, layer, SLOT_O);
+            if (oo != (uint64_t)~0ull) {
+                off_o = oo;
+                attn_fused_o = 1;
+            }
+        }
         attn_ok = (vulkan_k_attn_decode(ctx, q, k, v, att_out, layer, pos,
-                                        kcache + kvp, vcache + kvp) == 0);
+                                        kcache + kvp, vcache + kvp, off_o) == 0);
+        if (!attn_ok) attn_fused_o = 0;
     }
     if (!attn_ok) {
         uint32_t j2;
@@ -315,9 +325,11 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
             }
         }
     }
-    memcpy(x2, att_out, (size_t)hidden * 4);
-    vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype,
-                     layer, SLOT_O);
+    if (!attn_fused_o) {
+        memcpy(x2, att_out, (size_t)hidden * 4);
+        vk_or_cpu_matmul(ctx, att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype,
+                         layer, SLOT_O);
+    }
     for (j = 0; j < hidden; j++) x[j] += att_out[j];
 
     if (try_fused_ffn(ctx, x, att_out, hidden, inter, eps, base, mt, layer) == 0) {

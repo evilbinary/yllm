@@ -1,6 +1,6 @@
 #version 450
-/* Decode attn: 每 WG 一个 Q head; KV 同缓冲不同 slot (f32) */
-layout(local_size_x = 1) in;
+/* Decode attn: 每 WG 一个 Q head; 64 线程并行 score/softmax; V 由各线程按 dim 分担 */
+layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; };
 layout(set = 0, binding = 1) readonly buffer KvBuf { float kv[]; };
@@ -17,46 +17,68 @@ layout(push_constant) uniform Push {
     uint v_slot;
 } pc;
 
+shared float sred[64];
+shared float sscore[256]; /* 短上下文缓存; 更长则重算 score */
+
+float score_at(uint qoff, uint kv_head, uint s)
+{
+    uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+    float acc = 0.0;
+    for (uint j = 0u; j < pc.head_dim; j++)
+        acc += q[qoff + j] * kv[koff + j];
+    return acc * inversesqrt(float(pc.head_dim));
+}
+
 void main() {
     uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
     if (h >= pc.n_heads) return;
 
     uint kv_head = h * pc.n_kv_heads / pc.n_heads;
     uint qoff = h * pc.head_dim;
-    float inv_d = inversesqrt(float(pc.head_dim));
     uint tlen = pc.pos + 1u;
+    uint use_cache = (tlen <= 256u) ? 1u : 0u;
 
     float m = -1e30;
-    for (uint s = 0u; s < tlen; s++) {
-        uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
-        float acc = 0.0;
-        for (uint j = 0u; j < pc.head_dim; j++)
-            acc += q[qoff + j] * kv[koff + j];
-        acc *= inv_d;
-        if (acc > m) m = acc;
+    for (uint s = lid; s < tlen; s += 64u) {
+        float sc = score_at(qoff, kv_head, s);
+        if (use_cache == 1u)
+            sscore[s] = sc;
+        if (sc > m) m = sc;
     }
+    sred[lid] = m;
+    barrier();
+    for (uint r = 32u; r > 0u; r >>= 1u) {
+        if (lid < r) {
+            float o = sred[lid + r];
+            if (o > sred[lid]) sred[lid] = o;
+        }
+        barrier();
+    }
+    m = sred[0];
 
     float sum = 0.0;
-    for (uint s = 0u; s < tlen; s++) {
-        uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
-        float acc = 0.0;
-        for (uint j = 0u; j < pc.head_dim; j++)
-            acc += q[qoff + j] * kv[koff + j];
-        sum += exp(acc * inv_d - m);
+    for (uint s = lid; s < tlen; s += 64u) {
+        float sc = (use_cache == 1u) ? sscore[s] : score_at(qoff, kv_head, s);
+        sum += exp(sc - m);
     }
-    float inv_sum = 1.0 / max(sum, 1e-20);
+    sred[lid] = sum;
+    barrier();
+    for (uint r = 32u; r > 0u; r >>= 1u) {
+        if (lid < r)
+            sred[lid] += sred[lid + r];
+        barrier();
+    }
+    float inv_sum = 1.0 / max(sred[0], 1e-20);
 
-    for (uint j = 0u; j < pc.head_dim; j++)
-        outp[qoff + j] = 0.0;
-
-    for (uint s = 0u; s < tlen; s++) {
-        uint koff = (pc.k_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
-        uint voff = (pc.v_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+    for (uint j = lid; j < pc.head_dim; j += 64u) {
         float acc = 0.0;
-        for (uint j = 0u; j < pc.head_dim; j++)
-            acc += q[qoff + j] * kv[koff + j];
-        float a = exp(acc * inv_d - m) * inv_sum;
-        for (uint j = 0u; j < pc.head_dim; j++)
-            outp[qoff + j] += a * kv[voff + j];
+        for (uint s = 0u; s < tlen; s++) {
+            float sc = (use_cache == 1u) ? sscore[s] : score_at(qoff, kv_head, s);
+            float a = exp(sc - m) * inv_sum;
+            uint voff = (pc.v_slot * pc.max_seq + s) * pc.kv_dim + kv_head * pc.head_dim;
+            acc += a * kv[voff + j];
+        }
+        outp[qoff + j] = acc;
     }
 }

@@ -251,6 +251,9 @@ void vulkan_shutdown(VulkanCtx* ctx)
     VkInstance inst = (VkInstance)ctx->instance;
     if (!dev) return;
 
+    if (ctx->queue && a->QueueWaitIdle)
+        a->QueueWaitIdle((VkQueue)ctx->queue);
+
     destroy_pipe(a, dev, ctx->rms_pipeline, ctx->rms_pipe_layout, ctx->rms_shader,
                  ctx->rms_desc_pool, ctx->rms_desc_layout);
     destroy_pipe(a, dev, ctx->gemv_pipeline, ctx->gemv_pipe_layout, ctx->gemv_shader,

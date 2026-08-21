@@ -1,6 +1,6 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.8 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.9 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
@@ -28,7 +28,7 @@
   - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
     - `rmsnorm.spv`：块内 F32/F16 RMSNorm
     - `gemv_q4k.spv`：块内 Q4_K；**load 时整包常驻**（`resident=1`）
-    - **fused**：`rmsnorm+QKV`；整段 FFN；**attn_decode**（f32 KV 常驻，`attn=1`）；rope/bias/qk-norm/O 仍部分 CPU
+    - **fused**：`rmsnorm+QKV`；整段 FFN；**attn_decode**（并行 64 线程/head）+ **同 submit O**（`attn_o=1`）；rope/bias/qk-norm 仍 CPU
   - 失败 → `DEV_MODE_VULKAN_HOST`
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
   - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/vulkan/shaders/`
@@ -66,6 +66,6 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. GPU rope；O proj 与 attn 同 submit；lm_head  
-2. attn 并行化（当前每 head 单线程，长上下文会慢）  
+1. GPU rope（避免 QKV 读回再上传）；lm_head  
+2. 长上下文 attn 再优化（online softmax / 更大并行）  
 3. `adb` 冒烟；MoltenVK iOS

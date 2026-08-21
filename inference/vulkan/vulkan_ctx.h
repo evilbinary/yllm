@@ -48,6 +48,7 @@ typedef struct {
     void* gemv_ds0;
     void* gemv_ds1;
     void* gemv_ds2;
+    void* gemv_ds_xo; /* x=buf_o2 → y=buf_y (attn 后 O) */
     void* gemv_pipe_layout;
     void* gemv_pipeline;
     void* gemv_shader;
@@ -68,7 +69,7 @@ typedef struct {
     void* swi_shader;
     int swi_ready;
 
-    /* RoPE / Attn — rope 暂 CPU; attn 用 GPU f32 KV */
+    /* RoPE / Attn — rope 暂 CPU; attn 用 GPU f32 KV; 可选 fused O */
     void* attn_desc_pool;
     void* attn_desc_layout;
     void* attn_desc_set;
@@ -86,6 +87,7 @@ typedef struct {
     uint32_t head_dim;
     uint32_t n_blocks;
     int attn_ready;
+    int attn_o_ready; /* gemv_ds_xo 可用 */
 
     int compute_ready;
     uint32_t n_layers;

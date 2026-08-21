@@ -363,39 +363,40 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                                      bufs, ranges, gerr, sizeof(gerr)) != 0) {
                 ylog_warn("vulkan: gemv pipeline failed (%s)", gerr);
             } else {
-                /* 扩容 pool: 再建 3 个 set (y→o0/o1/o2, x=buf_y) */
+                /* 扩容 pool: ds0/1/2 (x=buf_y→o*) + ds_xo (x=o2→y) */
                 a->DestroyDescriptorPool(dev, pool, NULL);
                 VkDescriptorPoolSize dps = {0};
                 dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                dps.descriptorCount = 12;
+                dps.descriptorCount = 15;
                 VkDescriptorPoolCreateInfo dpi = {0};
                 dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-                dpi.maxSets = 4;
+                dpi.maxSets = 5;
                 dpi.poolSizeCount = 1;
                 dpi.pPoolSizes = &dps;
                 if (a->CreateDescriptorPool(dev, &dpi, NULL, &pool) != VK_SUCCESS) {
                     ylog_warn("vulkan: gemv desc pool recreate failed");
                 } else {
-                    VkDescriptorSetLayout layouts[4] = { dsl, dsl, dsl, dsl };
-                    VkDescriptorSet sets[4];
+                    VkDescriptorSetLayout layouts[5] = { dsl, dsl, dsl, dsl, dsl };
+                    VkDescriptorSet sets[5];
                     VkDescriptorSetAllocateInfo dai = {0};
                     dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
                     dai.descriptorPool = pool;
-                    dai.descriptorSetCount = 4;
+                    dai.descriptorSetCount = 5;
                     dai.pSetLayouts = layouts;
                     if (a->AllocateDescriptorSets(dev, &dai, sets) != VK_SUCCESS) {
                         ylog_warn("vulkan: gemv desc sets alloc failed");
                     } else {
-                        VkBuffer xb[4] = { bx, by, by, by };
-                        VkBuffer yb[4] = { by, bo0, bo1, bo2 };
+                        VkBuffer xb[5] = { bx, by, by, by, bo2 };
+                        VkBuffer yb[5] = { by, bo0, bo1, bo2, by };
                         uint32_t si;
-                        for (si = 0; si < 4; si++) {
+                        for (si = 0; si < 5; si++) {
                             VkDescriptorBufferInfo bis[3];
                             VkWriteDescriptorSet writes[3];
                             memset(bis, 0, sizeof(bis));
                             memset(writes, 0, sizeof(writes));
                             VkBuffer trip[3] = { xb[si], yb[si], bw };
-                            size_t rng[3] = { ctx->x_bytes, ctx->y_bytes, ctx->wq_bytes };
+                            size_t xrng = (si == 4) ? ctx->y_bytes : ctx->x_bytes;
+                            size_t rng[3] = { xrng, ctx->y_bytes, ctx->wq_bytes };
                             uint32_t b;
                             for (b = 0; b < 3; b++) {
                                 bis[b].buffer = trip[b];
@@ -418,6 +419,8 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                         ctx->gemv_ds0 = (void*)sets[1];
                         ctx->gemv_ds1 = (void*)sets[2];
                         ctx->gemv_ds2 = (void*)sets[3];
+                        ctx->gemv_ds_xo = (void*)sets[4];
+                        ctx->attn_o_ready = 1;
                         ctx->gemv_ready = 1;
                         ctx->fuse_ready = 1;
                         ylog_info("vulkan: gemv_q4k+fuse ready max_in=%u max_out=%u wq=%zuMB",
@@ -862,10 +865,21 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
 int vulkan_k_attn_decode(VulkanCtx* ctx,
                          const float* q, const float* k, const float* v, float* att_out,
                          uint32_t layer, uint32_t pos,
-                         uint16_t* host_k_row, uint16_t* host_v_row)
+                         uint16_t* host_k_row, uint16_t* host_v_row,
+                         uint64_t off_o)
 {
     if (!ctx || !ctx->attn_ready || !q || !k || !v || !att_out) return -1;
     if (pos >= ctx->max_seq || layer > ctx->n_blocks) return -1;
+
+    int fuse_o = (off_o != (uint64_t)~0ull);
+    if (fuse_o) {
+        if (!ctx->attn_o_ready || !ctx->gemv_ds_xo || !ctx->wq_resident) return -1;
+        if (off_o > 0xffffffffull) return -1;
+        uint32_t hidden = ctx->n_heads * ctx->head_dim;
+        if (hidden > ctx->max_in || hidden > ctx->max_out) return -1;
+        size_t wbytes = (size_t)hidden * ((size_t)(hidden / 256) * 144);
+        if ((hidden % 256) != 0 || off_o + wbytes > ctx->wq_bytes) return -1;
+    }
 
     uint32_t kv_dim = ctx->kv_dim;
     uint32_t hidden = ctx->n_heads * ctx->head_dim;
@@ -921,7 +935,15 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->attn_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, ctx->n_heads, 1, 1);
+
+    if (fuse_o) {
+        cmd_barrier_compute(cmd);
+        cmd_gemv(ctx, cmd, ctx->gemv_ds_xo, hidden, hidden, (uint32_t)off_o);
+    }
+
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
+    if (fuse_o)
+        return map_read(ctx, ctx->mem_y, att_out, qbytes);
     return map_read(ctx, ctx->mem_o2, att_out, qbytes);
 }
