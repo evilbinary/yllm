@@ -601,8 +601,10 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
         }
         return 0;
     }
-    /* Vulkan: 逐 token, 但层间激活常驻(fused_block) */
+    /* Vulkan: 层外批 prefill(摊销 stream); 失败回退逐 token */
     if (e->device_mode == DEV_MODE_VULKAN) {
+        if (vulkan_prefill(e, tokens, n, start_pos) == 0)
+            return 0;
         int i;
         for (i = 0; i < n; i++) {
             if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)

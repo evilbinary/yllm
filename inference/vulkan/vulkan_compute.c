@@ -1686,6 +1686,7 @@ int vulkan_fused_block(VulkanCtx* ctx,
 
     if (sync_host && host_x) {
         if (map_read(ctx, ctx->mem_x, host_x, xb) != 0) return -1;
+        ctx->x_on_dev = 0;
     }
     return 0;
 }

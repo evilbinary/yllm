@@ -75,6 +75,7 @@ void vulkan_after_embed(Engine* e);
 void vulkan_sync_x(Engine* e);
 /* GPU 批 prefill; 失败返回 -1(调用方回退) */
 int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos);
+int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos);
 /* PP 中/末段: host 激活 xin[n×hidden] → 本段 GPU 层 → x_out 或 logits */
 int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
                          float* x_out, float* logits_out);

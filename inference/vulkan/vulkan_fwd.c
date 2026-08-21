@@ -287,7 +287,7 @@ static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
                                       host_k_row, host_v_row);
 }
 
-static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
+static int vulkan_fwd_block_ex(Engine* e, uint32_t layer, uint32_t pos, int sync_host)
 {
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     const uint8_t* base = (const uint8_t*)e->ws.map.base + e->ws.model.dir[layer].offset;
@@ -323,7 +323,7 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     /* 快路径: 整层常驻激活(无 qk-norm) */
     if (try_fused_full_block(ctx, x, upload_x, hidden, kv_dim, inter, eps, theta, rope_mode,
                              layer, pos, base, mt, kcache + kvp, vcache + kvp,
-                             /* 层间不 sync; 末层由 final_norm/sync 拉回 */ 0) == 0) {
+                             sync_host) == 0) {
         return 0;
     }
     /* 回退: 需 host x */
@@ -475,11 +475,89 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     return 0;
 }
 
+static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
+{
+    return vulkan_fwd_block_ex(e, layer, pos, /*sync_host*/ 0);
+}
+
 void vulkan_attach_fwd(Engine* e)
 {
     engine_attach_cpu_fwd(e);
     if (e->device_mode == DEV_MODE_VULKAN)
         e->fwd_block = vulkan_fwd_block;
+}
+
+/* 层外×token 内: 每层只 stream 一次权, 再扫批内 token(摊销 H2D) */
+int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN || !tokens || n <= 0) return -1;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    if (!ctx || ctx->host_shim || !ctx->wq_resident) return -1;
+    if (!e->pb || e->pb_cap == 0) return -1;
+
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    uint32_t hidden = h->hidden;
+    const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
+    const uint8_t* emb = (const uint8_t*)ws->map.base + m->dir[0].offset;
+    uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
+    uint32_t Bcap = e->pb_cap;
+    int off = 0;
+
+    while (off < n) {
+        uint32_t nb = (uint32_t)(n - off);
+        if (nb > Bcap) nb = Bcap;
+        uint32_t b;
+        for (b = 0; b < nb; b++) {
+            float* xb = e->pb + (size_t)b * hidden;
+            switch (tm->dtype) {
+            case DT_F32: embed_f32(xb, emb, tokens[off + (int)b], hidden); break;
+            case DT_Q4K: embed_q4k(xb, emb, tokens[off + (int)b], hidden); break;
+            case DT_Q6K: embed_q6k(xb, emb, tokens[off + (int)b], hidden); break;
+            case DT_Q5K: embed_q5k(xb, emb, tokens[off + (int)b], hidden); break;
+            case DT_IQ4XS: embed_iq4xs(xb, emb, tokens[off + (int)b], hidden); break;
+            default: embed_f16(xb, emb, tokens[off + (int)b], hidden); break;
+            }
+        }
+
+        uint32_t layer;
+        for (layer = 1; layer <= trunk; layer++) {
+            if (ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
+                return -1;
+            for (b = 0; b < nb; b++) {
+                memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
+                vulkan_mark_x_host(ctx);
+                /* sync_host=1: 写回 e->x 供下一批层 / pb 镜像 */
+                if (vulkan_fwd_block_ex(e, layer, (uint32_t)(start_pos + off) + b, 1) != 0)
+                    return -1;
+                if (ctx->x_on_dev)
+                    (void)vulkan_sync_x_to_host(ctx, e->x, hidden);
+                vulkan_mark_x_host(ctx);
+                memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
+            }
+        }
+
+        if (e->mtp_h) {
+            memcpy(e->mtp_h, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
+            e->mtp_h_ready = 1;
+        }
+
+        if (off + (int)nb == n) {
+            memcpy(e->x, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
+            vulkan_mark_x_host(ctx);
+            if (vulkan_final_norm(e) != 0) return -1;
+            if (vulkan_lm_head(e) != 0) {
+                /* Q6_K 等: 走 CPU lm_head */
+                uint32_t li = h->n_blocks + 2;
+                const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[li].offset;
+                const LlfTensorMeta* out = &m->metas[m->base_idx[li]];
+                matmul(e->logits, e->x, base + out->offset, h->vocab, hidden, out->dtype);
+            }
+        }
+        off += (int)nb;
+    }
+    return 0;
 }
 
 void vulkan_after_embed(Engine* e)

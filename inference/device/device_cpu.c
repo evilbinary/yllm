@@ -191,4 +191,12 @@ void vulkan_sync_x(Engine* e)
 {
     (void)e;
 }
+int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
+{
+    (void)e;
+    (void)tokens;
+    (void)n;
+    (void)start_pos;
+    return -1;
+}
 #endif

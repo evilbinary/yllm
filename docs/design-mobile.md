@@ -1,6 +1,6 @@
 # yllm 跨平台与 Vulkan
 
-版本：v0.12 ｜ 关联：`design-gpu-inference.md`、`platform/`
+版本：v0.13 ｜ 关联：`design-gpu-inference.md`、`platform/`
 
 ## 1. 目录
 
@@ -28,8 +28,9 @@
   - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
     - `rmsnorm.spv`：块内 F32/F16 RMSNorm
     - `gemv_q4k.spv`：块内 Q4_K；**load 时整包常驻**（`resident=1`）
-    - **fused**：整层 `block=1`（常驻激活、GPU bias/store_kv/residual，约 2 submit/层）；无 qk-norm 时走通；`>1GB` 权按层 **stream**
-    - **final_norm**；**lm_head**（`lm=1` 当 output 为 Q4_K 且非 stream）
+    - **fused**：整层 `block=1`（常驻激活、GPU bias/store_kv/residual，约 2 submit/层）；无 qk-norm 时走通；权按层 **stream**
+    - **prefill**：`vulkan_prefill` 层外批（摊销 stream）；非多 token GEMM
+    - **final_norm**；**lm_head**（Q4_K 流式分块；Q6_K→CPU）
   - 失败 → `DEV_MODE_VULKAN_HOST`
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
   - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/vulkan/shaders/`
@@ -67,6 +68,7 @@ cmake --build build/android -j
 
 ## 4. 下一步
 
-1. 真 batch prefill（多 token GEMM）  
+1. ~~真 batch prefill~~：`vulkan_prefill` 层外×token 内（每层只 stream 一次）；多 token GEMM/attn_prefill 仍待做  
 2. 长上下文 attn（online softmax）  
 3. `adb` 冒烟；MoltenVK iOS
+4. GPU RoPE 重新启用（当前 fused 用 CPU RoPE）
