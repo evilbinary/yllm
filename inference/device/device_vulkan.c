@@ -20,11 +20,19 @@ static int tensor_out_in(const LlfTensorMeta* mt, uint32_t* out, uint32_t* in)
     uint32_t a = mt->shape[0], b = mt->shape[1];
     *out = a;
     *in = b;
-    if (mt->dtype == DT_Q4K) {
-        size_t e0 = (size_t)a * (b / 256) * 144;
-        size_t e1 = (size_t)b * (a / 256) * 144;
-        if (e0 != mt->size && e1 == mt->size) { *out = b; *in = a; }
-        else if (e0 != mt->size && e1 != mt->size) return -1;
+    if (mt->dtype == DT_Q4K || mt->dtype == DT_Q6K) {
+        size_t rowb = (mt->dtype == DT_Q4K) ? 144u : 210u;
+        size_t e0 = (size_t)a * ((size_t)(b / 256) * rowb);
+        size_t e1 = (size_t)b * ((size_t)(a / 256) * rowb);
+        if (e0 == mt->size && e1 == mt->size) {
+            /* 方阵歧义少见; 两侧都合法时取较大维为 out(vocab) */
+            if (a >= b) { *out = a; *in = b; }
+            else { *out = b; *in = a; }
+        } else if (e0 != mt->size && e1 == mt->size) {
+            *out = b; *in = a;
+        } else if (e0 != mt->size && e1 != mt->size) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -112,6 +120,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
     size_t cursor = 0;
     ctx->lm_ready = 0;
     ctx->lm_off = (uint64_t)~0ull;
+    ctx->lm_dtype = 0;
     for (li = 0; li < m->h.n_blocks; li++) {
         uint32_t layer = li + 1;
         if (layer >= m->n_layers) continue;
@@ -143,18 +152,19 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
         uint32_t layer = m->h.n_blocks + 2;
         if (layer < m->n_layers) {
             const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+            const uint8_t* base =
+                (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
             if (mt->dtype == DT_Q4K && mt->size > 0) {
                 uint32_t o, i;
                 if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
                     size_t nbytes = (size_t)o * ((size_t)(i / 256) * 144);
                     if (nbytes != mt->size) nbytes = (size_t)mt->size;
                     if (cursor + nbytes <= total) {
-                        const uint8_t* base =
-                            (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
                         memcpy(blob + cursor, base + mt->offset, nbytes);
                         ctx->lm_off = cursor;
                         ctx->lm_out = o;
                         ctx->lm_in = i;
+                        ctx->lm_dtype = DT_Q4K;
                         ctx->wq_off[(size_t)layer * nslot + 0] = cursor;
                         cursor += nbytes;
                         ctx->lm_ready = 1;
@@ -167,9 +177,11 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
                               mt->dtype, (unsigned long long)mt->size, mt->ndim,
                               mt->shape[0], mt->shape[1]);
                 }
-            } else if (mt->dtype != DT_Q4K) {
-                ylog_info("vulkan: lm_head dtype=%u (need Q4_K for GPU; CPU fallback)",
-                          mt->dtype);
+            } else if (mt->dtype == DT_Q6K && mt->size > 0) {
+                /* Q6_K lm_head: CPU matmul 更快且与 greedy 一致; 不置 lm_ready */
+                ylog_info("vulkan: lm_head Q6_K → CPU (exact)");
+            } else {
+                ylog_info("vulkan: lm_head dtype=%u (CPU fallback)", mt->dtype);
             }
         }
     }

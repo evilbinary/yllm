@@ -438,7 +438,8 @@ int vulkan_lm_head(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
-    if (!ctx || !ctx->gemv_ready || !ctx->lm_ready || !ctx->wq_resident) return -1;
+    if (!ctx || !ctx->lm_ready || !ctx->gemv_ready || !ctx->wq_resident) return -1;
+    if (ctx->lm_dtype != DT_Q4K) return -1;
     if (ctx->lm_in != ctx->hidden || ctx->lm_out == 0) return -1;
     if ((ctx->lm_in % 256) != 0) return -1;
 

@@ -98,10 +98,11 @@ typedef struct {
     void* rope_shader;
     int rope_ready;
 
-    /* lm_head: output 层 Q4_K 常驻偏移 */
+    /* lm_head: Q4_K 常驻偏移(Q6_K 等走 CPU) */
     uint64_t lm_off;
-    uint32_t lm_out; /* vocab */
-    uint32_t lm_in;  /* hidden */
+    uint32_t lm_out;
+    uint32_t lm_in;
+    uint32_t lm_dtype;
     int lm_ready;
     float norm_eps;
 

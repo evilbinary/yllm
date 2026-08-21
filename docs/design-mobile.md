@@ -28,7 +28,7 @@
   - 成功 → `DEV_MODE_VULKAN`（`mode=native`）：
     - `rmsnorm.spv`：块内 F32/F16 RMSNorm
     - `gemv_q4k.spv`：块内 Q4_K；**load 时整包常驻**（`resident=1`）
-    - **fused**：`rmsnorm+QKV(+bias/qk-norm)+rope+attn+O`；整段 FFN；**final_norm + lm_head**（`lm=1`，vocab 分块 gemv）
+    - **fused**：`rmsnorm+QKV(+bias/qk-norm)+rope+attn+O`；整段 FFN；**final_norm**；**lm_head**（`lm=1` 当 output 为 Q4_K；Q6_K 等仍 CPU）
   - 失败 → `DEV_MODE_VULKAN_HOST`
   - 强制 shim：`make vulkan YLLM_VULKAN_HOST=1`
   - SPIR-V：`YLLM_SHADER_DIR` 或 `inference/vulkan/shaders/`

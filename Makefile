@@ -433,6 +433,16 @@ chat-qwen2.5-1.5b-avx2-vulkan: vulkan $(Q25_LLF)
 	$(RUN_VULKAN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
+chat-qwen2.5-7b: $(BIN) $(Q25_7B_LLF)
+	$(RUN) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen2.5-7b-avx2: $(BIN_AVX2) $(Q25_7B_LLF)
+	$(RUN_AVX2) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen2.5-7b-avx2-vulkan: vulkan $(Q25_7B_LLF)
+	$(RUN_VULKAN) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 chat-qwen3-8b: $(BIN) $(Q3_8B_LLF)
 	$(RUN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
@@ -698,4 +708,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda vulkan clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
