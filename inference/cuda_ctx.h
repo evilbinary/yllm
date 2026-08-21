@@ -38,7 +38,6 @@ typedef struct {
     float* d_hb;
     float* d_hb2;
     float* d_ffn;
-    float* d_att;
     float* d_logits;
     uint16_t* d_xf16;           /* gemv/gemm 激活 FP16 暂存 */
     /* 批量 prefill (≤ pb_cap) */
@@ -49,7 +48,6 @@ typedef struct {
     float* d_pbv;
     float* d_pbg;
     float* d_pbu;
-    float* d_pba;
     uint32_t* d_tokens;         /* prefill token ids [pb_cap] */
     uint32_t pb_cap;
     void* cublas;               /* cublasHandle_t */

@@ -144,7 +144,6 @@ static void cuda_ctx_clear(CudaCtx* ctx)
         if (ctx->d_hb) cudaFree(ctx->d_hb);
         if (ctx->d_hb2) cudaFree(ctx->d_hb2);
         if (ctx->d_ffn) cudaFree(ctx->d_ffn);
-        if (ctx->d_att) cudaFree(ctx->d_att);
         if (ctx->d_logits) cudaFree(ctx->d_logits);
         if (ctx->d_xf16) cudaFree(ctx->d_xf16);
         if (ctx->d_pb) cudaFree(ctx->d_pb);
@@ -154,7 +153,6 @@ static void cuda_ctx_clear(CudaCtx* ctx)
         if (ctx->d_pbv) cudaFree(ctx->d_pbv);
         if (ctx->d_pbg) cudaFree(ctx->d_pbg);
         if (ctx->d_pbu) cudaFree(ctx->d_pbu);
-        if (ctx->d_pba) cudaFree(ctx->d_pba);
         if (ctx->d_tokens) cudaFree(ctx->d_tokens);
         if (ctx->cublas) cuda_k_cublas_destroy(ctx->cublas);
     } else
@@ -333,7 +331,6 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     CUDA_OK(cudaMalloc((void**)&ctx->d_hb, (size_t)ctx->hidden * 4 * 9), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_hb2, (size_t)ctx->hidden * 4 * 9), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_ffn, (size_t)2 * ctx->inter * 4), err, errlen);
-    CUDA_OK(cudaMalloc((void**)&ctx->d_att, (size_t)e->max_seq * h->n_heads * 4), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_logits, (size_t)h->vocab * 4), err, errlen);
     {
         uint32_t B = e->pb_cap ? e->pb_cap : 64;
@@ -347,8 +344,6 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
         CUDA_OK(cudaMalloc((void**)&ctx->d_pbv, (size_t)B * ctx->kv_dim * 4), err, errlen);
         CUDA_OK(cudaMalloc((void**)&ctx->d_pbg, (size_t)B * ctx->inter * 4), err, errlen);
         CUDA_OK(cudaMalloc((void**)&ctx->d_pbu, (size_t)B * ctx->inter * 4), err, errlen);
-        CUDA_OK(cudaMalloc((void**)&ctx->d_pba,
-                           (size_t)B * h->n_heads * e->max_seq * 4), err, errlen);
         CUDA_OK(cudaMalloc((void**)&ctx->d_tokens, (size_t)B * sizeof(uint32_t)), err, errlen);
     }
 

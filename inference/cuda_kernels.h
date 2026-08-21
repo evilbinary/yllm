@@ -52,14 +52,15 @@ void cuda_k_store_kv(uint16_t* kcache, uint16_t* vcache, const float* k, const f
 void cuda_k_store_kv_batch(uint16_t* kcache, uint16_t* vcache, const float* k, const float* v,
                            uint32_t pos_start, uint32_t B, uint32_t kv_dim);
 
-void cuda_k_attn_decode(float* att_out, float* att_scores,
+void cuda_k_attn_decode(float* att_out,
                         const float* q, const uint16_t* kcache, const uint16_t* vcache,
                         uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                        uint32_t kv_dim, uint32_t max_seq);
-void cuda_k_attn_prefill(float* att_out, float* att_scores,
+                        uint32_t kv_dim);
+/* Flash 风格 online-softmax; 不写 att_scores */
+void cuda_k_attn_prefill(float* att_out,
                          const float* q, const uint16_t* kcache, const uint16_t* vcache,
                          uint32_t pos_start, uint32_t B, uint32_t n_heads, uint32_t n_kv_heads,
-                         uint32_t head_dim, uint32_t kv_dim, uint32_t max_seq, uint32_t q_stride);
+                         uint32_t head_dim, uint32_t kv_dim, uint32_t q_stride);
 
 /* embed: 从 FP16 行表取 token 行 → FP32 */
 void cuda_k_embed_f16(float* y, const uint16_t* table, uint32_t token, uint32_t hidden);

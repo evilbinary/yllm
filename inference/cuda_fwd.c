@@ -96,7 +96,6 @@ static int cuda_fwd_block_gpu(Engine* e, uint32_t layer, uint32_t pos)
     float* k = ctx->d_hb2 + hidden;
     float* v = ctx->d_hb2 + hidden + kv_dim;
     float* att_out = ctx->d_hb2 + hidden + 2 * kv_dim;
-    float* att = ctx->d_att;
     float* fg = ctx->d_ffn;
     float* fu = ctx->d_ffn + ctx->inter;
 
@@ -138,8 +137,8 @@ static int cuda_fwd_block_gpu(Engine* e, uint32_t layer, uint32_t pos)
     uint16_t* vcache = kv + (size_t)(ctx->n_blocks + layer) * e->max_seq * kv_dim;
     cuda_k_store_kv(kcache, vcache, k, v, pos, kv_dim);
 
-    cuda_k_attn_decode(att_out, att, q, kcache, vcache, pos,
-                       ctx->n_heads, ctx->n_kv_heads, ctx->head_dim, kv_dim, e->max_seq);
+    cuda_k_attn_decode(att_out, q, kcache, vcache, pos,
+                       ctx->n_heads, ctx->n_kv_heads, ctx->head_dim, kv_dim);
 
     if (cuda_k_memcpy_d2d(x2, att_out, (size_t)hidden * 4) != 0) return -1;
     if (gemv(e, ctx, att_out, layer, SLOT_O, x2, err, sizeof(err)) != 0) return -1;
@@ -174,7 +173,6 @@ static int cuda_fwd_block_batch_gpu(Engine* e, uint32_t layer, uint32_t pos_star
     float* v = ctx->d_pbv;
     float* fg = ctx->d_pbg;
     float* fu = ctx->d_pbu;
-    float* att = ctx->d_pba;
     uint32_t n = 0;
 
     const float* wn1 = cuda_tensor_f32(e, layer, SLOT_NORM1, &n);
@@ -209,9 +207,8 @@ static int cuda_fwd_block_batch_gpu(Engine* e, uint32_t layer, uint32_t pos_star
     uint16_t* vcache = kv + (size_t)(ctx->n_blocks + layer) * e->max_seq * kv_dim;
     cuda_k_store_kv_batch(kcache, vcache, k, v, pos_start, B, kv_dim);
 
-    cuda_k_attn_prefill(x2, att, q, kcache, vcache, pos_start, B,
-                        ctx->n_heads, ctx->n_kv_heads, ctx->head_dim, kv_dim,
-                        e->max_seq, hidden);
+    cuda_k_attn_prefill(x2, q, kcache, vcache, pos_start, B,
+                        ctx->n_heads, ctx->n_kv_heads, ctx->head_dim, kv_dim, hidden);
 
     if (gemm(e, ctx, q, layer, SLOT_O, x2, B, err, sizeof(err)) != 0) return -1;
     cuda_k_add_batch(x, x, q, hidden, B);

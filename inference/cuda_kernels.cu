@@ -527,118 +527,131 @@ extern "C" void cuda_k_store_kv_batch(uint16_t* kcache, uint16_t* vcache, const 
     k_store_kv_batch<<<grid, 256>>>(kcache, vcache, k, v, pos_start, B, kv_dim);
 }
 
-__global__ void k_attn_decode(float* att_out, float* att_scores,
-                              const float* q, const uint16_t* kcache, const uint16_t* vcache,
-                              uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                              uint32_t kv_dim, uint32_t max_seq)
+__device__ __forceinline__ float attn_block_sum(float v)
+{
+    __shared__ float sh[256];
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    return sh[0];
+}
+
+/* Flash-style decode: online softmax, Q 常驻 shared, 无 O(seq) score 缓冲 */
+__global__ void k_attn_flash_decode(float* att_out, const float* q,
+                                    const uint16_t* kcache, const uint16_t* vcache,
+                                    uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads,
+                                    uint32_t head_dim, uint32_t kv_dim)
 {
     uint32_t hh = blockIdx.x;
     if (hh >= n_heads) return;
+    uint32_t tid = threadIdx.x;
     uint32_t kv_head = hh * n_kv_heads / n_heads;
-    const float* qh = q + (size_t)hh * head_dim;
-    float* att_h = att_scores + (size_t)hh * max_seq;
+    extern __shared__ float q_s[];
+    if (tid < head_dim)
+        q_s[tid] = q[(size_t)hh * head_dim + tid];
+    __syncthreads();
+
     float inv_d = rsqrtf((float)head_dim);
+    float m = -1.0e30f;
+    float l = 0.0f;
+    float o = 0.0f;
 
-    for (uint32_t s = threadIdx.x; s <= pos; s += blockDim.x) {
+    for (uint32_t s = 0; s <= pos; s++) {
         const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * head_dim;
-        float acc = 0.0f;
-        for (uint32_t jj = 0; jj < head_dim; jj++)
-            acc += qh[jj] * __half2float(__ushort_as_half(kh[jj]));
-        att_h[s] = acc * inv_d;
-    }
-    __syncthreads();
+        float partial = 0.0f;
+        if (tid < head_dim)
+            partial = q_s[tid] * __half2float(__ushort_as_half(kh[tid]));
+        float score = attn_block_sum(partial) * inv_d;
 
-    /* softmax on att_h[0..pos] — serial in thread 0 for simplicity */
-    if (threadIdx.x == 0) {
-        float m = att_h[0];
-        for (uint32_t s = 1; s <= pos; s++) if (att_h[s] > m) m = att_h[s];
-        float sum = 0.0f;
-        for (uint32_t s = 0; s <= pos; s++) {
-            att_h[s] = expf(att_h[s] - m);
-            sum += att_h[s];
-        }
-        float inv = 1.0f / sum;
-        for (uint32_t s = 0; s <= pos; s++) att_h[s] *= inv;
-    }
-    __syncthreads();
-
-    float* out = att_out + (size_t)hh * head_dim;
-    for (uint32_t jj = threadIdx.x; jj < head_dim; jj += blockDim.x) {
-        float o = 0.0f;
-        for (uint32_t s = 0; s <= pos; s++) {
+        float m_new = fmaxf(m, score);
+        float alpha = expf(m - m_new);
+        float p = expf(score - m_new);
+        float l_new = alpha * l + p;
+        if (tid < head_dim) {
             const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * head_dim;
-            o += att_h[s] * __half2float(__ushort_as_half(vh[jj]));
+            o = alpha * o + p * __half2float(__ushort_as_half(vh[tid]));
         }
-        out[jj] = o;
+        m = m_new;
+        l = l_new;
     }
+    if (tid < head_dim)
+        att_out[(size_t)hh * head_dim + tid] = o / l;
 }
 
-extern "C" void cuda_k_attn_decode(float* att_out, float* att_scores,
+static uint32_t attn_threads(uint32_t head_dim)
+{
+    uint32_t t = 32;
+    while (t < head_dim && t < 256u) t <<= 1;
+    return t;
+}
+
+extern "C" void cuda_k_attn_decode(float* att_out,
                                    const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                    uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                                   uint32_t kv_dim, uint32_t max_seq)
+                                   uint32_t kv_dim)
 {
-    k_attn_decode<<<n_heads, 128>>>(att_out, att_scores, q, kcache, vcache,
-                                    pos, n_heads, n_kv_heads, head_dim, kv_dim, max_seq);
+    if (head_dim == 0 || head_dim > 256 || n_heads == 0) return;
+    uint32_t t = attn_threads(head_dim);
+    k_attn_flash_decode<<<n_heads, t, head_dim * sizeof(float)>>>(
+        att_out, q, kcache, vcache, pos, n_heads, n_kv_heads, head_dim, kv_dim);
 }
 
-/* grid: (n_heads, B); q / att_out stride = q_stride (通常 = hidden = n_heads*head_dim)
- * att_scores: [B × n_heads × max_seq] */
-__global__ void k_attn_prefill(float* att_out, float* att_scores,
-                               const float* q, const uint16_t* kcache, const uint16_t* vcache,
-                               uint32_t pos_start, uint32_t B, uint32_t n_heads, uint32_t n_kv_heads,
-                               uint32_t head_dim, uint32_t kv_dim, uint32_t max_seq, uint32_t q_stride)
+__global__ void k_attn_flash_prefill(float* att_out, const float* q,
+                                     const uint16_t* kcache, const uint16_t* vcache,
+                                     uint32_t pos_start, uint32_t B, uint32_t n_heads, uint32_t n_kv_heads,
+                                     uint32_t head_dim, uint32_t kv_dim, uint32_t q_stride)
 {
     uint32_t hh = blockIdx.x;
     uint32_t bb = blockIdx.y;
     if (hh >= n_heads || bb >= B) return;
+    uint32_t tid = threadIdx.x;
     uint32_t pos = pos_start + bb;
     uint32_t kv_head = hh * n_kv_heads / n_heads;
-    const float* qh = q + (size_t)bb * q_stride + (size_t)hh * head_dim;
-    float* att_h = att_scores + ((size_t)bb * n_heads + hh) * max_seq;
+    extern __shared__ float q_s[];
+    if (tid < head_dim)
+        q_s[tid] = q[(size_t)bb * q_stride + (size_t)hh * head_dim + tid];
+    __syncthreads();
+
     float inv_d = rsqrtf((float)head_dim);
+    float m = -1.0e30f;
+    float l = 0.0f;
+    float o = 0.0f;
 
-    for (uint32_t s = threadIdx.x; s <= pos; s += blockDim.x) {
+    for (uint32_t s = 0; s <= pos; s++) {
         const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * head_dim;
-        float acc = 0.0f;
-        for (uint32_t jj = 0; jj < head_dim; jj++)
-            acc += qh[jj] * __half2float(__ushort_as_half(kh[jj]));
-        att_h[s] = acc * inv_d;
-    }
-    __syncthreads();
+        float partial = 0.0f;
+        if (tid < head_dim)
+            partial = q_s[tid] * __half2float(__ushort_as_half(kh[tid]));
+        float score = attn_block_sum(partial) * inv_d;
 
-    if (threadIdx.x == 0) {
-        float m = att_h[0];
-        for (uint32_t s = 1; s <= pos; s++) if (att_h[s] > m) m = att_h[s];
-        float sum = 0.0f;
-        for (uint32_t s = 0; s <= pos; s++) {
-            att_h[s] = expf(att_h[s] - m);
-            sum += att_h[s];
-        }
-        float inv = 1.0f / sum;
-        for (uint32_t s = 0; s <= pos; s++) att_h[s] *= inv;
-    }
-    __syncthreads();
-
-    float* out = att_out + (size_t)bb * q_stride + (size_t)hh * head_dim;
-    for (uint32_t jj = threadIdx.x; jj < head_dim; jj += blockDim.x) {
-        float o = 0.0f;
-        for (uint32_t s = 0; s <= pos; s++) {
+        float m_new = fmaxf(m, score);
+        float alpha = expf(m - m_new);
+        float p = expf(score - m_new);
+        float l_new = alpha * l + p;
+        if (tid < head_dim) {
             const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * head_dim;
-            o += att_h[s] * __half2float(__ushort_as_half(vh[jj]));
+            o = alpha * o + p * __half2float(__ushort_as_half(vh[tid]));
         }
-        out[jj] = o;
+        m = m_new;
+        l = l_new;
     }
+    if (tid < head_dim)
+        att_out[(size_t)bb * q_stride + (size_t)hh * head_dim + tid] = o / l;
 }
 
-extern "C" void cuda_k_attn_prefill(float* att_out, float* att_scores,
+extern "C" void cuda_k_attn_prefill(float* att_out,
                                     const float* q, const uint16_t* kcache, const uint16_t* vcache,
                                     uint32_t pos_start, uint32_t B, uint32_t n_heads, uint32_t n_kv_heads,
-                                    uint32_t head_dim, uint32_t kv_dim, uint32_t max_seq, uint32_t q_stride)
+                                    uint32_t head_dim, uint32_t kv_dim, uint32_t q_stride)
 {
+    if (head_dim == 0 || head_dim > 256 || n_heads == 0 || B == 0) return;
+    uint32_t t = attn_threads(head_dim);
     dim3 grid(n_heads, B);
-    k_attn_prefill<<<grid, 128>>>(att_out, att_scores, q, kcache, vcache,
-                                  pos_start, B, n_heads, n_kv_heads, head_dim, kv_dim, max_seq, q_stride);
+    k_attn_flash_prefill<<<grid, t, head_dim * sizeof(float)>>>(
+        att_out, q, kcache, vcache, pos_start, B, n_heads, n_kv_heads, head_dim, kv_dim, q_stride);
 }
 
 __global__ void k_embed_f16(float* y, const uint16_t* table, uint32_t token, uint32_t hidden)

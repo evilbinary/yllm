@@ -1,6 +1,6 @@
 # yllm GPU 推理设计方案
 
-版本：v0.3 ｜ 状态：P3 权压 FP16 进行中 ｜ 关联：`design-mmap-layer-streaming.md`（权重 mmap / 层流式）
+版本：v0.4 ｜ 状态：P3 核心项已落地 ｜ 关联：`design-mmap-layer-streaming.md`
 
 ## 1. 目标与边界
 
@@ -124,7 +124,7 @@ docs/design-gpu-inference.md
 | **P0** | `Device` + CPU `load_weights`；`engine_bind_device`；rank/config `--device` |
 | **P1** | `device_cuda` + raw blob `load_weights`；host-shim 可测通路径 |
 | **P2** | Decode：线性权上卡 + cublas + 小 kernel；`device_mode`；激活常驻 `d_x`；GPU 逐 token prefill |
-| **P3（进行中）** | ✅ FP16 权；✅ GPU batch prefill；✅ **原生 Q4_K** 上卡；待：FlashAttention |
+| **P3（进行中）** | ✅ FP16 权；✅ GPU batch prefill；✅ 原生 Q4_K；✅ **Flash 风格 attn**（online-softmax，无 O(seq) score 缓冲） |
 
 ### 构建
 
