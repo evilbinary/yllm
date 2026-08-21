@@ -146,6 +146,15 @@ static void cuda_ctx_clear(CudaCtx* ctx)
         if (ctx->d_att) cudaFree(ctx->d_att);
         if (ctx->d_logits) cudaFree(ctx->d_logits);
         if (ctx->d_xf16) cudaFree(ctx->d_xf16);
+        if (ctx->d_pb) cudaFree(ctx->d_pb);
+        if (ctx->d_pb2) cudaFree(ctx->d_pb2);
+        if (ctx->d_pbq) cudaFree(ctx->d_pbq);
+        if (ctx->d_pbk) cudaFree(ctx->d_pbk);
+        if (ctx->d_pbv) cudaFree(ctx->d_pbv);
+        if (ctx->d_pbg) cudaFree(ctx->d_pbg);
+        if (ctx->d_pbu) cudaFree(ctx->d_pbu);
+        if (ctx->d_pba) cudaFree(ctx->d_pba);
+        if (ctx->d_tokens) cudaFree(ctx->d_tokens);
         if (ctx->cublas) cuda_k_cublas_destroy(ctx->cublas);
     } else
 #endif
@@ -301,8 +310,20 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     CUDA_OK(cudaMalloc((void**)&ctx->d_att, (size_t)e->max_seq * h->n_heads * 4), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_logits, (size_t)h->vocab * 4), err, errlen);
     {
+        uint32_t B = e->pb_cap ? e->pb_cap : 64;
         uint32_t xf = ctx->hidden > ctx->inter ? ctx->hidden : ctx->inter;
-        CUDA_OK(cudaMalloc((void**)&ctx->d_xf16, (size_t)xf * 2), err, errlen);
+        ctx->pb_cap = B;
+        CUDA_OK(cudaMalloc((void**)&ctx->d_xf16, (size_t)B * xf * 2), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pb, (size_t)B * ctx->hidden * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pb2, (size_t)B * ctx->hidden * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pbq, (size_t)B * ctx->hidden * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pbk, (size_t)B * ctx->kv_dim * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pbv, (size_t)B * ctx->kv_dim * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pbg, (size_t)B * ctx->inter * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pbu, (size_t)B * ctx->inter * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_pba,
+                           (size_t)B * h->n_heads * e->max_seq * 4), err, errlen);
+        CUDA_OK(cudaMalloc((void**)&ctx->d_tokens, (size_t)B * sizeof(uint32_t)), err, errlen);
     }
 
     if (cuda_k_cublas_create(&ctx->cublas, err, errlen) != 0) return -1;
@@ -313,9 +334,9 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
     e->device_mode = DEV_MODE_CUDA;
     cuda_attach_fwd(e);
     cuda_k_sync();
-    ylog_info("cuda: load_weights GPU f16w=%.2f MB f32v=%.2f MB kv=%.2f MB layers=[%u,%u) gpu=%d",
+    ylog_info("cuda: load_weights GPU f16w=%.2f MB f32v=%.2f MB kv=%.2f MB pb=%u layers=[%u,%u) gpu=%d",
               (double)n_f16 * 2 / 1048576.0, (double)n_f32 * 4 / 1048576.0,
-              (double)ctx->kv_bytes / 1048576.0, begin, end, ctx->device_id);
+              (double)ctx->kv_bytes / 1048576.0, ctx->pb_cap, begin, end, ctx->device_id);
     return 0;
 }
 #endif

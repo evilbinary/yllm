@@ -589,8 +589,11 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
 /* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
 int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
-    /* GPU decode 路径: 逐 token 走 device fwd, KV 直接写 d_kv, 避免 CPU batch 后再 H2D */
+    /* GPU: 批 embed + GEMM + 因果 attn, KV 写 d_kv */
     if (e->device_mode == DEV_MODE_CUDA) {
+        if (cuda_prefill(e, tokens, n, start_pos) == 0)
+            return 0;
+        /* 回退逐 token */
         int i;
         for (i = 0; i < n; i++) {
             if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)

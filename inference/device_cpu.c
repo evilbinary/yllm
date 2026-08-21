@@ -112,4 +112,12 @@ int cuda_lm_head(Engine* e)
     (void)e;
     return -1;
 }
+int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
+{
+    (void)e;
+    (void)tokens;
+    (void)n;
+    (void)start_pos;
+    return -1;
+}
 #endif

@@ -37,7 +37,18 @@ typedef struct {
     float* d_ffn;
     float* d_att;
     float* d_logits;
-    uint16_t* d_xf16;           /* gemv 激活 FP16 暂存 (max(hidden,inter)) */
+    uint16_t* d_xf16;           /* gemv/gemm 激活 FP16 暂存 */
+    /* 批量 prefill (≤ pb_cap) */
+    float* d_pb;
+    float* d_pb2;
+    float* d_pbq;
+    float* d_pbk;
+    float* d_pbv;
+    float* d_pbg;
+    float* d_pbu;
+    float* d_pba;
+    uint32_t* d_tokens;         /* prefill token ids [pb_cap] */
+    uint32_t pb_cap;
     void* cublas;               /* cublasHandle_t */
     int x_on_dev;               /* 1 = d_x 为权威激活, 跳过层间 H2D/D2H */
     uint32_t hidden;
