@@ -12,6 +12,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 static FILE* g_fp = NULL;
 static int g_level = YLOG_INFO;
@@ -96,7 +99,17 @@ void ylog_log(int level, const char* fmt, ...)
     log_ensure_mu();
     ymutex_lock(g_mu);
     if (g_fp) fprintf(g_fp, "[%s] [%s] %s\n", stamp, name, buf);
-    if (g_console || !g_fp) fprintf(stderr, "[%s] [%s] %s\n", stamp, name, buf);
+    if (g_console || !g_fp) {
+#ifdef __ANDROID__
+        int prio = 3; /* ANDROID_LOG_DEBUG */
+        if (level == YLOG_INFO) prio = 4;
+        else if (level == YLOG_WARN) prio = 5;
+        else if (level == YLOG_ERROR) prio = 6;
+        __android_log_print(prio, "yllm", "[%s] %s", name, buf);
+#else
+        fprintf(stderr, "[%s] [%s] %s\n", stamp, name, buf);
+#endif
+    }
     if (g_fp) fflush(g_fp);
     ymutex_unlock(g_mu);
 }

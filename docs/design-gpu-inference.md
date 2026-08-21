@@ -8,9 +8,10 @@
 |------|--------|
 | 单卡 CUDA 跑 TinyLlama / Qwen2.5-7B 量级 | 连续多请求 batch（vLLM 式） |
 | 保留 LLF 量化权重（Q4_K 等） | Tensor Parallel |
-| Prefill B≤64 / Decode B=1 与现网一致 | OpenCL / Vulkan 双栈 |
-| 多卡复用现有 Pipeline Parallel（`dist.c`） | 立刻改 router / 会话协议 |
+| Prefill B≤64 / Decode B=1 与现网一致 | 立刻改 router / 会话协议 |
+| 多卡复用现有 Pipeline Parallel（`dist.c`） | OpenCL 第二栈 |
 | GPU↔CPU 混合（PP / 单进程层切 / 权流式） | 双缓冲异步 prefetch |
+| 跨端 Vulkan（见 `design-mobile.md`） | Web/WASM（`platform/web` 预留） |
 
 **原则：** serve / dist / sample 仍只调 `engine_forward*`；设备细节关在 `Device` + `fwd_block(_batch)` 里。
 

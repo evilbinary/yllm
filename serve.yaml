@@ -25,8 +25,8 @@ rank-port-base: 9410   # 模型0 rank 推理口基址
 http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
 cache-dir: ./sessions   # 会话缓存落盘目录(空 = 纯内存; server 存 token 列表, rank 存 KV)
 budget: 1024MB            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n>KB(如 2048MB / 1.5G)
-# device: cpu              # 推理设备: cpu | cuda(见 docs/design-gpu-inference.md)
-# gpu: 0                   # CUDA device index
+# device: cpu              # 推理设备: cpu | cuda | vulkan(见 design-mobile.md)
+# gpu: 0                   # CUDA/Vulkan device index
 # gpu-weights: auto        # CUDA 线性权: auto|q4k(原生省显存) | fp16(解量化更快)
 # gpu-layers: -1           # 单进程混合: 前 N 个 transformer block(+embed) 在 GPU, 其余 CPU; -1=全 GPU
 # gpu-stream: 0            # 1=权常驻 host 打包, 按层 prefetch H2D(省显存、多 H2D)

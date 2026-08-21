@@ -3,10 +3,12 @@
 #   make            标量版本
 #   make avx2       x86_64 上的 AVX2 版本(其他架构退化为标量)
 #   make cuda       AVX2 + CUDA 后端(产物在 build/avx2-cuda/, 与 avx2 隔离)
+#   make vulkan     AVX2 + Vulkan 后端(产物在 build/avx2-vulkan/; P0 host-shim)
 #   make gen-cuda / chat-cuda   用 --device cuda 冒烟
 #   make test       运行测试
 #   make clean
 #
+# 跨平台打包见 platform/{android,ios,pc,web}/ 与 docs/design-mobile.md
 # Windows 下请在 MSYS2 / MinGW 环境执行本 Makefile;
 # 若使用 MSVC, 请改用 CMake:
 #   cmake -S . -B build-msvc && cmake --build build-msvc --config Release
@@ -26,6 +28,7 @@ TEST_ENGINE_CORE := inference/platform.c inference/log.c inference/llf.c inferen
 #   make cuda YLLM_CUDA_HOST=0             # 强制真 CUDA runtime(需 libcudart)
 YLLM_CUDA ?= 0
 YLLM_CUDA_HOST ?=
+YLLM_VULKAN ?= 0
 GPU ?= 0
 GPU_WEIGHTS ?= auto
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
@@ -39,6 +42,10 @@ ifeq ($(YLLM_CUDA),1)
       YLLM_CUDA_HOST := 0
     endif
   endif
+endif
+ifeq ($(YLLM_VULKAN),1)
+  SRC += inference/device_vulkan.c
+  TEST_ENGINE_CORE += inference/device_vulkan.c
 endif
 
 # 真 CUDA 时由 nvcc 编译的 .cu(host-shim 不编)
@@ -104,6 +111,10 @@ ifeq ($(YLLM_CUDA),1)
     LIBS += -lcudart -lcublas
   endif
 endif
+ifeq ($(YLLM_VULKAN),1)
+  CFLAGS_BASE += -DYLLM_VULKAN=1
+  # 真 Vulkan loader 后续: LIBS += -lvulkan
+endif
 OBJDIR        := build
 BIN           := build/yllm$(EXE)
 OBJ           := $(SRC:inference/%.c=$(OBJDIR)/%.o) $(OBJDIR)/main.o $(OBJDIR)/rank.o $(OBJDIR)/server.o $(OBJDIR)/router.o $(OBJDIR)/supervisor.o $(OBJDIR)/hub.o $(OBJDIR)/router_http.o $(OBJDIR)/status.o $(OBJDIR)/ctl.o $(OBJDIR)/sync.o
@@ -131,6 +142,8 @@ endif
 # CUDA 独立产物(与 build/avx2 隔离, 避免 CPU/CUDA 目标混用同一 .o)
 OBJDIR_CUDA := build/avx2-cuda
 BIN_CUDA    := $(OBJDIR_CUDA)/yllm$(EXE)
+OBJDIR_VULKAN := build/avx2-vulkan
+BIN_VULKAN    := $(OBJDIR_VULKAN)/yllm$(EXE)
 
 all: $(BIN)
 
@@ -338,6 +351,16 @@ gen-cuda: cuda $(MODEL_LLF)
 chat-cuda: cuda $(MODEL_LLF)
 	$(RUN_CUDA) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
+
+# ---- Vulkan: 独立目录(P0 host-shim; 真 loader 后续) ----
+vulkan:
+	$(MAKE) avx2 YLLM_VULKAN=1 OBJDIR_AVX2=$(OBJDIR_VULKAN) BIN_AVX2=$(BIN_VULKAN)
+
+RUN_VULKAN = OMP_NUM_THREADS=$(NTHREADS) $(BIN_VULKAN)
+
+gen-vulkan: vulkan $(MODEL_LLF)
+	$(RUN_VULKAN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
@@ -621,4 +644,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda vulkan clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama

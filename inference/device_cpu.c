@@ -51,6 +51,11 @@ int device_kind_parse(const char* s, DeviceKind* out)
         *out = DEV_CUDA;
         return 0;
     }
+    if (strcmp(s, "vulkan") == 0 || strcmp(s, "Vulkan") == 0 ||
+        strcmp(s, "VULKAN") == 0 || strcmp(s, "vk") == 0 || strcmp(s, "VK") == 0) {
+        *out = DEV_VULKAN;
+        return 0;
+    }
     return -1;
 }
 
@@ -86,6 +91,16 @@ Device* device_create(DeviceKind kind, int device_id, char* err, size_t errlen)
 #else
         if (err && errlen)
             snprintf(err, errlen, "CUDA backend not built (rebuild with YLLM_CUDA=1)");
+        return NULL;
+#endif
+    }
+    if (kind == DEV_VULKAN) {
+#ifdef YLLM_VULKAN
+        extern Device* device_create_vulkan(int device_id, char* err, size_t errlen);
+        return device_create_vulkan(device_id, err, errlen);
+#else
+        if (err && errlen)
+            snprintf(err, errlen, "Vulkan backend not built (rebuild with YLLM_VULKAN=1)");
         return NULL;
 #endif
     }

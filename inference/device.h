@@ -1,7 +1,7 @@
-/* device.h — 推理设备后端(CPU / CUDA)
+/* device.h — 推理设备后端(CPU / CUDA / Vulkan)
  *
  * 权重上设备统一入口: Device.load_weights(Engine*)。
- * 详见 docs/design-gpu-inference.md。
+ * 详见 docs/design-gpu-inference.md / docs/design-mobile.md。
  */
 #ifndef YLLM_DEVICE_H
 #define YLLM_DEVICE_H
@@ -14,14 +14,17 @@ typedef struct Engine Engine;
 
 typedef enum {
     DEV_CPU = 0,
-    DEV_CUDA = 1
+    DEV_CUDA = 1,
+    DEV_VULKAN = 2
 } DeviceKind;
 
-/* 实际推理路径(比 DeviceKind 细: CUDA 还分 shim / 真 GPU) */
+/* 实际推理路径(比 DeviceKind 细) */
 typedef enum {
-    DEV_MODE_CPU = 0,        /* 主机 mmap + CPU 算子 */
-    DEV_MODE_CUDA_HOST = 1,  /* --device cuda 但 host-shim(权镜像 RAM + CPU 算) */
-    DEV_MODE_CUDA = 2        /* 真 CUDA kernel / cublas */
+    DEV_MODE_CPU = 0,          /* 主机 mmap + CPU 算子 */
+    DEV_MODE_CUDA_HOST = 1,    /* --device cuda 但 host-shim */
+    DEV_MODE_CUDA = 2,         /* 真 CUDA */
+    DEV_MODE_VULKAN_HOST = 3,  /* --device vulkan 但 host-shim(无 loader / 未完成 shader) */
+    DEV_MODE_VULKAN = 4        /* 真 Vulkan compute */
 } DeviceMode;
 
 /* CUDA 线性权上卡格式(bind 前设置 e->cuda_wmode) */
@@ -46,7 +49,7 @@ typedef struct Device {
     void (*release_layer)(Engine* e, uint32_t layer);
 } Device;
 
-/* 解析 "cpu" / "cuda"(大小写不敏感); 未知返回 -1 */
+/* 解析 "cpu" / "cuda" / "vulkan"(大小写不敏感); 未知返回 -1 */
 int device_kind_parse(const char* s, DeviceKind* out);
 /* 解析 "auto" / "q4k" / "fp16"; 未知返回 -1 */
 int cuda_weight_mode_parse(const char* s, CudaWeightMode* out);

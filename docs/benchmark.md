@@ -521,3 +521,38 @@ r1 的 rank 用默认 temp=1.0 → 每 token 4ms 做 softmax+qsort。
 - emit 链本身只有 1ms/16tok, 不是瓶颈。
 - 合并 send、关日志、小缓冲均无效(+1%), 已回退或保留无害优化。
 
+## CUDA / 混合路径(2026-08-21 RTX 4090)
+
+机:(RTX 4090 D 24GB, nvcc 12.0)。
+模型: TinyLlama-1.1B Q4\_K\_M；`build/avx2-cuda/yllm gen --prompt Hi --temp 0 --seed 42`；
+权格式默认 `gpu-weights=auto`(原生 Q4\_K + 非 Q4 解 FP16)。读数取 `prefill:` / `decode:` 行。
+
+### 单进程
+
+| 模式 | Prefill | Decode | 权显存(约) | 说明 |
+| --- | ------- | ------ | --------- | ---- |
+| 全 GPU(`--device cuda`) | ~30–31 | **~140–170** | Q4 ~490 MB + F16 ~355 MB | 最快；权整段上卡 |
+| CPU(`--device cpu`) | ~29–30 | ~23 | — | 同机 CPU 基线 |
+| `--gpu-layers 8` | ~15–23 | ~28–42 | Q4 ~198 MB + F16 ~92 MB | 前 8 block(+embed) GPU，其后 CPU |
+| `--gpu-stream 1` | ~9 | ~12 | 单层峰值 Q4 ~35 MB | 权常驻 host，按层 H2D；省显存、吞吐差 |
+
+- 全 GPU 相对同机 CPU decode **约 6–7×**。
+- `gpu-stream` 与全 GPU **同文**(同 kernel)，慢在同步 H2D；适合「整模装不下」而非小模型加速。
+- `gpu-layers` 因 GPU/CPU 算子非 bit-exact，贪心路径可与全 GPU 分叉，但仍连贯；切点靠近末端时更接近全 GPU 文案。
+
+### Pipeline Parallel(`--ranks 2`，本机 loopback)
+
+| 拓扑 | Decode(约) | 说明 |
+| ---- | ---------- | ---- |
+| CPU + CPU | ~16 | 段间 TCP；小于单进程 CPU |
+| GPU → CPU(rank0 CUDA / rank1 CPU) | ~26–30 | 前半 GPU；修 `batch_tokens` 后激活正确 |
+| CPU → GPU(rank0 CPU / rank1 CUDA) | ~11–32 | 受 CPU 前半 + 通信限制 |
+
+PP 测出并已修: GPU rank0 的 `engine_forward_batch_tokens` 曾把 embed 写在 host `e->pb`，而 CUDA batch 读 `d_pb`，发出去的激活错误(表现为整段换行)。现改为 CUDA 上逐 token `forward_range`。
+
+### 取舍(相对本节)
+
+- **要吞吐** → 全 GPU 常驻权。
+- **显存紧、大模型** → `--gpu-stream 1`(或日后双缓冲异步 prefetch)。
+- **单卡装不下、可切层** → `--gpu-layers N` 或 PP 多 rank 异设备；有通信/数值分叉成本，非小模型加速手段。
+

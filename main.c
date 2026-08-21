@@ -212,7 +212,7 @@ static int cmd_gen(int argc, char** argv)
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1]\n");
+        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1]\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -238,7 +238,7 @@ static int cmd_gen(int argc, char** argv)
     {
         DeviceKind dk = DEV_CPU;
         if (device_kind_parse(device_s, &dk) != 0) {
-            fprintf(stderr, "bad --device %s (want cpu|cuda)\n", device_s);
+            fprintf(stderr, "bad --device %s (want cpu|cuda|vulkan)\n", device_s);
             engine_free(&e);
             vocab_free(&v);
             return 1;
@@ -376,7 +376,7 @@ static int cmd_chat(int argc, char** argv)
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -397,7 +397,7 @@ static int cmd_chat(int argc, char** argv)
     {
         DeviceKind dk = DEV_CPU;
         if (device_kind_parse(device_s, &dk) != 0) {
-            fprintf(stderr, "bad --device %s (want cpu|cuda)\n", device_s);
+            fprintf(stderr, "bad --device %s (want cpu|cuda|vulkan)\n", device_s);
             engine_free(&e);
             vocab_free(&v);
             return 1;

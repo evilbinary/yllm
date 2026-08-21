@@ -697,7 +697,7 @@ int cmd_rank(ServeConfig* cfg)
     if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] "
-                        "[--device cpu|cuda] [--gpu N] [--gpu-weights auto|q4k|fp16] "
+                        "[--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] "
                         "[--gpu-layers N] [--gpu-stream 0|1] [--config <yaml>]\n");
         return 1;
     }
@@ -781,7 +781,7 @@ int cmd_rank(ServeConfig* cfg)
     {
         DeviceKind dk = DEV_CPU;
         if (cfg->device[0] && device_kind_parse(cfg->device, &dk) != 0) {
-            ylog_error("rank: bad --device %s (want cpu|cuda)", cfg->device);
+            ylog_error("rank: bad --device %s (want cpu|cuda|vulkan)", cfg->device);
             engine_free(&r.engine);
             vocab_free(&r.vocab);
             return 1;

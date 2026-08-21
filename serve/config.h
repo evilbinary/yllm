@@ -84,7 +84,7 @@ typedef struct {
     uint64_t seed;
     int64_t budget;         /* rank KV 内存预算(MB; -1 = auto)。解析时由 "auto"/"1024MB"/"1.5G" 转成 */
     int depth;
-    char device[32];        /* cpu | cuda(见 docs/design-gpu-inference.md) */
+    char device[32];        /* cpu | cuda | vulkan(见 design-gpu / design-mobile) */
     int gpu;                /* CUDA device index(默认 0) */
     char gpu_weights[16];   /* auto | q4k | fp16(CUDA 线性权上卡格式) */
     int gpu_layers;         /* -1=全 GPU; >=0 单进程混合: 前 N 个 block(+embed) 在 GPU */
