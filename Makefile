@@ -394,7 +394,7 @@ gen-vulkan: vulkan $(MODEL_LLF)
 
 chat-vulkan: vulkan $(MODEL_LLF)
 	$(RUN_VULKAN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --temp 0 --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU)
 
 # 与 chat-avx2 / gen-avx2 对称的命名(产物仍为 build/avx2-vulkan)
 chat-avx2-vulkan: chat-vulkan

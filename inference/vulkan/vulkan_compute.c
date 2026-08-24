@@ -891,8 +891,11 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
         uint32_t ncmd = n_layers + 8u;
         uint32_t i;
         VkCommandBuffer tmp[256];
-        if (ncmd < 8u) ncmd = 8u;
-        if (ncmd > 256u) ncmd = 256u;
+        if (ctx->integrated_gpu) ncmd = 1u;
+        else {
+            if (ncmd < 8u) ncmd = 8u;
+            if (ncmd > 256u) ncmd = 256u;
+        }
         cai.commandBufferCount = ncmd;
         if (a->AllocateCommandBuffers(dev, &cai, tmp) != VK_SUCCESS) {
             cai.commandBufferCount = 1;

@@ -473,6 +473,7 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ctx->lm_ready = 0;
                 ctx->lm_one_submit = 0;
                 ctx->lm_fused = 0;
+                ctx->wq_stream = 0;
                 ylog_warn("vulkan: iGPU gemv selftest failed; using CPU fwd (YLLM_VK_IGPU_GPU=1 to force GPU)");
             }
         }

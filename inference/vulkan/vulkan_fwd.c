@@ -36,6 +36,7 @@ int vulkan_selftest_rmsnorm(VulkanCtx* ctx)
     }
     float eps = 1e-6f;
     if (vulkan_k_rmsnorm(ctx, yg, x, w, n, eps) != 0) {
+        ylog_warn("vulkan: rmsnorm selftest dispatch failed");
         free(x); free(w); free(yg); free(yc);
         return -1;
     }
@@ -495,7 +496,7 @@ static int vulkan_fwd_block_ex(Engine* e, uint32_t layer, uint32_t pos, int sync
     uint32_t rope_mode = (h->arch == ARCH_QWEN) ? 1u : 0u;
     int upload_x = ctx ? !ctx->x_on_dev : 1;
 
-    if (ctx && ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
+    if (ctx && ctx->wq_stream && ctx->gemv_ready && vulkan_stream_layer(ctx, layer) != 0)
         return -1;
 
     /* 快路径: 整层常驻激活(无 qk-norm) */
@@ -662,8 +663,15 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 void vulkan_attach_fwd(Engine* e)
 {
     engine_attach_cpu_fwd(e);
-    if (e->device_mode == DEV_MODE_VULKAN)
+    if (e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return;
+    {
+        VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+        if (ctx->host_shim) return;
+        /* gemv/block 都关时必须走 CPU, 否则 stream 失败会被 engine 忽略, 整层跳过 */
+        if (!ctx->gemv_ready && !ctx->block_ready && !ctx->fuse_ready)
+            return;
         e->fwd_block = vulkan_fwd_block;
+    }
 }
 
 /* token 外×layer 内: 激活常驻 GPU, 每层结束只 D2H 一次 */
