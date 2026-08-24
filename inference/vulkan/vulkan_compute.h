@@ -9,7 +9,7 @@
 int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                          uint32_t max_in, uint32_t max_out,
                          size_t total_wq_bytes, uint32_t n_layers, uint32_t nslot,
-                         char* err, size_t errlen);
+                         uint32_t lm_vocab, char* err, size_t errlen);
 
 int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes);
 int vulkan_wq_upload_range(VulkanCtx* ctx, const void* src, size_t dst_off, size_t bytes);
@@ -19,6 +19,9 @@ int vulkan_stream_layer(VulkanCtx* ctx, uint32_t layer);
 
 int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
                      uint32_t n, float eps);
+int vulkan_k_rmsnorm_inplace(VulkanCtx* ctx, const float* w, uint32_t n, float eps);
+int vulkan_k_lm_gemv(VulkanCtx* ctx, float* y, const float* x, int x_on_dev,
+                     uint32_t vocab, uint32_t hidden, uint64_t w_byte_off, uint32_t dtype);
 int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
                       uint32_t out, uint32_t in, uint64_t w_byte_off);
 int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,

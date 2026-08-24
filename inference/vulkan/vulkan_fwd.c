@@ -116,6 +116,8 @@ int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
 {
     if (!ctx || !ctx->gemv_q6k_ready || !ctx->lm_ready || ctx->lm_dtype != DT_Q6K)
         return 0;
+    /* stream: lm 在 host_wq; map_wq 仅一层 GPU 权, lm_off 不可直接索引 */
+    if (ctx->wq_stream || !ctx->wq_resident) return 0;
     if (!ctx->map_wq || ctx->lm_off == (uint64_t)~0ull) return 0;
     uint32_t in = ctx->lm_in;
     uint32_t out = 8;
@@ -160,19 +162,25 @@ int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
             matmul_q6k(ycf, xq,
                        (const uint8_t*)ctx->map_wq + (size_t)ctx->lm_off,
                        vocab, in);
-            size_t row_bytes = (size_t)(in / 256) * 210u;
             uint32_t chunk = ctx->max_out;
-            if (chunk == 0 || chunk > vocab) chunk = vocab;
-            uint32_t rows = 0;
-            int ok = 1;
-            while (rows < vocab && ok) {
-                uint32_t n = vocab - rows;
-                if (n > chunk) n = chunk;
-                uint64_t off = ctx->lm_off + (uint64_t)rows * row_bytes;
-                if (vulkan_k_gemv_q6k(ctx, ygf + rows, xq, n, in, off) != 0)
-                    ok = 0;
-                else
-                    rows += n;
+            int ok = 0;
+            if (ctx->gemv_ds_lm && ctx->logits_bytes >= (size_t)vocab * 4)
+                ok = (vulkan_k_lm_gemv(ctx, ygf, xq, 0, vocab, in,
+                                       ctx->lm_off, DT_Q6K) == 0);
+            else {
+                size_t row_bytes = (size_t)(in / 256) * 210u;
+                if (chunk == 0 || chunk > vocab) chunk = vocab;
+                uint32_t rows = 0;
+                ok = 1;
+                while (rows < vocab && ok) {
+                    uint32_t n = vocab - rows;
+                    if (n > chunk) n = chunk;
+                    uint64_t off = ctx->lm_off + (uint64_t)rows * row_bytes;
+                    if (vulkan_k_gemv_q6k(ctx, ygf + rows, xq, n, in, off) != 0)
+                        ok = 0;
+                    else
+                        rows += n;
+                }
             }
             if (ok) {
                 maxe = 0.0f;
@@ -181,7 +189,8 @@ int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
                     if (d > maxe) maxe = d;
                 }
                 ylog_info("vulkan: lm_head chunk selftest max_abs_err=%.6g (vocab=%u chunk=%u)",
-                          (double)maxe, vocab, chunk);
+                          (double)maxe, vocab,
+                          ctx->gemv_ds_lm ? vocab : chunk);
             } else {
                 maxe = 1.0f;
             }
@@ -693,6 +702,14 @@ int vulkan_final_norm(Engine* e)
     const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
     uint32_t hidden = m->h.hidden;
     float eps = ctx->norm_eps;
+    if (ctx->lm_one_submit && ctx->rms_ds_inplace) {
+        if (!ctx->x_on_dev) {
+            if (vulkan_upload_x(ctx, e->x, hidden) != 0) return -1;
+        }
+        if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
+        if (vulkan_k_rmsnorm_inplace(ctx, ctx->host_w, hidden, eps) != 0) return -1;
+        return 0;
+    }
     if (ctx->x_on_dev)
         (void)vulkan_sync_x_to_host(ctx, e->x, hidden);
     if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
@@ -710,13 +727,30 @@ int vulkan_lm_head(Engine* e)
     if (ctx->lm_dtype == DT_Q4K && !ctx->gemv_ready) return -1;
     if (ctx->lm_dtype == DT_Q6K && !ctx->gemv_q6k_ready) return -1;
     if (ctx->lm_dtype != DT_Q4K && ctx->lm_dtype != DT_Q6K) return -1;
-    if (ctx->x_on_dev)
-        (void)vulkan_sync_x_to_host(ctx, e->x, ctx->hidden);
     if (ctx->lm_in != ctx->hidden || ctx->lm_out == 0) return -1;
     if ((ctx->lm_in % 256) != 0) return -1;
 
     uint32_t vocab = ctx->lm_out;
     uint32_t hidden = ctx->lm_in;
+
+    if (ctx->lm_one_submit && ctx->gemv_ds_lm && !ctx->wq_stream) {
+        const float* x_in = e->x;
+        int x_dev = ctx->x_on_dev ? 1 : 0;
+        if (ctx->lm_dtype == DT_Q6K) {
+            float* xq = (float*)alloca((size_t)hidden * 4);
+            if (ctx->x_on_dev && ctx->map_x)
+                matvec_q8k_quant((const float*)ctx->map_x, xq, hidden);
+            else
+                matvec_q8k_quant(e->x, xq, hidden);
+            x_in = xq;
+            x_dev = 0;
+        }
+        return vulkan_k_lm_gemv(ctx, e->logits, x_in, x_dev, vocab, hidden,
+                                ctx->lm_off, ctx->lm_dtype);
+    }
+
+    if (ctx->x_on_dev)
+        (void)vulkan_sync_x_to_host(ctx, e->x, ctx->hidden);
     const float* x_in = e->x;
     if (ctx->lm_dtype == DT_Q6K) {
         float* xq = (float*)alloca((size_t)hidden * 4);

@@ -316,8 +316,21 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
             }
         }
         char cerr[256];
+        uint32_t lm_vocab = 0;
+        {
+            LlModel* m = &e->ws.model;
+            uint32_t layer = m->h.n_blocks + 2;
+            if (layer < m->n_layers) {
+                const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+                if ((mt->dtype == DT_Q4K || mt->dtype == DT_Q6K) && mt->size > 0) {
+                    uint32_t o, i;
+                    if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0)
+                        lm_vocab = o;
+                }
+            }
+        }
         if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, gpu_wq,
-                                 e->ws.model.n_layers, BLOCK_TENSORS,
+                                 e->ws.model.n_layers, BLOCK_TENSORS, lm_vocab,
                                  cerr, sizeof(cerr)) != 0) {
             ylog_warn("vulkan: compute setup failed (%s); fwd stays CPU", cerr);
         } else {
@@ -338,6 +351,11 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ylog_warn("vulkan: gemv_q6k selftest failed; lm_head CPU fallback");
                 ctx->lm_ready = 0;
             }
+            if (ctx->lm_ready && ctx->gemv_ds_lm && !ctx->wq_stream &&
+                ctx->lm_out > 0 && ctx->logits_bytes >= (size_t)ctx->lm_out * 4) {
+                ctx->lm_one_submit = 1;
+                ylog_info("vulkan: lm_head one-submit vocab=%u", ctx->lm_out);
+            }
             if (ctx->fuse_ready) {
                 char aerr[256];
                 const LlfHeader* h = &e->ws.model.h;
@@ -352,13 +370,13 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d lm1=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
               ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident, ctx->wq_stream,
               ctx->fuse_ready, ctx->swi_ready, ctx->attn_ready, ctx->attn_o_ready,
               ctx->rope_ready, ctx->block_ready, ctx->embed_ready, ctx->use_gpu_rope,
-              ctx->lm_ready);
+              ctx->lm_ready, ctx->lm_one_submit);
     return 0;
 }
 

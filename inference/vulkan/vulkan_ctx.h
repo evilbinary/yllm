@@ -55,6 +55,7 @@ typedef struct {
     void* rms_desc_pool;
     void* rms_desc_layout;
     void* rms_desc_set;
+    void* rms_ds_inplace; /* x/y 均 buf_x */
     void* rms_pipe_layout;
     void* rms_pipeline;
     void* rms_shader;
@@ -71,6 +72,7 @@ typedef struct {
     void* gemv_ds1;
     void* gemv_ds2;
     void* gemv_ds_xo; /* x=buf_o2 → y=buf_y (attn 后 O) */
+    void* gemv_ds_lm; /* x=buf_x → y=buf_logits (lm_head 单次 dispatch) */
     void* gemv_pipe_layout;
     void* gemv_pipeline;
     void* gemv_shader;
@@ -175,7 +177,13 @@ typedef struct {
     uint32_t lm_in;
     uint32_t lm_dtype;
     int lm_ready;
+    int lm_one_submit; /* resident lm: 全 vocab 一次 gemv */
     float norm_eps;
+
+    void* buf_logits;
+    void* mem_logits;
+    void* map_logits;
+    size_t logits_bytes;
 
     /* 流式权: 大模型按层上传; 亦规避 maxStorageBufferRange */
     uint8_t* host_wq;

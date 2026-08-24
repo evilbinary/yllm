@@ -270,6 +270,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
         if (ctx->map_wq) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq); ctx->map_wq = NULL; }
         if (ctx->map_kv) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv); ctx->map_kv = NULL; }
         if (ctx->map_emb) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_emb); ctx->map_emb = NULL; }
+        if (ctx->map_logits) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_logits); ctx->map_logits = NULL; }
         if (ctx->map_bias) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_bias); ctx->map_bias = NULL; }
     }
 
@@ -308,6 +309,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->buf_wn && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wn, NULL);
     if (ctx->buf_wq && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wq, NULL);
     if (ctx->buf_emb && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_emb, NULL);
+    if (ctx->buf_logits && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_logits, NULL);
     if (ctx->buf_bias && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_bias, NULL);
     if (ctx->buf_kv && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_kv, NULL);
     if (ctx->mem_x && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_x, NULL);
@@ -318,6 +320,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->mem_wn && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wn, NULL);
     if (ctx->mem_wq && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wq, NULL);
     if (ctx->mem_emb && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_emb, NULL);
+    if (ctx->mem_logits && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_logits, NULL);
     if (ctx->mem_bias && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_bias, NULL);
     if (ctx->mem_kv && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_kv, NULL);
     free(ctx->host_w);
