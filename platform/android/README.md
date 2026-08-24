@@ -1,39 +1,39 @@
 # platform/android
 
-NDK 构建 yllm 引擎（默认 **CPU**；可选 `YLLM_VULKAN=1`）。
+NDK 构建 yllm 引擎。仓库根目录：
+
+```bash
+make android          # arm64 + Vulkan → build/android/yllm_gen + libyllm.so
+make android-cpu      # 不编 Vulkan → build/android-cpu/
+```
+
+未设 `ANDROID_NDK` 时会尝试 `E:/soft/android-ndk-*` 和 `%LOCALAPPDATA%/Android/Sdk/ndk`。
 
 ## 依赖
 
-- Android NDK r25+（`ANDROID_NDK` 环境变量）
-- CMake 3.22+
+- Android NDK r25+
+- CMake 3.22+（可用 SDK 自带 `cmake/3.22.1`）
 
-## 构建
+## 手动 CMake
 
 ```bash
-# 仓库根目录；用 Ninja，勿用默认 VS 生成器
 cmake -G Ninja -S platform/android -B build/android \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-28 \
-  -DANDROID_NDK=%ANDROID_NDK% \
-  -DCMAKE_TOOLCHAIN_FILE=%ANDROID_NDK%/build/cmake/android.toolchain.cmake \
+  -DANDROID_NDK=$ANDROID_NDK \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_MAKE_PROGRAM=%ANDROID_SDK%/cmake/3.22.1/bin/ninja.exe
+  -DYLLM_VULKAN=ON
 cmake --build build/android -j
-
-# 产物
-#   build/android/libyllm.so
-#   build/android/yllm_gen
 ```
-
-可选：`-DYLLM_VULKAN=ON`。
 
 ## 设备冒烟
 
 ```bash
-adb push build/android/yllm_gen /data/local/tmp/
-adb push build/android/libyllm.so /data/local/tmp/
-adb push models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf /data/local/tmp/
-adb push models/tinyllama.vocab.txt /data/local/tmp/
-adb shell "cd /data/local/tmp && export LD_LIBRARY_PATH=. && ./yllm_gen --model tinyllama-1.1b-chat-v1.0.Q4_K_M.llf \
-  --vocab tinyllama.vocab.txt --prompt Hi --tokens 16 --temp 0 --device cpu --budget 512MB"
+# Termux 示例
+scp -P 8022 build/android/yllm_gen build/android/libyllm.so user@phone:~/yllm-android/
+scp -P 8022 build/android/shaders/*.spv user@phone:~/yllm-android/shaders/
+# 设备上:
+#   export LD_LIBRARY_PATH=. YLLM_SHADER_DIR=$PWD/shaders
+#   ./yllm_gen --model ... --vocab ... --prompt "Once upon a time" --tokens 16 --temp 0 --device vulkan
 ```

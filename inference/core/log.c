@@ -106,6 +106,8 @@ void ylog_log(int level, const char* fmt, ...)
         else if (level == YLOG_WARN) prio = 5;
         else if (level == YLOG_ERROR) prio = 6;
         __android_log_print(prio, "yllm", "[%s] %s", name, buf);
+        fprintf(stderr, "[%s] [%s] %s\n", stamp, name, buf);
+        fflush(stderr);
 #else
         fprintf(stderr, "[%s] [%s] %s\n", stamp, name, buf);
 #endif

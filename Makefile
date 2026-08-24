@@ -3,7 +3,9 @@
 #   make            标量版本
 #   make avx2       x86_64 上的 AVX2 版本(其他架构退化为标量)
 #   make cuda       AVX2 + CUDA 后端(产物在 build/avx2-cuda/, 与 avx2 隔离)
-#   make vulkan     AVX2 + Vulkan 后端(产物在 build/avx2-vulkan/; P0 host-shim)
+#   make vulkan     AVX2 + Vulkan 后端(产物在 build/avx2-vulkan/)
+#   make android    NDK arm64 + Vulkan (platform/android → build/android)
+#   make android-cpu  同上但不编 Vulkan
 #   make gen-cuda / chat-cuda   用 --device cuda 冒烟
 #   make gen-vulkan / chat-vulkan / chat-*-avx2-vulkan
 #   make test       运行测试
@@ -400,6 +402,82 @@ chat-vulkan: vulkan $(MODEL_LLF)
 chat-avx2-vulkan: chat-vulkan
 gen-avx2-vulkan: gen-vulkan
 
+# ---- Android: platform/android CMake + NDK (arm64-v8a) ----
+#   make android          Vulkan ON  → build/android/yllm_gen + libyllm.so
+#   make android-cpu      Vulkan OFF → build/android-cpu/
+# 环境: ANDROID_NDK / ANDROID_SDK; 未设则扫 E:/soft/android-ndk-* 与 %LOCALAPPDATA%/Android/Sdk
+ANDROID_ABI      ?= arm64-v8a
+ANDROID_PLATFORM ?= android-28
+ANDROID_BUILD    ?= build/android
+ANDROID_BUILD_CPU ?= build/android-cpu
+
+ANDROID_SDK_CAND := $(subst \,/,$(LOCALAPPDATA))/Android/Sdk \
+	$(subst \,/,$(ANDROID_HOME)) \
+	E:/soft/Android/Sdk \
+	$(HOME)/Android/Sdk
+ifeq ($(strip $(ANDROID_SDK)),)
+ANDROID_SDK := $(firstword $(wildcard $(ANDROID_SDK_CAND)))
+endif
+
+ANDROID_NDK_CAND := $(subst \,/,$(ANDROID_NDK_ROOT)) \
+	E:/soft/android-ndk-r27d \
+	E:/soft/android-ndk-r27 \
+	$(ANDROID_SDK)/ndk-bundle
+ifeq ($(strip $(ANDROID_NDK)),)
+ANDROID_NDK := $(firstword $(wildcard $(ANDROID_NDK_CAND)))
+endif
+ifeq ($(strip $(ANDROID_NDK)),)
+  ifneq ($(strip $(ANDROID_SDK)),)
+    ANDROID_NDK := $(lastword $(sort $(wildcard $(ANDROID_SDK)/ndk/*)))
+  endif
+endif
+
+ifeq ($(strip $(ANDROID_CMAKE)),)
+ANDROID_CMAKE := $(firstword $(wildcard \
+	$(ANDROID_SDK)/cmake/3.22.1/bin/cmake.exe \
+	$(ANDROID_SDK)/cmake/3.22.1/bin/cmake \
+	$(ANDROID_SDK)/cmake/3.18.1/bin/cmake.exe \
+	$(ANDROID_SDK)/cmake/3.18.1/bin/cmake))
+endif
+ifeq ($(strip $(ANDROID_CMAKE)),)
+ANDROID_CMAKE := cmake
+endif
+ifeq ($(strip $(ANDROID_NINJA)),)
+ANDROID_NINJA := $(firstword $(wildcard \
+	$(ANDROID_SDK)/cmake/3.22.1/bin/ninja.exe \
+	$(ANDROID_SDK)/cmake/3.22.1/bin/ninja \
+	$(ANDROID_SDK)/cmake/3.18.1/bin/ninja.exe \
+	$(ANDROID_SDK)/cmake/3.18.1/bin/ninja))
+endif
+ifeq ($(strip $(ANDROID_NINJA)),)
+ANDROID_NINJA := ninja
+endif
+
+ANDROID_TOOLCHAIN = $(ANDROID_NDK)/build/cmake/android.toolchain.cmake
+
+define ANDROID_CMAKE_CFG
+	@if [ -z "$(ANDROID_NDK)" ] || [ ! -f "$(ANDROID_TOOLCHAIN)" ]; then \
+	  echo "android: set ANDROID_NDK (cmake toolchain not found)"; exit 1; \
+	fi
+	$(ANDROID_CMAKE) -G Ninja -S platform/android -B $(1) \
+		-DANDROID_ABI=$(ANDROID_ABI) \
+		-DANDROID_PLATFORM=$(ANDROID_PLATFORM) \
+		-DANDROID_NDK=$(ANDROID_NDK) \
+		-DCMAKE_TOOLCHAIN_FILE=$(ANDROID_TOOLCHAIN) \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_MAKE_PROGRAM=$(ANDROID_NINJA) \
+		-DYLLM_VULKAN=$(2)
+	$(ANDROID_CMAKE) --build $(1) -j
+endef
+
+android android-vulkan:
+	$(call ANDROID_CMAKE_CFG,$(ANDROID_BUILD),ON)
+	@echo "android: $(ANDROID_BUILD)/yllm_gen  $(ANDROID_BUILD)/libyllm.so"
+
+android-cpu:
+	$(call ANDROID_CMAKE_CFG,$(ANDROID_BUILD_CPU),OFF)
+	@echo "android-cpu: $(ANDROID_BUILD_CPU)/yllm_gen  $(ANDROID_BUILD_CPU)/libyllm.so"
+
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 Q25_LLF   ?= models/qwen2.5-1.5b.llf
@@ -708,4 +786,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda vulkan android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
