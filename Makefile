@@ -403,7 +403,7 @@ chat-avx2-vulkan: chat-vulkan
 gen-avx2-vulkan: gen-vulkan
 
 # ---- Android: platform/android CMake + NDK (arm64-v8a) ----
-#   make android          Vulkan ON  → build/android/yllm_gen + libyllm.so
+#   make android          Vulkan ON  → build/android/yllm + libyllm.so
 #   make android-cpu      Vulkan OFF → build/android-cpu/
 # 环境: ANDROID_NDK / ANDROID_SDK; 未设则扫 E:/soft/android-ndk-* 与 %LOCALAPPDATA%/Android/Sdk
 ANDROID_ABI      ?= arm64-v8a
@@ -472,11 +472,11 @@ endef
 
 android android-vulkan:
 	$(call ANDROID_CMAKE_CFG,$(ANDROID_BUILD),ON)
-	@echo "android: $(ANDROID_BUILD)/yllm_gen  $(ANDROID_BUILD)/libyllm.so"
+	@echo "android: $(ANDROID_BUILD)/yllm  $(ANDROID_BUILD)/libyllm.so"
 
 android-cpu:
 	$(call ANDROID_CMAKE_CFG,$(ANDROID_BUILD_CPU),OFF)
-	@echo "android-cpu: $(ANDROID_BUILD_CPU)/yllm_gen  $(ANDROID_BUILD_CPU)/libyllm.so"
+	@echo "android-cpu: $(ANDROID_BUILD_CPU)/yllm  $(ANDROID_BUILD_CPU)/libyllm.so"
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf

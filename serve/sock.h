@@ -24,6 +24,7 @@ static inline int sock_close(int fd) { return closesocket((SOCKET)fd); }
 #include <signal.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#include <time.h>
 static inline int sock_close(int fd) { return close(fd); }
 #endif
 
@@ -49,7 +50,7 @@ static inline int sock_local_ip(char* buf, size_t sz)
         a.sin_port = htons(80);
         if (connect(fd, (struct sockaddr*)&a, sizeof(a)) == 0) {
             struct sockaddr_in b;
-            int blen = sizeof(b);
+            socklen_t blen = sizeof(b);
             memset(&b, 0, sizeof(b));
             if (getsockname(fd, (struct sockaddr*)&b, &blen) == 0 && b.sin_addr.s_addr != 0) {
                 snprintf(buf, sz, "%s", inet_ntoa(b.sin_addr));
