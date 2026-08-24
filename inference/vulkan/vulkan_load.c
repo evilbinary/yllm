@@ -298,10 +298,10 @@ void vulkan_shutdown(VulkanCtx* ctx)
                  ctx->skv_desc_pool, ctx->skv_desc_layout);
     destroy_pipe(a, dev, ctx->embed_pipeline, ctx->embed_pipe_layout, ctx->embed_shader,
                  ctx->embed_desc_pool, ctx->embed_desc_layout);
-    if (ctx->cmd_pool && a->DestroyCommandPool)
-        a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
     if (ctx->fence && a->DestroyFence)
         a->DestroyFence(dev, (VkFence)ctx->fence, NULL);
+    if (ctx->cmd_pool && a->DestroyCommandPool)
+        a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
 
     if (ctx->buf_x && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_x, NULL);
     if (ctx->buf_y && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_y, NULL);

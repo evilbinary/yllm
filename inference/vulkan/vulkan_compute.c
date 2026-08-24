@@ -352,6 +352,18 @@ static int submit_and_wait(VulkanCtx* ctx, VkCommandBuffer cmd)
     if (a->QueueSubmit((VkQueue)ctx->queue, 1, &si, fence) != VK_SUCCESS) return -1;
     if (a->WaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull) != VK_SUCCESS)
         return -1;
+    if (ctx->prof_on) ctx->prof_submit_n++;
+    return 0;
+}
+
+void vulkan_gpu_discard(VulkanCtx* ctx)
+{
+    (void)ctx;
+}
+
+int vulkan_gpu_flush(VulkanCtx* ctx)
+{
+    (void)ctx;
     return 0;
 }
 

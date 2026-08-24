@@ -94,6 +94,8 @@ int vulkan_fused_block(VulkanCtx* ctx,
 void vulkan_mark_x_host(VulkanCtx* ctx);
 int vulkan_upload_x(VulkanCtx* ctx, const float* x, uint32_t hidden);
 int vulkan_sync_x_to_host(VulkanCtx* ctx, float* host_x, uint32_t hidden);
+void vulkan_gpu_discard(VulkanCtx* ctx);
+int vulkan_gpu_flush(VulkanCtx* ctx);
 
 /* YLLM_VK_PROF=1 时打印阶段耗时 */
 void vulkan_prof_dump(VulkanCtx* ctx);

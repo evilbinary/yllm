@@ -423,6 +423,7 @@ static int vulkan_fwd_block_ex(Engine* e, uint32_t layer, uint32_t pos, int sync
                              sync_host) == 0) {
         return 0;
     }
+    if (ctx) vulkan_gpu_discard(ctx);
     /* 回退: 需 host x */
     if (ctx && ctx->x_on_dev)
         (void)vulkan_sync_x_to_host(ctx, x, hidden);
@@ -831,7 +832,9 @@ int vulkan_lm_fused(Engine* e)
     uint32_t hidden = m->h.hidden;
     if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
     int upload = !ctx->x_on_dev;
-    return vulkan_k_lm_fused(ctx, e->logits, ctx->host_w, hidden, ctx->norm_eps,
-                             ctx->lm_out, ctx->lm_off, ctx->lm_dtype,
-                             upload, upload ? e->x : NULL);
+    int r = vulkan_k_lm_fused(ctx, e->logits, ctx->host_w, hidden, ctx->norm_eps,
+                              ctx->lm_out, ctx->lm_off, ctx->lm_dtype,
+                              upload, upload ? e->x : NULL);
+    if (r != 0) vulkan_gpu_discard(ctx);
+    return r;
 }
