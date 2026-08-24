@@ -12,6 +12,10 @@
 #include <vulkan/vulkan.h>
 
 typedef struct {
+    uint32_t hidden;
+} EmbedPush;
+
+typedef struct {
     uint32_t n;
     float eps;
 } RmsPush;
@@ -516,6 +520,42 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
             ylog_info("vulkan: swiglu ready");
         }
     }
+
+    /* Q4_K embed: 上传一行 → buf_x */
+    if (ctx->gemv_ready && ctx->buf_x && hidden >= 256 && (hidden % 256) == 0) {
+        char eerr[256];
+        uint32_t nb = hidden / 256;
+        ctx->emb_bytes = (size_t)nb * 144;
+        VkBuffer be = VK_NULL_HANDLE;
+        VkDeviceMemory me = VK_NULL_HANDLE;
+        if (create_host_buffer(ctx, ctx->emb_bytes, &be, &me, &ctx->map_emb) == 0) {
+            ctx->buf_emb = (void*)be;
+            ctx->mem_emb = (void*)me;
+            VkShaderModule sh = VK_NULL_HANDLE;
+            VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+            VkPipelineLayout pl = VK_NULL_HANDLE;
+            VkPipeline pipe = VK_NULL_HANDLE;
+            VkDescriptorPool pool = VK_NULL_HANDLE;
+            VkDescriptorSet dset = VK_NULL_HANDLE;
+            /* create_ssbo_pipeline expects 3 bindings; pad with duplicate emb */
+            VkBuffer bufs3[3] = { bx, be, be };
+            size_t ranges3[3] = { ctx->x_bytes, ctx->emb_bytes, ctx->emb_bytes };
+            if (create_ssbo_pipeline(ctx, "embed_q4k.spv", sizeof(EmbedPush),
+                                     &sh, &dsl, &pl, &pipe, &pool, &dset,
+                                     bufs3, ranges3, eerr, sizeof(eerr)) == 0) {
+                ctx->embed_shader = (void*)sh;
+                ctx->embed_desc_layout = (void*)dsl;
+                ctx->embed_pipe_layout = (void*)pl;
+                ctx->embed_pipeline = (void*)pipe;
+                ctx->embed_desc_pool = (void*)pool;
+                ctx->embed_desc_set = (void*)dset;
+                ctx->embed_ready = 1;
+                ylog_info("vulkan: embed_q4k ready hidden=%u", hidden);
+            } else {
+                ylog_warn("vulkan: embed_q4k pipeline failed (%s)", eerr);
+            }
+        }
+    }
     return 0;
 }
 
@@ -841,6 +881,43 @@ static int map_read(VulkanCtx* ctx, void* mem, void* dst, size_t nbytes)
     return 0;
 }
 
+int vulkan_k_embed_q4k(VulkanCtx* ctx, float* host_y, const uint8_t* table,
+                       uint32_t token, uint32_t hidden)
+{
+    if (!ctx || !ctx->embed_ready || !table || hidden == 0 || (hidden % 256) != 0)
+        return -1;
+    if ((size_t)hidden * 4 > ctx->x_bytes) return -1;
+    uint32_t nb = hidden / 256;
+    size_t rowb = (size_t)nb * 144;
+    const uint8_t* row = table + (size_t)token * rowb;
+    if (rowb > ctx->emb_bytes) return -1;
+    if (map_copy(ctx, ctx->mem_emb, row, rowb) != 0) return -1;
+
+    VulkanApi* a = vulkan_api();
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    a->BeginCommandBuffer(cmd, &bi);
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->embed_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)ctx->embed_desc_set;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->embed_pipe_layout, 0, 1, &ds, 0, NULL);
+    EmbedPush push;
+    push.hidden = hidden;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->embed_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, nb, 1, 1);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    ctx->x_on_dev = 1;
+    if (host_y)
+        return map_read(ctx, ctx->mem_x, host_y, (size_t)hidden * 4);
+    return 0;
+}
+
 int vulkan_fused_norm_qkv(VulkanCtx* ctx,
                           const float* x, const float* wn, uint32_t hidden, float eps,
                           float* q, float* k, float* v, uint32_t kv_dim,
@@ -928,9 +1005,6 @@ static void cmd_swiglu(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n)
     a->CmdDispatch(cmd, (n + 255u) / 256u, 1, 1);
 }
 
-#if defined(__GNUC__)
-__attribute__((unused))
-#endif
 static void cmd_rope(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
                      uint32_t n_heads, uint32_t head_dim, uint32_t pos,
                      uint32_t mode, float theta)
@@ -1290,6 +1364,9 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
         }
     }
     (void)setup_block_ops(ctx);
+    ctx->use_gpu_rope = (!ctx->integrated_gpu && ctx->rope_ready && ctx->skv_ready) ? 1 : 0;
+    if (ctx->use_gpu_rope)
+        ylog_info("vulkan: gpu_rope + single-submit block enabled");
     return 0;
 }
 
@@ -1323,7 +1400,6 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
 
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
-    void* p = NULL;
 
     if (map_copy(ctx, ctx->mem_o0, q, qbytes) != 0) return -1;
 
@@ -1611,7 +1687,6 @@ int vulkan_fused_block(VulkanCtx* ctx,
     }
 
     size_t xb = (size_t)hidden * 4;
-    size_t rowb = (size_t)kv_dim * 4;
     if (upload_x || !ctx->x_on_dev) {
         if (!host_x) return -1;
         if (map_copy(ctx, ctx->mem_x, host_x, xb) != 0) return -1;
@@ -1647,10 +1722,12 @@ int vulkan_fused_block(VulkanCtx* ctx,
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
+    int gpu_rope = ctx->use_gpu_rope && ctx->rope_ready && ctx->skv_ready &&
+                   !host_k_row && !host_v_row;
+
     a->ResetCommandBuffer(cmd, 0);
     a->BeginCommandBuffer(cmd, &bi);
 
-    /* attn 半层: QKV (+bias); RoPE 走 host */
     cmd_rmsnorm(ctx, cmd, hidden, eps);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
@@ -1660,53 +1737,73 @@ int vulkan_fused_block(VulkanCtx* ctx,
     if (bq) cmd_bias(ctx, cmd, ctx->bias_ds_q, hidden, bq_off);
     if (bk) cmd_bias(ctx, cmd, ctx->bias_ds_k, kv_dim, bk_off);
     if (bv) cmd_bias(ctx, cmd, ctx->bias_ds_v, kv_dim, bv_off);
-    a->EndCommandBuffer(cmd);
-    if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    /* CPU RoPE + 写 KV */
-    {
-        uint32_t hh;
-        float* q = (float*)ctx->map_o0;
-        if (!q) return -1;
-        for (hh = 0; hh < ctx->n_heads; hh++) {
-            if (rope_mode)
-                rope_inplace_qwen(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
-            else
-                rope_inplace(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+    if (gpu_rope) {
+        cmd_barrier_compute(cmd);
+        cmd_rope(ctx, cmd, ctx->rope_ds_q, ctx->n_heads, ctx->head_dim,
+                 pos, rope_mode, theta);
+        cmd_barrier_compute(cmd);
+        cmd_rope(ctx, cmd, ctx->rope_ds_k, ctx->n_kv_heads, ctx->head_dim,
+                 pos, rope_mode, theta);
+        cmd_barrier_compute(cmd);
+        {
+            uint32_t k_el = (uint32_t)(((size_t)layer * ctx->max_seq + pos) * kv_dim);
+            uint32_t v_el = (uint32_t)(((size_t)(ctx->n_blocks + layer) * ctx->max_seq + pos) * kv_dim);
+            cmd_store_kv(ctx, cmd, ctx->skv_ds_k, kv_dim, k_el);
+            cmd_store_kv(ctx, cmd, ctx->skv_ds_v, kv_dim, v_el);
+        }
+        cmd_barrier_compute(cmd);
+        if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
+    } else {
+        a->EndCommandBuffer(cmd);
+        if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+        /* CPU RoPE + 可选 host KV f16 */
+        {
+            uint32_t hh;
+            float* q = (float*)ctx->map_o0;
+            if (!q) return -1;
+            for (hh = 0; hh < ctx->n_heads; hh++) {
+                if (rope_mode)
+                    rope_inplace_qwen(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+                else
+                    rope_inplace(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+            }
+
+            float* k = (float*)ctx->map_o1;
+            if (!k) return -1;
+            for (hh = 0; hh < ctx->n_kv_heads; hh++) {
+                if (rope_mode)
+                    rope_inplace_qwen(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+                else
+                    rope_inplace(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
+            }
+            if (host_k_row) {
+                uint32_t j;
+                for (j = 0; j < kv_dim; j++) host_k_row[j] = f32_to_f16(k[j]);
+            }
+
+            if (host_v_row) {
+                float* vf = (float*)ctx->map_o2;
+                if (!vf) return -1;
+                uint32_t j;
+                for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
+            }
         }
 
-        float* k = (float*)ctx->map_o1;
-        if (!k) return -1;
-        for (hh = 0; hh < ctx->n_kv_heads; hh++) {
-            if (rope_mode)
-                rope_inplace_qwen(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
-            else
-                rope_inplace(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
-        }
-        if (host_k_row) {
-            uint32_t j;
-            for (j = 0; j < kv_dim; j++) host_k_row[j] = f32_to_f16(k[j]);
-        }
+        if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
 
-        if (host_v_row) {
-            float* vf = (float*)ctx->map_o2;
-            if (!vf) return -1;
-            uint32_t j;
-            for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
+        a->ResetCommandBuffer(cmd, 0);
+        a->BeginCommandBuffer(cmd, &bi);
+        {
+            uint32_t k_el = (uint32_t)(((size_t)layer * ctx->max_seq + pos) * kv_dim);
+            uint32_t v_el = (uint32_t)(((size_t)(ctx->n_blocks + layer) * ctx->max_seq + pos) * kv_dim);
+            cmd_store_kv(ctx, cmd, ctx->skv_ds_k, kv_dim, k_el);
+            cmd_store_kv(ctx, cmd, ctx->skv_ds_v, kv_dim, v_el);
         }
+        cmd_barrier_compute(cmd);
     }
 
-    if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
-
-    a->ResetCommandBuffer(cmd, 0);
-    a->BeginCommandBuffer(cmd, &bi);
-    {
-        uint32_t k_el = (uint32_t)(((size_t)layer * ctx->max_seq + pos) * kv_dim);
-        uint32_t v_el = (uint32_t)(((size_t)(ctx->n_blocks + layer) * ctx->max_seq + pos) * kv_dim);
-        cmd_store_kv(ctx, cmd, ctx->skv_ds_k, kv_dim, k_el);
-        cmd_store_kv(ctx, cmd, ctx->skv_ds_v, kv_dim, v_el);
-    }
-    cmd_barrier_compute(cmd);
     cmd_attn(ctx, cmd, layer, pos);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds_xo, hidden, hidden, (uint32_t)off_o);

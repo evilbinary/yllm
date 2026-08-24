@@ -312,12 +312,13 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d lm=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
               ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident, ctx->wq_stream,
               ctx->fuse_ready, ctx->swi_ready, ctx->attn_ready, ctx->attn_o_ready,
-              ctx->rope_ready, ctx->block_ready, ctx->lm_ready);
+              ctx->rope_ready, ctx->block_ready, ctx->embed_ready, ctx->use_gpu_rope,
+              ctx->lm_ready);
     return 0;
 }
 

@@ -1138,6 +1138,8 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     if (i == 0) {
         if (on_cuda && cuda_embed(e, token) == 0) {
             /* GPU embed: d_x 已权威 */
+        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_embed(e, token) == 0) {
+            /* GPU Q4_K embed → buf_x */
         } else {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
         switch (tm->dtype) {

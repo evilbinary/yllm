@@ -248,7 +248,10 @@ static int try_fused_full_block(VulkanCtx* ctx, float* x, int upload_x,
     return vulkan_fused_block(ctx, x, upload_x, ctx->host_w2, ctx->host_w,
                               hidden, eps, theta, rope_mode,
                               kv_dim, inter, oq, ok, ov, oo, og, ou, od,
-                              layer, pos, bq, bk, bv, host_k_row, host_v_row, sync_host);
+                              layer, pos, bq, bk, bv,
+                              ctx->use_gpu_rope ? NULL : host_k_row,
+                              ctx->use_gpu_rope ? NULL : host_v_row,
+                              sync_host);
 }
 
 static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
@@ -501,6 +504,7 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     uint32_t hidden = h->hidden;
     const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
     const uint8_t* emb = (const uint8_t*)ws->map.base + m->dir[0].offset;
+    emb += tm->offset;
     uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
     uint32_t Bcap = e->pb_cap;
     int off = 0;
@@ -510,20 +514,22 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
         if (nb > Bcap) nb = Bcap;
         uint32_t b;
         for (b = 0; b < nb; b++) {
-            float* xb = e->pb + (size_t)b * hidden;
-            switch (tm->dtype) {
-            case DT_F32: embed_f32(xb, emb, tokens[off + (int)b], hidden); break;
-            case DT_Q4K: embed_q4k(xb, emb, tokens[off + (int)b], hidden); break;
-            case DT_Q6K: embed_q6k(xb, emb, tokens[off + (int)b], hidden); break;
-            case DT_Q5K: embed_q5k(xb, emb, tokens[off + (int)b], hidden); break;
-            case DT_IQ4XS: embed_iq4xs(xb, emb, tokens[off + (int)b], hidden); break;
-            default: embed_f16(xb, emb, tokens[off + (int)b], hidden); break;
+            if (tm->dtype == DT_Q4K && ctx->embed_ready) {
+                if (vulkan_k_embed_q4k(ctx, NULL, emb, tokens[off + (int)b], hidden) != 0)
+                    return -1;
+            } else {
+                float* xb = e->pb + (size_t)b * hidden;
+                switch (tm->dtype) {
+                case DT_F32: embed_f32(xb, emb, tokens[off + (int)b], hidden); break;
+                case DT_Q4K: embed_q4k(xb, emb, tokens[off + (int)b], hidden); break;
+                case DT_Q6K: embed_q6k(xb, emb, tokens[off + (int)b], hidden); break;
+                case DT_Q5K: embed_q5k(xb, emb, tokens[off + (int)b], hidden); break;
+                case DT_IQ4XS: embed_iq4xs(xb, emb, tokens[off + (int)b], hidden); break;
+                default: embed_f16(xb, emb, tokens[off + (int)b], hidden); break;
+                }
+                if (vulkan_upload_x(ctx, xb, hidden) != 0)
+                    return -1;
             }
-        }
-
-        for (b = 0; b < nb; b++) {
-            if (vulkan_upload_x(ctx, e->pb + (size_t)b * hidden, hidden) != 0)
-                return -1;
             uint32_t layer;
             for (layer = 1; layer <= trunk; layer++) {
                 if (ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
@@ -566,6 +572,21 @@ void vulkan_after_embed(Engine* e)
         return;
     }
     (void)vulkan_upload_x(ctx, e->x, e->ws.model.h.hidden);
+}
+
+int vulkan_embed(Engine* e, uint32_t token)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return -1;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    if (ctx->host_shim || !ctx->embed_ready) return -1;
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
+    if (tm->dtype != DT_Q4K) return -1;
+    const uint8_t* emb = (const uint8_t*)ws->map.base + m->dir[0].offset;
+    const LlfTensorMeta* tm0 = &m->metas[m->base_idx[0]];
+    emb += tm0->offset;
+    return vulkan_k_embed_q4k(ctx, NULL, emb, token, m->h.hidden);
 }
 
 void vulkan_sync_x(Engine* e)

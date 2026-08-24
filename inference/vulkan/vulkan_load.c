@@ -269,6 +269,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
         if (ctx->map_wn) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wn); ctx->map_wn = NULL; }
         if (ctx->map_wq) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq); ctx->map_wq = NULL; }
         if (ctx->map_kv) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv); ctx->map_kv = NULL; }
+        if (ctx->map_emb) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_emb); ctx->map_emb = NULL; }
         if (ctx->map_bias) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_bias); ctx->map_bias = NULL; }
     }
 
@@ -288,6 +289,8 @@ void vulkan_shutdown(VulkanCtx* ctx)
                  ctx->bias_desc_pool, ctx->bias_desc_layout);
     destroy_pipe(a, dev, ctx->skv_pipeline, ctx->skv_pipe_layout, ctx->skv_shader,
                  ctx->skv_desc_pool, ctx->skv_desc_layout);
+    destroy_pipe(a, dev, ctx->embed_pipeline, ctx->embed_pipe_layout, ctx->embed_shader,
+                 ctx->embed_desc_pool, ctx->embed_desc_layout);
     if (ctx->cmd_pool && a->DestroyCommandPool)
         a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
     if (ctx->fence && a->DestroyFence)
@@ -300,6 +303,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->buf_o2 && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_o2, NULL);
     if (ctx->buf_wn && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wn, NULL);
     if (ctx->buf_wq && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_wq, NULL);
+    if (ctx->buf_emb && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_emb, NULL);
     if (ctx->buf_bias && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_bias, NULL);
     if (ctx->buf_kv && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_kv, NULL);
     if (ctx->mem_x && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_x, NULL);
@@ -309,6 +313,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->mem_o2 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o2, NULL);
     if (ctx->mem_wn && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wn, NULL);
     if (ctx->mem_wq && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_wq, NULL);
+    if (ctx->mem_emb && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_emb, NULL);
     if (ctx->mem_bias && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_bias, NULL);
     if (ctx->mem_kv && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_kv, NULL);
     free(ctx->host_w);

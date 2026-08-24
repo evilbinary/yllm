@@ -1,0 +1,60 @@
+#version 450
+/* 单行 Q4_K embed: 每 WG 解一个 256 块 → y[b*256..] */
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) buffer OutY { float y[]; };
+layout(set = 0, binding = 1) readonly buffer InW { uint w[]; };
+
+layout(push_constant) uniform Push {
+    uint hidden;
+} pc;
+
+uint load_u8(uint off)
+{
+    uint word = w[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+float load_f16(uint off)
+{
+    uint lo = load_u8(off);
+    uint hi = load_u8(off + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void scale_min(uint g, uint scp, out uint sc, out uint mn)
+{
+    if (g < 4u) {
+        sc = load_u8(scp + g) & 63u;
+        mn = load_u8(scp + g + 4u) & 63u;
+    } else {
+        sc = (load_u8(scp + g + 4u) & 15u) | ((load_u8(scp + g - 4u) >> 6u) << 4u);
+        mn = (load_u8(scp + g + 4u) >> 4u) | ((load_u8(scp + g) >> 6u) << 4u);
+    }
+}
+
+void main()
+{
+    uint b = gl_WorkGroupID.x;
+    uint nb = pc.hidden / 256u;
+    if (b >= nb) return;
+    uint blk = b * 144u;
+    float d = load_f16(blk);
+    float dmin = load_f16(blk + 2u);
+    uint scp = blk + 4u;
+    uint qs = blk + 16u;
+    uint yoff = b * 256u;
+    for (uint g = 0u; g < 8u; g++) {
+        uint sc, mn;
+        scale_min(g, scp, sc, mn);
+        float d1 = d * float(sc);
+        float m1 = dmin * float(mn);
+        uint q = qs + (g >> 1u) * 32u;
+        uint xbase = yoff + g * 32u;
+        for (uint e = gl_LocalInvocationID.x; e < 32u; e += 32u) {
+            uint nib = load_u8(q + e);
+            nib = ((g & 1u) != 0u) ? (nib >> 4u) : (nib & 15u);
+            y[xbase + e] = d1 * float(nib) - m1;
+        }
+    }
+}

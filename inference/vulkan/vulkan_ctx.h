@@ -149,6 +149,19 @@ typedef struct {
     int add_ready;
     int bias_ready;
     int skv_ready;
+    int embed_ready;
+    int use_gpu_rope; /* dGPU: GPU RoPE + 单层 1 submit */
+    void* embed_shader;
+    void* embed_desc_pool;
+    void* embed_desc_layout;
+    void* embed_desc_set;
+    void* embed_pipe_layout;
+    void* embed_pipeline;
+    void* buf_emb;
+    void* mem_emb;
+    void* map_emb;
+    size_t emb_bytes;
+
     int block_ready; /* 整层 fused 可用 */
 
     int x_on_dev; /* buf_x 为权威激活 */

@@ -24,6 +24,9 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
 int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
                            const uint8_t* w, uint32_t out, uint32_t in);
 
+int vulkan_k_embed_q4k(VulkanCtx* ctx, float* host_y, const uint8_t* table,
+                       uint32_t token, uint32_t hidden);
+
 /* 一次 submit: rmsnorm(x)+Q/K/V gemv → host q,k,v */
 int vulkan_fused_norm_qkv(VulkanCtx* ctx,
                           const float* x, const float* wn, uint32_t hidden, float eps,
