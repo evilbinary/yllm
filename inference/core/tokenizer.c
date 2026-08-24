@@ -959,6 +959,30 @@ static void chat_render_generic(Vocab* v, const ChatMsg* msgs, int n_msgs,
         chat_append_ids(v, "assistant: ", ids, max, n_out);
 }
 
+/* Gemma 4: <|turn>role\\n ... <turn|>\\n  <|turn>model\\n */
+static int chat_is_gemma4(const Vocab* v)
+{
+    return chat_vocab_has_token(v, "<|turn>") && chat_vocab_has_token(v, "<turn|>");
+}
+
+static void chat_render_gemma4(Vocab* v, const ChatMsg* msgs, int n_msgs,
+                               uint32_t* ids, int max, int* n_out)
+{
+    int mi;
+    for (mi = 0; mi < n_msgs && *n_out < max; mi++) {
+        const char* role = msgs[mi].role && msgs[mi].role[0] ? msgs[mi].role : "user";
+        if (strcmp(role, "assistant") == 0) role = "model";
+        chat_append_ids(v, "<|turn>", ids, max, n_out);
+        chat_append_ids(v, role, ids, max, n_out);
+        chat_append_ids(v, "\n", ids, max, n_out);
+        chat_append_ids(v, msgs[mi].content ? msgs[mi].content : "", ids, max, n_out);
+        chat_append_ids(v, "<turn|>\n", ids, max, n_out);
+    }
+    chat_append_ids(v, "<|turn>", ids, max, n_out);
+    chat_append_ids(v, "model", ids, max, n_out);
+    chat_append_ids(v, "\n", ids, max, n_out);
+}
+
 /* 多消息模板渲染: roles[i]/contents[i] 组成对话历史, 渲染完整模板。
  * 返回渲染出的 token 数; 无模板返回 -1。 */
 int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* contents,
@@ -978,7 +1002,10 @@ int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* 
     if (add_bos && v->bos >= 0 && n_out < max) ids[n_out++] = (uint32_t)v->bos;
 
     if (chat_template_unsupported(v->chat_template)) {
-        chat_render_generic(v, msgs, n_msgs, ids, max, &n_out);
+        if (chat_is_gemma4(v))
+            chat_render_gemma4(v, msgs, n_msgs, ids, max, &n_out);
+        else
+            chat_render_generic(v, msgs, n_msgs, ids, max, &n_out);
         free(msgs);
         return n_out;
     }

@@ -457,6 +457,12 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     /* 层前向分派: 按架构挂实现(一次) */
     e->arch = m->h.arch;
     engine_attach_cpu_fwd(e);
+    if (m->h.arch == ARCH_GEMMA4) {
+        LlfGemma4Ext g4log;
+        llf_gemma4_ext(&m->h, &g4log);
+        ylog_info("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u",
+                  e->n_ple, g4log.n_kv_shared_layers, g4log.swa_window, g4log.swa_pattern);
+    }
     /* 默认 CPU 设备: load_weights 空操作, 后续可 engine_bind_device(CUDA) */
     if (engine_bind_device(e, DEV_CPU, 0, err, errlen) != 0) {
         engine_free(e);
@@ -1235,7 +1241,8 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     float attn_cap = 0.0f;
     uint32_t s0 = 0;
     if (h->arch == ARCH_GEMMA4) {
-        attn_cap = llf_gemma4_attn_cap(h);
+        /* llama.cpp gemma4: f_attention_scale=1, 无 attention logit soft-cap */
+        attn_cap = 0.0f;
         if (gemma4_is_swa(&g4, il) && g4.swa_window > 0 && pos + 1 > g4.swa_window)
             s0 = pos + 1 - g4.swa_window;
     }

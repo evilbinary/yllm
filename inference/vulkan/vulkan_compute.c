@@ -2570,7 +2570,11 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
         }
     }
     (void)setup_block_ops(ctx);
-    ctx->use_gpu_rope = (!ctx->integrated_gpu && ctx->rope_ready && ctx->skv_ready) ? 1 : 0;
+    ctx->use_gpu_rope = (ctx->rope_ready && ctx->skv_ready) ? 1 : 0;
+    /* 流式权或显式 CPU rope: iGPU 上 GPU rope 曾数值不稳 */
+    if (ctx->use_gpu_rope && ctx->integrated_gpu &&
+        (ctx->wq_stream || getenv("YLLM_VK_CPU_ROPE")))
+        ctx->use_gpu_rope = 0;
     if (ctx->use_gpu_rope)
         ylog_info("vulkan: gpu_rope + single-submit block enabled");
     return 0;

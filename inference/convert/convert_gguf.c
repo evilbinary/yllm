@@ -571,8 +571,8 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     g.add_bos = 1; /* llama architecture default */
     g.bos_id = -1;
     g.eos_id = -1;
-    g.attn_logit_cap = 50.0f;
-    g.final_logit_cap = 30.0f;
+    g.attn_logit_cap = 0.0f;
+    g.final_logit_cap = 0.0f;
     g.swa_window = 4096;
     g.swa_pattern = 6;
     g.n_kv_shared_layers = 0;
@@ -978,6 +978,9 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         ext.n_embd_per_layer = g.n_embd_per_layer;
         ext.swa_mask = g.swa_mask;
         memcpy(h.reserved, &ext, sizeof(ext));
+        printf("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u mask=0x%llx final_cap=%g\n",
+               ext.n_embd_per_layer, ext.n_kv_shared_layers, ext.swa_window, ext.swa_pattern,
+               (unsigned long long)ext.swa_mask, (double)g.final_logit_cap);
     }
     {
         uint64_t vocab = 0;
