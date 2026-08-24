@@ -910,6 +910,58 @@ static int chat_append_ids(Vocab* v, const char* text, uint32_t* ids, int max, i
     return 0;
 }
 
+/* HF-style: match whole special pieces first, SPM-encode the gaps. */
+static int chat_spec_len_at(const char* p, const char** which)
+{
+    static const char* spec[] = {
+        "<|tool_response>", "<tool_response|>",
+        "<|tool_call>", "<tool_call|>",
+        "<|turn>", "<turn|>",
+        "<|tool>", "<tool|>",
+        "<bos>", "<eos>", "<pad>", "<unk>",
+        NULL
+    };
+    size_t best = 0;
+    const char* w = NULL;
+    int i;
+    for (i = 0; spec[i]; i++) {
+        size_t l = strlen(spec[i]);
+        if (l > best && strncmp(p, spec[i], l) == 0) {
+            best = l;
+            w = spec[i];
+        }
+    }
+    if (which) *which = w;
+    return (int)best;
+}
+
+static int chat_append_ids_specials(Vocab* v, const char* text, uint32_t* ids, int max, int* n)
+{
+    const char* p = text;
+    while (*p && *n < max) {
+        const char* sp = NULL;
+        int sl = chat_spec_len_at(p, &sp);
+        if (sl > 0) {
+            int id = vocab_id(v, sp);
+            if (id >= 0 && *n < max) ids[(*n)++] = (uint32_t)id;
+            p += sl;
+            continue;
+        }
+        const char* e = p + 1;
+        while (*e && chat_spec_len_at(e, NULL) == 0) e++;
+        {
+            size_t cl = (size_t)(e - p);
+            char* chunk = (char*)ymalloc(cl + 1);
+            memcpy(chunk, p, cl);
+            chunk[cl] = 0;
+            chat_append_ids(v, chunk, ids, max, n);
+            free(chunk);
+        }
+        p = e;
+    }
+    return 0;
+}
+
 /* 检测简化渲染器不支持的 jinja 构造(macro/set/namespace/异常/反向循环等)。
  * 命中时若强行解析, macro 体会被当顶层语句执行, 输出 raise_exception 文本等乱码。 */
 static int chat_template_unsupported(const char* tpl)
@@ -968,19 +1020,30 @@ static int chat_is_gemma4(const Vocab* v)
 static void chat_render_gemma4(Vocab* v, const ChatMsg* msgs, int n_msgs,
                                uint32_t* ids, int max, int* n_out)
 {
+    size_t need = 64;
     int mi;
-    for (mi = 0; mi < n_msgs && *n_out < max; mi++) {
+    char* buf;
+    size_t o = 0;
+    for (mi = 0; mi < n_msgs; mi++) {
         const char* role = msgs[mi].role && msgs[mi].role[0] ? msgs[mi].role : "user";
-        if (strcmp(role, "assistant") == 0) role = "model";
-        chat_append_ids(v, "<|turn>", ids, max, n_out);
-        chat_append_ids(v, role, ids, max, n_out);
-        chat_append_ids(v, "\n", ids, max, n_out);
-        chat_append_ids(v, msgs[mi].content ? msgs[mi].content : "", ids, max, n_out);
-        chat_append_ids(v, "<turn|>\n", ids, max, n_out);
+        const char* c = msgs[mi].content ? msgs[mi].content : "";
+        need += strlen(role) + strlen(c) + 32;
     }
-    chat_append_ids(v, "<|turn>", ids, max, n_out);
-    chat_append_ids(v, "model", ids, max, n_out);
-    chat_append_ids(v, "\n", ids, max, n_out);
+    buf = (char*)ymalloc(need);
+    buf[0] = 0;
+    for (mi = 0; mi < n_msgs; mi++) {
+        const char* role = msgs[mi].role && msgs[mi].role[0] ? msgs[mi].role : "user";
+        const char* c = msgs[mi].content ? msgs[mi].content : "";
+        int w;
+        if (strcmp(role, "assistant") == 0) role = "model";
+        w = snprintf(buf + o, need - o, "<|turn>%s\n%s<turn|>\n", role, c);
+        if (w > 0) o += (size_t)w;
+        if (o >= need) break;
+    }
+    if (o < need)
+        snprintf(buf + o, need - o, "<|turn>model\n");
+    chat_append_ids_specials(v, buf, ids, max, n_out);
+    free(buf);
 }
 
 /* 多消息模板渲染: roles[i]/contents[i] 组成对话历史, 渲染完整模板。

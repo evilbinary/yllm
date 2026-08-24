@@ -451,7 +451,15 @@ static int cmd_chat(int argc, char** argv)
             nprompt++;
         }
     }
-    ylog_info("chat prompt tokens: %d (bos=%d)", nprompt, v.bos);
+    ylog_info("chat prompt tokens: %d (bos=%d eos=%d)", nprompt, v.bos, v.eos);
+    if (nprompt > 0) {
+        char line[768];
+        int o = 0, i;
+        o += snprintf(line, sizeof(line), "prompt ids:");
+        for (i = 0; i < nprompt && i < 48 && o < (int)sizeof(line) - 12; i++)
+            o += snprintf(line + o, sizeof(line) - (size_t)o, " %u", ids[i]);
+        ylog_info("%s", line);
+    }
     uint64_t t0 = ynow_ms();
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));

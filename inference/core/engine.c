@@ -35,6 +35,7 @@ typedef struct {
     uint32_t n_kv_shared_layers;
     uint32_t n_embd_per_layer;
     uint64_t swa_mask;
+    uint32_t rope_theta_swa_bits; /* 0 = 默认 10000 */
 } LlfGemma4Ext;
 
 static void llf_gemma4_ext(const LlfHeader* h, LlfGemma4Ext* ext)
@@ -49,6 +50,18 @@ static int gemma4_is_swa(const LlfGemma4Ext* ext, uint32_t il)
     if (ext->swa_mask) return (int)((ext->swa_mask >> il) & 1ull);
     uint32_t p = ext->swa_pattern ? ext->swa_pattern : 6;
     return (il % p) < (p - 1);
+}
+
+/* llama.cpp: GEMMA4 = NEOX RoPE; SWA 层用 rope.freq_base_swa(默认 10000) */
+static float gemma4_rope_theta(const LlfHeader* h, const LlfGemma4Ext* ext, uint32_t il)
+{
+    float theta;
+    memcpy(&theta, &h->rope_theta_bits, 4);
+    if (!gemma4_is_swa(ext, il)) return theta;
+    float swa = 0.0f;
+    memcpy(&swa, &ext->rope_theta_swa_bits, 4);
+    if (!(swa > 0.0f)) swa = 10000.0f;
+    return swa;
 }
 
 static float llf_gemma4_attn_cap(const LlfHeader* h)
@@ -1153,6 +1166,8 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     int has_kv = 1;
     uint32_t kv_layer = layer;
     llf_gemma4_ext(h, &g4);
+    if (h->arch == ARCH_GEMMA4)
+        theta = gemma4_rope_theta(h, &g4, il);
     if (h->arch == ARCH_GEMMA4 && g4.n_kv_shared_layers > 0 &&
         g4.n_kv_shared_layers < h->n_blocks) {
         uint32_t kv_from = h->n_blocks - g4.n_kv_shared_layers;
@@ -1220,14 +1235,14 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh;
     for (hh = 0; hh < h->n_heads; hh++) {
-        if (h->arch == ARCH_QWEN)
+        if (h->arch == ARCH_QWEN || h->arch == ARCH_GEMMA4)
             rope_inplace_qwen(q + (size_t)hh * hd, hd, pos, theta);
         else
             rope_inplace(q + (size_t)hh * hd, hd, pos, theta);
     }
     if (has_kv) {
         for (hh = 0; hh < h->n_kv_heads; hh++) {
-            if (h->arch == ARCH_QWEN)
+            if (h->arch == ARCH_QWEN || h->arch == ARCH_GEMMA4)
                 rope_inplace_qwen(k + (size_t)hh * hd, hd, pos, theta);
             else
                 rope_inplace(k + (size_t)hh * hd, hd, pos, theta);
@@ -1929,6 +1944,32 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         timings->n_prefill = nprompt > 0 ? (uint32_t)nprompt : 0;
         t1 = ynow_ms();
         timings->prefill_ms = t1 - t0;
+    }
+    if (e->ws.model.h.arch == ARCH_GEMMA4 && e->logits) {
+        uint32_t vocab = e->ws.model.h.vocab;
+        uint32_t top_i[5];
+        float top_v[5];
+        uint32_t t, vi;
+        for (t = 0; t < 5; t++) { top_i[t] = 0; top_v[t] = -1e30f; }
+        for (vi = 0; vi < vocab; vi++) {
+            float z = e->logits[vi];
+            for (t = 0; t < 5; t++) {
+                if (z > top_v[t]) {
+                    uint32_t s;
+                    for (s = 4; s > t; s--) {
+                        top_v[s] = top_v[s - 1];
+                        top_i[s] = top_i[s - 1];
+                    }
+                    top_v[t] = z;
+                    top_i[t] = vi;
+                    break;
+                }
+            }
+        }
+        ylog_info("top logits: %u:%.3f %u:%.3f %u:%.3f %u:%.3f %u:%.3f",
+                  top_i[0], (double)top_v[0], top_i[1], (double)top_v[1],
+                  top_i[2], (double)top_v[2], top_i[3], (double)top_v[3],
+                  top_i[4], (double)top_v[4]);
     }
     uint32_t ngen = 0;
     uint32_t n_accept = 0, n_try = 0;
