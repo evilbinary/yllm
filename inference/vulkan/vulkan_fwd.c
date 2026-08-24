@@ -487,7 +487,7 @@ void vulkan_attach_fwd(Engine* e)
         e->fwd_block = vulkan_fwd_block;
 }
 
-/* 层外×token 内: 每层只 stream 一次权, 再扫批内 token(摊销 H2D) */
+/* token 外×layer 内: 激活常驻 GPU, 每层结束只 D2H 一次 */
 int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN || !tokens || n <= 0) return -1;
@@ -521,21 +521,19 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
             }
         }
 
-        uint32_t layer;
-        for (layer = 1; layer <= trunk; layer++) {
-            if (ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
+        for (b = 0; b < nb; b++) {
+            if (vulkan_upload_x(ctx, e->pb + (size_t)b * hidden, hidden) != 0)
                 return -1;
-            for (b = 0; b < nb; b++) {
-                memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
-                vulkan_mark_x_host(ctx);
-                /* sync_host=1: 写回 e->x 供下一批层 / pb 镜像 */
-                if (vulkan_fwd_block_ex(e, layer, (uint32_t)(start_pos + off) + b, 1) != 0)
+            uint32_t layer;
+            for (layer = 1; layer <= trunk; layer++) {
+                if (ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
                     return -1;
-                if (ctx->x_on_dev)
-                    (void)vulkan_sync_x_to_host(ctx, e->x, hidden);
-                vulkan_mark_x_host(ctx);
-                memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
+                if (vulkan_fwd_block_ex(e, layer, (uint32_t)(start_pos + off) + b, 0) != 0)
+                    return -1;
             }
+            if (vulkan_sync_x_to_host(ctx, e->pb + (size_t)b * hidden, hidden) != 0)
+                return -1;
+            vulkan_mark_x_host(ctx);
         }
 
         if (e->mtp_h) {
@@ -548,7 +546,6 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
             vulkan_mark_x_host(ctx);
             if (vulkan_final_norm(e) != 0) return -1;
             if (vulkan_lm_head(e) != 0) {
-                /* Q6_K 等: 走 CPU lm_head */
                 uint32_t li = h->n_blocks + 2;
                 const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[li].offset;
                 const LlfTensorMeta* out = &m->metas[m->base_idx[li]];
@@ -562,8 +559,13 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 
 void vulkan_after_embed(Engine* e)
 {
-    if (e && e->device_mode == DEV_MODE_VULKAN && e->w_dev)
-        vulkan_mark_x_host((VulkanCtx*)e->w_dev);
+    if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    if (ctx->host_shim || !ctx->compute_ready) {
+        vulkan_mark_x_host(ctx);
+        return;
+    }
+    (void)vulkan_upload_x(ctx, e->x, e->ws.model.h.hidden);
 }
 
 void vulkan_sync_x(Engine* e)

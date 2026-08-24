@@ -77,7 +77,8 @@ static uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
 }
 
 static int create_host_buffer(VulkanCtx* ctx, size_t bytes,
-                              VkBuffer* out_buf, VkDeviceMemory* out_mem)
+                              VkBuffer* out_buf, VkDeviceMemory* out_mem,
+                              void** persist_map)
 {
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
@@ -103,7 +104,26 @@ static int create_host_buffer(VulkanCtx* ctx, size_t bytes,
     ai.memoryTypeIndex = mi;
     if (a->AllocateMemory(dev, &ai, NULL, out_mem) != VK_SUCCESS) return -1;
     if (a->BindBufferMemory(dev, *out_buf, *out_mem, 0) != VK_SUCCESS) return -1;
+    if (persist_map) {
+        void* p = NULL;
+        if (a->MapMemory(dev, *out_mem, 0, bytes, 0, &p) != VK_SUCCESS) return -1;
+        *persist_map = p;
+    }
     return 0;
+}
+
+static void* vk_map_slot(VulkanCtx* ctx, void* mem, size_t off)
+{
+    if (mem == ctx->mem_x && ctx->map_x) return (uint8_t*)ctx->map_x + off;
+    if (mem == ctx->mem_y && ctx->map_y) return (uint8_t*)ctx->map_y + off;
+    if (mem == ctx->mem_o0 && ctx->map_o0) return (uint8_t*)ctx->map_o0 + off;
+    if (mem == ctx->mem_o1 && ctx->map_o1) return (uint8_t*)ctx->map_o1 + off;
+    if (mem == ctx->mem_o2 && ctx->map_o2) return (uint8_t*)ctx->map_o2 + off;
+    if (mem == ctx->mem_wn && ctx->map_wn) return (uint8_t*)ctx->map_wn + off;
+    if (mem == ctx->mem_wq && ctx->map_wq) return (uint8_t*)ctx->map_wq + off;
+    if (mem == ctx->mem_kv && ctx->map_kv) return (uint8_t*)ctx->map_kv + off;
+    if (mem == ctx->mem_bias && ctx->map_bias) return (uint8_t*)ctx->map_bias + off;
+    return NULL;
 }
 
 static uint32_t* read_spv(const char* path, size_t* out_nwords)
@@ -315,8 +335,8 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
 
     VkBuffer bx = VK_NULL_HANDLE, by = VK_NULL_HANDLE;
     VkDeviceMemory mx = VK_NULL_HANDLE, my = VK_NULL_HANDLE;
-    if (create_host_buffer(ctx, ctx->x_bytes, &bx, &mx) != 0) return -1;
-    if (create_host_buffer(ctx, ctx->y_bytes, &by, &my) != 0) return -1;
+    if (create_host_buffer(ctx, ctx->x_bytes, &bx, &mx, &ctx->map_x) != 0) return -1;
+    if (create_host_buffer(ctx, ctx->y_bytes, &by, &my, &ctx->map_y) != 0) return -1;
     ctx->buf_x = (void*)bx; ctx->mem_x = (void*)mx;
     ctx->buf_y = (void*)by; ctx->mem_y = (void*)my;
 
@@ -344,7 +364,7 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
     {
         VkBuffer bw = VK_NULL_HANDLE;
         VkDeviceMemory mw = VK_NULL_HANDLE;
-        if (create_host_buffer(ctx, ctx->wn_bytes, &bw, &mw) != 0) return -1;
+        if (create_host_buffer(ctx, ctx->wn_bytes, &bw, &mw, &ctx->map_wn) != 0) return -1;
         ctx->buf_wn = (void*)bw; ctx->mem_wn = (void*)mw;
         VkBuffer bufs[3] = { bx, by, bw };
         size_t ranges[3] = { ctx->x_bytes, ctx->y_bytes, ctx->wn_bytes };
@@ -376,10 +396,10 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
         char gerr[256];
         VkBuffer bo0 = VK_NULL_HANDLE, bo1 = VK_NULL_HANDLE, bo2 = VK_NULL_HANDLE;
         VkDeviceMemory mo0 = VK_NULL_HANDLE, mo1 = VK_NULL_HANDLE, mo2 = VK_NULL_HANDLE;
-        if (create_host_buffer(ctx, ctx->wq_bytes, &bw, &mw) != 0 ||
-            create_host_buffer(ctx, ctx->y_bytes, &bo0, &mo0) != 0 ||
-            create_host_buffer(ctx, ctx->y_bytes, &bo1, &mo1) != 0 ||
-            create_host_buffer(ctx, ctx->y_bytes, &bo2, &mo2) != 0) {
+        if (create_host_buffer(ctx, ctx->wq_bytes, &bw, &mw, &ctx->map_wq) != 0 ||
+            create_host_buffer(ctx, ctx->y_bytes, &bo0, &mo0, &ctx->map_o0) != 0 ||
+            create_host_buffer(ctx, ctx->y_bytes, &bo1, &mo1, &ctx->map_o1) != 0 ||
+            create_host_buffer(ctx, ctx->y_bytes, &bo2, &mo2, &ctx->map_o2) != 0) {
             ylog_warn("vulkan: gemv buffers alloc failed");
         } else {
             ctx->buf_wq = (void*)bw; ctx->mem_wq = (void*)mw;
@@ -503,23 +523,26 @@ int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes)
 {
     if (!ctx || !ctx->gemv_ready || !blob || bytes == 0) return -1;
     if (bytes > ctx->wq_bytes) return -1;
-    VulkanApi* a = vulkan_api();
-    VkDevice dev = (VkDevice)ctx->device;
-    /* 分块 map+memcpy: 大块一次 Map 在部分 iGPU 上不可靠 */
-    const size_t chunk = 16u * 1024u * 1024u;
-    size_t off = 0;
-    while (off < bytes) {
-        size_t n = bytes - off;
-        if (n > chunk) n = chunk;
-        void* pw = NULL;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, off, n, 0, &pw) != VK_SUCCESS)
-            return -1;
-        memcpy(pw, (const uint8_t*)blob + off, n);
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
-        off += n;
+    if (ctx->map_wq) {
+        memcpy(ctx->map_wq, blob, bytes);
+    } else {
+        VulkanApi* a = vulkan_api();
+        VkDevice dev = (VkDevice)ctx->device;
+        const size_t chunk = 16u * 1024u * 1024u;
+        size_t off = 0;
+        while (off < bytes) {
+            size_t n = bytes - off;
+            if (n > chunk) n = chunk;
+            void* pw = NULL;
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, off, n, 0, &pw) != VK_SUCCESS)
+                return -1;
+            memcpy(pw, (const uint8_t*)blob + off, n);
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+            off += n;
+        }
     }
     ctx->wq_resident = 1;
-    ylog_info("vulkan: Q4_K weights resident %zuMB (chunked)", bytes / (1024 * 1024));
+    ylog_info("vulkan: Q4_K weights resident %zuMB", bytes / (1024 * 1024));
     return 0;
 }
 
@@ -527,6 +550,10 @@ int vulkan_wq_upload_range(VulkanCtx* ctx, const void* src, size_t dst_off, size
 {
     if (!ctx || !ctx->mem_wq || !src || bytes == 0) return -1;
     if (dst_off + bytes > ctx->wq_bytes) return -1;
+    if (ctx->map_wq) {
+        memcpy((uint8_t*)ctx->map_wq + dst_off, src, bytes);
+        return 0;
+    }
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
     const size_t chunk = 16u * 1024u * 1024u;
@@ -563,8 +590,9 @@ int vulkan_stream_layer(VulkanCtx* ctx, uint32_t layer)
     if (lo + nbytes > ctx->host_wq_bytes)
         nbytes = ctx->host_wq_bytes - (size_t)lo;
     if (nbytes > ctx->wq_bytes) nbytes = ctx->wq_bytes;
-    /* 分块写到 GPU offset 0 */
-    {
+    if (ctx->map_wq) {
+        memcpy(ctx->map_wq, ctx->host_wq + (size_t)lo, nbytes);
+    } else {
         const size_t chunk = 16u * 1024u * 1024u;
         size_t done = 0;
         VulkanApi* a = vulkan_api();
@@ -596,16 +624,23 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
     size_t nbytes = (size_t)n * 4;
-    void* px = NULL; void* py = NULL; void* pw = NULL;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, nbytes, 0, &px) != VK_SUCCESS)
-        return -1;
-    memcpy(px, x, nbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wn, 0, nbytes, 0, &pw) != VK_SUCCESS)
-        return -1;
-    memcpy(pw, w, nbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wn);
+    if (ctx->map_x) memcpy(ctx->map_x, x, nbytes);
+    else {
+        void* px = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, nbytes, 0, &px) != VK_SUCCESS)
+            return -1;
+        memcpy(px, x, nbytes);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
+    }
+    if (ctx->map_wn) memcpy(ctx->map_wn, w, nbytes);
+    else {
+        void* pw = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wn, 0, nbytes, 0, &pw) != VK_SUCCESS)
+            return -1;
+        memcpy(pw, w, nbytes);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wn);
+    }
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     a->ResetCommandBuffer(cmd, 0);
@@ -626,10 +661,14 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_y, 0, nbytes, 0, &py) != VK_SUCCESS)
-        return -1;
-    memcpy(y, py, nbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
+    if (ctx->map_y) memcpy(y, ctx->map_y, nbytes);
+    else {
+        void* py = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_y, 0, nbytes, 0, &py) != VK_SUCCESS)
+            return -1;
+        memcpy(y, py, nbytes);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
+    }
     return 0;
 }
 
@@ -655,12 +694,18 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     void* xmem = wide ? ctx->mem_y : ctx->mem_x;
     void* ymem = wide ? ctx->mem_o0 : ctx->mem_y;
     void* dset = wide ? ctx->gemv_ds0 : ctx->gemv_desc_set;
-    void* px = NULL; void* py = NULL;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)xmem, 0, xbytes, 0, &px) != VK_SUCCESS)
-        return -1;
-    memcpy(px, x, xbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)xmem);
+    {
+        void* px = vk_map_slot(ctx, xmem, 0);
+        if (px) memcpy(px, x, xbytes);
+        else {
+            void* tmp = NULL;
+            if (a->MapMemory(dev, (VkDeviceMemory)xmem, 0, xbytes, 0, &tmp) != VK_SUCCESS)
+                return -1;
+            memcpy(tmp, x, xbytes);
+            a->UnmapMemory(dev, (VkDeviceMemory)xmem);
+        }
+    }
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     a->ResetCommandBuffer(cmd, 0);
@@ -683,10 +728,17 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)ymem, 0, ybytes, 0, &py) != VK_SUCCESS)
-        return -1;
-    memcpy(y, py, ybytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ymem);
+    {
+        void* py = vk_map_slot(ctx, ymem, 0);
+        if (py) memcpy(y, py, ybytes);
+        else {
+            void* tmp = NULL;
+            if (a->MapMemory(dev, (VkDeviceMemory)ymem, 0, ybytes, 0, &tmp) != VK_SUCCESS)
+                return -1;
+            memcpy(y, tmp, ybytes);
+            a->UnmapMemory(dev, (VkDeviceMemory)ymem);
+        }
+    }
     return 0;
 }
 
@@ -698,13 +750,16 @@ int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
     if (ctx->wq_resident) return -1;
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
     if (wbytes > ctx->wq_bytes) return -1;
-    VulkanApi* a = vulkan_api();
-    VkDevice dev = (VkDevice)ctx->device;
-    void* pw = NULL;
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, 0, wbytes, 0, &pw) != VK_SUCCESS)
-        return -1;
-    memcpy(pw, w, wbytes);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+    if (ctx->map_wq) memcpy(ctx->map_wq, w, wbytes);
+    else {
+        VulkanApi* a = vulkan_api();
+        VkDevice dev = (VkDevice)ctx->device;
+        void* pw = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wq, 0, wbytes, 0, &pw) != VK_SUCCESS)
+            return -1;
+        memcpy(pw, w, wbytes);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq);
+    }
     return vulkan_k_gemv_q4k(ctx, y, x, out, in, 0);
 }
 
@@ -756,22 +811,32 @@ static void cmd_gemv(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
 
 static int map_copy(VulkanCtx* ctx, void* mem, const void* src, size_t nbytes)
 {
+    void* p = vk_map_slot(ctx, mem, 0);
+    if (p) {
+        memcpy(p, src, nbytes);
+        return 0;
+    }
     VulkanApi* a = vulkan_api();
-    void* p = NULL;
-    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &p) != VK_SUCCESS)
+    void* tmp = NULL;
+    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &tmp) != VK_SUCCESS)
         return -1;
-    memcpy(p, src, nbytes);
+    memcpy(tmp, src, nbytes);
     a->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem);
     return 0;
 }
 
 static int map_read(VulkanCtx* ctx, void* mem, void* dst, size_t nbytes)
 {
+    void* p = vk_map_slot(ctx, mem, 0);
+    if (p) {
+        memcpy(dst, p, nbytes);
+        return 0;
+    }
     VulkanApi* a = vulkan_api();
-    void* p = NULL;
-    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &p) != VK_SUCCESS)
+    void* tmp = NULL;
+    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &tmp) != VK_SUCCESS)
         return -1;
-    memcpy(dst, p, nbytes);
+    memcpy(dst, tmp, nbytes);
     a->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem);
     return 0;
 }
@@ -1055,7 +1120,7 @@ static int setup_block_ops(VulkanCtx* ctx)
     {
         VkBuffer bb = VK_NULL_HANDLE;
         VkDeviceMemory mb = VK_NULL_HANDLE;
-        if (create_host_buffer(ctx, ctx->bias_bytes, &bb, &mb) != 0) return -1;
+        if (create_host_buffer(ctx, ctx->bias_bytes, &bb, &mb, &ctx->map_bias) != 0) return -1;
         ctx->buf_bias = (void*)bb;
         ctx->mem_bias = (void*)mb;
         VkBuffer triples[3][3] = {
@@ -1117,21 +1182,13 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
 
     VkBuffer bkv = VK_NULL_HANDLE;
     VkDeviceMemory mkv = VK_NULL_HANDLE;
-    if (create_host_buffer(ctx, ctx->kv_bytes, &bkv, &mkv) != 0) {
+    if (create_host_buffer(ctx, ctx->kv_bytes, &bkv, &mkv, &ctx->map_kv) != 0) {
         if (err && errlen) snprintf(err, errlen, "kv buffer alloc %zu", ctx->kv_bytes);
         return -1;
     }
     ctx->buf_kv = (void*)bkv;
     ctx->mem_kv = (void*)mkv;
-    /* 清零 */
-    {
-        VulkanApi* a = vulkan_api();
-        void* p = NULL;
-        if (a->MapMemory((VkDevice)ctx->device, mkv, 0, ctx->kv_bytes, 0, &p) == VK_SUCCESS) {
-            memset(p, 0, ctx->kv_bytes);
-            a->UnmapMemory((VkDevice)ctx->device, mkv);
-        }
-    }
+    if (ctx->map_kv) memset(ctx->map_kv, 0, ctx->kv_bytes);
 
     VkBuffer bufs[3] = { (VkBuffer)ctx->buf_o0, bkv, (VkBuffer)ctx->buf_o2 };
     size_t ranges[3] = { ctx->y_bytes, ctx->kv_bytes, ctx->y_bytes };
@@ -1270,14 +1327,20 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
 
     if (map_copy(ctx, ctx->mem_o0, q, qbytes) != 0) return -1;
 
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, k_off, rowb, 0, &p) != VK_SUCCESS)
-        return -1;
-    memcpy(p, k, rowb);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
-    if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, v_off, rowb, 0, &p) != VK_SUCCESS)
-        return -1;
-    memcpy(p, v, rowb);
-    a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+    if (ctx->map_kv) {
+        memcpy((uint8_t*)ctx->map_kv + k_off, k, rowb);
+        memcpy((uint8_t*)ctx->map_kv + v_off, v, rowb);
+    } else {
+        void* p = NULL;
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, k_off, rowb, 0, &p) != VK_SUCCESS)
+            return -1;
+        memcpy(p, k, rowb);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, v_off, rowb, 0, &p) != VK_SUCCESS)
+            return -1;
+        memcpy(p, v, rowb);
+        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
+    }
 
     if (host_k_row && host_v_row) {
         uint32_t j;
@@ -1362,7 +1425,6 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
     if (map_copy(ctx, ctx->mem_wn, wn, xb) != 0) return -1;
 
     VulkanApi* a = vulkan_api();
-    VkDevice dev = (VkDevice)ctx->device;
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     VkCommandBufferBeginInfo bi = {0};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1380,11 +1442,9 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
 
     /* bias / qk-norm / RoPE 在 host 就地改 o* */
     {
-        void* p = NULL;
         uint32_t j, hh;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o0, 0, xb, 0, &p) != VK_SUCCESS)
-            return -1;
-        float* q = (float*)p;
+        float* q = (float*)ctx->map_o0;
+        if (!q) return -1;
         if (bq) for (j = 0; j < hidden; j++) q[j] += bq[j];
         if (qnorm) {
             for (hh = 0; hh < ctx->n_heads; hh++)
@@ -1397,11 +1457,9 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
             else
                 rope_inplace(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
         }
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0);
 
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &p) != VK_SUCCESS)
-            return -1;
-        float* k = (float*)p;
+        float* k = (float*)ctx->map_o1;
+        if (!k) return -1;
         if (bk) for (j = 0; j < kv_dim; j++) k[j] += bk[j];
         if (knorm) {
             for (hh = 0; hh < ctx->n_kv_heads; hh++)
@@ -1414,50 +1472,30 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
             else
                 rope_inplace(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
         }
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
 
         if (bv) {
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &p) != VK_SUCCESS)
-                return -1;
-            float* v = (float*)p;
+            float* v = (float*)ctx->map_o2;
+            if (!v) return -1;
             for (j = 0; j < kv_dim; j++) v[j] += bv[j];
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
         }
     }
 
     /* o1=K o2=V → GPU KV; 可选同步 host f16 */
     {
-        void* src = NULL;
-        void* dst = NULL;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &src) != VK_SUCCESS)
-            return -1;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, k_off, rowb, 0, &dst) != VK_SUCCESS) {
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
-            return -1;
-        }
-        memcpy(dst, src, rowb);
+        if (!ctx->map_o1 || !ctx->map_kv) return -1;
+        memcpy((uint8_t*)ctx->map_kv + k_off, ctx->map_o1, rowb);
         if (host_k_row) {
             uint32_t j;
-            const float* kf = (const float*)src;
+            const float* kf = (const float*)ctx->map_o1;
             for (j = 0; j < kv_dim; j++) host_k_row[j] = f32_to_f16(kf[j]);
         }
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
 
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &src) != VK_SUCCESS)
-            return -1;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_kv, v_off, rowb, 0, &dst) != VK_SUCCESS) {
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
-            return -1;
-        }
-        memcpy(dst, src, rowb);
+        memcpy((uint8_t*)ctx->map_kv + v_off, ctx->map_o2, rowb);
         if (host_v_row) {
             uint32_t j;
-            const float* vf = (const float*)src;
+            const float* vf = (const float*)ctx->map_o2;
             for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
         }
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv);
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
     }
 
     a->ResetCommandBuffer(cmd, 0);
@@ -1524,6 +1562,16 @@ void vulkan_mark_x_host(VulkanCtx* ctx)
     if (ctx) ctx->x_on_dev = 0;
 }
 
+int vulkan_upload_x(VulkanCtx* ctx, const float* x, uint32_t hidden)
+{
+    if (!ctx || !x || hidden == 0) return -1;
+    size_t nbytes = (size_t)hidden * 4;
+    if (nbytes > ctx->x_bytes) return -1;
+    if (map_copy(ctx, ctx->mem_x, x, nbytes) != 0) return -1;
+    ctx->x_on_dev = 1;
+    return 0;
+}
+
 int vulkan_sync_x_to_host(VulkanCtx* ctx, float* host_x, uint32_t hidden)
 {
     if (!ctx || !host_x || !ctx->mem_x) return -1;
@@ -1574,20 +1622,26 @@ int vulkan_fused_block(VulkanCtx* ctx,
     uint32_t bq_off = 0, bk_off = hidden, bv_off = hidden + kv_dim;
     if (bq || bk || bv) {
         if (!ctx->bias_ready) return -1;
-        void* p = NULL;
-        VulkanApi* a0 = vulkan_api();
-        if (a0->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)ctx->mem_bias,
-                          0, ctx->bias_bytes, 0, &p) != VK_SUCCESS)
-            return -1;
-        memset(p, 0, ctx->bias_bytes);
-        if (bq) memcpy((float*)p + bq_off, bq, xb);
-        if (bk) memcpy((float*)p + bk_off, bk, (size_t)kv_dim * 4);
-        if (bv) memcpy((float*)p + bv_off, bv, (size_t)kv_dim * 4);
-        a0->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)ctx->mem_bias);
+        if (ctx->map_bias) {
+            memset(ctx->map_bias, 0, ctx->bias_bytes);
+            if (bq) memcpy((float*)ctx->map_bias + bq_off, bq, xb);
+            if (bk) memcpy((float*)ctx->map_bias + bk_off, bk, (size_t)kv_dim * 4);
+            if (bv) memcpy((float*)ctx->map_bias + bv_off, bv, (size_t)kv_dim * 4);
+        } else {
+            void* p = NULL;
+            VulkanApi* a0 = vulkan_api();
+            if (a0->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)ctx->mem_bias,
+                              0, ctx->bias_bytes, 0, &p) != VK_SUCCESS)
+                return -1;
+            memset(p, 0, ctx->bias_bytes);
+            if (bq) memcpy((float*)p + bq_off, bq, xb);
+            if (bk) memcpy((float*)p + bk_off, bk, (size_t)kv_dim * 4);
+            if (bv) memcpy((float*)p + bv_off, bv, (size_t)kv_dim * 4);
+            a0->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)ctx->mem_bias);
+        }
     }
 
     VulkanApi* a = vulkan_api();
-    VkDevice dev = (VkDevice)ctx->device;
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     VkCommandBufferBeginInfo bi = {0};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1611,22 +1665,18 @@ int vulkan_fused_block(VulkanCtx* ctx,
 
     /* CPU RoPE + 写 KV */
     {
-        void* p = NULL;
         uint32_t hh;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o0, 0, xb, 0, &p) != VK_SUCCESS)
-            return -1;
-        float* q = (float*)p;
+        float* q = (float*)ctx->map_o0;
+        if (!q) return -1;
         for (hh = 0; hh < ctx->n_heads; hh++) {
             if (rope_mode)
                 rope_inplace_qwen(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
             else
                 rope_inplace(q + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
         }
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0);
 
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o1, 0, rowb, 0, &p) != VK_SUCCESS)
-            return -1;
-        float* k = (float*)p;
+        float* k = (float*)ctx->map_o1;
+        if (!k) return -1;
         for (hh = 0; hh < ctx->n_kv_heads; hh++) {
             if (rope_mode)
                 rope_inplace_qwen(k + (size_t)hh * ctx->head_dim, ctx->head_dim, pos, theta);
@@ -1637,17 +1687,12 @@ int vulkan_fused_block(VulkanCtx* ctx,
             uint32_t j;
             for (j = 0; j < kv_dim; j++) host_k_row[j] = f32_to_f16(k[j]);
         }
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1);
 
         if (host_v_row) {
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_o2, 0, rowb, 0, &p) != VK_SUCCESS)
-                return -1;
-            {
-                uint32_t j;
-                const float* vf = (const float*)p;
-                for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
-            }
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2);
+            float* vf = (float*)ctx->map_o2;
+            if (!vf) return -1;
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) host_v_row[j] = f32_to_f16(vf[j]);
         }
     }
 

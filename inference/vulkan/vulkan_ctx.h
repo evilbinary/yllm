@@ -8,6 +8,8 @@
 typedef struct {
     int device_id;
     int host_shim;
+    int integrated_gpu;   /* iGPU: 强制按层流式权 */
+    uint64_t max_ssbo_range;
     void* instance;
     void* phys;
     void* device;
@@ -28,8 +30,27 @@ typedef struct {
     void* mem_o0;
     void* mem_o1;
     void* mem_o2;
+    /* HOST_VISIBLE 常驻映射, 避免反复 Map/Unmap */
+    void* map_x;
+    void* map_y;
+    void* map_o0;
+    void* map_o1;
+    void* map_o2;
+    void* map_wn;
+    void* map_wq;
+    void* map_kv;
+    void* map_bias;
     size_t x_bytes;
     size_t y_bytes;
+
+    /* YLLM_VK_PROF=1 时累计 */
+    int prof_on;
+    uint64_t prof_submit_ns;
+    uint64_t prof_map_ns;
+    uint64_t prof_stream_ns;
+    uint32_t prof_submit_n;
+    uint32_t prof_map_n;
+    uint32_t prof_stream_n;
 
     void* rms_desc_pool;
     void* rms_desc_layout;

@@ -247,22 +247,38 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
         uint32_t max_in = ctx->hidden, max_out = ctx->hidden;
         size_t total_wq = 0;
         scan_block_q4k(&e->ws.model, &max_in, &max_out, &total_wq);
-        /* 始终按层流式: 规避 iGPU maxStorageBufferRange, 并减少共享内存占用 */
-        ctx->wq_stream = 0;
         ctx->layer_wq_max = 0;
         ctx->stream_base = 0;
+        size_t layer_max = max_block_q4k_bytes(&e->ws.model);
+        if (layer_max == 0) layer_max = total_wq;
+        layer_max = (layer_max + 4095u) & ~(size_t)4095u;
+        if (layer_max < 144 * 8) layer_max = 144 * 8;
+        ctx->layer_wq_max = layer_max;
+
+        /* iGPU / 超大 SSBO / YLLM_VK_STREAM=1 → 按层流式; dGPU 能装下则一次 resident */
+        ctx->wq_stream = 0;
         size_t gpu_wq = total_wq;
         {
-            size_t layer_max = max_block_q4k_bytes(&e->ws.model);
-            if (layer_max == 0) layer_max = total_wq;
-            layer_max = (layer_max + 4095u) & ~(size_t)4095u;
-            /* 至少容纳 selftest 8 行 */
-            if (layer_max < 144 * 8) layer_max = 144 * 8;
-            ctx->wq_stream = 1;
-            ctx->layer_wq_max = layer_max;
-            gpu_wq = layer_max;
-            ylog_info("vulkan: weight stream on (total=%zuMB layer_gpu=%zuMB)",
-                      total_wq / (1024 * 1024), layer_max / (1024 * 1024));
+            const char* env = getenv("YLLM_VK_STREAM");
+            int force_stream = (env && env[0] == '1') ? 1 : 0;
+            int force_resident = (env && env[0] == '0') ? 1 : 0;
+            int need_stream = 0;
+            if (!force_resident) {
+                if (ctx->integrated_gpu) need_stream = 1;
+                else if (total_wq > ctx->max_ssbo_range) need_stream = 1;
+                else if (force_stream) need_stream = 1;
+            }
+            if (need_stream) {
+                ctx->wq_stream = 1;
+                gpu_wq = layer_max;
+                ylog_info("vulkan: weight stream on (total=%zuMB layer_gpu=%zuMB igpu=%d)",
+                          total_wq / (1024 * 1024), layer_max / (1024 * 1024),
+                          ctx->integrated_gpu);
+            } else {
+                ylog_info("vulkan: weight resident (total=%zuMB ssbo_max=%zuMB)",
+                          total_wq / (1024 * 1024),
+                          (size_t)(ctx->max_ssbo_range / (1024 * 1024)));
+            }
         }
         char cerr[256];
         if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, gpu_wq,

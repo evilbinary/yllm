@@ -70,3 +70,5 @@ tools/__pycache__/bench_cross.cpython-311.pyc
 tmp_chat_err.txt
 tmp_chat_out.txt
 tmp_vk_gen.txt
+tmp_gprof_run.txt
+tmp_gprof.txt

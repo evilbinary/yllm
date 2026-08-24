@@ -165,9 +165,14 @@ int vulkan_try_init(VulkanCtx* ctx, int device_id, char* err, size_t errlen)
 
     VkPhysicalDeviceProperties props;
     g_GetPhysicalDeviceProperties(pd, &props);
-    ylog_info("vulkan: physical[%d/%u] %s api=%u.%u",
+    ctx->integrated_gpu =
+        (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 1 : 0;
+    ctx->max_ssbo_range = props.limits.maxStorageBufferRange;
+    ylog_info("vulkan: physical[%d/%u] %s api=%u.%u type=%u ssbo_max=%zuMB",
               idx, ndev, props.deviceName,
-              VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion));
+              VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion),
+              (unsigned)props.deviceType,
+              (size_t)(ctx->max_ssbo_range / (1024 * 1024)));
 
     uint32_t nq = 0;
     g_GetPhysicalDeviceQueueFamilyProperties(pd, &nq, NULL);
@@ -253,6 +258,19 @@ void vulkan_shutdown(VulkanCtx* ctx)
 
     if (ctx->queue && a->QueueWaitIdle)
         a->QueueWaitIdle((VkQueue)ctx->queue);
+
+    if (a->UnmapMemory) {
+        VkDevice dev = (VkDevice)ctx->device;
+        if (ctx->map_x) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x); ctx->map_x = NULL; }
+        if (ctx->map_y) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y); ctx->map_y = NULL; }
+        if (ctx->map_o0) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o0); ctx->map_o0 = NULL; }
+        if (ctx->map_o1) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o1); ctx->map_o1 = NULL; }
+        if (ctx->map_o2) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_o2); ctx->map_o2 = NULL; }
+        if (ctx->map_wn) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wn); ctx->map_wn = NULL; }
+        if (ctx->map_wq) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wq); ctx->map_wq = NULL; }
+        if (ctx->map_kv) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_kv); ctx->map_kv = NULL; }
+        if (ctx->map_bias) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_bias); ctx->map_bias = NULL; }
+    }
 
     destroy_pipe(a, dev, ctx->rms_pipeline, ctx->rms_pipe_layout, ctx->rms_shader,
                  ctx->rms_desc_pool, ctx->rms_desc_layout);
