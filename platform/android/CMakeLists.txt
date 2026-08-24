@@ -51,9 +51,13 @@ if(YLLM_VULKAN)
   endif()
 endif()
 
-# arm64: 允许编译器自动向量化; 显式 NEON 路径后续补 matvec
+# arm64: Q4_K NEON(+dotprod) + OpenMP。-static-openmp 避免设备缺 libomp.so
 if(ANDROID_ABI STREQUAL "arm64-v8a")
-  target_compile_options(yllm PRIVATE -O2 -ffast-math)
+  target_compile_options(yllm PRIVATE
+    -O3 -ffast-math -fno-finite-math-only
+    -march=armv8.2-a+dotprod
+    -fopenmp)
+  target_link_options(yllm PRIVATE -fopenmp -static-openmp)
 endif()
 
 find_library(LOG_LIB log)
