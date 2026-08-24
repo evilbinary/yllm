@@ -21,6 +21,8 @@ typedef struct VulkanApi {
     PFN_vkBindBufferMemory BindBufferMemory;
     PFN_vkMapMemory MapMemory;
     PFN_vkUnmapMemory UnmapMemory;
+    PFN_vkFlushMappedMemoryRanges FlushMappedMemoryRanges;
+    PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges;
     PFN_vkCreateShaderModule CreateShaderModule;
     PFN_vkDestroyShaderModule DestroyShaderModule;
     PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
@@ -42,11 +44,15 @@ typedef struct VulkanApi {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCmdCopyBuffer CmdCopyBuffer;
+    PFN_vkCmdFillBuffer CmdFillBuffer;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkQueueWaitIdle QueueWaitIdle;
     PFN_vkCreateFence CreateFence;
     PFN_vkDestroyFence DestroyFence;
+    PFN_vkCreateSemaphore CreateSemaphore;
+    PFN_vkDestroySemaphore DestroySemaphore;
     PFN_vkWaitForFences WaitForFences;
     PFN_vkResetFences ResetFences;
     PFN_vkResetCommandBuffer ResetCommandBuffer;

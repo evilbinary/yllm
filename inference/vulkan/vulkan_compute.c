@@ -19,14 +19,24 @@ typedef struct {
 typedef struct {
     uint32_t n;
     float eps;
+    uint32_t w_off;
+    uint32_t _pad;
 } RmsPush;
 
 typedef struct {
     uint32_t out_n;
     uint32_t in_n;
     uint32_t w_off;
-    uint32_t _pad;
+    uint32_t serial; /* iGPU: 1 */
 } GemvPush;
+
+static uint32_t gemv_serial_flag(const VulkanCtx* ctx)
+{
+    /* 默认并行; YLLM_VK_GEMV_SERIAL=1 才单线程(仅排查 iGPU 归约) */
+    (void)ctx;
+    const char* e = getenv("YLLM_VK_GEMV_SERIAL");
+    return (e && e[0] == '1') ? 1u : 0u;
+}
 
 typedef struct {
     uint32_t n;
@@ -85,6 +95,73 @@ static uint32_t find_memory_type(VkPhysicalDevice pd, uint32_t type_bits,
     return (uint32_t)~0u;
 }
 
+/* HOST_VISIBLE。dGPU 优先 DEVICE_LOCAL(ReBAR)；iGPU 优先 HOST_CACHED，
+ * 否则 CPU memcpy 到 WC/uncached UMA 后 GPU 可能读到脏数据。 */
+static uint32_t find_ssbo_memory(VkPhysicalDevice pd, uint32_t type_bits, int igpu,
+                                 VkMemoryPropertyFlags* out_flags)
+{
+    VulkanApi* a = vulkan_api();
+    VkPhysicalDeviceMemoryProperties mp;
+    a->GetPhysicalDeviceMemoryProperties(pd, &mp);
+    uint32_t i, best = (uint32_t)~0u;
+    int best_score = -1;
+    VkMemoryPropertyFlags best_flags = 0;
+    for (i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f;
+        int score;
+        if ((type_bits & (1u << i)) == 0) continue;
+        f = mp.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+        score = 0;
+        if (igpu) {
+            if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) score += 8;
+            if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) score += 4;
+            if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) score += 1;
+        } else {
+            if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) score += 8;
+            if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) score += 2;
+            if ((f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) == 0) score += 1;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best = i;
+            best_flags = f;
+        }
+    }
+    if (out_flags) *out_flags = best_flags;
+    return best;
+}
+
+/* 纯显存: 不要 HOST_VISIBLE, 避免 ReBAR 上 compute-compute 不可见 */
+static uint32_t find_vram_memory(VkPhysicalDevice pd, uint32_t type_bits,
+                                 VkMemoryPropertyFlags* out_flags)
+{
+    VulkanApi* a = vulkan_api();
+    VkPhysicalDeviceMemoryProperties mp;
+    a->GetPhysicalDeviceMemoryProperties(pd, &mp);
+    uint32_t i, best = (uint32_t)~0u;
+    int best_score = -1;
+    VkMemoryPropertyFlags best_flags = 0;
+    for (i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f;
+        int score;
+        if ((type_bits & (1u << i)) == 0) continue;
+        f = mp.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
+        score = 4;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) score += 8;
+        else score -= 4;
+        if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) score -= 2;
+        if (score > best_score) {
+            best_score = score;
+            best = i;
+            best_flags = f;
+        }
+    }
+    if (out_flags) *out_flags = best_flags;
+    return best;
+}
+
 static int create_host_buffer(VulkanCtx* ctx, size_t bytes,
                               VkBuffer* out_buf, VkDeviceMemory* out_mem,
                               void** persist_map)
@@ -97,15 +174,32 @@ static int create_host_buffer(VulkanCtx* ctx, size_t bytes,
     VkBufferCreateInfo bi = {0};
     bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = bytes;
-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (a->CreateBuffer(dev, &bi, NULL, out_buf) != VK_SUCCESS) return -1;
 
     VkMemoryRequirements req;
+    VkMemoryPropertyFlags mflags = 0;
+    uint32_t mi;
     a->GetBufferMemoryRequirements(dev, *out_buf, &req);
-    uint32_t mi = find_memory_type(pd, req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    mi = find_ssbo_memory(pd, req.memoryTypeBits, ctx->integrated_gpu, &mflags);
+    if (mi == (uint32_t)~0u)
+        mi = find_memory_type(pd, req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (mi == (uint32_t)~0u) return -1;
+    {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            ylog_info("vulkan: SSBO mem type=%u flags=0x%x%s%s", mi, (unsigned)mflags,
+                      (mflags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " DEVICE_LOCAL" : " sysmem",
+                      (mflags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " CACHED" : "");
+        }
+        if (bytes >= (1u << 20) && (mflags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0)
+            ylog_warn("vulkan: SSBO %zuMB not DEVICE_LOCAL (type=%u flags=0x%x); token-batch may be wrong",
+                      bytes / (1024 * 1024), mi, (unsigned)mflags);
+    }
 
     VkMemoryAllocateInfo ai = {0};
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -115,10 +209,84 @@ static int create_host_buffer(VulkanCtx* ctx, size_t bytes,
     if (a->BindBufferMemory(dev, *out_buf, *out_mem, 0) != VK_SUCCESS) return -1;
     if (persist_map) {
         void* p = NULL;
-        if (a->MapMemory(dev, *out_mem, 0, bytes, 0, &p) != VK_SUCCESS) return -1;
+        /* 必须覆盖整个 allocation, 否则 Flush/Invalidate VK_WHOLE_SIZE 非法 */
+        if (a->MapMemory(dev, *out_mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS)
+            return -1;
         *persist_map = p;
     }
     return 0;
+}
+
+/* dGPU 激活/KV: 优先不带 HOST_VISIBLE 的 DEVICE_LOCAL. */
+static int create_scratch_buffer(VulkanCtx* ctx, size_t bytes,
+                                 VkBuffer* out_buf, VkDeviceMemory* out_mem,
+                                 void** persist_map)
+{
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    VkPhysicalDevice pd = (VkPhysicalDevice)ctx->phys;
+    if (ctx->integrated_gpu || getenv("YLLM_VK_MAP_SCRATCH") ||
+        !getenv("YLLM_VK_VRAM_SCRATCH"))
+        return create_host_buffer(ctx, bytes, out_buf, out_mem, persist_map);
+    if (bytes < 16) bytes = 16;
+    {
+        VkBufferCreateInfo bi = {0};
+        VkMemoryRequirements req;
+        VkMemoryPropertyFlags mflags = 0;
+        uint32_t mi;
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size = bytes;
+        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (a->CreateBuffer(dev, &bi, NULL, out_buf) != VK_SUCCESS) return -1;
+        a->GetBufferMemoryRequirements(dev, *out_buf, &req);
+        mi = find_vram_memory(pd, req.memoryTypeBits, &mflags);
+        if (mi == (uint32_t)~0u) {
+            a->DestroyBuffer(dev, *out_buf, NULL);
+            return create_host_buffer(ctx, bytes, out_buf, out_mem, persist_map);
+        }
+        {
+            static int logged;
+            VkMemoryAllocateInfo ai = {0};
+            ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = mi;
+            if (a->AllocateMemory(dev, &ai, NULL, out_mem) != VK_SUCCESS) {
+                a->DestroyBuffer(dev, *out_buf, NULL);
+                return -1;
+            }
+            if (a->BindBufferMemory(dev, *out_buf, *out_mem, 0) != VK_SUCCESS) {
+                a->FreeMemory(dev, *out_mem, NULL);
+                a->DestroyBuffer(dev, *out_buf, NULL);
+                return -1;
+            }
+            if (persist_map) *persist_map = NULL;
+            if (!logged) {
+                logged = 1;
+                ylog_info("vulkan: scratch mem type=%u flags=0x%x%s",
+                          mi, (unsigned)mflags,
+                          (mflags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " ReBAR" : " VRAM");
+            }
+            return 0;
+        }
+    }
+}
+
+static VkBuffer mem_to_buf(VulkanCtx* ctx, void* mem)
+{
+    if (mem == ctx->mem_x) return (VkBuffer)ctx->buf_x;
+    if (mem == ctx->mem_y) return (VkBuffer)ctx->buf_y;
+    if (mem == ctx->mem_o0) return (VkBuffer)ctx->buf_o0;
+    if (mem == ctx->mem_o1) return (VkBuffer)ctx->buf_o1;
+    if (mem == ctx->mem_o2) return (VkBuffer)ctx->buf_o2;
+    if (mem == ctx->mem_wn) return (VkBuffer)ctx->buf_wn;
+    if (mem == ctx->mem_wq) return (VkBuffer)ctx->buf_wq;
+    if (mem == ctx->mem_kv) return (VkBuffer)ctx->buf_kv;
+    if (mem == ctx->mem_bias) return (VkBuffer)ctx->buf_bias;
+    if (mem == ctx->mem_logits) return (VkBuffer)ctx->buf_logits;
+    if (mem == ctx->mem_emb) return (VkBuffer)ctx->buf_emb;
+    return VK_NULL_HANDLE;
 }
 
 static void* vk_map_slot(VulkanCtx* ctx, void* mem, size_t off)
@@ -339,6 +507,52 @@ static int create_compute_pipeline(VulkanCtx* ctx, const char* spv_name,
     return 0;
 }
 
+static void cmd_barrier_host_to_shader(VkCommandBuffer cmd, VkBuffer buf)
+{
+    VulkanApi* a = vulkan_api();
+    VkBufferMemoryBarrier bb = {0};
+    if (!buf) return;
+    bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = buf;
+    bb.size = VK_WHOLE_SIZE;
+    a->CmdPipelineBarrier(cmd,
+                          VK_PIPELINE_STAGE_HOST_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 0, NULL, 1, &bb, 0, NULL);
+}
+
+static void cmd_barrier_shader_to_host(VkCommandBuffer cmd, VkBuffer buf)
+{
+    VulkanApi* a = vulkan_api();
+    VkBufferMemoryBarrier bb = {0};
+    if (!buf) return;
+    bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = buf;
+    bb.size = VK_WHOLE_SIZE;
+    a->CmdPipelineBarrier(cmd,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 0, NULL, 1, &bb, 0, NULL);
+}
+static void host_flush_mem(VulkanCtx* ctx, void* mem)
+{
+    VulkanApi* a = vulkan_api();
+    VkMappedMemoryRange rng = {0};
+    if (!ctx || !mem || !a->FlushMappedMemoryRanges) return;
+    rng.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    rng.memory = (VkDeviceMemory)mem;
+    rng.size = VK_WHOLE_SIZE;
+    a->FlushMappedMemoryRanges((VkDevice)ctx->device, 1, &rng);
+}
+
 static int submit_and_wait(VulkanCtx* ctx, VkCommandBuffer cmd)
 {
     VulkanApi* a = vulkan_api();
@@ -352,19 +566,266 @@ static int submit_and_wait(VulkanCtx* ctx, VkCommandBuffer cmd)
     if (a->QueueSubmit((VkQueue)ctx->queue, 1, &si, fence) != VK_SUCCESS) return -1;
     if (a->WaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull) != VK_SUCCESS)
         return -1;
+    if (a->InvalidateMappedMemoryRanges) {
+        VkDeviceMemory mems[8];
+        VkMappedMemoryRange rng[8];
+        uint32_t n = 0, i;
+        if (ctx->map_x) mems[n++] = (VkDeviceMemory)ctx->mem_x;
+        if (ctx->map_y) mems[n++] = (VkDeviceMemory)ctx->mem_y;
+        if (ctx->map_o0) mems[n++] = (VkDeviceMemory)ctx->mem_o0;
+        if (ctx->map_o1) mems[n++] = (VkDeviceMemory)ctx->mem_o1;
+        if (ctx->map_o2) mems[n++] = (VkDeviceMemory)ctx->mem_o2;
+        if (ctx->map_kv) mems[n++] = (VkDeviceMemory)ctx->mem_kv;
+        if (ctx->map_logits) mems[n++] = (VkDeviceMemory)ctx->mem_logits;
+        if (ctx->map_stage) mems[n++] = (VkDeviceMemory)ctx->mem_stage;
+        memset(rng, 0, sizeof(rng));
+        for (i = 0; i < n; i++) {
+            rng[i].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            rng[i].memory = mems[i];
+            rng[i].size = VK_WHOLE_SIZE;
+        }
+        if (n) a->InvalidateMappedMemoryRanges(dev, n, rng);
+    }
     if (ctx->prof_on) ctx->prof_submit_n++;
     return 0;
 }
 
+static void host_invalidate_scratch(VulkanCtx* ctx)
+{
+    VulkanApi* a = vulkan_api();
+    VkDevice dev;
+    VkDeviceMemory mems[8];
+    VkMappedMemoryRange rng[8];
+    uint32_t n = 0, i;
+    if (!ctx || !a->InvalidateMappedMemoryRanges) return;
+    dev = (VkDevice)ctx->device;
+    if (ctx->map_x) mems[n++] = (VkDeviceMemory)ctx->mem_x;
+    if (ctx->map_y) mems[n++] = (VkDeviceMemory)ctx->mem_y;
+    if (ctx->map_o0) mems[n++] = (VkDeviceMemory)ctx->mem_o0;
+    if (ctx->map_o1) mems[n++] = (VkDeviceMemory)ctx->mem_o1;
+    if (ctx->map_o2) mems[n++] = (VkDeviceMemory)ctx->mem_o2;
+    if (ctx->map_kv) mems[n++] = (VkDeviceMemory)ctx->mem_kv;
+    if (ctx->map_logits) mems[n++] = (VkDeviceMemory)ctx->mem_logits;
+    if (ctx->map_stage) mems[n++] = (VkDeviceMemory)ctx->mem_stage;
+    memset(rng, 0, sizeof(rng));
+    for (i = 0; i < n; i++) {
+        rng[i].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        rng[i].memory = mems[i];
+        rng[i].size = VK_WHOLE_SIZE;
+    }
+    if (n) a->InvalidateMappedMemoryRanges(dev, n, rng);
+}
+
+/* finish=0: 只 submit, 用 semaphore 链到下一次; finish=1: 等 fence 并清 tokb_i */
+static int submit_chained(VulkanCtx* ctx, VkCommandBuffer cmd, int finish)
+{
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    VkFence fence = finish ? (VkFence)ctx->fence : VK_NULL_HANDLE;
+    VkSubmitInfo si = {0};
+    VkPipelineStageFlags wait_st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSemaphore wait_sem = VK_NULL_HANDLE;
+    VkSemaphore sig_sem = VK_NULL_HANDLE;
+
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (ctx->tokb_i > 0 && ctx->sem_ring && ctx->tokb_i - 1u < ctx->cmd_n) {
+        wait_sem = (VkSemaphore)ctx->sem_ring[ctx->tokb_i - 1u];
+        if (wait_sem) {
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores = &wait_sem;
+            si.pWaitDstStageMask = &wait_st;
+        }
+    }
+    if (!finish && ctx->sem_ring && ctx->tokb_i < ctx->cmd_n) {
+        sig_sem = (VkSemaphore)ctx->sem_ring[ctx->tokb_i];
+        if (sig_sem) {
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &sig_sem;
+        }
+    }
+    if (finish && fence) a->ResetFences(dev, 1, &fence);
+    if (a->QueueSubmit((VkQueue)ctx->queue, 1, &si, fence) != VK_SUCCESS) return -1;
+    ctx->tokb_i++;
+    if (finish) {
+        if (!fence) {
+            a->QueueWaitIdle((VkQueue)ctx->queue);
+        } else if (a->WaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull) != VK_SUCCESS)
+            return -1;
+        host_invalidate_scratch(ctx);
+        ctx->tokb_i = 0;
+        if (ctx->prof_on) ctx->prof_submit_n++;
+    } else if (ctx->prof_on) {
+        ctx->prof_submit_n++;
+    }
+    return 0;
+}
+
+static VkCommandBuffer tokb_cmd(VulkanCtx* ctx)
+{
+    if (ctx && ctx->tokb_chain && ctx->cmd_ring && ctx->tokb_i < ctx->cmd_n &&
+        ctx->cmd_ring[ctx->tokb_i])
+        return (VkCommandBuffer)ctx->cmd_ring[ctx->tokb_i];
+    return ctx ? (VkCommandBuffer)ctx->cmd : VK_NULL_HANDLE;
+}
+
+static int stage_copy(VulkanCtx* ctx, VkBuffer dst, const void* src, size_t nbytes, int h2d)
+{
+    VulkanApi* a = vulkan_api();
+    VkBuffer stg;
+    VkBufferCopy cp;
+    if (!ctx || !ctx->map_stage || !ctx->buf_stage || nbytes == 0) return -1;
+    if (nbytes > ctx->stage_bytes) return -1;
+    stg = (VkBuffer)ctx->buf_stage;
+    if (h2d) {
+        memcpy(ctx->map_stage, src, nbytes);
+        host_flush_mem(ctx, ctx->mem_stage);
+    }
+    if (ctx->cmd_open) {
+        VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+        VkBufferMemoryBarrier bb = {0};
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.size = VK_WHOLE_SIZE;
+        if (h2d) {
+            bb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bb.buffer = stg;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        } else {
+            bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bb.buffer = dst;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        }
+        memset(&cp, 0, sizeof(cp));
+        cp.size = nbytes;
+        if (h2d) a->CmdCopyBuffer(cmd, stg, dst, 1, &cp);
+        else a->CmdCopyBuffer(cmd, dst, stg, 1, &cp);
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        if (h2d) {
+            bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            bb.buffer = dst;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        } else {
+            bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            bb.buffer = stg;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        }
+        return 0;
+    }
+    {
+        VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+        VkCommandBufferBeginInfo bi = {0};
+        VkBufferMemoryBarrier bb = {0};
+        a->ResetCommandBuffer(cmd, 0);
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        a->BeginCommandBuffer(cmd, &bi);
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.size = VK_WHOLE_SIZE;
+        if (h2d) {
+            bb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bb.buffer = stg;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        }
+        memset(&cp, 0, sizeof(cp));
+        cp.size = nbytes;
+        if (h2d) a->CmdCopyBuffer(cmd, stg, dst, 1, &cp);
+        else a->CmdCopyBuffer(cmd, dst, stg, 1, &cp);
+        if (!h2d) {
+            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            bb.buffer = stg;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        } else {
+            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            bb.buffer = dst;
+            a->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bb, 0, NULL);
+        }
+        if (a->EndCommandBuffer(cmd) != VK_SUCCESS) return -1;
+        if (submit_and_wait(ctx, cmd) != 0) return -1;
+    }
+    if (!h2d) {
+        if (a->InvalidateMappedMemoryRanges && ctx->mem_stage) {
+            VkMappedMemoryRange rng = {0};
+            rng.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            rng.memory = (VkDeviceMemory)ctx->mem_stage;
+            rng.size = VK_WHOLE_SIZE;
+            a->InvalidateMappedMemoryRanges((VkDevice)ctx->device, 1, &rng);
+        }
+    }
+    return 0;
+}
+
+static int map_copy(VulkanCtx* ctx, void* mem, const void* src, size_t nbytes);
+static int map_read(VulkanCtx* ctx, void* mem, void* dst, size_t nbytes);
+
 void vulkan_gpu_discard(VulkanCtx* ctx)
 {
-    (void)ctx;
+    if (!ctx || !ctx->cmd_open) return;
+    VulkanApi* a = vulkan_api();
+    a->ResetCommandBuffer((VkCommandBuffer)ctx->cmd, 0);
+    ctx->cmd_open = 0;
 }
 
 int vulkan_gpu_flush(VulkanCtx* ctx)
 {
-    (void)ctx;
+    if (!ctx) return 0;
+    if (ctx->tokb_i > 0 && ctx->tokb_chain) {
+        /* 半截 token: 等队列清空, 避免 semaphore 残留 signaled */
+        VulkanApi* a = vulkan_api();
+        if (ctx->queue && a->QueueWaitIdle)
+            a->QueueWaitIdle((VkQueue)ctx->queue);
+        ctx->tokb_i = 0;
+        ctx->cmd_open = 0;
+        return 0;
+    }
+    if (!ctx->cmd_open) return 0;
+    VulkanApi* a = vulkan_api();
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+    ctx->cmd_open = 0;
     return 0;
+}
+
+static uint32_t norm_w_off1(VulkanCtx* ctx, uint32_t layer)
+{
+    return (layer - 1u) * 2u * ctx->hidden;
+}
+
+static uint32_t norm_w_off2(VulkanCtx* ctx, uint32_t layer)
+{
+    return norm_w_off1(ctx, layer) + ctx->hidden;
+}
+
+static uint32_t norm_w_final(VulkanCtx* ctx)
+{
+    return ctx->n_blocks * 2u * ctx->hidden;
+}
+
+static uint32_t tokb_group(VulkanCtx* ctx)
+{
+    /* 默认 1: 多层同一 CB 在 NVIDIA 上数值错误。YLLM_VK_TOKB_GRP 才合并录制 */
+    const char* eg = getenv("YLLM_VK_TOKB_GRP");
+    uint32_t grp = eg ? (uint32_t)atoi(eg) : 1u;
+    if (grp < 1u) grp = 1u;
+    if (ctx->n_blocks && grp > ctx->n_blocks) grp = ctx->n_blocks;
+    return grp;
 }
 
 int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
@@ -388,7 +849,11 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
     ctx->wq_nslot = nslot ? nslot : 24;
     ctx->x_bytes = (size_t)max_in * 4;
     ctx->y_bytes = (size_t)max_out * 4;
-    ctx->wn_bytes = (size_t)hidden * 4;
+    {
+        uint32_t nb = ctx->n_blocks ? ctx->n_blocks
+                                    : (n_layers > 3u ? n_layers - 3u : 1u);
+        ctx->wn_bytes = (size_t)(2u * nb + 1u) * hidden * 4;
+    }
     /* 至少留 8 行自检空间 */
     if (total_wq_bytes < 144 * 8) total_wq_bytes = 144 * 8;
     /* 4 字节对齐(uint SSBO) */
@@ -406,8 +871,8 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
 
     VkBuffer bx = VK_NULL_HANDLE, by = VK_NULL_HANDLE;
     VkDeviceMemory mx = VK_NULL_HANDLE, my = VK_NULL_HANDLE;
-    if (create_host_buffer(ctx, ctx->x_bytes, &bx, &mx, &ctx->map_x) != 0) return -1;
-    if (create_host_buffer(ctx, ctx->y_bytes, &by, &my, &ctx->map_y) != 0) return -1;
+    if (create_scratch_buffer(ctx, ctx->x_bytes, &bx, &mx, &ctx->map_x) != 0) return -1;
+    if (create_scratch_buffer(ctx, ctx->y_bytes, &by, &my, &ctx->map_y) != 0) return -1;
     ctx->buf_x = (void*)bx; ctx->mem_x = (void*)mx;
     ctx->buf_y = (void*)by; ctx->mem_y = (void*)my;
 
@@ -422,10 +887,42 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
     cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cai.commandPool = cmdpool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (a->AllocateCommandBuffers(dev, &cai, &cmd) != VK_SUCCESS) return -1;
-    ctx->cmd = (void*)cmd;
+    {
+        uint32_t ncmd = n_layers + 8u;
+        uint32_t i;
+        VkCommandBuffer tmp[256];
+        if (ncmd < 8u) ncmd = 8u;
+        if (ncmd > 256u) ncmd = 256u;
+        cai.commandBufferCount = ncmd;
+        if (a->AllocateCommandBuffers(dev, &cai, tmp) != VK_SUCCESS) {
+            cai.commandBufferCount = 1;
+            if (a->AllocateCommandBuffers(dev, &cai, tmp) != VK_SUCCESS) return -1;
+            ncmd = 1;
+        }
+        ctx->cmd_n = ncmd;
+        ctx->cmd = (void*)tmp[0];
+        ctx->cmd_ring = (void**)calloc(ncmd, sizeof(void*));
+        if (ctx->cmd_ring) {
+            for (i = 0; i < ncmd; i++) ctx->cmd_ring[i] = (void*)tmp[i];
+        }
+        ctx->tokb_i = 0;
+        ctx->tokb_chain = 0;
+        ctx->sem_ring = (void**)calloc(ncmd, sizeof(void*));
+        if (ctx->sem_ring && a->CreateSemaphore && ncmd > 1u) {
+            VkSemaphoreCreateInfo sci = {0};
+            sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            for (i = 0; i < ncmd; i++) {
+                VkSemaphore s = VK_NULL_HANDLE;
+                if (a->CreateSemaphore(dev, &sci, NULL, &s) != VK_SUCCESS) {
+                    ctx->tokb_chain = 0;
+                    break;
+                }
+                ctx->sem_ring[i] = (void*)s;
+            }
+            if (i == ncmd && ctx->cmd_ring) ctx->tokb_chain = 1;
+        }
+        ctx->tokb_i = 0;
+    }
     VkFenceCreateInfo fi = {0};
     fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence = VK_NULL_HANDLE;
@@ -533,15 +1030,29 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
             }
         }
         if (create_host_buffer(ctx, ctx->wq_bytes, &bw, &mw, &ctx->map_wq) != 0 ||
-            create_host_buffer(ctx, ctx->y_bytes, &bo0, &mo0, &ctx->map_o0) != 0 ||
-            create_host_buffer(ctx, ctx->y_bytes, &bo1, &mo1, &ctx->map_o1) != 0 ||
-            create_host_buffer(ctx, ctx->y_bytes, &bo2, &mo2, &ctx->map_o2) != 0) {
+            create_scratch_buffer(ctx, ctx->y_bytes, &bo0, &mo0, &ctx->map_o0) != 0 ||
+            create_scratch_buffer(ctx, ctx->y_bytes, &bo1, &mo1, &ctx->map_o1) != 0 ||
+            create_scratch_buffer(ctx, ctx->y_bytes, &bo2, &mo2, &ctx->map_o2) != 0) {
             ylog_warn("vulkan: gemv buffers alloc failed");
         } else {
             ctx->buf_wq = (void*)bw; ctx->mem_wq = (void*)mw;
             ctx->buf_o0 = (void*)bo0; ctx->mem_o0 = (void*)mo0;
             ctx->buf_o1 = (void*)bo1; ctx->mem_o1 = (void*)mo1;
             ctx->buf_o2 = (void*)bo2; ctx->mem_o2 = (void*)mo2;
+            ctx->stage_bytes = ctx->y_bytes;
+            if (ctx->x_bytes > ctx->stage_bytes) ctx->stage_bytes = ctx->x_bytes;
+            if (ctx->logits_bytes > ctx->stage_bytes) ctx->stage_bytes = ctx->logits_bytes;
+            {
+                VkBuffer bst = VK_NULL_HANDLE;
+                VkDeviceMemory mst = VK_NULL_HANDLE;
+                if (create_host_buffer(ctx, ctx->stage_bytes, &bst, &mst, &ctx->map_stage) != 0) {
+                    ylog_warn("vulkan: staging buffer alloc failed");
+                    ctx->map_stage = NULL;
+                } else {
+                    ctx->buf_stage = (void*)bst;
+                    ctx->mem_stage = (void*)mst;
+                }
+            }
             VkBuffer bufs[3] = { bx, by, bw };
             size_t ranges[3] = { ctx->x_bytes, ctx->y_bytes, ctx->wq_bytes };
             VkShaderModule sh = VK_NULL_HANDLE;
@@ -742,6 +1253,7 @@ int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes)
     if (bytes > ctx->wq_bytes) return -1;
     if (ctx->map_wq) {
         memcpy(ctx->map_wq, blob, bytes);
+        host_flush_mem(ctx, ctx->mem_wq);
     } else {
         VulkanApi* a = vulkan_api();
         VkDevice dev = (VkDevice)ctx->device;
@@ -769,6 +1281,7 @@ int vulkan_wq_upload_range(VulkanCtx* ctx, const void* src, size_t dst_off, size
     if (dst_off + bytes > ctx->wq_bytes) return -1;
     if (ctx->map_wq) {
         memcpy((uint8_t*)ctx->map_wq + dst_off, src, bytes);
+        host_flush_mem(ctx, ctx->mem_wq);
         return 0;
     }
     VulkanApi* a = vulkan_api();
@@ -809,6 +1322,7 @@ int vulkan_stream_layer(VulkanCtx* ctx, uint32_t layer)
     if (nbytes > ctx->wq_bytes) nbytes = ctx->wq_bytes;
     if (ctx->map_wq) {
         memcpy(ctx->map_wq, ctx->host_wq + (size_t)lo, nbytes);
+        host_flush_mem(ctx, ctx->mem_wq);
     } else {
         const size_t chunk = 16u * 1024u * 1024u;
         size_t done = 0;
@@ -841,23 +1355,8 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
     size_t nbytes = (size_t)n * 4;
-
-    if (ctx->map_x) memcpy(ctx->map_x, x, nbytes);
-    else {
-        void* px = NULL;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, nbytes, 0, &px) != VK_SUCCESS)
-            return -1;
-        memcpy(px, x, nbytes);
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
-    }
-    if (ctx->map_wn) memcpy(ctx->map_wn, w, nbytes);
-    else {
-        void* pw = NULL;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wn, 0, nbytes, 0, &pw) != VK_SUCCESS)
-            return -1;
-        memcpy(pw, w, nbytes);
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_wn);
-    }
+    if (map_copy(ctx, ctx->mem_x, x, nbytes) != 0) return -1;
+    if (map_copy(ctx, ctx->mem_wn, w, nbytes) != 0) return -1;
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     a->ResetCommandBuffer(cmd, 0);
@@ -865,6 +1364,8 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     a->BeginCommandBuffer(cmd, &bi);
+    cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_x);
+    cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wn);
     a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->rms_pipeline);
     VkDescriptorSet ds = (VkDescriptorSet)ctx->rms_desc_set;
     a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -872,20 +1373,16 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
     RmsPush push;
     push.n = n;
     push.eps = eps;
+    push.w_off = 0;
+    push._pad = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->rms_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, 1, 1, 1);
+    cmd_barrier_shader_to_host(cmd, (VkBuffer)ctx->buf_y);
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    if (ctx->map_y) memcpy(y, ctx->map_y, nbytes);
-    else {
-        void* py = NULL;
-        if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_y, 0, nbytes, 0, &py) != VK_SUCCESS)
-            return -1;
-        memcpy(y, py, nbytes);
-        a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
-    }
+    if (map_read(ctx, ctx->mem_y, y, nbytes) != 0) return -1;
     return 0;
 }
 
@@ -897,7 +1394,7 @@ int vulkan_k_rmsnorm_inplace(VulkanCtx* ctx, const float* w, uint32_t n, float e
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
     size_t nbytes = (size_t)n * 4;
-    if (ctx->map_wn) memcpy(ctx->map_wn, w, nbytes);
+    if (ctx->map_wn) { memcpy(ctx->map_wn, w, nbytes); host_flush_mem(ctx, ctx->mem_wn); }
     else {
         void* pw = NULL;
         if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_wn, 0, nbytes, 0, &pw) != VK_SUCCESS)
@@ -918,6 +1415,8 @@ int vulkan_k_rmsnorm_inplace(VulkanCtx* ctx, const float* w, uint32_t n, float e
     RmsPush push;
     push.n = n;
     push.eps = eps;
+    push.w_off = 0;
+    push._pad = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->rms_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, 1, 1, 1);
@@ -948,15 +1447,7 @@ int vulkan_k_lm_gemv(VulkanCtx* ctx, float* y, const float* x, int x_on_dev,
 
     if (!x_on_dev) {
         if (!x) return -1;
-        void* px = vk_map_slot(ctx, ctx->mem_x, 0);
-        if (px) memcpy(px, x, xbytes);
-        else {
-            void* tmp = NULL;
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, xbytes, 0, &tmp) != VK_SUCCESS)
-                return -1;
-            memcpy(tmp, x, xbytes);
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
-        }
+        if (map_copy(ctx, ctx->mem_x, x, xbytes) != 0) return -1;
         ctx->x_on_dev = 1;
     }
 
@@ -975,7 +1466,7 @@ int vulkan_k_lm_gemv(VulkanCtx* ctx, float* y, const float* x, int x_on_dev,
     push.out_n = vocab;
     push.in_n = hidden;
     push.w_off = (uint32_t)w_byte_off;
-    push._pad = 0;
+    push.serial = gemv_serial_flag(ctx);
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, vocab, 1, 1);
@@ -1019,14 +1510,9 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
 
     {
         void* px = vk_map_slot(ctx, xmem, 0);
-        if (px) memcpy(px, x, xbytes);
-        else {
-            void* tmp = NULL;
-            if (a->MapMemory(dev, (VkDeviceMemory)xmem, 0, xbytes, 0, &tmp) != VK_SUCCESS)
-                return -1;
-            memcpy(tmp, x, xbytes);
-            a->UnmapMemory(dev, (VkDeviceMemory)xmem);
-        }
+        if (px) { memcpy(px, x, xbytes); host_flush_mem(ctx, xmem); }
+        else if (map_copy(ctx, xmem, x, xbytes) != 0)
+            return -1;
     }
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
@@ -1035,6 +1521,8 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     a->BeginCommandBuffer(cmd, &bi);
+    cmd_barrier_host_to_shader(cmd, (VkBuffer)(wide ? ctx->buf_y : ctx->buf_x));
+    cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wq);
     a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->gemv_pipeline);
     VkDescriptorSet ds = (VkDescriptorSet)dset;
     a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1043,24 +1531,15 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     push.out_n = out;
     push.in_n = in;
     push.w_off = (uint32_t)w_byte_off;
-    push._pad = 0;
+    push.serial = gemv_serial_flag(ctx);
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, out, 1, 1);
+    cmd_barrier_shader_to_host(cmd, (VkBuffer)(wide ? ctx->buf_o0 : ctx->buf_y));
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    {
-        void* py = vk_map_slot(ctx, ymem, 0);
-        if (py) memcpy(y, py, ybytes);
-        else {
-            void* tmp = NULL;
-            if (a->MapMemory(dev, (VkDeviceMemory)ymem, 0, ybytes, 0, &tmp) != VK_SUCCESS)
-                return -1;
-            memcpy(y, tmp, ybytes);
-            a->UnmapMemory(dev, (VkDeviceMemory)ymem);
-        }
-    }
+    if (map_read(ctx, ymem, y, ybytes) != 0) return -1;
     return 0;
 }
 
@@ -1080,17 +1559,7 @@ int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,
     size_t xbytes = (size_t)in * 4;
     size_t ybytes = (size_t)out * 4;
 
-    {
-        void* px = vk_map_slot(ctx, ctx->mem_x, 0);
-        if (px) memcpy(px, x, xbytes);
-        else {
-            void* tmp = NULL;
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, xbytes, 0, &tmp) != VK_SUCCESS)
-                return -1;
-            memcpy(tmp, x, xbytes);
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
-        }
-    }
+    if (map_copy(ctx, ctx->mem_x, x, xbytes) != 0) return -1;
 
     VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
     a->ResetCommandBuffer(cmd, 0);
@@ -1106,24 +1575,14 @@ int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,
     push.out_n = out;
     push.in_n = in;
     push.w_off = (uint32_t)w_byte_off;
-    push._pad = 0;
+    push.serial = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, out, 1, 1);
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    {
-        void* py = vk_map_slot(ctx, ctx->mem_y, 0);
-        if (py) memcpy(y, py, ybytes);
-        else {
-            void* tmp = NULL;
-            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_y, 0, ybytes, 0, &tmp) != VK_SUCCESS)
-                return -1;
-            memcpy(y, tmp, ybytes);
-            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
-        }
-    }
+    if (map_read(ctx, ctx->mem_y, y, ybytes) != 0) return -1;
     return 0;
 }
 
@@ -1135,7 +1594,10 @@ int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
     if (ctx->wq_resident) return -1;
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
     if (wbytes > ctx->wq_bytes) return -1;
-    if (ctx->map_wq) memcpy(ctx->map_wq, w, wbytes);
+    if (ctx->map_wq) {
+        memcpy(ctx->map_wq, w, wbytes);
+        host_flush_mem(ctx, ctx->mem_wq);
+    }
     else {
         VulkanApi* a = vulkan_api();
         VkDevice dev = (VkDevice)ctx->device;
@@ -1154,14 +1616,59 @@ static void cmd_barrier_compute(VkCommandBuffer cmd)
     VkMemoryBarrier mb = {0};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     a->CmdPipelineBarrier(cmd,
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-static void cmd_rmsnorm(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n, float eps)
+static void cmd_barrier_buf(VkCommandBuffer cmd, VkBuffer buf, VkDeviceSize sz)
+{
+    if (!buf || sz == 0) return;
+    VulkanApi* a = vulkan_api();
+    VkBufferMemoryBarrier bb = {0};
+    bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = buf;
+    bb.offset = 0;
+    bb.size = VK_WHOLE_SIZE;
+    (void)sz;
+    a->CmdPipelineBarrier(cmd,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 0, NULL, 1, &bb, 0, NULL);
+}
+
+static void cmd_barrier_layer(VulkanCtx* ctx, VkCommandBuffer cmd)
+{
+    VulkanApi* a = vulkan_api();
+    VkMemoryBarrier mb = {0};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    a->CmdPipelineBarrier(cmd,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          0, 1, &mb, 0, NULL, 0, NULL);
+    cmd_barrier_buf(cmd, (VkBuffer)ctx->buf_x, (VkDeviceSize)ctx->x_bytes);
+    cmd_barrier_buf(cmd, (VkBuffer)ctx->buf_y, (VkDeviceSize)ctx->y_bytes);
+    if (ctx->buf_o0)
+        cmd_barrier_buf(cmd, (VkBuffer)ctx->buf_o0, (VkDeviceSize)ctx->y_bytes);
+    if (ctx->buf_o1)
+        cmd_barrier_buf(cmd, (VkBuffer)ctx->buf_o1, (VkDeviceSize)ctx->y_bytes);
+    if (ctx->buf_o2)
+        cmd_barrier_buf(cmd, (VkBuffer)ctx->buf_o2, (VkDeviceSize)ctx->y_bytes);
+    if (ctx->buf_kv)
+        cmd_barrier_buf(cmd, (VkBuffer)ctx->buf_kv, (VkDeviceSize)ctx->kv_bytes);
+}
+
+static void cmd_rmsnorm(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n, float eps,
+                        uint32_t w_off)
 {
     VulkanApi* a = vulkan_api();
     a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->rms_pipeline);
@@ -1171,12 +1678,15 @@ static void cmd_rmsnorm(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n, float e
     RmsPush push;
     push.n = n;
     push.eps = eps;
+    push.w_off = w_off;
+    push._pad = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->rms_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, 1, 1, 1);
 }
 
-static void cmd_rmsnorm_inplace(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n, float eps)
+static void cmd_rmsnorm_inplace(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n, float eps,
+                                uint32_t w_off)
 {
     VulkanApi* a = vulkan_api();
     a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->rms_pipeline);
@@ -1186,6 +1696,8 @@ static void cmd_rmsnorm_inplace(VulkanCtx* ctx, VkCommandBuffer cmd, uint32_t n,
     RmsPush push;
     push.n = n;
     push.eps = eps;
+    push.w_off = w_off;
+    push._pad = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->rms_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, 1, 1, 1);
@@ -1217,7 +1729,7 @@ static void cmd_gemv_q6k(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
     push.out_n = out;
     push.in_n = in;
     push.w_off = w_off;
-    push._pad = 0;
+    push.serial = 0;
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, out, 1, 1);
@@ -1235,7 +1747,7 @@ static void cmd_gemv(VulkanCtx* ctx, VkCommandBuffer cmd, void* dset,
     push.out_n = out;
     push.in_n = in;
     push.w_off = w_off;
-    push._pad = 0;
+    push.serial = gemv_serial_flag(ctx);
     a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     a->CmdDispatch(cmd, out, 1, 1);
@@ -1246,15 +1758,14 @@ static int map_copy(VulkanCtx* ctx, void* mem, const void* src, size_t nbytes)
     void* p = vk_map_slot(ctx, mem, 0);
     if (p) {
         memcpy(p, src, nbytes);
+        host_flush_mem(ctx, mem);
         return 0;
     }
-    VulkanApi* a = vulkan_api();
-    void* tmp = NULL;
-    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &tmp) != VK_SUCCESS)
-        return -1;
-    memcpy(tmp, src, nbytes);
-    a->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem);
-    return 0;
+    {
+        VkBuffer dst = mem_to_buf(ctx, mem);
+        if (!dst || stage_copy(ctx, dst, src, nbytes, 1) != 0) return -1;
+        return 0;
+    }
 }
 
 /* final norm(in-place) + 可选 q8k + lm gemv → logits; 单次 submit */
@@ -1263,8 +1774,9 @@ int vulkan_k_lm_fused(VulkanCtx* ctx, float* y, const float* w_norm,
                       uint64_t w_byte_off, uint32_t dtype,
                       int upload_x, const float* host_x)
 {
-    if (!ctx || !ctx->rms_ds_inplace || !ctx->gemv_ds_lm || !ctx->map_logits || !y || !w_norm)
+    if (!ctx || !ctx->rms_ds_inplace || !ctx->gemv_ds_lm || !ctx->map_logits || !y)
         return -1;
+    if (!ctx->norm_ready && !w_norm) return -1;
     if (vocab == 0 || hidden == 0 || (hidden % 256) != 0) return -1;
     if ((size_t)vocab * 4 > ctx->logits_bytes) return -1;
 
@@ -1286,24 +1798,42 @@ int vulkan_k_lm_fused(VulkanCtx* ctx, float* y, const float* w_norm,
     VkDevice dev = (VkDevice)ctx->device;
     size_t xbytes = (size_t)hidden * 4;
     size_t wnbytes = (size_t)hidden * 4;
+    uint32_t w_off = ctx->norm_ready ? norm_w_final(ctx) : 0u;
 
-    if (upload_x && host_x) {
+    if (upload_x && host_x && !ctx->cmd_open) {
         if (map_copy(ctx, ctx->mem_x, host_x, xbytes) != 0) return -1;
         ctx->x_on_dev = 1;
-    } else if (!ctx->x_on_dev) {
+    } else if (!ctx->x_on_dev && !ctx->cmd_open) {
         return -1;
     }
 
-    if (map_copy(ctx, ctx->mem_wn, w_norm, wnbytes) != 0) return -1;
+    if (!ctx->norm_ready) {
+        if (map_copy(ctx, ctx->mem_wn, w_norm, wnbytes) != 0) return -1;
+    }
 
-    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
-    a->ResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo bi = {0};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    a->BeginCommandBuffer(cmd, &bi);
+    VkCommandBuffer cmd;
+    if (ctx->tokb_chain && ctx->tokb_i > 0 && !ctx->cmd_open) {
+        cmd = tokb_cmd(ctx);
+        a->ResetCommandBuffer(cmd, 0);
+        {
+            VkCommandBufferBeginInfo bi = {0};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            a->BeginCommandBuffer(cmd, &bi);
+        }
+    } else if (!ctx->cmd_open) {
+        cmd = (VkCommandBuffer)ctx->cmd;
+        a->ResetCommandBuffer(cmd, 0);
+        VkCommandBufferBeginInfo bi = {0};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        a->BeginCommandBuffer(cmd, &bi);
+    } else {
+        cmd = (VkCommandBuffer)ctx->cmd;
+        cmd_barrier_layer(ctx, cmd);
+    }
 
-    cmd_rmsnorm_inplace(ctx, cmd, hidden, eps);
+    cmd_rmsnorm_inplace(ctx, cmd, hidden, eps, w_off);
     cmd_barrier_compute(cmd);
     if (q6) {
         cmd_q8k_quant(ctx, cmd, hidden);
@@ -1315,7 +1845,12 @@ int vulkan_k_lm_fused(VulkanCtx* ctx, float* y, const float* w_norm,
         cmd_gemv(ctx, cmd, ctx->gemv_ds_lm, vocab, hidden, (uint32_t)w_byte_off);
 
     a->EndCommandBuffer(cmd);
-    if (submit_and_wait(ctx, cmd) != 0) return -1;
+    if (ctx->tokb_chain && ctx->tokb_i > 0) {
+        if (submit_chained(ctx, cmd, 1) != 0) return -1;
+    } else if (submit_and_wait(ctx, cmd) != 0) {
+        return -1;
+    }
+    ctx->cmd_open = 0;
 
     ctx->x_on_dev = 1;
     size_t ybytes = (size_t)vocab * 4;
@@ -1337,13 +1872,12 @@ static int map_read(VulkanCtx* ctx, void* mem, void* dst, size_t nbytes)
         memcpy(dst, p, nbytes);
         return 0;
     }
-    VulkanApi* a = vulkan_api();
-    void* tmp = NULL;
-    if (a->MapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem, 0, nbytes, 0, &tmp) != VK_SUCCESS)
-        return -1;
-    memcpy(dst, tmp, nbytes);
-    a->UnmapMemory((VkDevice)ctx->device, (VkDeviceMemory)mem);
-    return 0;
+    {
+        VkBuffer srcb = mem_to_buf(ctx, mem);
+        if (!srcb || stage_copy(ctx, srcb, NULL, nbytes, 0) != 0) return -1;
+        memcpy(dst, ctx->map_stage, nbytes);
+        return 0;
+    }
 }
 
 int vulkan_k_embed_q4k(VulkanCtx* ctx, float* host_y, const uint8_t* table,
@@ -1407,7 +1941,7 @@ int vulkan_fused_norm_qkv(VulkanCtx* ctx,
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     a->BeginCommandBuffer(cmd, &bi);
-    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_rmsnorm(ctx, cmd, hidden, eps, 0);
     cmd_barrier_compute(cmd);
     /* Q/K/V 只读 buf_y, 写不同 o* — 可并行 dispatch */
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
@@ -1444,7 +1978,7 @@ int vulkan_fused_norm_gate_up(VulkanCtx* ctx,
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     a->BeginCommandBuffer(cmd, &bi);
-    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_rmsnorm(ctx, cmd, hidden, eps, 0);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, inter, hidden, (uint32_t)off_gate);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, inter, hidden, (uint32_t)off_up);
@@ -1538,7 +2072,7 @@ int vulkan_fused_ffn(VulkanCtx* ctx,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     a->BeginCommandBuffer(cmd, &bi);
 
-    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_rmsnorm(ctx, cmd, hidden, eps, 0);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, inter, hidden, (uint32_t)off_gate);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, inter, hidden, (uint32_t)off_up);
@@ -1721,13 +2255,26 @@ int vulkan_attn_setup(VulkanCtx* ctx, uint32_t n_blocks, uint32_t max_seq,
 
     VkBuffer bkv = VK_NULL_HANDLE;
     VkDeviceMemory mkv = VK_NULL_HANDLE;
-    if (create_host_buffer(ctx, ctx->kv_bytes, &bkv, &mkv, &ctx->map_kv) != 0) {
+    if (create_scratch_buffer(ctx, ctx->kv_bytes, &bkv, &mkv, &ctx->map_kv) != 0) {
         if (err && errlen) snprintf(err, errlen, "kv buffer alloc %zu", ctx->kv_bytes);
         return -1;
     }
     ctx->buf_kv = (void*)bkv;
     ctx->mem_kv = (void*)mkv;
     if (ctx->map_kv) memset(ctx->map_kv, 0, ctx->kv_bytes);
+    else {
+        VulkanApi* a = vulkan_api();
+        VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+        VkCommandBufferBeginInfo bi = {0};
+        if (!a->CmdFillBuffer || !ctx->cmd) return -1;
+        a->ResetCommandBuffer(cmd, 0);
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        a->BeginCommandBuffer(cmd, &bi);
+        a->CmdFillBuffer(cmd, bkv, 0, ctx->kv_bytes, 0);
+        if (a->EndCommandBuffer(cmd) != VK_SUCCESS) return -1;
+        if (submit_and_wait(ctx, cmd) != 0) return -1;
+    }
 
     VkBuffer bufs[3] = { (VkBuffer)ctx->buf_o0, bkv, (VkBuffer)ctx->buf_o2 };
     size_t ranges[3] = { ctx->y_bytes, ctx->kv_bytes, ctx->y_bytes };
@@ -1973,7 +2520,7 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
 
     a->ResetCommandBuffer(cmd, 0);
     a->BeginCommandBuffer(cmd, &bi);
-    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_rmsnorm(ctx, cmd, hidden, eps, 0);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
@@ -2134,8 +2681,8 @@ int vulkan_fused_block(VulkanCtx* ctx,
                        uint16_t* host_k_row, uint16_t* host_v_row,
                        int sync_host)
 {
-    if (!ctx || !ctx->block_ready || !ctx->wq_resident || !wn1 || !wn2)
-        return -1;
+    if (!ctx || !ctx->block_ready || !ctx->wq_resident) return -1;
+    if (!ctx->norm_ready && (!wn1 || !wn2)) return -1;
     if (hidden != ctx->n_heads * ctx->head_dim || kv_dim != ctx->kv_dim) return -1;
     if (hidden > ctx->max_in || inter > ctx->max_out || hidden > ctx->max_out) return -1;
     if (pos >= ctx->max_seq || layer > ctx->n_blocks) return -1;
@@ -2152,11 +2699,19 @@ int vulkan_fused_block(VulkanCtx* ctx,
     }
 
     size_t xb = (size_t)hidden * 4;
-    if (upload_x || !ctx->x_on_dev) {
+    uint32_t w1_off = ctx->norm_ready ? norm_w_off1(ctx, layer) : 0u;
+    uint32_t w2_off = ctx->norm_ready ? norm_w_off2(ctx, layer) : 0u;
+
+    if ((upload_x || !ctx->x_on_dev) && !ctx->cmd_open) {
         if (!host_x) return -1;
         if (map_copy(ctx, ctx->mem_x, host_x, xb) != 0) return -1;
+        ctx->x_on_dev = 1;
+    } else if (!ctx->x_on_dev && !ctx->cmd_open) {
+        return -1;
     }
-    if (map_copy(ctx, ctx->mem_wn, wn1, xb) != 0) return -1;
+    if (!ctx->norm_ready) {
+        if (map_copy(ctx, ctx->mem_wn, wn1, xb) != 0) return -1;
+    }
 
     /* 打包 bias 到 buf_bias: [0,h) q, [h,h+kv) k, [h+kv,...) v */
     uint32_t bq_off = 0, bk_off = hidden, bv_off = hidden + kv_dim;
@@ -2189,11 +2744,49 @@ int vulkan_fused_block(VulkanCtx* ctx,
 
     int gpu_rope = ctx->use_gpu_rope && ctx->rope_ready && ctx->skv_ready &&
                    !host_k_row && !host_v_row;
+    int batch = ctx->token_batch && !sync_host && gpu_rope && !getenv("YLLM_VK_NOTOKB");
+    int last_layer = (layer >= ctx->n_blocks);
+    int chain = batch && ctx->tokb_chain && ctx->cmd_n > 1u && !ctx->map_x &&
+                !getenv("YLLM_VK_TOKB_ONECB");
+    uint32_t tgrp = tokb_group(ctx);
+    int defer_lm = !chain && batch && last_layer && ctx->lm_fused;
+    int defer_submit = !chain && batch && !last_layer && ((layer % tgrp) != 0u);
+    int finish = 0;
 
-    a->ResetCommandBuffer(cmd, 0);
-    a->BeginCommandBuffer(cmd, &bi);
+    if (chain) {
+        if (ctx->cmd_open) vulkan_gpu_discard(ctx);
+        cmd = tokb_cmd(ctx);
+        a->ResetCommandBuffer(cmd, 0);
+        a->BeginCommandBuffer(cmd, &bi);
+        if (ctx->tokb_i == 0) {
+            cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_x);
+            cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wq);
+            cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wn);
+            if (ctx->buf_bias)
+                cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_bias);
+        }
+        finish = last_layer && !ctx->lm_fused;
+    } else if (!gpu_rope) {
+        if (ctx->cmd_open) vulkan_gpu_discard(ctx);
+        a->ResetCommandBuffer(cmd, 0);
+        a->BeginCommandBuffer(cmd, &bi);
+        cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_x);
+        cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wq);
+        cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wn);
+    } else if (!ctx->cmd_open) {
+        a->ResetCommandBuffer(cmd, 0);
+        a->BeginCommandBuffer(cmd, &bi);
+        ctx->cmd_open = 1;
+        cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_x);
+        cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wq);
+        cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_wn);
+        if (ctx->buf_bias)
+            cmd_barrier_host_to_shader(cmd, (VkBuffer)ctx->buf_bias);
+    } else {
+        cmd_barrier_layer(ctx, cmd);
+    }
 
-    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    cmd_rmsnorm(ctx, cmd, hidden, eps, w1_off);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
@@ -2218,7 +2811,9 @@ int vulkan_fused_block(VulkanCtx* ctx,
             cmd_store_kv(ctx, cmd, ctx->skv_ds_v, kv_dim, v_el);
         }
         cmd_barrier_compute(cmd);
-        if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
+        if (!ctx->norm_ready) {
+            if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
+        }
     } else {
         a->EndCommandBuffer(cmd);
         if (submit_and_wait(ctx, cmd) != 0) return -1;
@@ -2258,6 +2853,7 @@ int vulkan_fused_block(VulkanCtx* ctx,
 
         if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
 
+        if (ctx->cmd_open) vulkan_gpu_discard(ctx);
         a->ResetCommandBuffer(cmd, 0);
         a->BeginCommandBuffer(cmd, &bi);
         {
@@ -2275,8 +2871,8 @@ int vulkan_fused_block(VulkanCtx* ctx,
     cmd_barrier_compute(cmd);
     cmd_add(ctx, cmd, ctx->add_ds_xy, hidden);
     cmd_barrier_compute(cmd);
-    /* FFN: wn 已是 wn2 */
-    cmd_rmsnorm(ctx, cmd, hidden, eps);
+    /* FFN: wn 已是 wn2 或分片偏移 w2_off */
+    cmd_rmsnorm(ctx, cmd, hidden, eps, w2_off);
     cmd_barrier_compute(cmd);
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, inter, hidden, (uint32_t)off_g);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, inter, hidden, (uint32_t)off_u);
@@ -2286,9 +2882,25 @@ int vulkan_fused_block(VulkanCtx* ctx,
     cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, inter, (uint32_t)off_d);
     cmd_barrier_compute(cmd);
     cmd_add(ctx, cmd, ctx->add_ds_xo, hidden);
-    a->EndCommandBuffer(cmd);
-    if (submit_and_wait(ctx, cmd) != 0) return -1;
 
+    if (batch && defer_lm) {
+        ctx->x_on_dev = 1;
+        return 0;
+    }
+    if (defer_submit) {
+        ctx->x_on_dev = 1;
+        return 0;
+    }
+
+    if (sync_host && host_x)
+        cmd_barrier_shader_to_host(cmd, (VkBuffer)ctx->buf_x);
+    a->EndCommandBuffer(cmd);
+    if (chain) {
+        if (submit_chained(ctx, cmd, finish) != 0) return -1;
+    } else if (submit_and_wait(ctx, cmd) != 0) {
+        return -1;
+    }
+    ctx->cmd_open = 0;
     ctx->x_on_dev = 1;
 
     if (sync_host && host_x) {

@@ -9,6 +9,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifdef CreateSemaphore
+#undef CreateSemaphore
+#endif
 #else
 #include <dlfcn.h>
 #endif
@@ -76,6 +79,8 @@ static int load_device_fns(VkInstance inst, VkDevice dev)
     GD(BindBufferMemory);
     GD(MapMemory);
     GD(UnmapMemory);
+    GD(FlushMappedMemoryRanges);
+    GD(InvalidateMappedMemoryRanges);
     GD(CreateShaderModule);
     GD(DestroyShaderModule);
     GD(CreateDescriptorSetLayout);
@@ -97,11 +102,15 @@ static int load_device_fns(VkInstance inst, VkDevice dev)
     GD(CmdBindDescriptorSets);
     GD(CmdPushConstants);
     GD(CmdDispatch);
+    GD(CmdCopyBuffer);
+    GD(CmdFillBuffer);
     GD(CmdPipelineBarrier);
     GD(QueueSubmit);
     GD(QueueWaitIdle);
     GD(CreateFence);
     GD(DestroyFence);
+    GD(CreateSemaphore);
+    GD(DestroySemaphore);
     GD(WaitForFences);
     GD(ResetFences);
     GD(ResetCommandBuffer);
@@ -256,6 +265,11 @@ void vulkan_shutdown(VulkanCtx* ctx)
     VkInstance inst = (VkInstance)ctx->instance;
     if (!dev) return;
 
+    if (ctx->cmd_open && ctx->cmd && a->ResetCommandBuffer) {
+        a->ResetCommandBuffer((VkCommandBuffer)ctx->cmd, 0);
+        ctx->cmd_open = 0;
+    }
+
     if (ctx->queue && a->QueueWaitIdle)
         a->QueueWaitIdle((VkQueue)ctx->queue);
 
@@ -272,6 +286,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
         if (ctx->map_emb) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_emb); ctx->map_emb = NULL; }
         if (ctx->map_logits) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_logits); ctx->map_logits = NULL; }
         if (ctx->map_bias) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_bias); ctx->map_bias = NULL; }
+        if (ctx->map_stage) { a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_stage); ctx->map_stage = NULL; }
     }
 
     destroy_pipe(a, dev, ctx->rms_pipeline, ctx->rms_pipe_layout, ctx->rms_shader,
@@ -300,6 +315,17 @@ void vulkan_shutdown(VulkanCtx* ctx)
                  ctx->embed_desc_pool, ctx->embed_desc_layout);
     if (ctx->fence && a->DestroyFence)
         a->DestroyFence(dev, (VkFence)ctx->fence, NULL);
+    if (ctx->sem_ring && a->DestroySemaphore) {
+        uint32_t si;
+        for (si = 0; si < ctx->cmd_n; si++) {
+            if (ctx->sem_ring[si])
+                a->DestroySemaphore(dev, (VkSemaphore)ctx->sem_ring[si], NULL);
+        }
+    }
+    free(ctx->sem_ring);
+    free(ctx->cmd_ring);
+    ctx->sem_ring = NULL;
+    ctx->cmd_ring = NULL;
     if (ctx->cmd_pool && a->DestroyCommandPool)
         a->DestroyCommandPool(dev, (VkCommandPool)ctx->cmd_pool, NULL);
 
@@ -314,6 +340,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->buf_logits && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_logits, NULL);
     if (ctx->buf_bias && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_bias, NULL);
     if (ctx->buf_kv && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_kv, NULL);
+    if (ctx->buf_stage && a->DestroyBuffer) a->DestroyBuffer(dev, (VkBuffer)ctx->buf_stage, NULL);
     if (ctx->mem_x && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_x, NULL);
     if (ctx->mem_y && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_y, NULL);
     if (ctx->mem_o0 && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_o0, NULL);
@@ -325,6 +352,7 @@ void vulkan_shutdown(VulkanCtx* ctx)
     if (ctx->mem_logits && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_logits, NULL);
     if (ctx->mem_bias && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_bias, NULL);
     if (ctx->mem_kv && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_kv, NULL);
+    if (ctx->mem_stage && a->FreeMemory) a->FreeMemory(dev, (VkDeviceMemory)ctx->mem_stage, NULL);
     free(ctx->host_w);
     free(ctx->host_w2);
     free(ctx->host_wq);

@@ -19,6 +19,9 @@ typedef struct {
     void* cmd_pool;
     void* cmd;
     void* fence;
+    int cmd_open;     /* token-batch: 多层层命令缓冲录制中 */
+    int token_batch;  /* decode: 全层(+lm) 合并 submit */
+    int norm_ready;   /* 各层 norm 已分片常驻 mem_wn */
 
     void* buf_x;
     void* buf_y;
@@ -42,6 +45,11 @@ typedef struct {
     void* map_bias;
     size_t x_bytes;
     size_t y_bytes;
+    /* dGPU 激活/KV 走纯 DEVICE_LOCAL 时的 host staging */
+    void* buf_stage;
+    void* mem_stage;
+    void* map_stage;
+    size_t stage_bytes;
 
     /* YLLM_VK_PROF=1 时累计 */
     int prof_on;
@@ -207,6 +215,13 @@ typedef struct {
     uint32_t hidden;
     uint32_t max_in;
     uint32_t max_out;
+
+    /* 每层独立 CB + 队列 semaphore: 正确性同 GRP=1, CPU 不等每层 fence */
+    void** cmd_ring;
+    void** sem_ring;
+    uint32_t cmd_n;
+    uint32_t tokb_i;
+    int tokb_chain;
 } VulkanCtx;
 
 #endif

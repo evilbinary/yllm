@@ -704,7 +704,9 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max)
         uint32_t id = ids[i];
         if (id >= (uint32_t)v->n) continue;
         const char* pc = v->pieces[id];
-        if (strcmp(pc, "<s>") == 0 || strcmp(pc, "</s>") == 0) continue;
+        if (strcmp(pc, "<s>") == 0 || strcmp(pc, "</s>") == 0 ||
+            strcmp(pc, "<unk>") == 0)
+            continue;
         if (strncmp(pc, "<0x", 3) == 0 && strlen(pc) == 6 && pc[5] == '>') {
             unsigned int b;
             if (sscanf(pc + 3, "%2x", &b) == 1 && o < max) out[o++] = (char)b;

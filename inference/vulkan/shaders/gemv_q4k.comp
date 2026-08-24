@@ -10,6 +10,7 @@ layout(push_constant) uniform Push {
     uint out_n;
     uint in_n;
     uint w_off; /* 权在 SSBO 中的字节偏移 */
+    uint serial; /* 1: 单线程累加(iGPU barrier/reduction 不可靠) */
 } pc;
 
 uint load_u8(uint off)
@@ -69,20 +70,31 @@ void main()
     uint nb = pc.in_n / 256u;
     uint rowb = nb * 144u;
     uint row = pc.w_off + o * rowb;
+    uint lid = gl_LocalInvocationID.x;
+
+    /* iGPU: 跳过 shared 归约(Intel UHD 上多 block 行会得到垃圾) */
+    if (pc.serial != 0u) {
+        if (lid == 0u) {
+            float acc = 0.0;
+            for (uint b = 0u; b < nb; b++)
+                acc += q4k_dot256(row + b * 144u, b * 256u);
+            y[o] = acc;
+        }
+        return;
+    }
+
     float acc = 0.0;
-    for (uint b = gl_LocalInvocationID.x; b < nb; b += 64u)
+    for (uint b = lid; b < nb; b += 64u)
         acc += q4k_dot256(row + b * 144u, b * 256u);
 
-    uint lid = gl_LocalInvocationID.x;
     sh[lid] = acc;
     memoryBarrierShared();
     barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (lid < s)
-            sh[lid] += sh[lid + s];
-        memoryBarrierShared();
-        barrier();
+    /* 单线程求和, 少一次易错的树形归约 */
+    if (lid == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < 64u; i++)
+            s += sh[i];
+        y[o] = s;
     }
-    if (lid == 0u)
-        y[o] = sh[0];
 }

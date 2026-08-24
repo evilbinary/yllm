@@ -9,6 +9,8 @@ layout(set = 0, binding = 2) readonly buffer WBuf { float w[]; };
 layout(push_constant) uniform Push {
     uint n;
     float eps;
+    uint w_off; /* 权在 WBuf 中的 float 元素偏移 */
+    uint _pad;
 } pc;
 
 shared float sdata[256];
@@ -31,5 +33,5 @@ void main() {
 
     float inv = inversesqrt(sdata[0] / float(pc.n) + pc.eps);
     for (uint i = lid; i < pc.n; i += 256u)
-        y[i] = x[i] * inv * w[i];
+        y[i] = x[i] * inv * w[pc.w_off + i];
 }

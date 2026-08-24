@@ -9,10 +9,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "matvec.h"
 
 void vulkan_attach_fwd(Engine* e);
 int vulkan_selftest_rmsnorm(VulkanCtx* ctx);
 int vulkan_selftest_gemv_q4k(VulkanCtx* ctx);
+int vulkan_selftest_gemv_q4k_real(VulkanCtx* ctx);
 int vulkan_selftest_gemv_q6k(VulkanCtx* ctx);
 
 static int tensor_out_in(const LlfTensorMeta* mt, uint32_t* out, uint32_t* in)
@@ -103,6 +105,64 @@ static size_t max_block_q4k_bytes(const LlModel* m)
         if (layer_sz > mx) mx = layer_sz;
     }
     return mx;
+}
+
+static int pack_norm_slice(float* dst, const uint8_t* wbytes, uint32_t n, uint32_t dtype)
+{
+    if (dtype == DT_F32) {
+        memcpy(dst, wbytes, (size_t)n * 4);
+        return 0;
+    }
+    if (dtype == DT_F16) {
+        uint32_t i;
+        const uint16_t* wh = (const uint16_t*)wbytes;
+        for (i = 0; i < n; i++) dst[i] = f16_to_f32(wh[i]);
+        return 0;
+    }
+    return -1;
+}
+
+/* 各层 norm1/norm2 + final norm 分片写入 mem_wn, 供 token-batch 使用 */
+static int vk_pack_norms(Engine* e, VulkanCtx* ctx)
+{
+    LlModel* m = &e->ws.model;
+    uint32_t n_blocks = m->h.n_blocks;
+    uint32_t hidden = m->h.hidden;
+    size_t need = (size_t)(2u * n_blocks + 1u) * hidden * 4;
+    if (!ctx->map_wn || need > ctx->wn_bytes) return -1;
+
+    float* dst = (float*)ctx->map_wn;
+    uint32_t li;
+    for (li = 0; li < n_blocks; li++) {
+        uint32_t layer = li + 1;
+        if (layer >= m->n_layers) return -1;
+        const uint8_t* base =
+            (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
+        const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+        uint32_t nt = m->dir[layer].n_tensors;
+        if (nt > BLOCK_TENSORS) nt = BLOCK_TENSORS;
+        if (mt[SLOT_NORM1].size == 0 || mt[SLOT_NORM2].size == 0) return -1;
+        if (pack_norm_slice(dst + (size_t)li * 2u * hidden,
+                            base + mt[SLOT_NORM1].offset, hidden,
+                            mt[SLOT_NORM1].dtype) != 0)
+            return -1;
+        if (pack_norm_slice(dst + (size_t)(li * 2u + 1u) * hidden,
+                            base + mt[SLOT_NORM2].offset, hidden,
+                            mt[SLOT_NORM2].dtype) != 0)
+            return -1;
+    }
+    {
+        uint32_t layer = n_blocks + 1;
+        if (layer >= m->n_layers) return -1;
+        const uint8_t* base =
+            (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
+        const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
+        if (pack_norm_slice(dst + (size_t)n_blocks * 2u * hidden,
+                            base + tm->offset, hidden, tm->dtype) != 0)
+            return -1;
+    }
+    ctx->norm_ready = 1;
+    return 0;
 }
 
 /* 打包块内 Q4_K → 连续 blob, 填 wq_off[layer*nslot+slot] */
@@ -346,6 +406,11 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ylog_warn("vulkan: Q4_K resident upload failed; gemv falls back host-W");
                 ctx->wq_resident = 0;
             }
+            if (ctx->gemv_ready && ctx->wq_resident && !getenv("YLLM_VK_NOSELFTEST") &&
+                vulkan_selftest_gemv_q4k_real(ctx) != 0) {
+                ylog_warn("vulkan: gemv_q4k real-weight selftest failed; GPU gemv disabled");
+                ctx->gemv_ready = 0;
+            }
             if (ctx->lm_ready && ctx->gemv_q6k_ready && !getenv("YLLM_VK_NOSELFTEST") &&
                 vulkan_selftest_gemv_q6k(ctx) != 0) {
                 ylog_warn("vulkan: gemv_q6k selftest failed; lm_head CPU fallback");
@@ -373,17 +438,55 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                     ylog_warn("vulkan: attn setup failed (%s)", aerr);
                 }
             }
+            if (ctx->compute_ready && ctx->wq_resident && !ctx->wq_stream) {
+                if (vk_pack_norms(e, ctx) == 0) {
+                    ylog_info("vulkan: norm weights resident (%u blocks, %zuKB)",
+                              e->ws.model.h.n_blocks, ctx->wn_bytes / 1024);
+                } else {
+                    ylog_warn("vulkan: norm pack failed; token-batch disabled");
+                }
+            }
+            if (ctx->norm_ready && ctx->block_ready && ctx->wq_resident &&
+                ctx->use_gpu_rope && !ctx->wq_stream && !getenv("YLLM_VK_NOTOKB")) {
+                ctx->token_batch = 1;
+                ylog_info("vulkan: token-batch decode (per-layer fence; YLLM_VK_VRAM_SCRATCH=1 for VRAM+sem)");
+            }
+            if (getenv("YLLM_VK_NOFUSE")) {
+                ctx->block_ready = 0;
+                ctx->fuse_ready = 0;
+                ctx->attn_ready = 0;
+                ctx->embed_ready = 0;
+                ctx->use_gpu_rope = 0;
+                ctx->token_batch = 0;
+                ctx->lm_fused = 0;
+                ctx->lm_one_submit = 0;
+                ylog_info("vulkan: NOFUSE per-op gemv (no fused block/attn/embed)");
+            }
+            if (ctx->integrated_gpu && !ctx->gemv_ready && !getenv("YLLM_VK_IGPU_GPU")) {
+                ctx->compute_ready = 0;
+                ctx->block_ready = 0;
+                ctx->fuse_ready = 0;
+                ctx->attn_ready = 0;
+                ctx->embed_ready = 0;
+                ctx->use_gpu_rope = 0;
+                ctx->token_batch = 0;
+                ctx->lm_ready = 0;
+                ctx->lm_one_submit = 0;
+                ctx->lm_fused = 0;
+                ylog_warn("vulkan: iGPU gemv selftest failed; using CPU fwd (YLLM_VK_IGPU_GPU=1 to force GPU)");
+            }
         }
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d lm1=%d lmf=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d lm1=%d lmf=%d norm=%d tokb=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
               ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident, ctx->wq_stream,
               ctx->fuse_ready, ctx->swi_ready, ctx->attn_ready, ctx->attn_o_ready,
               ctx->rope_ready, ctx->block_ready, ctx->embed_ready, ctx->use_gpu_rope,
-              ctx->lm_ready, ctx->lm_one_submit, ctx->lm_fused);
+              ctx->lm_ready, ctx->lm_one_submit, ctx->lm_fused, ctx->norm_ready,
+              ctx->token_batch);
     return 0;
 }
 

@@ -15,6 +15,8 @@
 #include <alloca.h>
 #endif
 
+static uint64_t wq_off(VulkanCtx* ctx, uint32_t layer, uint32_t slot);
+
 int vulkan_selftest_rmsnorm(VulkanCtx* ctx)
 {
     if (!ctx || !ctx->compute_ready || ctx->hidden == 0) return -1;
@@ -53,15 +55,13 @@ int vulkan_selftest_rmsnorm(VulkanCtx* ctx)
     return maxe < 1e-3f ? 0 : -1;
 }
 
-/* 合成一小块 Q4_K 与 CPU matmul_q4k 对比 */
-int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
+/* 合成 Q4_K 与 CPU 反量化点积对比; in=256 与 hidden(多 block) 各测一次 */
+static int gemv_q4k_synth_case(VulkanCtx* ctx, uint32_t in, uint32_t out)
 {
-    if (!ctx || !ctx->gemv_ready) return -1;
-    uint32_t in = 256;
-    uint32_t out = 8;
-    if (in > ctx->max_in || out > ctx->max_out) return -1;
-    size_t wbytes = (size_t)out * 144;
-    if (wbytes > ctx->wq_bytes) return -1;
+    size_t rowb = (size_t)(in / 256) * 144;
+    size_t wbytes = (size_t)out * rowb;
+    if (in == 0 || (in % 256) != 0 || out == 0) return -1;
+    if (in > ctx->max_in || out > ctx->max_out || wbytes > ctx->wq_bytes) return -1;
 
     float* x = (float*)malloc((size_t)in * 4);
     float* yg = (float*)malloc((size_t)out * 4);
@@ -71,32 +71,33 @@ int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
         free(x); free(yg); free(yc); free(w);
         return -1;
     }
-    uint32_t i;
+    uint32_t i, o, b, e;
     for (i = 0; i < in; i++)
         x[i] = 0.02f * (float)((int)(i % 17) - 8);
-    /* 每行一块: d=1, dmin=0, scales=1, qs 填递增 nibble */
-    for (i = 0; i < out; i++) {
-        uint8_t* blk = w + (size_t)i * 144;
-        ((uint16_t*)blk)[0] = 0x3c00; /* f16 1.0 */
-        ((uint16_t*)blk)[1] = 0x0000; /* f16 0.0 */
-        memset(blk + 4, 0x01, 12);    /* sc/min 低 6bit ≈1 */
-        uint32_t e;
-        for (e = 0; e < 128; e++)
-            blk[16 + e] = (uint8_t)((e & 0xF) | (((e + 3) & 0xF) << 4));
+    for (o = 0; o < out; o++) {
+        for (b = 0; b < in / 256; b++) {
+            uint8_t* blk = w + (size_t)o * rowb + (size_t)b * 144;
+            ((uint16_t*)blk)[0] = 0x3c00;
+            ((uint16_t*)blk)[1] = 0x0000;
+            memset(blk + 4, 0x01, 12);
+            for (e = 0; e < 128; e++)
+                blk[16 + e] = (uint8_t)((e & 0xF) | (((e + 3) & 0xF) << 4));
+        }
     }
     if (vulkan_k_gemv_q4k_host(ctx, yg, x, w, out, in) != 0) {
         free(x); free(yg); free(yc); free(w);
         return -1;
     }
-    /* 参考用反量化+点积(勿用 AVX Q8 路径, 会引入额外量化误差) */
     {
         float deq[256];
-        uint32_t o, j;
+        uint32_t j;
         for (o = 0; o < out; o++) {
             float acc = 0.0f;
-            const uint8_t* row = w + (size_t)o * 144;
-            q4k_block(deq, row, 0);
-            for (j = 0; j < 256; j++) acc += x[j] * deq[j];
+            const uint8_t* row = w + (size_t)o * rowb;
+            for (b = 0; b < in / 256; b++) {
+                q4k_block(deq, row + (size_t)b * 144, 0);
+                for (j = 0; j < 256; j++) acc += x[(size_t)b * 256 + j] * deq[j];
+            }
             yc[o] = acc;
         }
     }
@@ -107,6 +108,80 @@ int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
     }
     free(x); free(yg); free(yc); free(w);
     ylog_info("vulkan: gemv_q4k selftest max_abs_err=%.6g (out=%u in=%u)",
+              (double)maxe, out, in);
+    return maxe < 1e-3f ? 0 : -1;
+}
+
+int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
+{
+    if (!ctx || !ctx->gemv_ready) return -1;
+    if (gemv_q4k_synth_case(ctx, 256, 8) != 0) return -1;
+    if (ctx->hidden >= 512 && (ctx->hidden % 256) == 0 &&
+        ctx->hidden <= ctx->max_in) {
+        if (gemv_q4k_synth_case(ctx, ctx->hidden, 8) != 0) return -1;
+    }
+    return 0;
+}
+
+/* 打包/流式后: 第 1 层 Q 前 8 行 vs CPU 标量反量化 */
+int vulkan_selftest_gemv_q4k_real(VulkanCtx* ctx)
+{
+    uint32_t layer, in, out, i, b, j;
+    uint64_t abs, goff;
+    size_t rowb, nbytes;
+    const uint8_t* wcpu;
+    float *x, *yg, *yc, deq[256], maxe;
+
+    if (!ctx || !ctx->gemv_ready || !ctx->wq_resident || !ctx->wq_off)
+        return 0;
+    layer = 1;
+    if (ctx->n_blocks == 0) return 0;
+    if (ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0) return -1;
+    abs = ctx->wq_off[(size_t)layer * ctx->wq_nslot + SLOT_Q];
+    goff = wq_off(ctx, layer, SLOT_Q);
+    if (abs == (uint64_t)~0ull || goff == (uint64_t)~0ull) return 0;
+    in = ctx->hidden;
+    out = 8;
+    if (in == 0 || (in % 256) != 0 || in > ctx->max_in || out > ctx->max_out)
+        return 0;
+    rowb = (size_t)(in / 256) * 144;
+    nbytes = (size_t)out * rowb;
+    wcpu = NULL;
+    if (ctx->host_wq && abs + nbytes <= ctx->host_wq_bytes)
+        wcpu = ctx->host_wq + (size_t)abs;
+    else if (ctx->map_wq && !ctx->wq_stream && abs + nbytes <= ctx->wq_bytes)
+        wcpu = (const uint8_t*)ctx->map_wq + (size_t)abs;
+    if (!wcpu) return 0;
+
+    x = (float*)malloc((size_t)in * 4);
+    yg = (float*)malloc((size_t)out * 4);
+    yc = (float*)malloc((size_t)out * 4);
+    if (!x || !yg || !yc) {
+        free(x); free(yg); free(yc);
+        return -1;
+    }
+    for (i = 0; i < in; i++)
+        x[i] = 0.02f * (float)((int)(i % 17) - 8);
+    if (vulkan_k_gemv_q4k(ctx, yg, x, out, in, goff) != 0) {
+        free(x); free(yg); free(yc);
+        return -1;
+    }
+    for (i = 0; i < out; i++) {
+        float acc = 0.0f;
+        const uint8_t* row = wcpu + (size_t)i * rowb;
+        for (b = 0; b < in / 256; b++) {
+            q4k_block(deq, row + (size_t)b * 144, 0);
+            for (j = 0; j < 256; j++) acc += x[(size_t)b * 256 + j] * deq[j];
+        }
+        yc[i] = acc;
+    }
+    maxe = 0.0f;
+    for (i = 0; i < out; i++) {
+        float d = fabsf(yg[i] - yc[i]);
+        if (d > maxe) maxe = d;
+    }
+    free(x); free(yg); free(yc);
+    ylog_info("vulkan: gemv_q4k real-weight selftest max_abs_err=%.6g (layer=1 Q out=%u in=%u)",
               (double)maxe, out, in);
     return maxe < 1e-3f ? 0 : -1;
 }
@@ -233,7 +308,8 @@ static void vk_or_cpu_rmsnorm(VulkanCtx* ctx,
                               float* y, const float* x,
                               const uint8_t* wbytes, uint32_t n, float eps, uint32_t dtype)
 {
-    if (ctx && ctx->compute_ready && (size_t)n * 4 <= ctx->x_bytes &&
+    if (ctx && ctx->compute_ready && !ctx->integrated_gpu &&
+        (size_t)n * 4 <= ctx->x_bytes &&
         (size_t)n * 4 <= ctx->wn_bytes) {
         if (dtype == DT_F32) {
             if (vulkan_k_rmsnorm(ctx, y, x, (const float*)wbytes, n, eps) == 0)
@@ -254,7 +330,7 @@ static void vk_or_cpu_matmul(VulkanCtx* ctx, float* y, const float* x,
                              uint32_t layer, uint32_t slot)
 {
     if (ctx && ctx->gemv_ready && dtype == DT_Q4K) {
-        if (ctx->wq_resident && ctx->wq_off) {
+        if (ctx->wq_resident && ctx->wq_off && !getenv("YLLM_VK_HOSTW")) {
             uint64_t off = wq_off(ctx, layer, slot);
             if (off != (uint64_t)~0ull &&
                 vulkan_k_gemv_q4k(ctx, y, x, out, in, off) == 0)
@@ -312,17 +388,20 @@ static int try_fused_full_block(VulkanCtx* ctx, float* x, int upload_x,
                                 int sync_host)
 {
     if (!ctx || !ctx->block_ready || !ctx->wq_resident) return -1;
+    if (getenv("YLLM_VK_NOBLOCK") || getenv("YLLM_VK_HOSTW")) return -1;
     if (!ctx->host_w || !ctx->host_w2) return -1;
     if (mt[SLOT_QNORM].size > 0 || mt[SLOT_KNORM].size > 0) return -1;
     if (mt[SLOT_Q].dtype != DT_Q4K || mt[SLOT_K].dtype != DT_Q4K || mt[SLOT_V].dtype != DT_Q4K ||
         mt[SLOT_O].dtype != DT_Q4K || mt[SLOT_GATE].dtype != DT_Q4K ||
         mt[SLOT_UP].dtype != DT_Q4K || mt[SLOT_DOWN].dtype != DT_Q4K)
         return -1;
-    if (load_norm_f32(ctx, base + mt[SLOT_NORM1].offset, hidden, mt[SLOT_NORM1].dtype) != 0)
-        return -1;
-    memcpy(ctx->host_w2, ctx->host_w, (size_t)hidden * 4);
-    if (load_norm_f32(ctx, base + mt[SLOT_NORM2].offset, hidden, mt[SLOT_NORM2].dtype) != 0)
-        return -1;
+    if (!ctx->norm_ready) {
+        if (load_norm_f32(ctx, base + mt[SLOT_NORM1].offset, hidden, mt[SLOT_NORM1].dtype) != 0)
+            return -1;
+        memcpy(ctx->host_w2, ctx->host_w, (size_t)hidden * 4);
+        if (load_norm_f32(ctx, base + mt[SLOT_NORM2].offset, hidden, mt[SLOT_NORM2].dtype) != 0)
+            return -1;
+    }
 
     uint64_t oq = wq_off(ctx, layer, SLOT_Q);
     uint64_t ok = wq_off(ctx, layer, SLOT_K);
@@ -339,7 +418,9 @@ static int try_fused_full_block(VulkanCtx* ctx, float* x, int upload_x,
     const float* bk = mt[SLOT_KBIAS].size > 0 ? (const float*)(base + mt[SLOT_KBIAS].offset) : NULL;
     const float* bv = mt[SLOT_VBIAS].size > 0 ? (const float*)(base + mt[SLOT_VBIAS].offset) : NULL;
 
-    return vulkan_fused_block(ctx, x, upload_x, ctx->host_w2, ctx->host_w,
+    return vulkan_fused_block(ctx, x, upload_x,
+                              ctx->norm_ready ? NULL : ctx->host_w2,
+                              ctx->norm_ready ? NULL : ctx->host_w,
                               hidden, eps, theta, rope_mode,
                               kv_dim, inter, oq, ok, ov, oo, og, ou, od,
                               layer, pos, bq, bk, bv,
@@ -629,11 +710,15 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
             for (layer = 1; layer <= trunk; layer++) {
                 if (ctx->wq_stream && vulkan_stream_layer(ctx, layer) != 0)
                     return -1;
-                if (vulkan_fwd_block_ex(e, layer, (uint32_t)(start_pos + off) + b, 0) != 0)
+                if (vulkan_fwd_block_ex(e, layer, (uint32_t)(start_pos + off) + b, 1) != 0)
                     return -1;
             }
-            if (vulkan_sync_x_to_host(ctx, e->pb + (size_t)b * hidden, hidden) != 0)
-                return -1;
+            if (ctx->x_on_dev) {
+                if (vulkan_sync_x_to_host(ctx, e->pb + (size_t)b * hidden, hidden) != 0)
+                    return -1;
+            } else {
+                memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
+            }
             vulkan_mark_x_host(ctx);
         }
 
@@ -830,9 +915,13 @@ int vulkan_lm_fused(Engine* e)
     const uint8_t* base = (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
     const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
     uint32_t hidden = m->h.hidden;
-    if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
+    if (!ctx->norm_ready) {
+        if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
+    }
     int upload = !ctx->x_on_dev;
-    int r = vulkan_k_lm_fused(ctx, e->logits, ctx->host_w, hidden, ctx->norm_eps,
+    int r = vulkan_k_lm_fused(ctx, e->logits,
+                              ctx->norm_ready ? NULL : ctx->host_w,
+                              hidden, ctx->norm_eps,
                               ctx->lm_out, ctx->lm_off, ctx->lm_dtype,
                               upload, upload ? e->x : NULL);
     if (r != 0) vulkan_gpu_discard(ctx);
