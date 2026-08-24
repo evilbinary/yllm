@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #define YLLM_MAGIC "YLLMLLF1"
-#define YLLM_VERSION 4   /* 14→24(qwen35 SSM 槽位), 旧文件必须重转 */
+#define YLLM_VERSION 6   /* gemma4 PLE 进 llf; 旧 gemma4 文件必须重转 */
 #define LLF_HEADER_SIZE 128
 #define LLF_DIR_ENTRY_SIZE 32
 #define LLF_TENSOR_META_SIZE 64
@@ -22,6 +22,7 @@
 #define ARCH_LLAMA 0
 #define ARCH_QWEN 1
 #define ARCH_QWEN35 2
+#define ARCH_GEMMA4 3
 
 #define SLOT_EMBED 0
 #define SLOT_NORM1 0
@@ -48,15 +49,25 @@
 #define SLOT_SSM_BETA 21    /* GDN ssm_beta [in, n_vheads] */
 #define SLOT_SSM_NORM 22    /* GDN ssm_norm [head_v_dim] */
 #define SLOT_SSM_OUT 23     /* GDN ssm_out [hidden, in] */
-#define BLOCK_TENSORS 24
-/* MTP(Multi-Token Prediction)槽: 存 output(lm_head)层的高槽位 24..27,
+#define SLOT_NORM3 24       /* gemma4 post_attention_norm [hidden] */
+#define SLOT_NORM4 25       /* gemma4 post_feedforward_norm [hidden] */
+#define SLOT_LAYER_SCALE 26 /* gemma4 layer_output_scale scalar [1] F32 */
+/* gemma4 per-layer embedding: 复用 GDN 空槽(与 qwen35 不共存) */
+#define SLOT_PLE_GATE SLOT_QKV       /* blk.N.inp_gate [hidden, n_ple] */
+#define SLOT_PLE_PROJ SLOT_GATE_ATTN /* blk.N.proj [n_ple, hidden] */
+#define SLOT_PLE_POST SLOT_QGATE     /* blk.N.post_norm [hidden] */
+#define SLOT_PLE_TOK  1              /* embed 层 per_layer_token_embd */
+#define SLOT_PLE_MPROJ 2             /* embed 层 per_layer_model_proj */
+#define SLOT_PLE_PNORM 3             /* embed 层 per_layer_proj_norm */
+#define BLOCK_TENSORS 27
+/* MTP(Multi-Token Prediction)槽: 存 output(lm_head)层的高槽位 27..30,
  * 与主 transformer 块共用 BLOCK_TENSORS 上限之外; llf 层目录 n_tensors 需容纳。
- * 布局(见 convert.c): output 层 = blocks+2, 槽 24=eh_proj 25=enorm 26=hnorm 27=shared_head_norm */
-#define SLOT_MTP_EH 24
-#define SLOT_MTP_ENORM 25
-#define SLOT_MTP_HNORM 26
-#define SLOT_MTP_HEAD_NORM 27
-#define BLOCK_TENSORS_MTP 28
+ * 布局(见 convert.c): output 层 = blocks+2, 槽 27=eh_proj 28=enorm 29=hnorm 30=shared_head_norm */
+#define SLOT_MTP_EH 27
+#define SLOT_MTP_ENORM 28
+#define SLOT_MTP_HNORM 29
+#define SLOT_MTP_HEAD_NORM 30
+#define BLOCK_TENSORS_MTP 31
 
 #pragma pack(push, 1)
 typedef struct {
@@ -74,7 +85,9 @@ typedef struct {
     uint32_t dtype;
     uint32_t norm_eps_bits;
     uint32_t rope_theta_bits;
-    uint8_t reserved[52];
+    /* 通用扩展入口: 非 common 的架构专用字段不要直接放在公共头里 */
+    uint64_t ext_ptr;             /* 预留: 指向扩展区(当前版本保留为 0) */
+    uint8_t reserved[44];         /* 预留扩展数据 */
 } LlfHeader;
 
 typedef struct {

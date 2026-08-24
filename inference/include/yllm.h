@@ -128,6 +128,10 @@ typedef struct Engine {
     float* ssm_state;   /* [n_gdn × n_vheads × head_v_dim²] 递归状态 S */
     float* ssm_conv;    /* [n_gdn × (conv_kernel-1) × conv_channels] conv1d 延迟线 */
     float* scratch;     /* GDN/attention 层临时工作区 */
+    /* gemma4 per-layer embedding: [n_blocks × n_ple] */
+    float* ple;
+    float* ple_work;
+    uint32_t n_ple;
     /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
     float* pb;      /* [PB_MAX × hidden]  输入/残差 */
     float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */

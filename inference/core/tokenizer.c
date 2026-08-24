@@ -80,8 +80,11 @@ static int parse_sp(const uint8_t* data, uint64_t size, Vocab* v)
             v->pieces[v->n] = pc;
             if (pct == 2 && v->unk < 0) v->unk = v->n;
             if (pct == 3) {
-                if (strcmp(pc, "<s>") == 0) v->bos = v->n;
-                if (strcmp(pc, "</s>") == 0) v->eos = v->n;
+                if (strcmp(pc, "<bos>") == 0) v->bos = v->n;
+                else if (v->bos < 0 && strcmp(pc, "<s>") == 0) v->bos = v->n;
+                if (strcmp(pc, "<eos>") == 0) v->eos = v->n;
+                else if (v->eos < 0 && strcmp(pc, "</s>") == 0) v->eos = v->n;
+                if (strcmp(pc, "<unk>") == 0 && v->unk < 0) v->unk = v->n;
             }
             v->n++;
         } else if ((tag & 7) == 2) {
@@ -179,8 +182,10 @@ static int parse_text(const char* path, Vocab* v)
         v->pieces[v->n] = unescape_piece(pc);
         if (id == v->n) {
             if (strcmp(pc, "<unk>") == 0) v->unk = v->n;
-            if (strcmp(pc, "<s>") == 0) v->bos = v->n;
-            if (strcmp(pc, "</s>") == 0) v->eos = v->n;
+            if (strcmp(pc, "<bos>") == 0) v->bos = v->n;
+            else if (v->bos < 0 && strcmp(pc, "<s>") == 0) v->bos = v->n;
+            if (strcmp(pc, "<eos>") == 0) v->eos = v->n;
+            else if (v->eos < 0 && strcmp(pc, "</s>") == 0) v->eos = v->n;
         }
         v->n++;
     }
@@ -234,6 +239,9 @@ static int parse_text(const char* path, Vocab* v)
                     v->add_bos = atoi(line + 8);
                 } else if (strncmp(line, "eos_id=", 7) == 0) {
                     v->eos = atoi(line + 7);
+                } else if (strncmp(line, "bos_id=", 7) == 0) {
+                    int id = atoi(line + 7);
+                    if (id >= 0) v->bos = id;
                 } else if (strncmp(line, "template=", 9) == 0) {
                     v->chat_template = unescape_piece(line + 9);
                 }
@@ -705,7 +713,8 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max)
         if (id >= (uint32_t)v->n) continue;
         const char* pc = v->pieces[id];
         if (strcmp(pc, "<s>") == 0 || strcmp(pc, "</s>") == 0 ||
-            strcmp(pc, "<unk>") == 0)
+            strcmp(pc, "<bos>") == 0 || strcmp(pc, "<eos>") == 0 ||
+            strcmp(pc, "<unk>") == 0 || strcmp(pc, "<pad>") == 0)
             continue;
         if (strncmp(pc, "<0x", 3) == 0 && strlen(pc) == 6 && pc[5] == '>') {
             unsigned int b;

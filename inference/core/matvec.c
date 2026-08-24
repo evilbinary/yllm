@@ -1212,6 +1212,39 @@ void swiglu(float* y, const float* gate, const float* up, uint32_t n)
     }
 }
 
+/* GeGLU: y[i] = gelu(gate[i]) * up[i]  (gemma4 FFN 激活) */
+static float gelu_approx(float x)
+{
+    /* tanh approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))) */
+    float c = 0.7978845608f; /* sqrt(2/pi) */
+    float inner = c * (x + 0.044715f * x * x * x);
+    float t = tanhf(inner);
+    return 0.5f * x * (1.0f + t);
+}
+
+void geglu(float* y, const float* gate, const float* up, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        y[i] = gelu_approx(gate[i]) * up[i];
+}
+
+void gelu_inplace(float* y, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        y[i] = gelu_approx(y[i]);
+}
+
+void rmsnorm_unit(float* y, const float* x, uint32_t n, float eps)
+{
+    float s = 0.0f;
+    uint32_t i;
+    for (i = 0; i < n; i++) s += x[i] * x[i];
+    float inv = 1.0f / sqrtf(s / (float)n + eps);
+    for (i = 0; i < n; i++) y[i] = x[i] * inv;
+}
+
 void add_inplace(float* y, const float* x, uint32_t n)
 {
     uint32_t i = 0;

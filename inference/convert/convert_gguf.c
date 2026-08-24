@@ -94,7 +94,26 @@ typedef struct {
     char* chat_template;
     int add_bos;
     int eos_id;
+    int bos_id;
+    /* gemma4 专用 */
+    float attn_logit_cap;    /* attention logit soft-cap (默认 50.0) */
+    float final_logit_cap;   /* final logit soft-cap (默认 30.0) */
+    uint32_t swa_window;     /* sliding window size (默认 4096) */
+    uint32_t swa_pattern;    /* 每 N 层为全局层 (默认 6) */
+    uint32_t n_kv_shared_layers; /* shared KV 层数 (默认 1) */
+    uint32_t n_embd_per_layer;   /* PLE 每层宽度 */
+    uint64_t swa_mask;           /* bit i = is_swa(i); 0 = 用 swa_pattern */
 } GgufMeta;
+
+typedef struct {
+    uint32_t attn_logit_cap_bits;
+    uint32_t final_logit_cap_bits;
+    uint32_t swa_window;
+    uint32_t swa_pattern;
+    uint32_t n_kv_shared_layers;
+    uint32_t n_embd_per_layer;
+    uint64_t swa_mask;
+} LlfGemma4Ext;
 
 static void gg_merges_grow(GgufMeta* g, uint64_t need)
 {
@@ -161,6 +180,14 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(key, "general.alignment")) g->alignment = v;
         else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
         else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
+        else if (!strcmp(key, "tokenizer.ggml.bos_token_id")) g->bos_id = (int)v;
+        /* gemma4 */
+        else if (!strcmp(k, "attn_logit_softcapping")) { float f; memcpy(&f, &v, 4); g->attn_logit_cap = f; }
+        else if (!strcmp(k, "final_logit_softcapping")) { float f; memcpy(&f, &v, 4); g->final_logit_cap = f; }
+        else if (!strcmp(k, "attention.sliding_window")) g->swa_window = v;
+        else if (!strcmp(k, "attention.sliding_window_pattern")) g->swa_pattern = v;
+        else if (!strcmp(k, "attention.shared_kv_layers")) g->n_kv_shared_layers = v;
+        else if (!strcmp(k, "embedding_length_per_layer_input")) g->n_embd_per_layer = v;
         break;
     }
     case GVT_U64:
@@ -174,12 +201,17 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(k, "context_length")) g->context_len = (uint32_t)v;
         else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
         else if (!strcmp(key, "tokenizer.ggml.eos_token_id")) g->eos_id = (int)v;
+        else if (!strcmp(key, "tokenizer.ggml.bos_token_id")) g->bos_id = (int)v;
+        else if (!strcmp(k, "embedding_length_per_layer_input")) g->n_embd_per_layer = (uint32_t)v;
+        else if (!strcmp(k, "attention.shared_kv_layers")) g->n_kv_shared_layers = (uint32_t)v;
         break;
     }
     case GVT_F64: {
         double v = gb_f64(b);
         if (!strcmp(k, "rope.freq_base")) g->freq_base = (float)v;
         else if (!strcmp(k, "attention.layer_norm_rms_epsilon")) g->rms_eps = (float)v;
+        else if (!strcmp(k, "attn_logit_softcapping")) g->attn_logit_cap = (float)v;
+        else if (!strcmp(k, "final_logit_softcapping")) g->final_logit_cap = (float)v;
         break;
     }
     case GVT_STR: {
@@ -203,6 +235,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         int is_tokens = !strcmp(key, "tokenizer.ggml.tokens");
         int is_scores = !strcmp(key, "tokenizer.ggml.scores");
         int is_merges = !strcmp(key, "tokenizer.ggml.merges");
+        int is_swa_arr = !strcmp(k, "attention.sliding_window_pattern");
         if (is_tokens) gg_tokens_grow(g, (uint64_t)g->n_tokens + n);
         if (is_scores) gg_scores_grow(g, (uint64_t)g->n_scores + n);
         if (is_merges) gg_merges_grow(g, (uint64_t)g->n_merges + n);
@@ -221,6 +254,13 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
                 char* s = gb_str(b);
                 if (!s) break;
                 g->merges[g->n_merges++] = s;
+            } else if (is_swa_arr && i < 64 &&
+                       (at == GVT_U8 || at == GVT_I8 || at == GVT_BOOL ||
+                        at == GVT_U32 || at == GVT_I32)) {
+                uint32_t v = 0;
+                if (at == GVT_U32 || at == GVT_I32) v = gb_u32(b);
+                else { v = (uint32_t)(unsigned char)b->p[0]; gb_skip(b, 1); }
+                if (v) g->swa_mask |= (1ull << i);
             } else {
                 switch (at) {
                 case GVT_U8: case GVT_I8: case GVT_BOOL: gb_skip(b, 1); break;
@@ -350,9 +390,25 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
             }
         }
     }
+    /* ggml type 30 = BF16: 2 bytes/elem */
+    {
+        int seen = 0, ok = 1;
+        for (i = 0; i < (size_t)l->n; i++) {
+            const GGTensor* t = &l->t[i];
+            if (t->gtype != 30) continue;
+            seen = 1;
+            uint64_t nelem = 1;
+            uint32_t d;
+            for (d = 0; d < t->ndims; d++) nelem *= t->dims[d];
+            if (nelem == 0 || t->nbytes != nelem * 2) { ok = 0; break; }
+        }
+        if (seen && ok) map[30] = DT_BF16;
+    }
 }
 
-enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4, SP_MTP_EH = 100, SP_MTP_ENORM = 101, SP_MTP_HNORM = 102, SP_MTP_HEAD_NORM = 103 };
+enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4,
+       SP_PLE_TOK = -10, SP_PLE_MPROJ = -11, SP_PLE_PNORM = -12,
+       SP_MTP_EH = 100, SP_MTP_ENORM = 101, SP_MTP_HNORM = 102, SP_MTP_HEAD_NORM = 103 };
 
 /* Q8_0 去量化成 F16: 每 32 元素 = 1 fp16 scale + 32 int8。
  * 返回 malloc 的 F16 缓冲(nelem*2 字节), 调用方负责释放。 */
@@ -390,7 +446,7 @@ static int gg_slot_for(const char* name, int* layer)
         while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
         if (*p != '.') return -1;
         p++;
-        static const struct { const char* suf; int slot; } tab[] = {
+        static const struct { const char* suf; int slot; } tab_qwen[] = {
             { "input_layernorm.weight", SLOT_NORM1 },
             { "self_attn.q_proj.weight", SLOT_Q },
             { "self_attn.k_proj.weight", SLOT_K },
@@ -404,21 +460,24 @@ static int gg_slot_for(const char* name, int* layer)
             { "mlp.down_proj.weight", SLOT_DOWN },
         };
         size_t i;
-        for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
-            if (strcmp(p, tab[i].suf) == 0) { *layer = n; return tab[i].slot; }
+        for (i = 0; i < sizeof(tab_qwen) / sizeof(tab_qwen[0]); i++) {
+            if (strcmp(p, tab_qwen[i].suf) == 0) { *layer = n; return tab_qwen[i].slot; }
         }
         return -1;
     }
     if (strcmp(name, "token_embd.weight") == 0) { *layer = 0; return SP_EMBED; }
     if (strcmp(name, "output_norm.weight") == 0) { *layer = 0; return SP_FINALNORM; }
     if (strcmp(name, "output.weight") == 0) { *layer = 0; return SP_OUTPUT; }
+    if (strcmp(name, "per_layer_token_embd.weight") == 0) { *layer = 0; return SP_PLE_TOK; }
+    if (strcmp(name, "per_layer_model_proj.weight") == 0) { *layer = 0; return SP_PLE_MPROJ; }
+    if (strcmp(name, "per_layer_proj_norm.weight") == 0) { *layer = 0; return SP_PLE_PNORM; }
     if (strncmp(name, "blk.", 4) == 0) {
         const char* p = name + 4;
         int n = 0;
         while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
         if (*p != '.') return -1;
         p++;
-        static const struct { const char* suf; int slot; } tab[] = {
+        static const struct { const char* suf; int slot; } tab_blk[] = {
             { "nextn.eh_proj.weight", SP_MTP_EH },
             { "nextn.enorm.weight", SP_MTP_ENORM },
             { "nextn.hnorm.weight", SP_MTP_HNORM },
@@ -429,7 +488,13 @@ static int gg_slot_for(const char* name, int* layer)
             { "attn_v.weight", SLOT_V },
             { "attn_output.weight", SLOT_O },
             { "ffn_norm.weight", SLOT_NORM2 },
-            { "post_attention_norm.weight", SLOT_NORM2 },
+            { "post_attention_norm.weight", SLOT_NORM3 },
+            { "post_ffw_norm.weight", SLOT_NORM4 },
+            { "layer_output_scale.weight", SLOT_LAYER_SCALE },
+            { "inp_gate.weight", SLOT_PLE_GATE },
+            { "proj.weight", SLOT_PLE_PROJ },
+            { "post_norm.weight", SLOT_PLE_POST },
+            { "post_attention_layernorm.weight", SLOT_NORM2 },
             { "ffn_gate.weight", SLOT_GATE },
             { "ffn_up.weight", SLOT_UP },
             { "ffn_down.weight", SLOT_DOWN },
@@ -449,8 +514,8 @@ static int gg_slot_for(const char* name, int* layer)
             { "ssm_out.weight", SLOT_SSM_OUT },
         };
         size_t i;
-        for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
-            if (strcmp(p, tab[i].suf) == 0) { *layer = n; return tab[i].slot; }
+        for (i = 0; i < sizeof(tab_blk) / sizeof(tab_blk[0]); i++) {
+            if (strcmp(p, tab_blk[i].suf) == 0) { *layer = n; return tab_blk[i].slot; }
         }
     }
     return -1;
@@ -504,6 +569,13 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     g.freq_base = 10000.0f;
     g.rms_eps = 1e-5f;
     g.add_bos = 1; /* llama architecture default */
+    g.bos_id = -1;
+    g.eos_id = -1;
+    g.attn_logit_cap = 50.0f;
+    g.final_logit_cap = 30.0f;
+    g.swa_window = 4096;
+    g.swa_pattern = 6;
+    g.n_kv_shared_layers = 0;
 
     uint64_t i;
     for (i = 0; i < n_kv && !b.err; i++) {
@@ -524,8 +596,9 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
     if (!g.arch || (strcmp(g.arch, "llama") != 0 && strcmp(g.arch, "qwen2") != 0 &&
-                    strcmp(g.arch, "qwen3") != 0 && strcmp(g.arch, "qwen35") != 0)) {
-        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama' and 'qwen2/qwen3/qwen35' supported)", g.arch ? g.arch : "?");
+                    strcmp(g.arch, "qwen3") != 0 && strcmp(g.arch, "qwen35") != 0 &&
+                    strcmp(g.arch, "gemma4") != 0)) {
+        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama', 'qwen2/qwen3/qwen35' and 'gemma4' supported)", g.arch ? g.arch : "?");
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
@@ -536,6 +609,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
      * 代码按 tensor 是否存在自动跳过) */
     int is_qwen = g.arch && (strcmp(g.arch, "qwen2") == 0 || strcmp(g.arch, "qwen3") == 0);
     int is_qwen35 = g.arch && strcmp(g.arch, "qwen35") == 0;
+    int is_gemma4 = g.arch && strcmp(g.arch, "gemma4") == 0;
     free(g.arch);
     if (g.n_blocks == 0 || g.hidden == 0 || g.heads == 0) {
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
@@ -618,12 +692,12 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     uint8_t type_map[256];
     gg_probe_layout(&list, data, data_start, fsize, type_map);
     {
-        static const char* dn[8] = { "f16", "f32", "bf16", "q4_k", "q6_k", "iq4_xs" };
+        static const char* dn[8] = { "f16", "f32", "bf16", "q4_k", "q6_k", "iq4_xs", "q5_k" };
         int a;
         for (a = 0; a < 256; a++) {
             int has = 0;
             for (i = 0; i < (uint64_t)list.n; i++) if (list.t[i].gtype == (uint32_t)a) { has = 1; break; }
-            if (has) printf("probe: gguf type %d -> %s\n", a, type_map[a] < 6 ? dn[type_map[a]] : "?");
+            if (has) printf("probe: gguf type %d -> %s\n", a, type_map[a] < 7 ? dn[type_map[a]] : "?");
         }
     }
     {
@@ -656,7 +730,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             if (strstr(t->name, "nextn") && t->gtype == 8) {
                 c.nbytes = (nelem / 256) * 272;   /* Q8_0 块大小 */
             } else if (dt == DT_F32) c.nbytes = nelem * 4;
-            else if (dt == DT_F16) c.nbytes = nelem * 2;
+            else if (dt == DT_F16 || dt == DT_BF16) c.nbytes = nelem * 2;
             else {
                 uint64_t nb = (dt == DT_Q6K) ? 210 : (dt == DT_Q5K) ? 176 : 144;
                 c.nbytes = (nelem / 256) * nb;
@@ -684,15 +758,21 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     for (i = 0; i < (uint64_t)list.n; i++) {
         int layer;
         int slot = gg_slot_for(list.t[i].name, &layer);
-        if (slot == SP_EMBED) { items[n].layer = 0; items[n].slot = 0; }
+        if (slot == SP_EMBED) {
+            items[n].layer = 0; items[n].slot = 0;
+            /* gemma4 tied embedding: embed == lm_head, 先写 embed, 然后额外写 output */
+        }
         else if (slot == SP_FINALNORM) { items[n].layer = g.n_blocks + 1; items[n].slot = 0; }
         else if (slot == SP_OUTPUT) { items[n].layer = g.n_blocks + 2; items[n].slot = 0; }
         else if (slot == SP_MTP_EH) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_EH; }
         else if (slot == SP_MTP_ENORM) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_ENORM; }
         else if (slot == SP_MTP_HNORM) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_HNORM; }
         else if (slot == SP_MTP_HEAD_NORM) { items[n].layer = g.n_blocks + 2; items[n].slot = SLOT_MTP_HEAD_NORM; }
+        else if (slot == SP_PLE_TOK) { items[n].layer = 0; items[n].slot = SLOT_PLE_TOK; }
+        else if (slot == SP_PLE_MPROJ) { items[n].layer = 0; items[n].slot = SLOT_PLE_MPROJ; }
+        else if (slot == SP_PLE_PNORM) { items[n].layer = 0; items[n].slot = SLOT_PLE_PNORM; }
         else if (slot >= SLOT_NORM1 && slot <= SLOT_KNORM) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
-        else if (slot >= SLOT_QKV && slot <= SLOT_SSM_OUT) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
+        else if (slot >= SLOT_QKV && slot <= SLOT_LAYER_SCALE) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else { printf("gguf: SKIP '%s'\n", list.t[i].name); continue; }
         const GGTensor* t = &list.t[i];
         items[n].dtype = type_map[t->gtype];
@@ -712,7 +792,25 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             items[n].dtype = DT_F16;
             items[n].nbytes = mnelem * 2;
         }
+        if (items[n].dtype == DT_BF16) {
+            uint64_t mnelem = 1;
+            for (d = 0; d < t->ndims; d++) mnelem *= t->dims[d];
+            uint8_t* nb = (uint8_t*)ymalloc((size_t)mnelem * 2);
+            bf16_to_f16_buf((const uint16_t*)items[n].src, (uint16_t*)nb, (size_t)mnelem);
+            items[n].src = nb;
+            items[n].src_off = 0;
+            items[n].dtype = DT_F16;
+            items[n].nbytes = mnelem * 2;
+            if (qg_n < 32) qg_bufs[qg_n++] = nb;
+        }
         n++;
+        /* gemma4 tied embedding: 写完 embed 后额外写一份 output(lm_head) 指向同一数据 */
+        if (is_gemma4 && slot == SP_EMBED) {
+            items[n] = items[n - 1];
+            items[n].layer = g.n_blocks + 2;
+            snprintf(items[n].name, sizeof(items[n].name), "output.weight");
+            n++;
+        }
         if (is_qwen35 && slot == SLOT_Q && t->ndims == 2 &&
             t->dims[1] == 2 * (uint64_t)g.heads * (g.key_length ? g.key_length : g.hidden / g.heads)) {
             /* qwen35 attention 层: attn_q = [q|gate] 拼接(输出维 2×qdim)。
@@ -755,9 +853,63 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     }
     if (n == 0) { free(items); free(list.t); wmap_close(&gmap); snprintf(err, errlen, "no recognized tensors"); return -1; }
 
+    if (is_gemma4 && g.n_embd_per_layer == 0) {
+        int p2;
+        for (p2 = 0; p2 < n; p2++) {
+            if (items[p2].layer == 0 && items[p2].slot == SLOT_PLE_TOK && g.n_blocks > 0 &&
+                items[p2].shape[0] % g.n_blocks == 0)
+                g.n_embd_per_layer = items[p2].shape[0] / g.n_blocks;
+        }
+    }
+
     {
         int p2;
         int missing = 0;
+        /* gemma4: 每层必需 4 norm + Q/K/V/O + Gate/Up/Down */
+        if (is_gemma4) {
+        static const int g4req[] = { SLOT_NORM1, SLOT_NORM2, SLOT_NORM3, SLOT_NORM4,
+                                         SLOT_Q, SLOT_O,
+                                         SLOT_GATE, SLOT_UP, SLOT_DOWN };
+            uint32_t kv_from = g.n_blocks;
+            if (g.n_kv_shared_layers > 0 && g.n_kv_shared_layers < g.n_blocks)
+                kv_from = g.n_blocks - g.n_kv_shared_layers;
+            for (i = 1; i <= g.n_blocks && !missing; i++) {
+                size_t si;
+                for (si = 0; si < sizeof(g4req)/sizeof(g4req[0]); si++) {
+                    int found = 0;
+                    for (p2 = 0; p2 < n; p2++) {
+                        if (items[p2].layer == i && items[p2].slot == (uint32_t)g4req[si]) { found = 1; break; }
+                    }
+                    if (!found) { missing = 1; break; }
+                }
+                if (!missing && (i - 1) < kv_from) {
+                    int has_k = 0, has_v = 0;
+                    for (p2 = 0; p2 < n; p2++) {
+                        if (items[p2].layer == i && items[p2].slot == SLOT_K) has_k = 1;
+                        if (items[p2].layer == i && items[p2].slot == SLOT_V) has_v = 1;
+                    }
+                    if (!has_k || !has_v) missing = 1;
+                }
+                if (!missing && g.n_embd_per_layer > 0) {
+                    int has_g = 0, has_p = 0, has_n = 0;
+                    for (p2 = 0; p2 < n; p2++) {
+                        if (items[p2].layer == i && items[p2].slot == SLOT_PLE_GATE) has_g = 1;
+                        if (items[p2].layer == i && items[p2].slot == SLOT_PLE_PROJ) has_p = 1;
+                        if (items[p2].layer == i && items[p2].slot == SLOT_PLE_POST) has_n = 1;
+                    }
+                    if (!has_g || !has_p || !has_n) missing = 1;
+                }
+            }
+            if (!missing && g.n_embd_per_layer > 0) {
+                int has_tok = 0, has_mp = 0, has_pn = 0;
+                for (p2 = 0; p2 < n; p2++) {
+                    if (items[p2].layer == 0 && items[p2].slot == SLOT_PLE_TOK) has_tok = 1;
+                    if (items[p2].layer == 0 && items[p2].slot == SLOT_PLE_MPROJ) has_mp = 1;
+                    if (items[p2].layer == 0 && items[p2].slot == SLOT_PLE_PNORM) has_pn = 1;
+                }
+                if (!has_tok || !has_mp || !has_pn) missing = 1;
+            }
+        } else {
         /* 公共必需: ffn 三件套 + 两个 norm */
         static const int common[5] = { SLOT_NORM1, SLOT_NORM2, SLOT_GATE, SLOT_UP, SLOT_DOWN };
         for (i = 1; i <= g.n_blocks && !missing; i++) {
@@ -789,6 +941,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                 }
             }
         }
+        } /* end !is_gemma4 */
         if (missing) {
             for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
             free(list.t); free(items); wmap_close(&gmap);
@@ -802,7 +955,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     memset(&h, 0, sizeof(h));
     memcpy(h.magic, YLLM_MAGIC, 8);
     h.version = YLLM_VERSION;
-    h.arch = is_qwen35 ? ARCH_QWEN35 : (is_qwen ? ARCH_QWEN : ARCH_LLAMA);
+    h.arch = is_qwen35 ? ARCH_QWEN35 : (is_qwen ? ARCH_QWEN : (is_gemma4 ? ARCH_GEMMA4 : ARCH_LLAMA));
     h.n_blocks = g.n_blocks;
     h.hidden = g.hidden;
     h.n_heads = g.heads;
@@ -813,6 +966,19 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     h.dtype = DT_Q4K;
     memcpy(&h.norm_eps_bits, &g.rms_eps, 4);
     memcpy(&h.rope_theta_bits, &g.freq_base, 4);
+    h.ext_ptr = 0;
+    if (is_gemma4) {
+        LlfGemma4Ext ext;
+        memset(&ext, 0, sizeof(ext));
+        memcpy(&ext.attn_logit_cap_bits, &g.attn_logit_cap, 4);
+        memcpy(&ext.final_logit_cap_bits, &g.final_logit_cap, 4);
+        ext.swa_window = g.swa_window;
+        ext.swa_pattern = g.swa_pattern;
+        ext.n_kv_shared_layers = g.n_kv_shared_layers;
+        ext.n_embd_per_layer = g.n_embd_per_layer;
+        ext.swa_mask = g.swa_mask;
+        memcpy(h.reserved, &ext, sizeof(ext));
+    }
     {
         uint64_t vocab = 0;
         int p2;
@@ -877,6 +1043,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             fprintf(vf, "#CHAT#\n");
             fprintf(vf, "add_bos=%d\n", g.add_bos);
             fprintf(vf, "eos_id=%d\n", g.eos_id);
+            fprintf(vf, "bos_id=%d\n", g.bos_id);
             fprintf(vf, "template=");
             if (g.chat_template) {
                 const char* s = g.chat_template;
