@@ -40,6 +40,78 @@ static int tensor_out_in(const LlfTensorMeta* mt, uint32_t* out, uint32_t* in)
     return 0;
 }
 
+/* bank=0 不填充. 张量不跨 SSBO 边界 */
+static size_t wq_bank_align(size_t cursor, size_t nbytes, size_t bank)
+{
+    size_t used;
+    if (bank == 0 || nbytes == 0 || nbytes > bank) return cursor;
+    used = cursor % bank;
+    if (used && used + nbytes > bank)
+        cursor += bank - used;
+    return cursor;
+}
+
+static size_t block_q4k_bytes(const LlModel* m, uint32_t layer)
+{
+    size_t sum = 0;
+    uint32_t s, hidx, nt;
+    if (layer >= m->n_layers) return 0;
+    hidx = m->base_idx[layer];
+    nt = m->dir[layer].n_tensors;
+    for (s = 0; s < nt; s++) {
+        const LlfTensorMeta* mt = &m->metas[hidx + s];
+        uint32_t o, i;
+        if (mt->dtype != DT_Q4K || mt->size == 0) continue;
+        if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+        sum += (size_t)o * ((size_t)(i / 256) * 144);
+    }
+    return sum;
+}
+
+static size_t q4k_packed_bytes(const LlModel* m, size_t bank)
+{
+    size_t cursor = 0;
+    uint32_t li, s;
+    for (li = 0; li < m->h.n_blocks; li++) {
+        uint32_t layer = li + 1;
+        uint32_t hidx, nt;
+        if (layer >= m->n_layers) continue;
+        cursor = wq_bank_align(cursor, block_q4k_bytes(m, layer), bank);
+        hidx = m->base_idx[layer];
+        nt = m->dir[layer].n_tensors;
+        for (s = 0; s < nt; s++) {
+            const LlfTensorMeta* mt = &m->metas[hidx + s];
+            uint32_t o, i;
+            size_t nbytes;
+            if (mt->dtype != DT_Q4K || mt->size == 0) continue;
+            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            nbytes = (size_t)o * ((size_t)(i / 256) * 144);
+            cursor = wq_bank_align(cursor, nbytes, bank);
+            cursor += nbytes;
+        }
+    }
+    {
+        uint32_t layer = m->h.n_blocks + 2;
+        if (layer < m->n_layers) {
+            const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+            uint32_t o, i;
+            if (mt->size > 0 && tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
+                size_t nbytes = 0;
+                if (mt->dtype == DT_Q4K)
+                    nbytes = (size_t)o * ((size_t)(i / 256) * 144);
+                else if (mt->dtype == DT_Q6K)
+                    nbytes = (size_t)o * ((size_t)(i / 256) * 210);
+                if (nbytes) {
+                    if (nbytes != mt->size) nbytes = (size_t)mt->size;
+                    cursor = wq_bank_align(cursor, nbytes, bank);
+                    cursor += nbytes;
+                }
+            }
+        }
+    }
+    return cursor;
+}
+
 static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out,
                            size_t* total_wq)
 {
@@ -170,38 +242,9 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
 {
     LlModel* m = &e->ws.model;
     uint32_t nslot = ctx->wq_nslot;
-    size_t total = 0;
+    size_t bank = (!ctx->wq_stream && ctx->wq_nbank > 1) ? ctx->wq_bank_size : 0;
+    size_t total = q4k_packed_bytes(m, bank);
     uint32_t li, s;
-
-    for (li = 0; li < m->h.n_blocks; li++) {
-        uint32_t layer = li + 1;
-        if (layer >= m->n_layers) continue;
-        uint32_t hidx = m->base_idx[layer];
-        uint32_t nt = m->dir[layer].n_tensors;
-        if (nt > nslot) nt = nslot;
-        for (s = 0; s < nt; s++) {
-            const LlfTensorMeta* mt = &m->metas[hidx + s];
-            if (mt->dtype != DT_Q4K || mt->size == 0) continue;
-            uint32_t o, i;
-            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
-            total += (size_t)o * ((size_t)(i / 256) * 144);
-        }
-    }
-    {
-        uint32_t layer = m->h.n_blocks + 2;
-        if (layer < m->n_layers) {
-            const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
-            if (mt->size > 0) {
-                uint32_t o, i;
-                if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
-                    if (mt->dtype == DT_Q4K)
-                        total += (size_t)o * ((size_t)(i / 256) * 144);
-                    else if (mt->dtype == DT_Q6K)
-                        total += (size_t)o * ((size_t)(i / 256) * 210);
-                }
-            }
-        }
-    }
     if (total == 0) return -1;
     if (!ctx->wq_stream && total > ctx->wq_bytes) {
         ylog_warn("vulkan: Q4_K pack size %zu vs buf %zu", total, ctx->wq_bytes);
@@ -222,6 +265,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
         uint32_t hidx = m->base_idx[layer];
         uint32_t nt = m->dir[layer].n_tensors;
         if (nt > nslot) nt = nslot;
+        cursor = wq_bank_align(cursor, block_q4k_bytes(m, layer), bank);
         for (s = 0; s < nt; s++) {
             const LlfTensorMeta* mt = &m->metas[hidx + s];
             if (mt->dtype != DT_Q4K || mt->size == 0) continue;
@@ -232,6 +276,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
                 ylog_warn("vulkan: Q4_K size mismatch slot=%u layer=%u calc=%zu meta=%llu; use calc",
                           s, layer, nbytes, (unsigned long long)mt->size);
             }
+            cursor = wq_bank_align(cursor, nbytes, bank);
             if (cursor + nbytes > total) {
                 free(blob);
                 return -1;
@@ -252,6 +297,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
                 if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
                     size_t nbytes = (size_t)o * ((size_t)(i / 256) * 144);
                     if (nbytes != mt->size) nbytes = (size_t)mt->size;
+                    cursor = wq_bank_align(cursor, nbytes, bank);
                     if (cursor + nbytes <= total) {
                         memcpy(blob + cursor, base + mt->offset, nbytes);
                         ctx->lm_off = cursor;
@@ -275,6 +321,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
                 if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
                     size_t nbytes = (size_t)o * ((size_t)(i / 256) * 210);
                     if (nbytes != mt->size) nbytes = (size_t)mt->size;
+                    cursor = wq_bank_align(cursor, nbytes, bank);
                     if (cursor + nbytes <= total) {
                         memcpy(blob + cursor, base + mt->offset, nbytes);
                         ctx->lm_off = cursor;
@@ -350,29 +397,39 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
         if (layer_max < 144 * 8) layer_max = 144 * 8;
         ctx->layer_wq_max = layer_max;
 
-        /* iGPU / 超大 SSBO / YLLM_VK_STREAM=1 → 按层流式; dGPU 能装下则一次 resident */
+        /* 单 SSBO 装不下则拆 bank 常驻; YLLM_VK_STREAM=1 才强制按层拷 */
         ctx->wq_stream = 0;
         size_t gpu_wq = total_wq;
         {
             const char* env = getenv("YLLM_VK_STREAM");
             int force_stream = (env && env[0] == '1') ? 1 : 0;
             int force_resident = (env && env[0] == '0') ? 1 : 0;
-            int need_stream = 0;
-            if (!force_resident) {
-                if (ctx->integrated_gpu) need_stream = 1;
-                else if (total_wq > ctx->max_ssbo_range) need_stream = 1;
-                else if (force_stream) need_stream = 1;
-            }
-            if (need_stream) {
+            size_t ssbo = (size_t)ctx->max_ssbo_range;
+            if (ssbo > (size_t)256 * 1024 * 1024) ssbo = (size_t)256 * 1024 * 1024;
+            ssbo &= ~(size_t)4095u;
+            if (ssbo < 16u * 1024u * 1024u) ssbo = 16u * 1024u * 1024u;
+            if (force_stream) {
                 ctx->wq_stream = 1;
                 gpu_wq = layer_max;
-                ylog_info("vulkan: weight stream on (total=%zuMB layer_gpu=%zuMB igpu=%d)",
-                          total_wq / (1024 * 1024), layer_max / (1024 * 1024),
-                          ctx->integrated_gpu);
+                ylog_info("vulkan: weight stream on (YLLM_VK_STREAM=1 total=%zuMB layer_gpu=%zuMB)",
+                          total_wq / (1024 * 1024), layer_max / (1024 * 1024));
             } else {
-                ylog_info("vulkan: weight resident (total=%zuMB ssbo_max=%zuMB)",
-                          total_wq / (1024 * 1024),
-                          (size_t)(ctx->max_ssbo_range / (1024 * 1024)));
+                size_t padded = (total_wq > ssbo) ? q4k_packed_bytes(&e->ws.model, ssbo) : total_wq;
+                size_t nbank = ssbo ? (padded + ssbo - 1) / ssbo : 1;
+                if (!force_resident && (nbank > YLLM_VK_MAX_WQ_BANKS || layer_max > ssbo)) {
+                    ctx->wq_stream = 1;
+                    gpu_wq = layer_max;
+                    ylog_info("vulkan: weight stream on (total=%zuMB layer_gpu=%zuMB banks_need=%zu)",
+                              total_wq / (1024 * 1024), layer_max / (1024 * 1024), nbank);
+                } else {
+                    gpu_wq = padded;
+                    ctx->wq_bank_size = ssbo;
+                    ctx->wq_nbank = (int)nbank;
+                    if (ctx->wq_nbank < 1) ctx->wq_nbank = 1;
+                    ylog_info("vulkan: weight resident (total=%zuMB packed=%zuMB ssbo_max=%zuMB banks~%zu igpu=%d)",
+                              total_wq / (1024 * 1024), padded / (1024 * 1024),
+                              ssbo / (1024 * 1024), nbank, ctx->integrated_gpu);
+                }
             }
         }
         char cerr[256];
@@ -447,7 +504,8 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 }
             }
             if (ctx->norm_ready && ctx->block_ready && ctx->wq_resident &&
-                ctx->use_gpu_rope && !ctx->wq_stream && !getenv("YLLM_VK_NOTOKB")) {
+                ctx->use_gpu_rope && !ctx->wq_stream && ctx->wq_nbank <= 1 &&
+                !getenv("YLLM_VK_NOTOKB")) {
                 ctx->token_batch = 1;
                 ylog_info("vulkan: token-batch decode (per-layer fence; YLLM_VK_VRAM_SCRATCH=1 for VRAM+sem)");
             }

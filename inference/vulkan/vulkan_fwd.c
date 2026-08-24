@@ -17,6 +17,23 @@
 
 static uint64_t wq_off(VulkanCtx* ctx, uint32_t layer, uint32_t slot);
 
+static const uint8_t* wq_host_at(VulkanCtx* ctx, uint64_t abs, size_t nbytes)
+{
+    if (!ctx) return NULL;
+    if (ctx->host_wq && abs + nbytes <= ctx->host_wq_bytes)
+        return ctx->host_wq + (size_t)abs;
+    if (!ctx->wq_stream && ctx->wq_nbank > 1 && ctx->wq_bank_size > 0) {
+        int b = (int)(abs / ctx->wq_bank_size);
+        size_t loc = (size_t)(abs % ctx->wq_bank_size);
+        if (b >= 0 && b < ctx->wq_nbank && ctx->map_wq_bank[b] &&
+            loc + nbytes <= ctx->wq_bank_bytes[b])
+            return (const uint8_t*)ctx->map_wq_bank[b] + loc;
+    }
+    if (ctx->map_wq && !ctx->wq_stream && abs + nbytes <= ctx->wq_bytes)
+        return (const uint8_t*)ctx->map_wq + (size_t)abs;
+    return NULL;
+}
+
 int vulkan_selftest_rmsnorm(VulkanCtx* ctx)
 {
     if (!ctx || !ctx->compute_ready || ctx->hidden == 0) return -1;
@@ -147,11 +164,7 @@ int vulkan_selftest_gemv_q4k_real(VulkanCtx* ctx)
         return 0;
     rowb = (size_t)(in / 256) * 144;
     nbytes = (size_t)out * rowb;
-    wcpu = NULL;
-    if (ctx->host_wq && abs + nbytes <= ctx->host_wq_bytes)
-        wcpu = ctx->host_wq + (size_t)abs;
-    else if (ctx->map_wq && !ctx->wq_stream && abs + nbytes <= ctx->wq_bytes)
-        wcpu = (const uint8_t*)ctx->map_wq + (size_t)abs;
+    wcpu = wq_host_at(ctx, abs, nbytes);
     if (!wcpu) return 0;
 
     x = (float*)malloc((size_t)in * 4);
@@ -194,10 +207,12 @@ int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
         return 0;
     /* stream: lm 在 host_wq; map_wq 仅一层 GPU 权, lm_off 不可直接索引 */
     if (ctx->wq_stream || !ctx->wq_resident) return 0;
-    if (!ctx->map_wq || ctx->lm_off == (uint64_t)~0ull) return 0;
+    if (ctx->lm_off == (uint64_t)~0ull) return 0;
     uint32_t in = ctx->lm_in;
     uint32_t out = 8;
     if (in == 0 || (in % 256) != 0 || out > ctx->max_out) return -1;
+    const uint8_t* wcpu = wq_host_at(ctx, ctx->lm_off, (size_t)out * 210u);
+    if (!wcpu) return 0;
 
     float* x = (float*)malloc((size_t)in * 4);
     float* xq = (float*)malloc((size_t)in * 4);
@@ -211,7 +226,7 @@ int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
     for (i = 0; i < in; i++)
         x[i] = 0.015f * (float)((int)(i % 23) - 11);
     matvec_q8k_quant(x, xq, in);
-    matmul_q6k(yc8, xq, (const uint8_t*)ctx->map_wq + (size_t)ctx->lm_off, out, in);
+    matmul_q6k(yc8, xq, wcpu, out, in);
     if (vulkan_k_gemv_q6k(ctx, yg8, xq, out, in, ctx->lm_off) != 0) {
         free(x); free(xq); free(yg8); free(yc8);
         return -1;
@@ -235,9 +250,7 @@ int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
         ycf = (float*)malloc((size_t)vocab * 4);
         ygf = (float*)malloc((size_t)vocab * 4);
         if (ycf && ygf) {
-            matmul_q6k(ycf, xq,
-                       (const uint8_t*)ctx->map_wq + (size_t)ctx->lm_off,
-                       vocab, in);
+            matmul_q6k(ycf, xq, wcpu, vocab, in);
             uint32_t chunk = ctx->max_out;
             int ok = 0;
             if (ctx->gemv_ds_lm && ctx->logits_bytes >= (size_t)vocab * 4)

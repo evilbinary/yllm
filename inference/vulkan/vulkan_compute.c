@@ -282,6 +282,11 @@ static VkBuffer mem_to_buf(VulkanCtx* ctx, void* mem)
     if (mem == ctx->mem_o2) return (VkBuffer)ctx->buf_o2;
     if (mem == ctx->mem_wn) return (VkBuffer)ctx->buf_wn;
     if (mem == ctx->mem_wq) return (VkBuffer)ctx->buf_wq;
+    {
+        int bi;
+        for (bi = 0; bi < ctx->wq_nbank; bi++)
+            if (mem == ctx->mem_wq_bank[bi]) return (VkBuffer)ctx->buf_wq_bank[bi];
+    }
     if (mem == ctx->mem_kv) return (VkBuffer)ctx->buf_kv;
     if (mem == ctx->mem_bias) return (VkBuffer)ctx->buf_bias;
     if (mem == ctx->mem_logits) return (VkBuffer)ctx->buf_logits;
@@ -298,6 +303,12 @@ static void* vk_map_slot(VulkanCtx* ctx, void* mem, size_t off)
     if (mem == ctx->mem_o2 && ctx->map_o2) return (uint8_t*)ctx->map_o2 + off;
     if (mem == ctx->mem_wn && ctx->map_wn) return (uint8_t*)ctx->map_wn + off;
     if (mem == ctx->mem_wq && ctx->map_wq) return (uint8_t*)ctx->map_wq + off;
+    {
+        int bi;
+        for (bi = 0; bi < ctx->wq_nbank; bi++)
+            if (mem == ctx->mem_wq_bank[bi] && ctx->map_wq_bank[bi])
+                return (uint8_t*)ctx->map_wq_bank[bi] + off;
+    }
     if (mem == ctx->mem_kv && ctx->map_kv) return (uint8_t*)ctx->map_kv + off;
     if (mem == ctx->mem_bias && ctx->map_bias) return (uint8_t*)ctx->map_bias + off;
     return NULL;
@@ -1032,7 +1043,50 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                 ctx->mem_logits = (void*)mlogits;
             }
         }
-        if (create_host_buffer(ctx, ctx->wq_bytes, &bw, &mw, &ctx->map_wq) != 0 ||
+        {
+            int bi, nbank = ctx->wq_nbank;
+            size_t bsz = ctx->wq_bank_size;
+            int wq_ok = 1;
+            if (nbank < 1) nbank = 1;
+            if (nbank == 1 || bsz == 0) {
+                nbank = 1;
+                bsz = ctx->wq_bytes;
+            }
+            if (nbank > YLLM_VK_MAX_WQ_BANKS) {
+                ylog_warn("vulkan: weight banks %d > max %d", nbank, YLLM_VK_MAX_WQ_BANKS);
+                wq_ok = 0;
+                nbank = 1;
+            }
+            ctx->wq_nbank = nbank;
+            ctx->wq_bank_size = (nbank > 1) ? bsz : ctx->wq_bytes;
+            for (bi = 0; wq_ok && bi < nbank; bi++) {
+                VkBuffer bwb = VK_NULL_HANDLE;
+                VkDeviceMemory mwb = VK_NULL_HANDLE;
+                size_t this_sz = ctx->wq_bank_size;
+                if (nbank > 1 && (size_t)(bi + 1) * ctx->wq_bank_size > ctx->wq_bytes)
+                    this_sz = ctx->wq_bytes - (size_t)bi * ctx->wq_bank_size;
+                if (this_sz < 16) this_sz = 16;
+                ctx->wq_bank_bytes[bi] = this_sz;
+                if (create_host_buffer(ctx, this_sz, &bwb, &mwb, &ctx->map_wq_bank[bi]) != 0) {
+                    ylog_warn("vulkan: weight bank %d/%d alloc failed (%zu MB)",
+                              bi, nbank, this_sz / (1024 * 1024));
+                    wq_ok = 0;
+                    break;
+                }
+                ctx->buf_wq_bank[bi] = (void*)bwb;
+                ctx->mem_wq_bank[bi] = (void*)mwb;
+            }
+            if (wq_ok) {
+                bw = (VkBuffer)ctx->buf_wq_bank[0];
+                mw = (VkDeviceMemory)ctx->mem_wq_bank[0];
+                ctx->map_wq = ctx->map_wq_bank[0];
+                ctx->wq_bind_bank = 0;
+                ylog_info("vulkan: weight banks=%d size=%zuMB total=%zuMB",
+                          nbank, ctx->wq_bank_size / (1024 * 1024),
+                          ctx->wq_bytes / (1024 * 1024));
+            }
+        }
+        if (!bw ||
             create_scratch_buffer(ctx, ctx->y_bytes, &bo0, &mo0, &ctx->map_o0) != 0 ||
             create_scratch_buffer(ctx, ctx->y_bytes, &bo1, &mo1, &ctx->map_o1) != 0 ||
             create_scratch_buffer(ctx, ctx->y_bytes, &bo2, &mo2, &ctx->map_o2) != 0) {
@@ -1057,7 +1111,8 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                 }
             }
             VkBuffer bufs[3] = { bx, by, bw };
-            size_t ranges[3] = { ctx->x_bytes, ctx->y_bytes, ctx->wq_bytes };
+            size_t wq_range = ctx->wq_bank_bytes[0] ? ctx->wq_bank_bytes[0] : ctx->wq_bytes;
+            size_t ranges[3] = { ctx->x_bytes, ctx->y_bytes, wq_range };
             VkShaderModule sh = VK_NULL_HANDLE;
             VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
             VkPipelineLayout pl = VK_NULL_HANDLE;
@@ -1105,7 +1160,7 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                             VkBuffer trip[3] = { xb[si], yb[si], bw };
                             size_t xrng = (si == 0 || si == 5) ? ctx->x_bytes : ctx->y_bytes;
                             size_t yrng = (si == 5 && blogits) ? ctx->logits_bytes : ctx->y_bytes;
-                            size_t rng[3] = { xrng, yrng, ctx->wq_bytes };
+                            size_t rng[3] = { xrng, yrng, wq_range };
                             uint32_t b;
                             for (b = 0; b < 3; b++) {
                                 bis[b].buffer = trip[b];
@@ -1250,10 +1305,108 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
     return 0;
 }
 
+static void vulkan_wq_write_binding(VulkanCtx* ctx, void* dset, VkBuffer buf, size_t range)
+{
+    VulkanApi* a = vulkan_api();
+    VkDescriptorBufferInfo bi = {0};
+    VkWriteDescriptorSet w = {0};
+    if (!ctx || !dset || !buf || range == 0) return;
+    bi.buffer = buf;
+    bi.range = range;
+    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet = (VkDescriptorSet)dset;
+    w.dstBinding = 2;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &bi;
+    a->UpdateDescriptorSets((VkDevice)ctx->device, 1, &w, 0, NULL);
+}
+
+static int vulkan_wq_bind_bank(VulkanCtx* ctx, int bank)
+{
+    VkBuffer buf;
+    size_t rng;
+    if (!ctx) return -1;
+    if (ctx->wq_nbank <= 1) {
+        ctx->wq_bind_bank = 0;
+        return 0;
+    }
+    if (bank < 0 || bank >= ctx->wq_nbank) return -1;
+    if (bank == ctx->wq_bind_bank && ctx->buf_wq == ctx->buf_wq_bank[bank])
+        return 0;
+    buf = (VkBuffer)ctx->buf_wq_bank[bank];
+    rng = ctx->wq_bank_bytes[bank];
+    if (!buf || rng == 0) return -1;
+    vulkan_wq_write_binding(ctx, ctx->gemv_desc_set, buf, rng);
+    vulkan_wq_write_binding(ctx, ctx->gemv_ds0, buf, rng);
+    vulkan_wq_write_binding(ctx, ctx->gemv_ds1, buf, rng);
+    vulkan_wq_write_binding(ctx, ctx->gemv_ds2, buf, rng);
+    vulkan_wq_write_binding(ctx, ctx->gemv_ds_xo, buf, rng);
+    vulkan_wq_write_binding(ctx, ctx->gemv_ds_lm, buf, rng);
+    ctx->buf_wq = ctx->buf_wq_bank[bank];
+    ctx->mem_wq = ctx->mem_wq_bank[bank];
+    ctx->map_wq = ctx->map_wq_bank[bank];
+    ctx->wq_bind_bank = bank;
+    return 0;
+}
+
+static int wq_prep(VulkanCtx* ctx, uint64_t glob, uint32_t* local)
+{
+    if (!ctx || !local) return -1;
+    if (glob > 0xffffffffull) return -1;
+    if (ctx->wq_nbank > 1 && ctx->wq_bank_size > 0) {
+        int b = (int)(glob / ctx->wq_bank_size);
+        size_t loc = (size_t)(glob % ctx->wq_bank_size);
+        if (vulkan_wq_bind_bank(ctx, b) != 0) return -1;
+        if (loc > 0xffffffffull) return -1;
+        *local = (uint32_t)loc;
+        return 0;
+    }
+    *local = (uint32_t)glob;
+    return 0;
+}
+
+static int wq_prep_n(VulkanCtx* ctx, const uint64_t* glob, int n, uint32_t* local)
+{
+    int i;
+    if (!glob || n <= 0 || !local) return -1;
+    if (wq_prep(ctx, glob[0], &local[0]) != 0) return -1;
+    if (ctx->wq_nbank <= 1 || ctx->wq_bank_size == 0) {
+        for (i = 1; i < n; i++) {
+            if (glob[i] > 0xffffffffull) return -1;
+            local[i] = (uint32_t)glob[i];
+        }
+        return 0;
+    }
+    for (i = 1; i < n; i++) {
+        if (glob[i] / ctx->wq_bank_size != glob[0] / ctx->wq_bank_size)
+            return -1;
+        local[i] = (uint32_t)(glob[i] % ctx->wq_bank_size);
+    }
+    return 0;
+}
+
 int vulkan_wq_upload(VulkanCtx* ctx, const void* blob, size_t bytes)
 {
     if (!ctx || !ctx->gemv_ready || !blob || bytes == 0) return -1;
     if (bytes > ctx->wq_bytes) return -1;
+    if (ctx->wq_nbank > 1 && ctx->wq_bank_size > 0) {
+        int bi;
+        for (bi = 0; bi < ctx->wq_nbank; bi++) {
+            size_t off = (size_t)bi * ctx->wq_bank_size;
+            size_t n;
+            if (off >= bytes) break;
+            n = bytes - off;
+            if (n > ctx->wq_bank_bytes[bi]) n = ctx->wq_bank_bytes[bi];
+            if (!ctx->map_wq_bank[bi]) return -1;
+            memcpy(ctx->map_wq_bank[bi], (const uint8_t*)blob + off, n);
+            host_flush_mem(ctx, ctx->mem_wq_bank[bi]);
+        }
+        ctx->wq_resident = 1;
+        ylog_info("vulkan: Q4_K weights resident %zuMB in %d banks",
+                  bytes / (1024 * 1024), ctx->wq_nbank);
+        return 0;
+    }
     if (ctx->map_wq) {
         memcpy(ctx->map_wq, blob, bytes);
         host_flush_mem(ctx, ctx->mem_wq);
@@ -1439,6 +1592,11 @@ int vulkan_k_lm_gemv(VulkanCtx* ctx, float* y, const float* x, int x_on_dev,
     size_t wbytes = (size_t)vocab * ((size_t)(hidden / 256) * rowb);
     if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
     if (w_byte_off > 0xffffffffull) return -1;
+    {
+        uint32_t wloc = 0;
+        if (wq_prep(ctx, w_byte_off, &wloc) != 0) return -1;
+        w_byte_off = wloc;
+    }
 
     int q6 = (dtype == DT_Q6K);
     if (q6 && !ctx->gemv_q6k_ready) return -1;
@@ -1502,6 +1660,11 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 144);
     if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
     if (w_byte_off > 0xffffffffull) return -1;
+    {
+        uint32_t wloc = 0;
+        if (wq_prep(ctx, w_byte_off, &wloc) != 0) return -1;
+        w_byte_off = wloc;
+    }
 
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
@@ -1556,6 +1719,11 @@ int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,
     size_t wbytes = (size_t)out * ((size_t)(in / 256) * 210);
     if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
     if (w_byte_off > 0xffffffffull) return -1;
+    {
+        uint32_t wloc = 0;
+        if (wq_prep(ctx, w_byte_off, &wloc) != 0) return -1;
+        w_byte_off = wloc;
+    }
 
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
@@ -1796,6 +1964,11 @@ int vulkan_k_lm_fused(VulkanCtx* ctx, float* y, const float* w_norm,
     size_t wbytes = (size_t)vocab * ((size_t)(hidden / 256) * rowb);
     if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
     if (w_byte_off > 0xffffffffull) return -1;
+    {
+        uint32_t wloc = 0;
+        if (wq_prep(ctx, w_byte_off, &wloc) != 0) return -1;
+        w_byte_off = wloc;
+    }
 
     VulkanApi* a = vulkan_api();
     VkDevice dev = (VkDevice)ctx->device;
@@ -1931,6 +2104,12 @@ int vulkan_fused_norm_qkv(VulkanCtx* ctx,
         return -1;
     if (off_q > 0xffffffffull || off_k > 0xffffffffull || off_v > 0xffffffffull)
         return -1;
+    {
+        uint64_t g[3] = { off_q, off_k, off_v };
+        uint32_t l[3];
+        if (wq_prep_n(ctx, g, 3, l) != 0) return -1;
+        off_q = l[0]; off_k = l[1]; off_v = l[2];
+    }
 
     size_t xb = (size_t)hidden * 4;
     size_t kb = (size_t)kv_dim * 4;
@@ -1968,6 +2147,12 @@ int vulkan_fused_norm_gate_up(VulkanCtx* ctx,
         return -1;
     if (hidden > ctx->max_in || inter > ctx->max_out) return -1;
     if (off_gate > 0xffffffffull || off_up > 0xffffffffull) return -1;
+    {
+        uint64_t g[2] = { off_gate, off_up };
+        uint32_t l[2];
+        if (wq_prep_n(ctx, g, 2, l) != 0) return -1;
+        off_gate = l[0]; off_up = l[1];
+    }
 
     size_t xb = (size_t)hidden * 4;
     size_t ib = (size_t)inter * 4;
@@ -2062,6 +2247,12 @@ int vulkan_fused_ffn(VulkanCtx* ctx,
         return -1;
     if (off_gate > 0xffffffffull || off_up > 0xffffffffull || off_down > 0xffffffffull)
         return -1;
+    {
+        uint64_t g[3] = { off_gate, off_up, off_down };
+        uint32_t l[3];
+        if (wq_prep_n(ctx, g, 3, l) != 0) return -1;
+        off_gate = l[0]; off_up = l[1]; off_down = l[2];
+    }
 
     size_t xb = (size_t)hidden * 4;
     if (map_copy(ctx, ctx->mem_x, x, xb) != 0) return -1;
@@ -2402,6 +2593,11 @@ int vulkan_k_attn_decode(VulkanCtx* ctx,
         if (hidden > ctx->max_in || hidden > ctx->max_out) return -1;
         size_t wbytes = (size_t)hidden * ((size_t)(hidden / 256) * 144);
         if ((hidden % 256) != 0 || off_o + wbytes > ctx->wq_bytes) return -1;
+        {
+            uint32_t wloc = 0;
+            if (wq_prep(ctx, off_o, &wloc) != 0) return -1;
+            off_o = wloc;
+        }
     }
 
     uint32_t kv_dim = ctx->kv_dim;
@@ -2503,6 +2699,13 @@ int vulkan_fused_qkv_rope_attn(VulkanCtx* ctx,
         if (off_o > 0xffffffffull) return -1;
         size_t wbytes = (size_t)hidden * ((size_t)(hidden / 256) * 144);
         if ((hidden % 256) != 0 || off_o + wbytes > ctx->wq_bytes) return -1;
+    }
+    {
+        uint64_t g[4] = { off_q, off_k, off_v, fuse_o ? off_o : off_q };
+        uint32_t l[4];
+        if (wq_prep_n(ctx, g, fuse_o ? 4 : 3, l) != 0) return -1;
+        off_q = l[0]; off_k = l[1]; off_v = l[2];
+        if (fuse_o) off_o = l[3];
     }
 
     size_t xb = (size_t)hidden * 4;
@@ -2700,6 +2903,13 @@ int vulkan_fused_block(VulkanCtx* ctx,
             if (vulkan_stream_layer(ctx, layer) != 0) return -1;
         }
     }
+    {
+        uint64_t g[7] = { off_q, off_k, off_v, off_o, off_g, off_u, off_d };
+        uint32_t l[7];
+        if (wq_prep_n(ctx, g, 7, l) != 0) return -1;
+        off_q = l[0]; off_k = l[1]; off_v = l[2]; off_o = l[3];
+        off_g = l[4]; off_u = l[5]; off_d = l[6];
+    }
 
     size_t xb = (size_t)hidden * 4;
     uint32_t w1_off = ctx->norm_ready ? norm_w_off1(ctx, layer) : 0u;
@@ -2854,7 +3064,9 @@ int vulkan_fused_block(VulkanCtx* ctx,
             }
         }
 
-        if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
+        if (!ctx->norm_ready) {
+            if (map_copy(ctx, ctx->mem_wn, wn2, xb) != 0) return -1;
+        }
 
         if (ctx->cmd_open) vulkan_gpu_discard(ctx);
         a->ResetCommandBuffer(cmd, 0);

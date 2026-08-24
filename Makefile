@@ -478,6 +478,38 @@ android-cpu:
 	$(call ANDROID_CMAKE_CFG,$(ANDROID_BUILD_CPU),OFF)
 	@echo "android-cpu: $(ANDROID_BUILD_CPU)/yllm  $(ANDROID_BUILD_CPU)/libyllm.so"
 
+# ---- 指定模型的 chat 快捷目标(gemma4) ----
+G4_E2B_GGUF  ?= models/gemma-4-E2B-it-Q4_K_M.gguf
+G4_E2B_LLF   ?= models/gemma-4-E2B-it-Q4_K_M.llf
+G4_E4B_GGUF  ?= models/gemma-4-E4B-it-Q4_K_M.gguf
+G4_E4B_LLF   ?= models/gemma-4-E4B-it-Q4_K_M.llf
+
+$(G4_E2B_LLF): $(G4_E2B_GGUF) | $(BIN)
+	$(BIN) convert --gguf $(G4_E2B_GGUF) --out $(G4_E2B_LLF) --seq 8192
+
+$(G4_E4B_LLF): $(G4_E4B_GGUF) | $(BIN)
+	$(BIN) convert --gguf $(G4_E4B_GGUF) --out $(G4_E4B_LLF) --seq 8192
+
+chat-gemma4-e2b: $(BIN) $(G4_E2B_LLF)
+	$(RUN) chat --model $(G4_E2B_LLF) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-gemma4-e2b-avx2: $(BIN_AVX2) $(G4_E2B_LLF)
+	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-gemma4-e2b-avx2-vulkan: vulkan $(G4_E2B_LLF)
+	$(RUN_VULKAN) chat --model $(G4_E2B_LLF) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
+chat-gemma4-e4b: $(BIN) $(G4_E4B_LLF)
+	$(RUN) chat --model $(G4_E4B_LLF) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-gemma4-e4b-avx2: $(BIN_AVX2) $(G4_E4B_LLF)
+	$(RUN_AVX2) chat --model $(G4_E4B_LLF) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-gemma4-e4b-avx2-vulkan: vulkan $(G4_E4B_LLF)
+	$(RUN_VULKAN) chat --model $(G4_E4B_LLF) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 Q25_LLF   ?= models/qwen2.5-1.5b.llf

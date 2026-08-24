@@ -8,7 +8,7 @@
 typedef struct {
     int device_id;
     int host_shim;
-    int integrated_gpu;   /* iGPU: 强制按层流式权 */
+    int integrated_gpu;   /* UMA iGPU; 权重大于单 SSBO 时走多 bank 常驻 */
     uint64_t max_ssbo_range;
     void* instance;
     void* phys;
@@ -90,6 +90,14 @@ typedef struct {
     void* buf_wq;
     void* mem_wq;
     size_t wq_bytes;
+#define YLLM_VK_MAX_WQ_BANKS 16
+    void* buf_wq_bank[YLLM_VK_MAX_WQ_BANKS];
+    void* mem_wq_bank[YLLM_VK_MAX_WQ_BANKS];
+    void* map_wq_bank[YLLM_VK_MAX_WQ_BANKS];
+    size_t wq_bank_bytes[YLLM_VK_MAX_WQ_BANKS];
+    size_t wq_bank_size;
+    int wq_nbank;
+    int wq_bind_bank;
     uint64_t* wq_off;
     uint32_t wq_nslot;
     int wq_resident;
