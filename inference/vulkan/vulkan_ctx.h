@@ -74,6 +74,9 @@ typedef struct {
     void* gemv_pipe_layout;
     void* gemv_pipeline;
     void* gemv_shader;
+    void* gemv_q6k_pipeline;
+    void* gemv_q6k_shader;
+    int gemv_q6k_ready;
     void* buf_wq;
     void* mem_wq;
     size_t wq_bytes;
@@ -166,7 +169,7 @@ typedef struct {
 
     int x_on_dev; /* buf_x 为权威激活 */
 
-    /* lm_head: Q4_K 常驻偏移(Q6_K 等走 CPU) */
+    /* lm_head: Q4_K / Q6_K 常驻偏移 */
     uint64_t lm_off;
     uint32_t lm_out;
     uint32_t lm_in;

@@ -284,6 +284,56 @@ static int create_ssbo_pipeline(VulkanCtx* ctx, const char* spv_name,
     return 0;
 }
 
+static int create_compute_pipeline(VulkanCtx* ctx, const char* spv_name,
+                                   VkPipelineLayout pl,
+                                   VkShaderModule* out_shader, VkPipeline* out_pipe,
+                                   char* err, size_t errlen)
+{
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    char pathbuf[512];
+    const char* path = find_spv_named(spv_name, pathbuf, sizeof(pathbuf));
+    if (!path) {
+        if (err && errlen) snprintf(err, errlen, "%s not found", spv_name);
+        return -1;
+    }
+    uint32_t* code = NULL;
+    size_t nwords = 0;
+    code = read_spv(path, &nwords);
+    if (!code) {
+        if (err && errlen) snprintf(err, errlen, "read %s failed", path);
+        return -1;
+    }
+    VkShaderModuleCreateInfo smi = {0};
+    smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smi.codeSize = nwords * 4;
+    smi.pCode = code;
+    VkShaderModule sh = VK_NULL_HANDLE;
+    VkResult r = a->CreateShaderModule(dev, &smi, NULL, &sh);
+    free(code);
+    if (r != VK_SUCCESS) {
+        if (err && errlen) snprintf(err, errlen, "CreateShaderModule %s %d", spv_name, (int)r);
+        return -1;
+    }
+    VkComputePipelineCreateInfo cpi = {0};
+    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = sh;
+    cpi.stage.pName = "main";
+    cpi.layout = pl;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (a->CreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe) != VK_SUCCESS) {
+        a->DestroyShaderModule(dev, sh, NULL);
+        if (err && errlen) snprintf(err, errlen, "CreateComputePipelines %s failed", spv_name);
+        return -1;
+    }
+    *out_shader = sh;
+    *out_pipe = pipe;
+    ylog_info("vulkan: pipeline %s ready (%s)", spv_name, path);
+    return 0;
+}
+
 static int submit_and_wait(VulkanCtx* ctx, VkCommandBuffer cmd)
 {
     VulkanApi* a = vulkan_api();
@@ -486,6 +536,22 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                         ctx->fuse_ready = 1;
                         ylog_info("vulkan: gemv_q4k+fuse ready max_in=%u max_out=%u wq=%zuMB",
                                   max_in, max_out, ctx->wq_bytes / (1024 * 1024));
+                        {
+                            char q6err[256];
+                            VkShaderModule q6sh = VK_NULL_HANDLE;
+                            VkPipeline q6pipe = VK_NULL_HANDLE;
+                            if (create_compute_pipeline(ctx, "gemv_q6k.spv",
+                                                        (VkPipelineLayout)pl,
+                                                        &q6sh, &q6pipe,
+                                                        q6err, sizeof(q6err)) != 0) {
+                                ylog_warn("vulkan: gemv_q6k pipeline failed (%s)", q6err);
+                            } else {
+                                ctx->gemv_q6k_shader = (void*)q6sh;
+                                ctx->gemv_q6k_pipeline = (void*)q6pipe;
+                                ctx->gemv_q6k_ready = 1;
+                                ylog_info("vulkan: gemv_q6k ready");
+                            }
+                        }
                     }
                 }
             }
@@ -777,6 +843,69 @@ int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
                 return -1;
             memcpy(y, tmp, ybytes);
             a->UnmapMemory(dev, (VkDeviceMemory)ymem);
+        }
+    }
+    return 0;
+}
+
+int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,
+                      uint32_t out, uint32_t in, uint64_t w_byte_off)
+{
+    if (!ctx || !ctx->gemv_q6k_ready || !y || !x) return -1;
+    if (out == 0 || in == 0 || (in % 256) != 0) return -1;
+    if (out > ctx->max_out) return -1;
+    if (in > ctx->max_in) return -1;
+    size_t wbytes = (size_t)out * ((size_t)(in / 256) * 210);
+    if (w_byte_off + wbytes > ctx->wq_bytes) return -1;
+    if (w_byte_off > 0xffffffffull) return -1;
+
+    VulkanApi* a = vulkan_api();
+    VkDevice dev = (VkDevice)ctx->device;
+    size_t xbytes = (size_t)in * 4;
+    size_t ybytes = (size_t)out * 4;
+
+    {
+        void* px = vk_map_slot(ctx, ctx->mem_x, 0);
+        if (px) memcpy(px, x, xbytes);
+        else {
+            void* tmp = NULL;
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_x, 0, xbytes, 0, &tmp) != VK_SUCCESS)
+                return -1;
+            memcpy(tmp, x, xbytes);
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_x);
+        }
+    }
+
+    VkCommandBuffer cmd = (VkCommandBuffer)ctx->cmd;
+    a->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = {0};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    a->BeginCommandBuffer(cmd, &bi);
+    a->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)ctx->gemv_q6k_pipeline);
+    VkDescriptorSet ds = (VkDescriptorSet)ctx->gemv_desc_set;
+    a->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             (VkPipelineLayout)ctx->gemv_pipe_layout, 0, 1, &ds, 0, NULL);
+    GemvPush push;
+    push.out_n = out;
+    push.in_n = in;
+    push.w_off = (uint32_t)w_byte_off;
+    push._pad = 0;
+    a->CmdPushConstants(cmd, (VkPipelineLayout)ctx->gemv_pipe_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    a->CmdDispatch(cmd, out, 1, 1);
+    a->EndCommandBuffer(cmd);
+    if (submit_and_wait(ctx, cmd) != 0) return -1;
+
+    {
+        void* py = vk_map_slot(ctx, ctx->mem_y, 0);
+        if (py) memcpy(y, py, ybytes);
+        else {
+            void* tmp = NULL;
+            if (a->MapMemory(dev, (VkDeviceMemory)ctx->mem_y, 0, ybytes, 0, &tmp) != VK_SUCCESS)
+                return -1;
+            memcpy(y, tmp, ybytes);
+            a->UnmapMemory(dev, (VkDeviceMemory)ctx->mem_y);
         }
     }
     return 0;

@@ -1,0 +1,132 @@
+#version 450
+/* Q6_K gemv: y[o] = row_o · x ; 210 B/block, 与 CPU matmul_q6k 标量路径一致 */
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer InX { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer OutY { float y[]; };
+layout(set = 0, binding = 2) readonly buffer InW { uint w[]; };
+
+layout(push_constant) uniform Push {
+    uint out_n;
+    uint in_n;
+    uint w_off;
+} pc;
+
+uint load_u8(uint off)
+{
+    uint word = w[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+float load_f16(uint off)
+{
+    uint lo = load_u8(off);
+    uint hi = load_u8(off + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+int load_i8(uint off)
+{
+    uint u = load_u8(off);
+    if (u >= 128u) return int(u) - 256;
+    return int(u);
+}
+
+int q6(int ql, int qh, int shift)
+{
+    return ((ql & 15) | (((qh >> shift) & 3) << 4)) - 32;
+}
+
+float q6k_dot256(uint blk, uint xoff)
+{
+    float d = load_f16(blk + 208u);
+    uint ql = blk;
+    uint qh = blk + 128u;
+    uint scp = blk + 192u;
+    float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0, s5 = 0.0, s6 = 0.0, s7 = 0.0;
+    float s8 = 0.0, s9 = 0.0, sa = 0.0, sb = 0.0, scv = 0.0, sd = 0.0, se = 0.0, sf = 0.0;
+
+    for (uint chunk = 0u; chunk < 2u; chunk++) {
+        uint is = chunk * 8u;
+        uint ql_c = ql + chunk * 64u;
+        uint qh_c = qh + chunk * 32u;
+        uint xp = xoff + chunk * 128u;
+        for (uint l = 0u; l < 16u; l++) {
+            uint ql0 = load_u8(ql_c + l);
+            uint ql32 = load_u8(ql_c + l + 32u);
+            uint qh0 = load_u8(qh_c + l);
+            int q1 = q6(int(ql0), int(qh0), 0);
+            int q2 = q6(int(ql32), int(qh0), 2);
+            int q3 = q6(int(ql0 >> 4u), int(qh0), 4);
+            int q4 = q6(int(ql32 >> 4u), int(qh0), 6);
+            if (is == 0u) {
+                s0 += float(q1) * x[xp + l];
+                s2 += float(q2) * x[xp + l + 32u];
+                s4 += float(q3) * x[xp + l + 64u];
+                s6 += float(q4) * x[xp + l + 96u];
+            } else {
+                s8 += float(q1) * x[xp + l];
+                sa += float(q2) * x[xp + l + 32u];
+                scv += float(q3) * x[xp + l + 64u];
+                se += float(q4) * x[xp + l + 96u];
+            }
+        }
+        for (uint l = 16u; l < 32u; l++) {
+            uint ql0 = load_u8(ql_c + l);
+            uint ql32 = load_u8(ql_c + l + 32u);
+            uint qh0 = load_u8(qh_c + l);
+            int q1 = q6(int(ql0), int(qh0), 0);
+            int q2 = q6(int(ql32), int(qh0), 2);
+            int q3 = q6(int(ql0 >> 4u), int(qh0), 4);
+            int q4 = q6(int(ql32 >> 4u), int(qh0), 6);
+            if (is == 0u) {
+                s1 += float(q1) * x[xp + l];
+                s3 += float(q2) * x[xp + l + 32u];
+                s5 += float(q3) * x[xp + l + 64u];
+                s7 += float(q4) * x[xp + l + 96u];
+            } else {
+                s9 += float(q1) * x[xp + l];
+                sb += float(q2) * x[xp + l + 32u];
+                sd += float(q3) * x[xp + l + 64u];
+                sf += float(q4) * x[xp + l + 96u];
+            }
+        }
+    }
+    return d * (
+        float(load_i8(scp + 0u)) * s0 + float(load_i8(scp + 1u)) * s1 +
+        float(load_i8(scp + 2u)) * s2 + float(load_i8(scp + 3u)) * s3 +
+        float(load_i8(scp + 4u)) * s4 + float(load_i8(scp + 5u)) * s5 +
+        float(load_i8(scp + 6u)) * s6 + float(load_i8(scp + 7u)) * s7 +
+        float(load_i8(scp + 8u)) * s8 + float(load_i8(scp + 9u)) * s9 +
+        float(load_i8(scp + 10u)) * sa + float(load_i8(scp + 11u)) * sb +
+        float(load_i8(scp + 12u)) * scv + float(load_i8(scp + 13u)) * sd +
+        float(load_i8(scp + 14u)) * se + float(load_i8(scp + 15u)) * sf);
+}
+
+shared float sh[64];
+
+void main()
+{
+    uint o = gl_WorkGroupID.x;
+    if (o >= pc.out_n) return;
+
+    uint nb = pc.in_n / 256u;
+    uint rowb = nb * 210u;
+    uint row = pc.w_off + o * rowb;
+    float acc = 0.0;
+    for (uint b = gl_LocalInvocationID.x; b < nb; b += 64u)
+        acc += q6k_dot256(row + b * 210u, b * 256u);
+
+    uint lid = gl_LocalInvocationID.x;
+    sh[lid] = acc;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lid < s)
+            sh[lid] += sh[lid + s];
+        memoryBarrierShared();
+        barrier();
+    }
+    if (lid == 0u)
+        y[o] = sh[0];
+}

@@ -13,6 +13,7 @@
 void vulkan_attach_fwd(Engine* e);
 int vulkan_selftest_rmsnorm(VulkanCtx* ctx);
 int vulkan_selftest_gemv_q4k(VulkanCtx* ctx);
+int vulkan_selftest_gemv_q6k(VulkanCtx* ctx);
 
 static int tensor_out_in(const LlfTensorMeta* mt, uint32_t* out, uint32_t* in)
 {
@@ -68,10 +69,14 @@ static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out
         uint32_t layer = m->h.n_blocks + 2;
         if (layer < m->n_layers) {
             const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
-            if (mt->dtype == DT_Q4K && mt->size > 0) {
+            if (mt->size > 0) {
                 uint32_t o, i;
-                if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0)
-                    *total_wq += (size_t)o * ((size_t)(i / 256) * 144);
+                if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
+                    if (mt->dtype == DT_Q4K)
+                        *total_wq += (size_t)o * ((size_t)(i / 256) * 144);
+                    else if (mt->dtype == DT_Q6K)
+                        *total_wq += (size_t)o * ((size_t)(i / 256) * 210);
+                }
             }
         }
     }
@@ -126,10 +131,14 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
         uint32_t layer = m->h.n_blocks + 2;
         if (layer < m->n_layers) {
             const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
-            if (mt->dtype == DT_Q4K && mt->size > 0) {
+            if (mt->size > 0) {
                 uint32_t o, i;
-                if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0)
-                    total += (size_t)o * ((size_t)(i / 256) * 144);
+                if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
+                    if (mt->dtype == DT_Q4K)
+                        total += (size_t)o * ((size_t)(i / 256) * 144);
+                    else if (mt->dtype == DT_Q6K)
+                        total += (size_t)o * ((size_t)(i / 256) * 210);
+                }
             }
         }
     }
@@ -202,8 +211,28 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
                               mt->shape[0], mt->shape[1]);
                 }
             } else if (mt->dtype == DT_Q6K && mt->size > 0) {
-                /* Q6_K lm_head: CPU matmul 更快且与 greedy 一致; 不置 lm_ready */
-                ylog_info("vulkan: lm_head Q6_K → CPU (exact)");
+                uint32_t o, i;
+                if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
+                    size_t nbytes = (size_t)o * ((size_t)(i / 256) * 210);
+                    if (nbytes != mt->size) nbytes = (size_t)mt->size;
+                    if (cursor + nbytes <= total) {
+                        memcpy(blob + cursor, base + mt->offset, nbytes);
+                        ctx->lm_off = cursor;
+                        ctx->lm_out = o;
+                        ctx->lm_in = i;
+                        ctx->lm_dtype = DT_Q6K;
+                        ctx->wq_off[(size_t)layer * nslot + 0] = cursor;
+                        cursor += nbytes;
+                        ctx->lm_ready = 1;
+                    } else {
+                        ylog_warn("vulkan: lm_head Q6_K pack overflow cursor=%zu need=%zu total=%zu",
+                                  cursor, nbytes, total);
+                    }
+                } else {
+                    ylog_warn("vulkan: lm_head Q6_K skip shape dtype=%u size=%llu ndim=%u s0=%u s1=%u",
+                              mt->dtype, (unsigned long long)mt->size, mt->ndim,
+                              mt->shape[0], mt->shape[1]);
+                }
             } else {
                 ylog_info("vulkan: lm_head dtype=%u (CPU fallback)", mt->dtype);
             }
@@ -214,16 +243,22 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
         ctx->host_wq_bytes = cursor;
         ctx->wq_resident = 1;
         ctx->stream_layer = (uint32_t)~0u;
-        if (ctx->lm_ready)
-            ylog_info("vulkan: lm_head Q4_K stream-chunked out=%u in=%u", ctx->lm_out, ctx->lm_in);
+        if (ctx->lm_ready) {
+            if (ctx->lm_dtype == DT_Q6K)
+                ylog_info("vulkan: lm_head Q6_K stream-chunked out=%u in=%u", ctx->lm_out, ctx->lm_in);
+            else
+                ylog_info("vulkan: lm_head Q4_K stream-chunked out=%u in=%u", ctx->lm_out, ctx->lm_in);
+        }
         ylog_info("vulkan: Q4_K stream host=%zuMB layer_gpu=%zuMB",
                   cursor / (1024 * 1024), ctx->wq_bytes / (1024 * 1024));
         return 0;
     }
     int rc = vulkan_wq_upload(ctx, blob, cursor);
     free(blob);
-    if (rc == 0 && ctx->lm_ready)
-        ylog_info("vulkan: lm_head resident out=%u in=%u", ctx->lm_out, ctx->lm_in);
+    if (rc == 0 && ctx->lm_ready) {
+        const char* tag = (ctx->lm_dtype == DT_Q6K) ? "Q6_K" : "Q4_K";
+        ylog_info("vulkan: lm_head %s resident out=%u in=%u", tag, ctx->lm_out, ctx->lm_in);
+    }
     return rc;
 }
 
@@ -297,6 +332,11 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
             if (ctx->gemv_ready && pack_upload_q4k(e, ctx) != 0) {
                 ylog_warn("vulkan: Q4_K resident upload failed; gemv falls back host-W");
                 ctx->wq_resident = 0;
+            }
+            if (ctx->lm_ready && ctx->gemv_q6k_ready && !getenv("YLLM_VK_NOSELFTEST") &&
+                vulkan_selftest_gemv_q6k(ctx) != 0) {
+                ylog_warn("vulkan: gemv_q6k selftest failed; lm_head CPU fallback");
+                ctx->lm_ready = 0;
             }
             if (ctx->fuse_ready) {
                 char aerr[256];

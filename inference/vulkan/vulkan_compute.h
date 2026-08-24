@@ -21,6 +21,8 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
                      uint32_t n, float eps);
 int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
                       uint32_t out, uint32_t in, uint64_t w_byte_off);
+int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,
+                      uint32_t out, uint32_t in, uint64_t w_byte_off);
 int vulkan_k_gemv_q4k_host(VulkanCtx* ctx, float* y, const float* x,
                            const uint8_t* w, uint32_t out, uint32_t in);
 

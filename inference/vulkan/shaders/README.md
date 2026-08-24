@@ -5,6 +5,7 @@
 ```bash
 glslc -fshader-stage=compute rmsnorm.comp -o rmsnorm.spv
 glslc -fshader-stage=compute gemv_q4k.comp -o gemv_q4k.spv
+glslc -fshader-stage=compute gemv_q6k.comp -o gemv_q6k.spv
 glslc -fshader-stage=compute embed_q4k.comp -o embed_q4k.spv
 glslc -fshader-stage=compute swiglu.comp -o swiglu.spv
 glslc -fshader-stage=compute attn_decode.comp -o attn_decode.spv
@@ -14,6 +15,7 @@ glslc -fshader-stage=compute attn_decode.comp -o attn_decode.spv
 
 - `rmsnorm.comp` — 单 WG RMSNorm
 - `gemv_q4k.comp` — 每 WG 一行 Q4_K·x（144B/block）
+- `gemv_q6k.comp` — 每 WG 一行 Q6_K·x（210B/block, lm_head）
 - `embed_q4k.comp` — token embedding 行 Q4_K 解包 → buf_x
 - `swiglu.comp` — silu(gate)*up
 - `attn_decode.comp` — 每 head 一个 WG、64 线程；score 共享缓存；可与 O gemv 同 submit

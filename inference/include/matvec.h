@@ -10,6 +10,8 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
+/* Q6_K matmul 前激活量化(与 matmul_q6k 一致) */
+void matvec_q8k_quant(const float* x, float* xq, uint32_t n);
 
 /* 行分块 matmul: 只算 [row_begin, row_begin+n_rows) 行。
  * 量化权重行主序; F32/F16 列主序(out = 总列数, 行区间在列上连续)。

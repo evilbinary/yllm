@@ -9,6 +9,11 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>
+#else
+#include <alloca.h>
+#endif
 
 int vulkan_selftest_rmsnorm(VulkanCtx* ctx)
 {
@@ -104,6 +109,86 @@ int vulkan_selftest_gemv_q4k(VulkanCtx* ctx)
     ylog_info("vulkan: gemv_q4k selftest max_abs_err=%.6g (out=%u in=%u)",
               (double)maxe, out, in);
     return maxe < 1e-3f ? 0 : -1;
+}
+
+/* 用 resident lm_head 前若干行对比 CPU matmul_q6k */
+int vulkan_selftest_gemv_q6k(VulkanCtx* ctx)
+{
+    if (!ctx || !ctx->gemv_q6k_ready || !ctx->lm_ready || ctx->lm_dtype != DT_Q6K)
+        return 0;
+    if (!ctx->map_wq || ctx->lm_off == (uint64_t)~0ull) return 0;
+    uint32_t in = ctx->lm_in;
+    uint32_t out = 8;
+    if (in == 0 || (in % 256) != 0 || out > ctx->max_out) return -1;
+
+    float* x = (float*)malloc((size_t)in * 4);
+    float* xq = (float*)malloc((size_t)in * 4);
+    float* yg8 = (float*)malloc((size_t)out * 4);
+    float* yc8 = (float*)malloc((size_t)out * 4);
+    if (!x || !xq || !yg8 || !yc8) {
+        free(x); free(xq); free(yg8); free(yc8);
+        return -1;
+    }
+    uint32_t i;
+    for (i = 0; i < in; i++)
+        x[i] = 0.015f * (float)((int)(i % 23) - 11);
+    matvec_q8k_quant(x, xq, in);
+    matmul_q6k(yc8, xq, (const uint8_t*)ctx->map_wq + (size_t)ctx->lm_off, out, in);
+    if (vulkan_k_gemv_q6k(ctx, yg8, xq, out, in, ctx->lm_off) != 0) {
+        free(x); free(xq); free(yg8); free(yc8);
+        return -1;
+    }
+    float maxe = 0.0f;
+    for (i = 0; i < out; i++) {
+        float d = fabsf(yg8[i] - yc8[i]);
+        if (d > maxe) maxe = d;
+    }
+    ylog_info("vulkan: gemv_q6k selftest max_abs_err=%.6g (out=%u in=%u)",
+              (double)maxe, out, in);
+    if (maxe >= 5e-2f) {
+        free(x); free(xq); free(yg8); free(yc8);
+        return -1;
+    }
+
+    uint32_t vocab = ctx->lm_out;
+    float* ycf = NULL;
+    float* ygf = NULL;
+    if (getenv("YLLM_VK_LMTEST") && vocab > 0 && vocab <= 65536u) {
+        ycf = (float*)malloc((size_t)vocab * 4);
+        ygf = (float*)malloc((size_t)vocab * 4);
+        if (ycf && ygf) {
+            matmul_q6k(ycf, xq,
+                       (const uint8_t*)ctx->map_wq + (size_t)ctx->lm_off,
+                       vocab, in);
+            size_t row_bytes = (size_t)(in / 256) * 210u;
+            uint32_t chunk = ctx->max_out;
+            if (chunk == 0 || chunk > vocab) chunk = vocab;
+            uint32_t rows = 0;
+            int ok = 1;
+            while (rows < vocab && ok) {
+                uint32_t n = vocab - rows;
+                if (n > chunk) n = chunk;
+                uint64_t off = ctx->lm_off + (uint64_t)rows * row_bytes;
+                if (vulkan_k_gemv_q6k(ctx, ygf + rows, xq, n, in, off) != 0)
+                    ok = 0;
+                else
+                    rows += n;
+            }
+            if (ok) {
+                maxe = 0.0f;
+                for (i = 0; i < vocab; i++) {
+                    float d = fabsf(ygf[i] - ycf[i]);
+                    if (d > maxe) maxe = d;
+                }
+                ylog_info("vulkan: lm_head chunk selftest max_abs_err=%.6g (vocab=%u chunk=%u)",
+                          (double)maxe, vocab, chunk);
+            } else {
+                maxe = 1.0f;
+            }
+        }
+    }
+    free(x); free(xq); free(yg8); free(yc8); free(ycf); free(ygf);
+    return maxe < 5e-2f ? 0 : -1;
 }
 
 static int load_norm_f32(VulkanCtx* ctx, const uint8_t* wbytes, uint32_t n, uint32_t dtype)
@@ -619,9 +704,12 @@ int vulkan_final_norm(Engine* e)
 int vulkan_lm_head(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    if (getenv("YLLM_VK_LM_CPU")) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
-    if (!ctx || !ctx->lm_ready || !ctx->gemv_ready || !ctx->wq_resident) return -1;
-    if (ctx->lm_dtype != DT_Q4K) return -1;
+    if (!ctx || !ctx->lm_ready || !ctx->wq_resident) return -1;
+    if (ctx->lm_dtype == DT_Q4K && !ctx->gemv_ready) return -1;
+    if (ctx->lm_dtype == DT_Q6K && !ctx->gemv_q6k_ready) return -1;
+    if (ctx->lm_dtype != DT_Q4K && ctx->lm_dtype != DT_Q6K) return -1;
     if (ctx->x_on_dev)
         (void)vulkan_sync_x_to_host(ctx, e->x, ctx->hidden);
     if (ctx->lm_in != ctx->hidden || ctx->lm_out == 0) return -1;
@@ -629,7 +717,14 @@ int vulkan_lm_head(Engine* e)
 
     uint32_t vocab = ctx->lm_out;
     uint32_t hidden = ctx->lm_in;
-    size_t row_bytes = (size_t)(hidden / 256) * 144;
+    const float* x_in = e->x;
+    if (ctx->lm_dtype == DT_Q6K) {
+        float* xq = (float*)alloca((size_t)hidden * 4);
+        matvec_q8k_quant(e->x, xq, hidden);
+        x_in = xq;
+    }
+    size_t blk_bytes = (ctx->lm_dtype == DT_Q6K) ? 210u : 144u;
+    size_t row_bytes = (size_t)(hidden / 256) * blk_bytes;
     uint32_t chunk = ctx->max_out;
     if (chunk == 0) chunk = hidden;
     if (chunk > vocab) chunk = vocab;
@@ -637,7 +732,6 @@ int vulkan_lm_head(Engine* e)
         uint32_t by_wq = (uint32_t)(ctx->wq_bytes / row_bytes);
         if (by_wq == 0) return -1;
         if (chunk > by_wq) chunk = by_wq;
-        /* 覆盖当前层权; 下一 token 会重新 stream_layer */
         ctx->stream_layer = (uint32_t)~0u;
     }
 
@@ -657,8 +751,13 @@ int vulkan_lm_head(Engine* e)
         } else {
             off = ctx->lm_off + (uint64_t)rows * row_bytes;
         }
-        if (vulkan_k_gemv_q4k(ctx, e->logits + rows, e->x, n, hidden, off) != 0)
-            return -1;
+        if (ctx->lm_dtype == DT_Q6K) {
+            if (vulkan_k_gemv_q6k(ctx, e->logits + rows, x_in, n, hidden, off) != 0)
+                return -1;
+        } else {
+            if (vulkan_k_gemv_q4k(ctx, e->logits + rows, x_in, n, hidden, off) != 0)
+                return -1;
+        }
         rows += n;
     }
     return 0;

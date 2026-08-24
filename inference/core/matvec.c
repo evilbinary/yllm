@@ -240,6 +240,11 @@ static void q8k_quant(const float* x, float* xq, uint32_t n)
     }
 }
 
+void matvec_q8k_quant(const float* x, float* xq, uint32_t n)
+{
+    q8k_quant(x, xq, n);
+}
+
 /* int8 量化 x + 每 256 元素块缩放(供 int8 maddubs 点积) */
 static void q8k_quant_i8(const float* x, int8_t* xq, float* xs, uint32_t n)
 {
