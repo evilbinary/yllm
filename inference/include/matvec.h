@@ -31,6 +31,8 @@ void embed_iq4xs(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps, uint32_t dtype);
 void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta);
 void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta);
+/* NEOX RoPE, 可选 freq_factors[d/2]: ang = pos * theta^(-2j/d) / factor[j] (llama.cpp ggml_rope_ext) */
+void rope_inplace_qwen_ff(float* v, uint32_t d, uint32_t pos, float theta, const float* freq_factors);
 void rope_inplace_mrope(float* v, uint32_t head_dim, uint32_t n_dims, uint32_t pos, float theta);
 void l2norm_inplace(float* v, uint32_t n, float eps);
 void conv1d_update(float* state, const float* x, const uint8_t* w, uint32_t dim, uint32_t kwidth);

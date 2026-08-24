@@ -132,6 +132,8 @@ typedef struct Engine {
     float* ple;
     float* ple_work;
     uint32_t n_ple;
+    float* rope_ff;          /* gemma4 全局层 rope_freqs, F32 [n_rope_ff] */
+    uint32_t n_rope_ff;
     /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
     float* pb;      /* [PB_MAX × hidden]  输入/残差 */
     float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */

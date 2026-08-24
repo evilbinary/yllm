@@ -1076,14 +1076,18 @@ void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta)
     }
 }
 
-/* qwen2 interleaved RoPE: v[i] 与 v[i+half] 配对(llama 是 v[2j]/v[2j+1]) */
-void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
+void rope_inplace_qwen_ff(float* v, uint32_t d, uint32_t pos, float theta, const float* freq_factors)
 {
     uint32_t half = d / 2;
     uint32_t j;
     for (j = 0; j < half; j++) {
         float freq = powf(theta, -2.0f * (float)j / (float)d);
-        float ang = freq * (float)pos;
+        float ff = 1.0f;
+        if (freq_factors) {
+            ff = freq_factors[j];
+            if (!(ff > 0.0f)) ff = 1.0f;
+        }
+        float ang = freq * (float)pos / ff;
         float c = cosf(ang);
         float s = sinf(ang);
         float a = v[j];
@@ -1091,6 +1095,12 @@ void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
         v[j] = a * c - b * s;
         v[j + half] = a * s + b * c;
     }
+}
+
+/* qwen2 interleaved RoPE: v[i] 与 v[i+half] 配对(llama 是 v[2j]/v[2j+1]) */
+void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
+{
+    rope_inplace_qwen_ff(v, d, pos, theta, NULL);
 }
 
 /* M-RoPE(qwen35 纯文本): 只作用前 n_dims 维, interleaved pair (v[i], v[i+n_dims/2]) */

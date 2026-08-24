@@ -78,6 +78,7 @@ typedef struct {
     uint32_t heads;
     uint32_t kv_heads;
     float freq_base;
+    float freq_base_swa;
     float rms_eps;
     uint32_t context_len;
     uint32_t key_length;
@@ -113,6 +114,7 @@ typedef struct {
     uint32_t n_kv_shared_layers;
     uint32_t n_embd_per_layer;
     uint64_t swa_mask;
+    uint32_t rope_theta_swa_bits;
 } LlfGemma4Ext;
 
 static void gg_merges_grow(GgufMeta* g, uint64_t need)
@@ -176,6 +178,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(k, "attention.key_length")) g->key_length = v;
         else if (!strcmp(k, "context_length")) g->context_len = v;
         else if (!strcmp(k, "rope.freq_base")) { float f; memcpy(&f, &v, 4); g->freq_base = f; }
+        else if (!strcmp(k, "rope.freq_base_swa")) { float f; memcpy(&f, &v, 4); g->freq_base_swa = f; }
         else if (!strcmp(k, "attention.layer_norm_rms_epsilon")) { float f; memcpy(&f, &v, 4); g->rms_eps = f; }
         else if (!strcmp(key, "general.alignment")) g->alignment = v;
         else if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
@@ -209,6 +212,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
     case GVT_F64: {
         double v = gb_f64(b);
         if (!strcmp(k, "rope.freq_base")) g->freq_base = (float)v;
+        else if (!strcmp(k, "rope.freq_base_swa")) g->freq_base_swa = (float)v;
         else if (!strcmp(k, "attention.layer_norm_rms_epsilon")) g->rms_eps = (float)v;
         else if (!strcmp(k, "attn_logit_softcapping")) g->attn_logit_cap = (float)v;
         else if (!strcmp(k, "final_logit_softcapping")) g->final_logit_cap = (float)v;
@@ -408,6 +412,7 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
 
 enum { SP_EMBED = -2, SP_FINALNORM = -3, SP_OUTPUT = -4,
        SP_PLE_TOK = -10, SP_PLE_MPROJ = -11, SP_PLE_PNORM = -12,
+       SP_ROPE_FREQS = -13,
        SP_MTP_EH = 100, SP_MTP_ENORM = 101, SP_MTP_HNORM = 102, SP_MTP_HEAD_NORM = 103 };
 
 /* Q8_0 去量化成 F16: 每 32 元素 = 1 fp16 scale + 32 int8。
@@ -468,6 +473,7 @@ static int gg_slot_for(const char* name, int* layer)
     if (strcmp(name, "token_embd.weight") == 0) { *layer = 0; return SP_EMBED; }
     if (strcmp(name, "output_norm.weight") == 0) { *layer = 0; return SP_FINALNORM; }
     if (strcmp(name, "output.weight") == 0) { *layer = 0; return SP_OUTPUT; }
+    if (strcmp(name, "rope_freqs.weight") == 0) { *layer = 0; return SP_ROPE_FREQS; }
     if (strcmp(name, "per_layer_token_embd.weight") == 0) { *layer = 0; return SP_PLE_TOK; }
     if (strcmp(name, "per_layer_model_proj.weight") == 0) { *layer = 0; return SP_PLE_MPROJ; }
     if (strcmp(name, "per_layer_proj_norm.weight") == 0) { *layer = 0; return SP_PLE_PNORM; }
@@ -491,6 +497,7 @@ static int gg_slot_for(const char* name, int* layer)
             { "post_attention_norm.weight", SLOT_NORM3 },
             { "post_ffw_norm.weight", SLOT_NORM4 },
             { "layer_output_scale.weight", SLOT_LAYER_SCALE },
+            { "rope_freqs.weight", SP_ROPE_FREQS },
             { "inp_gate.weight", SLOT_PLE_GATE },
             { "proj.weight", SLOT_PLE_PROJ },
             { "post_norm.weight", SLOT_PLE_POST },
@@ -755,6 +762,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     uint8_t* qg_bufs[32] = { 0 };  /* attn_q 交错重排临时缓冲(llf_emit 后释放) */
     int qg_n = 0;
     int n = 0;
+    int have_rf = 0;
     for (i = 0; i < (uint64_t)list.n; i++) {
         int layer;
         int slot = gg_slot_for(list.t[i].name, &layer);
@@ -771,6 +779,12 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         else if (slot == SP_PLE_TOK) { items[n].layer = 0; items[n].slot = SLOT_PLE_TOK; }
         else if (slot == SP_PLE_MPROJ) { items[n].layer = 0; items[n].slot = SLOT_PLE_MPROJ; }
         else if (slot == SP_PLE_PNORM) { items[n].layer = 0; items[n].slot = SLOT_PLE_PNORM; }
+        else if (slot == SP_ROPE_FREQS) {
+            if (have_rf) continue;
+            have_rf = 1;
+            items[n].layer = 0;
+            items[n].slot = SLOT_ROPE_FREQS;
+        }
         else if (slot >= SLOT_NORM1 && slot <= SLOT_KNORM) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else if (slot >= SLOT_QKV && slot <= SLOT_LAYER_SCALE) { items[n].layer = (uint32_t)layer + 1; items[n].slot = (uint32_t)slot; }
         else { printf("gguf: SKIP '%s'\n", list.t[i].name); continue; }
@@ -977,10 +991,12 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         ext.n_kv_shared_layers = g.n_kv_shared_layers;
         ext.n_embd_per_layer = g.n_embd_per_layer;
         ext.swa_mask = g.swa_mask;
+        memcpy(&ext.rope_theta_swa_bits, &g.freq_base_swa, 4);
         memcpy(h.reserved, &ext, sizeof(ext));
-        printf("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u mask=0x%llx final_cap=%g\n",
+        printf("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u mask=0x%llx final_cap=%g rope_freqs=%s\n",
                ext.n_embd_per_layer, ext.n_kv_shared_layers, ext.swa_window, ext.swa_pattern,
-               (unsigned long long)ext.swa_mask, (double)g.final_logit_cap);
+               (unsigned long long)ext.swa_mask, (double)g.final_logit_cap,
+               have_rf ? "yes" : "no");
     }
     {
         uint64_t vocab = 0;

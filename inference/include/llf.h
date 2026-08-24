@@ -59,6 +59,7 @@
 #define SLOT_PLE_TOK  1              /* embed 层 per_layer_token_embd */
 #define SLOT_PLE_MPROJ 2             /* embed 层 per_layer_model_proj */
 #define SLOT_PLE_PNORM 3             /* embed 层 per_layer_proj_norm */
+#define SLOT_ROPE_FREQS 4            /* embed 层: gemma4 rope_freqs [head_dim/2] (块层同号是 SLOT_O) */
 #define BLOCK_TENSORS 27
 /* MTP(Multi-Token Prediction)槽: 存 output(lm_head)层的高槽位 27..30,
  * 与主 transformer 块共用 BLOCK_TENSORS 上限之外; llf 层目录 n_tensors 需容纳。

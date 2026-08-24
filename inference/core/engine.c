@@ -382,6 +382,8 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->n_ple = 0;
     e->ple = NULL;
     e->ple_work = NULL;
+    e->rope_ff = NULL;
+    e->n_rope_ff = 0;
     if (m->h.arch == ARCH_GEMMA4) {
         LlfGemma4Ext g4;
         llf_gemma4_ext(&m->h, &g4);
@@ -390,6 +392,31 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
             uint32_t psz = e->n_ple * m->h.n_blocks;
             e->ple = (float*)ycalloc(psz, 4);
             e->ple_work = (float*)ycalloc(psz, 4);
+        }
+        {
+            const LlfTensorMeta* tm = &m->metas[m->base_idx[0] + SLOT_ROPE_FREQS];
+            if (tm->size > 0) {
+                uint32_t n = 1, d;
+                for (d = 0; d < tm->ndim && d < 4; d++) {
+                    if (tm->shape[d] > 0) n *= tm->shape[d];
+                }
+                if (n > 0 && n <= 8192) {
+                    const uint8_t* p = (const uint8_t*)ws->map.base + m->dir[0].offset + tm->offset;
+                    e->rope_ff = (float*)ymalloc((size_t)n * 4);
+                    e->n_rope_ff = n;
+                    if (tm->dtype == DT_F32) {
+                        memcpy(e->rope_ff, p, (size_t)n * 4);
+                    } else if (tm->dtype == DT_F16) {
+                        const uint16_t* hp = (const uint16_t*)p;
+                        uint32_t j;
+                        for (j = 0; j < n; j++) e->rope_ff[j] = f16_to_f32(hp[j]);
+                    } else {
+                        free(e->rope_ff);
+                        e->rope_ff = NULL;
+                        e->n_rope_ff = 0;
+                    }
+                }
+            }
         }
     }
     /* 批量 prefill 工作区 */
@@ -473,8 +500,9 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     if (m->h.arch == ARCH_GEMMA4) {
         LlfGemma4Ext g4log;
         llf_gemma4_ext(&m->h, &g4log);
-        ylog_info("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u",
-                  e->n_ple, g4log.n_kv_shared_layers, g4log.swa_window, g4log.swa_pattern);
+        ylog_info("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u rope_freqs=%u",
+                  e->n_ple, g4log.n_kv_shared_layers, g4log.swa_window, g4log.swa_pattern,
+                  e->n_rope_ff);
     }
     /* 默认 CPU 设备: load_weights 空操作, 后续可 engine_bind_device(CUDA) */
     if (engine_bind_device(e, DEV_CPU, 0, err, errlen) != 0) {
@@ -558,6 +586,7 @@ void engine_free(Engine* e)
     if (e->scratch) free(e->scratch);
     if (e->ple) free(e->ple);
     if (e->ple_work) free(e->ple_work);
+    if (e->rope_ff) free(e->rope_ff);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
     if (e->ws.res) free(e->ws.res);
@@ -1234,16 +1263,24 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     uint16_t* vcache = kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh;
+    const float* rope_ff = NULL;
+    if (h->arch == ARCH_GEMMA4 && e->rope_ff && e->n_rope_ff >= hd / 2 &&
+        !gemma4_is_swa(&g4, il))
+        rope_ff = e->rope_ff;
     for (hh = 0; hh < h->n_heads; hh++) {
-        if (h->arch == ARCH_QWEN || h->arch == ARCH_GEMMA4)
+        if (h->arch == ARCH_QWEN)
             rope_inplace_qwen(q + (size_t)hh * hd, hd, pos, theta);
+        else if (h->arch == ARCH_GEMMA4)
+            rope_inplace_qwen_ff(q + (size_t)hh * hd, hd, pos, theta, rope_ff);
         else
             rope_inplace(q + (size_t)hh * hd, hd, pos, theta);
     }
     if (has_kv) {
         for (hh = 0; hh < h->n_kv_heads; hh++) {
-            if (h->arch == ARCH_QWEN || h->arch == ARCH_GEMMA4)
+            if (h->arch == ARCH_QWEN)
                 rope_inplace_qwen(k + (size_t)hh * hd, hd, pos, theta);
+            else if (h->arch == ARCH_GEMMA4)
+                rope_inplace_qwen_ff(k + (size_t)hh * hd, hd, pos, theta, rope_ff);
             else
                 rope_inplace(k + (size_t)hh * hd, hd, pos, theta);
         }
@@ -1944,32 +1981,6 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
         timings->n_prefill = nprompt > 0 ? (uint32_t)nprompt : 0;
         t1 = ynow_ms();
         timings->prefill_ms = t1 - t0;
-    }
-    if (e->ws.model.h.arch == ARCH_GEMMA4 && e->logits) {
-        uint32_t vocab = e->ws.model.h.vocab;
-        uint32_t top_i[5];
-        float top_v[5];
-        uint32_t t, vi;
-        for (t = 0; t < 5; t++) { top_i[t] = 0; top_v[t] = -1e30f; }
-        for (vi = 0; vi < vocab; vi++) {
-            float z = e->logits[vi];
-            for (t = 0; t < 5; t++) {
-                if (z > top_v[t]) {
-                    uint32_t s;
-                    for (s = 4; s > t; s--) {
-                        top_v[s] = top_v[s - 1];
-                        top_i[s] = top_i[s - 1];
-                    }
-                    top_v[t] = z;
-                    top_i[t] = vi;
-                    break;
-                }
-            }
-        }
-        ylog_info("top logits: %u:%.3f %u:%.3f %u:%.3f %u:%.3f %u:%.3f",
-                  top_i[0], (double)top_v[0], top_i[1], (double)top_v[1],
-                  top_i[2], (double)top_v[2], top_i[3], (double)top_v[3],
-                  top_i[4], (double)top_v[4]);
     }
     uint32_t ngen = 0;
     uint32_t n_accept = 0, n_try = 0;

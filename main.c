@@ -48,10 +48,6 @@ static int on_token_cb(uint32_t id, void* ctx)
     Vocab* v = (Vocab*)ctx;
     char tmp[65536];
     vocab_decode(v, &id, 1, tmp, sizeof(tmp));
-    if (tmp[0] == 0) {
-        const char* pc = (id < (uint32_t)v->n) ? v->pieces[id] : "?";
-        ylog_info("token id=%u piece=%s (not printed)", id, pc ? pc : "?");
-    }
     fputs(tmp, stdout);
     fflush(stdout);
     ylog_raw_log("%s", tmp);
@@ -452,14 +448,6 @@ static int cmd_chat(int argc, char** argv)
         }
     }
     ylog_info("chat prompt tokens: %d (bos=%d eos=%d)", nprompt, v.bos, v.eos);
-    if (nprompt > 0) {
-        char line[768];
-        int o = 0, i;
-        o += snprintf(line, sizeof(line), "prompt ids:");
-        for (i = 0; i < nprompt && i < 48 && o < (int)sizeof(line) - 12; i++)
-            o += snprintf(line + o, sizeof(line) - (size_t)o, " %u", ids[i]);
-        ylog_info("%s", line);
-    }
     uint64_t t0 = ynow_ms();
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));
