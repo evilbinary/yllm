@@ -64,3 +64,11 @@ add_executable(yllm_gen
 )
 target_include_directories(yllm_gen PRIVATE ${INFER_INC})
 target_link_libraries(yllm_gen yllm ${LOG_LIB})
+
+# 运行时 SPIR-V：与 yllm_gen 同目录的 shaders/
+if(YLLM_VULKAN)
+  file(GLOB YLLM_SPV "${INFER}/vulkan/shaders/*.spv")
+  if(YLLM_SPV)
+    file(COPY ${YLLM_SPV} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+  endif()
+endif()
