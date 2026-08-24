@@ -183,6 +183,16 @@ int vulkan_lm_head(Engine* e)
     (void)e;
     return -1;
 }
+int vulkan_lm_fused_active(Engine* e)
+{
+    (void)e;
+    return 0;
+}
+int vulkan_lm_fused(Engine* e)
+{
+    (void)e;
+    return -1;
+}
 int vulkan_embed(Engine* e, uint32_t token)
 {
     (void)e;

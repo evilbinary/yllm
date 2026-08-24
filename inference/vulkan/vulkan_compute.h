@@ -22,6 +22,10 @@ int vulkan_k_rmsnorm(VulkanCtx* ctx, float* y, const float* x, const float* w,
 int vulkan_k_rmsnorm_inplace(VulkanCtx* ctx, const float* w, uint32_t n, float eps);
 int vulkan_k_lm_gemv(VulkanCtx* ctx, float* y, const float* x, int x_on_dev,
                      uint32_t vocab, uint32_t hidden, uint64_t w_byte_off, uint32_t dtype);
+int vulkan_k_lm_fused(VulkanCtx* ctx, float* y, const float* w_norm,
+                      uint32_t hidden, float eps, uint32_t vocab,
+                      uint64_t w_byte_off, uint32_t dtype,
+                      int upload_x, const float* host_x);
 int vulkan_k_gemv_q4k(VulkanCtx* ctx, float* y, const float* x,
                       uint32_t out, uint32_t in, uint64_t w_byte_off);
 int vulkan_k_gemv_q6k(VulkanCtx* ctx, float* y, const float* x,

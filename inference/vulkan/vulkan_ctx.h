@@ -178,7 +178,16 @@ typedef struct {
     uint32_t lm_dtype;
     int lm_ready;
     int lm_one_submit; /* resident lm: 全 vocab 一次 gemv */
+    int lm_fused;      /* norm(+q8k)+lm 单次 submit */
     float norm_eps;
+
+    void* q8k_shader;
+    void* q8k_desc_pool;
+    void* q8k_desc_layout;
+    void* q8k_desc_set;
+    void* q8k_pipe_layout;
+    void* q8k_pipeline;
+    int q8k_ready;
 
     void* buf_logits;
     void* mem_logits;

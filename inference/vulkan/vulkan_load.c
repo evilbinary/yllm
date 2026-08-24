@@ -276,6 +276,8 @@ void vulkan_shutdown(VulkanCtx* ctx)
 
     destroy_pipe(a, dev, ctx->rms_pipeline, ctx->rms_pipe_layout, ctx->rms_shader,
                  ctx->rms_desc_pool, ctx->rms_desc_layout);
+    destroy_pipe(a, dev, ctx->q8k_pipeline, ctx->q8k_pipe_layout, ctx->q8k_shader,
+                 ctx->q8k_desc_pool, ctx->q8k_desc_layout);
     destroy_pipe(a, dev, ctx->gemv_pipeline, ctx->gemv_pipe_layout, ctx->gemv_shader,
                  ctx->gemv_desc_pool, ctx->gemv_desc_layout);
     if (ctx->gemv_q6k_pipeline && a->DestroyPipeline)

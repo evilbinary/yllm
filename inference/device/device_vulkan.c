@@ -355,6 +355,13 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ctx->lm_out > 0 && ctx->logits_bytes >= (size_t)ctx->lm_out * 4) {
                 ctx->lm_one_submit = 1;
                 ylog_info("vulkan: lm_head one-submit vocab=%u", ctx->lm_out);
+                if (ctx->rms_ds_inplace) {
+                    if (ctx->lm_dtype == DT_Q4K ||
+                        (ctx->lm_dtype == DT_Q6K && ctx->q8k_ready)) {
+                        ctx->lm_fused = 1;
+                        ylog_info("vulkan: lm_head fused norm+lm vocab=%u", ctx->lm_out);
+                    }
+                }
             }
             if (ctx->fuse_ready) {
                 char aerr[256];
@@ -370,13 +377,13 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     }
 
     vulkan_attach_fwd(e);
-    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d lm1=%d",
+    ylog_info("vulkan: mode=%s gpu=%d layers=%u hidden=%u rms=%d gemv=%d resident=%d stream=%d fuse=%d swi=%d attn=%d attn_o=%d rope=%d block=%d embed=%d gpu_rope=%d lm=%d lm1=%d lmf=%d",
               ctx->host_shim ? "host-shim" : "native",
               ctx->device_id, ctx->n_layers, ctx->hidden,
               ctx->compute_ready, ctx->gemv_ready, ctx->wq_resident, ctx->wq_stream,
               ctx->fuse_ready, ctx->swi_ready, ctx->attn_ready, ctx->attn_o_ready,
               ctx->rope_ready, ctx->block_ready, ctx->embed_ready, ctx->use_gpu_rope,
-              ctx->lm_ready, ctx->lm_one_submit);
+              ctx->lm_ready, ctx->lm_one_submit, ctx->lm_fused);
     return 0;
 }
 

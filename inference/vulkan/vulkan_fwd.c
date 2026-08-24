@@ -641,15 +641,27 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
             e->mtp_h_ready = 1;
         }
 
-        if (off + (int)nb == n) {
+            if (off + (int)nb == n) {
             memcpy(e->x, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
             vulkan_mark_x_host(ctx);
-            if (vulkan_final_norm(e) != 0) return -1;
-            if (vulkan_lm_head(e) != 0) {
-                uint32_t li = h->n_blocks + 2;
-                const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[li].offset;
-                const LlfTensorMeta* out = &m->metas[m->base_idx[li]];
-                matmul(e->logits, e->x, base + out->offset, h->vocab, hidden, out->dtype);
+            if (vulkan_lm_fused_active(e)) {
+                if (vulkan_lm_fused(e) != 0) {
+                    if (vulkan_final_norm(e) != 0) return -1;
+                    if (vulkan_lm_head(e) != 0) {
+                        uint32_t li = h->n_blocks + 2;
+                        const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[li].offset;
+                        const LlfTensorMeta* out = &m->metas[m->base_idx[li]];
+                        matmul(e->logits, e->x, base + out->offset, h->vocab, hidden, out->dtype);
+                    }
+                }
+            } else {
+                if (vulkan_final_norm(e) != 0) return -1;
+                if (vulkan_lm_head(e) != 0) {
+                    uint32_t li = h->n_blocks + 2;
+                    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[li].offset;
+                    const LlfTensorMeta* out = &m->metas[m->base_idx[li]];
+                    matmul(e->logits, e->x, base + out->offset, h->vocab, hidden, out->dtype);
+                }
             }
         }
         off += (int)nb;
@@ -695,6 +707,7 @@ int vulkan_final_norm(Engine* e)
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->compute_ready) return -1;
+    if (ctx->lm_fused) return 0;
     LlModel* m = &e->ws.model;
     uint32_t layer = m->h.n_blocks + 1;
     if (layer >= m->n_layers) return -1;
@@ -795,4 +808,30 @@ int vulkan_lm_head(Engine* e)
         rows += n;
     }
     return 0;
+}
+
+int vulkan_lm_fused_active(Engine* e)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return 0;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    return ctx->lm_fused;
+}
+
+int vulkan_lm_fused(Engine* e)
+{
+    if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    if (getenv("YLLM_VK_LM_CPU")) return -1;
+    VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
+    if (!ctx || !ctx->lm_fused || !ctx->lm_ready) return -1;
+    LlModel* m = &e->ws.model;
+    uint32_t layer = m->h.n_blocks + 1;
+    if (layer >= m->n_layers) return -1;
+    const uint8_t* base = (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
+    const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
+    uint32_t hidden = m->h.hidden;
+    if (load_norm_f32(ctx, base + tm->offset, hidden, tm->dtype) != 0) return -1;
+    int upload = !ctx->x_on_dev;
+    return vulkan_k_lm_fused(ctx, e->logits, ctx->host_w, hidden, ctx->norm_eps,
+                             ctx->lm_out, ctx->lm_off, ctx->lm_dtype,
+                             upload, upload ? e->x : NULL);
 }

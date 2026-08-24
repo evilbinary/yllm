@@ -71,6 +71,8 @@ int cuda_final_norm(Engine* e);
 int cuda_lm_head(Engine* e);
 int vulkan_final_norm(Engine* e);
 int vulkan_lm_head(Engine* e);
+int vulkan_lm_fused_active(Engine* e);
+int vulkan_lm_fused(Engine* e);
 int vulkan_embed(Engine* e, uint32_t token);
 void vulkan_after_embed(Engine* e);
 void vulkan_sync_x(Engine* e);

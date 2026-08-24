@@ -1,0 +1,42 @@
+#version 450
+/* Q8_K 激活量化 in-place: 每 256 元素 block, d=amax/127, x=round(x/d)*d */
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer InOut { float x[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+} pc;
+
+shared float sdata[256];
+
+void main()
+{
+    uint b = gl_WorkGroupID.x;
+    uint nb = pc.n / 256u;
+    if (b >= nb) return;
+
+    uint base = b * 256u;
+    uint lid = gl_LocalInvocationID.x;
+
+    float amax = abs(x[base + lid]);
+    sdata[lid] = amax;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s)
+            sdata[lid] = max(sdata[lid], sdata[lid + s]);
+        memoryBarrierShared();
+        barrier();
+    }
+
+    float d = sdata[0] / 127.0;
+    if (d <= 0.0) {
+        x[base + lid] = 0.0;
+        return;
+    }
+    float inv = 1.0 / d;
+    float q = round(x[base + lid] * inv);
+    q = clamp(q, -128.0, 127.0);
+    x[base + lid] = q * d;
+}
