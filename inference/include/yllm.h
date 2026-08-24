@@ -58,6 +58,8 @@ char* ystrdup(const char* s);
 uint64_t ynow_ms(void);
 uint64_t ynow_ns(void);
 void ymsleep(uint32_t ms);
+/* 绑高频核并设置 OpenMP 线程数(可用 YLLM_NO_AFFINITY=1 关闭) */
+void yllm_tune_cpu(void);
 int ythread_create(void* t, void (*fn)(void*), void* arg);
 void ythread_join(void* t);
 void ymutex_create(void** m);

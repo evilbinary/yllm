@@ -1,4 +1,8 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "yllm.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -14,6 +18,15 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <time.h>
+#endif
+#if defined(__linux__)
+#include <sched.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#if defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 void* ymalloc(size_t n)
@@ -72,6 +85,67 @@ void ymsleep(uint32_t ms)
     Sleep(ms);
 #else
     usleep((useconds_t)ms * 1000);
+#endif
+}
+
+void yllm_tune_cpu(void)
+{
+    static int once;
+    if (once) return;
+    once = 1;
+    if (getenv("YLLM_NO_AFFINITY")) return;
+#if defined(__linux__)
+    {
+        unsigned long khz[64];
+        int n = 0, i;
+        unsigned long minf = 0, maxf = 0;
+        for (i = 0; i < 64; i++) {
+            char path[96];
+            FILE* f;
+            unsigned long hz = 0;
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+            f = fopen(path, "r");
+            if (!f) break;
+            if (fscanf(f, "%lu", &hz) != 1) hz = 0;
+            fclose(f);
+            khz[n++] = hz;
+        }
+        if (n <= 1) return;
+        minf = maxf = khz[0];
+        for (i = 1; i < n; i++) {
+            if (khz[i] < minf) minf = khz[i];
+            if (khz[i] > maxf) maxf = khz[i];
+        }
+        if (maxf > minf) {
+            unsigned long thresh = minf + (maxf - minf) / 2;
+            cpu_set_t set;
+            int nbig = 0;
+            char buf[128];
+            int off = 0;
+            CPU_ZERO(&set);
+            buf[0] = 0;
+            for (i = 0; i < n; i++) {
+                if (khz[i] >= thresh) {
+                    CPU_SET(i, &set);
+                    nbig++;
+                    if (off < (int)sizeof(buf) - 8)
+                        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%s%d", off ? "," : "", i);
+                }
+            }
+            if (nbig > 0 && nbig < n && sched_setaffinity(0, sizeof(set), &set) == 0) {
+#ifdef _OPENMP
+                if (!getenv("OMP_NUM_THREADS"))
+                    omp_set_num_threads(nbig);
+#endif
+                ylog_info("cpu: affinity [%s] (%d/%d cores, %lu-%lu kHz)",
+                          buf, nbig, n, minf, maxf);
+            }
+        }
+    }
+#endif
+#ifdef _OPENMP
+    omp_set_dynamic(0);
 #endif
 }
 
@@ -392,8 +466,15 @@ uint16_t bf16_to_f16(uint16_t b)
 
 void f32_to_f16_buf(const float* src, uint16_t* dst, size_t n)
 {
-    size_t i;
-    for (i = 0; i < n; i++) dst[i] = f32_to_f16(src[i]);
+    size_t i = 0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t h0 = vcvt_f16_f32(vld1q_f32(src + i));
+        float16x4_t h1 = vcvt_f16_f32(vld1q_f32(src + i + 4));
+        vst1q_f16((__fp16*)(dst + i), vcombine_f16(h0, h1));
+    }
+#endif
+    for (; i < n; i++) dst[i] = f32_to_f16(src[i]);
 }
 
 void bf16_to_f16_buf(const uint16_t* src, uint16_t* dst, size_t n)

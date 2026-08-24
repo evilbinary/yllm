@@ -41,6 +41,9 @@ void rmsnorm_gated(float* y, const float* x, const uint8_t* w, const float* z,
                    uint32_t n, float eps, uint32_t dtype);
 void softmax(float* v, uint32_t n);
 void swiglu(float* y, const float* gate, const float* up, uint32_t n);
+void add_inplace(float* y, const float* x, uint32_t n);
+float vec_dot_f32_f16(const float* a, const uint16_t* b, uint32_t n);
+void vec_axpy_f16(float* y, const uint16_t* x, float a, uint32_t n);
 
 /* 单块解量化(导出供测试/embed 使用) */
 void q4k_block(float* y, const uint8_t* blk, uint32_t stride);

@@ -200,6 +200,7 @@ static uint32_t head_chunk_rows(size_t rbytes, uint32_t max_rows)
 int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, char* err, size_t errlen)
 {
     memset(e, 0, sizeof(*e));
+    yllm_tune_cpu();
     if (wmap_open(model_path, &e->ws.map) != 0) {
         snprintf(err, errlen, "cannot open %s", model_path);
         return -1;
@@ -521,11 +522,8 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
             uint64_t kvp = (uint64_t)pos * kv_dim;
             const float* kvk = e->pbk + (size_t)b * kv_dim;
             const float* kvv = e->pbv + (size_t)b * kv_dim;
-            uint32_t j;
-            for (j = 0; j < kv_dim; j++) {
-                kcache[kvp + j] = f32_to_f16(kvk[j]);
-                vcache[kvp + j] = f32_to_f16(kvv[j]);
-            }
+            f32_to_f16_buf(kvk, kcache + kvp, kv_dim);
+            f32_to_f16_buf(kvv, vcache + kvp, kv_dim);
         }
     }
 
@@ -541,13 +539,11 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
                 const float* qh = e->pbq + (size_t)bb * hidden + (size_t)hh * h->head_dim;
                 float* att_h = e->pba + ((size_t)bb * h->n_heads + hh) * e->max_seq;
                 float inv_d = 1.0f / sqrtf((float)h->head_dim);
-                uint32_t s, jj;
+                uint32_t s;
                 for (s = 0; s <= pos; s++) {
                     const uint16_t* kh = e->kv + (size_t)layer * e->max_seq * kv_dim
                                          + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-                    float acc = 0.0f;
-                    for (jj = 0; jj < h->head_dim; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
-                    att_h[s] = acc * inv_d;
+                    att_h[s] = vec_dot_f32_f16(qh, kh, h->head_dim) * inv_d;
                 }
                 softmax(att_h, pos + 1);
                 float* out = e->pb2 + (size_t)bb * hidden + (size_t)hh * h->head_dim;
@@ -555,8 +551,7 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
                 for (s = 0; s <= pos; s++) {
                     const uint16_t* vh = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim
                                          + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-                    float a = att_h[s];
-                    for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+                    vec_axpy_f16(out, vh, att_h[s], h->head_dim);
                 }
             }
         }
@@ -567,8 +562,7 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
     for (b = 0; b < B; b++) {
         float* xb = e->pb + (size_t)b * hidden;
         float* ob = e->pbq + (size_t)b * hidden;
-        uint32_t j;
-        for (j = 0; j < hidden; j++) xb[j] += ob[j];
+        add_inplace(xb, ob, hidden);
         rmsnorm(e->pb2 + (size_t)b * hidden, xb, base + mt[SLOT_NORM2].offset,
                 hidden, eps, mt[SLOT_NORM2].dtype);
     }
@@ -580,8 +574,7 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
     matmul_batch(e->pbq, e->pbg, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype, B);
     for (b = 0; b < B; b++) {
         float* xb = e->pb + (size_t)b * hidden;
-        uint32_t j;
-        for (j = 0; j < hidden; j++) xb[j] += e->pbq[(size_t)b * hidden + j];
+        add_inplace(xb, e->pbq + (size_t)b * hidden, hidden);
     }
     return 0;
 }
@@ -928,10 +921,8 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
         uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
         uint64_t kvp = (uint64_t)pos * kv_dim;
-        for (ii = 0; ii < kv_dim; ii++) {
-            kcache[kvp + ii] = f32_to_f16(k[ii]);
-            vcache[kvp + ii] = f32_to_f16(v[ii]);
-        }
+        f32_to_f16_buf(k, kcache + kvp, kv_dim);
+        f32_to_f16_buf(v, vcache + kvp, kv_dim);
         float* att = e->att;
         float inv_d = 1.0f / sqrtf((float)hd);
         #pragma omp parallel for schedule(static)
@@ -939,20 +930,17 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
             float* att_h = att + (size_t)hh * e->max_seq;
             uint32_t kv_head = hh * n_kv / n_heads;
             const float* qh = q + (size_t)hh * hd;
-            uint32_t s, jj;
+            uint32_t s;
             for (s = 0; s <= pos; s++) {
                 const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-                float acc = 0.0f;
-                for (jj = 0; jj < hd; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
-                att_h[s] = acc * inv_d;
+                att_h[s] = vec_dot_f32_f16(qh, kh, hd) * inv_d;
             }
             softmax(att_h, pos + 1);
             float* out = att_out + (size_t)hh * hd;
             memset(out, 0, (size_t)hd * 4);
             for (s = 0; s <= pos; s++) {
                 const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-                float a = att_h[s];
-                for (jj = 0; jj < hd; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+                vec_axpy_f16(out, vh, att_h[s], hd);
             }
         }
         /* gate 门控: att_out *= sigmoid(gate) */
@@ -969,8 +957,7 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
 
         memcpy(x2, att_out, (size_t)qdim * 4);
         matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, qdim, mt[SLOT_O].dtype);
-        uint32_t j;
-        for (j = 0; j < hidden; j++) x[j] += att_out[j];
+        add_inplace(x, att_out, hidden);
         rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
         float* fg = e->ffn;
         float* fu = e->ffn + inter;
@@ -978,7 +965,7 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
         swiglu(x2, fg, fu, inter);
         matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
-        for (j = 0; j < hidden; j++) x[j] += att_out[j];
+        add_inplace(x, att_out, hidden);
     }
     return 0;
 }
@@ -1065,11 +1052,8 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     }
 
 
-    uint32_t j;
-    for (j = 0; j < kv_dim; j++) {
-        kcache[kvp + j] = f32_to_f16(k[j]);
-        vcache[kvp + j] = f32_to_f16(v[j]);
-    }
+    f32_to_f16_buf(k, kcache + kvp, kv_dim);
+    f32_to_f16_buf(v, vcache + kvp, kv_dim);
 
     float* att = e->att;
     float inv_d = 1.0f / sqrtf((float)h->head_dim);
@@ -1078,25 +1062,22 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
         float* att_h = att + (size_t)hh * e->max_seq;
         uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
         const float* qh = q + (size_t)hh * h->head_dim;
-        uint32_t s, jj;
+        uint32_t s;
         for (s = 0; s <= pos; s++) {
             const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-            float acc = 0.0f;
-            for (jj = 0; jj < h->head_dim; jj++) acc += qh[jj] * f16_to_f32(kh[jj]);
-            att_h[s] = acc * inv_d;
+            att_h[s] = vec_dot_f32_f16(qh, kh, h->head_dim) * inv_d;
         }
         softmax(att_h, pos + 1);
         float* out = att_out + (size_t)hh * h->head_dim;
         memset(out, 0, (size_t)h->head_dim * 4);
         for (s = 0; s <= pos; s++) {
             const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-            float a = att_h[s];
-            for (jj = 0; jj < h->head_dim; jj++) out[jj] += a * f16_to_f32(vh[jj]);
+            vec_axpy_f16(out, vh, att_h[s], h->head_dim);
         }
     }
     memcpy(x2, att_out, (size_t)hidden * 4);
     matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype);
-    for (j = 0; j < hidden; j++) x[j] += att_out[j];
+    add_inplace(x, att_out, hidden);
     rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
     float* fg = e->ffn;
     float* fu = e->ffn + inter;
@@ -1104,7 +1085,7 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
     swiglu(x2, fg, fu, inter);
     matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
-    for (j = 0; j < hidden; j++) x[j] += att_out[j];
+    add_inplace(x, att_out, hidden);
     return 0;
 }
 

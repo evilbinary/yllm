@@ -37,3 +37,5 @@ scp -P 8022 build/android/shaders/*.spv user@phone:~/yllm-android/shaders/
 #   export LD_LIBRARY_PATH=. YLLM_SHADER_DIR=$PWD/shaders
 #   ./yllm_gen --model ... --vocab ... --prompt "Once upon a time" --tokens 16 --temp 0 --device vulkan
 ```
+
+CPU 会自动绑到高频核(big.LITTLE)，`YLLM_NO_AFFINITY=1` 可关闭。
