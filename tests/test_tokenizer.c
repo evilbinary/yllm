@@ -439,7 +439,7 @@ static void test_chat_template_qwen3_real(void)
         return;
     }
     uint32_t ids[256];
-    int n = vocab_chat_ids(&v, "Hello", ids, 256, v.add_bos);
+    int n = vocab_chat_ids(&v, "Hello", ids, 256, 0);
     CHECK(n > 0, "qwen3 render produces tokens");
     if (n > 0) {
         char out[1024];
@@ -450,8 +450,10 @@ static void test_chat_template_qwen3_real(void)
               "qwen3: generation prompt rendered");
         CHECK(strstr(out, "Unexpected") == NULL && strstr(out, "content._type") == NULL,
               "qwen3: no template garbage");
-        /* 模板行以 im_start 起始(不含 BOS) */
-        if (n > 0) CHECK(ids[0] == 248045, "qwen3: first token <|im_start|>");
+        /* 模板行以 im_start 起始(不含 BOS); id 随 vocab 变, 按 piece 比对 */
+        CHECK(ids[0] < v.n && v.pieces[ids[0]] &&
+              strcmp(v.pieces[ids[0]], "<|im_start|>") == 0,
+              "qwen3: first token <|im_start|>");
     }
     vocab_free(&v);
 }

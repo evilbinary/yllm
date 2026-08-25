@@ -161,9 +161,13 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
     switch (type) {
     case GVT_U8:
     case GVT_I8:
-    case GVT_BOOL:
+    case GVT_BOOL: {
+        uint8_t v = 0;
+        if (b->p < b->end) v = *b->p;
         gb_skip(b, 1);
+        if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
         break;
+    }
     case GVT_U16:
     case GVT_I16:
         gb_skip(b, 2);
@@ -584,7 +588,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     memset(&g, 0, sizeof(g));
     g.freq_base = 10000.0f;
     g.rms_eps = 1e-5f;
-    g.add_bos = 1; /* llama architecture default */
+    g.add_bos = -1; /* unset: llama default 1, qwen/gemma 0 */
     g.bos_id = -1;
     g.eos_id = -1;
     g.attn_logit_cap = 0.0f;
@@ -627,6 +631,9 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     int is_qwen35 = g.arch && strcmp(g.arch, "qwen35") == 0;
     int is_gemma4 = g.arch && strcmp(g.arch, "gemma4") == 0;
     free(g.arch);
+    /* GGUF 常省略 add_bos_token; llama 默认加 BOS, qwen/gemma 聊天模板以特殊 token 起始 */
+    if (g.add_bos < 0)
+        g.add_bos = (is_qwen || is_qwen35 || is_gemma4) ? 0 : 1;
     if (g.n_blocks == 0 || g.hidden == 0 || g.heads == 0) {
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
