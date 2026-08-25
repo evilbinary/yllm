@@ -18,11 +18,18 @@
 #define DT_Q6K 4
 #define DT_IQ4XS 5
 #define DT_Q5K 6
-#define DT_W4B64 7   /* int4 block-64, 行主序; 见 matvec w4b64_* */
+#define DT_W4B64 7   /* int4 block-64, MNN Arm82 tile; 见 matvec w4b64_* */
 #define DT_KEEP 0xFFFFFFFFu  /* convert: 保持源 dtype, 不重打包 */
 
 #define W4B64_BLK 64
-#define W4B64_BLK_BYTES 34  /* f16 scale + 32B nibbles */
+#define W4B64_HP 8          /* OC tile (Arm82 UNIT) */
+#define W4B64_SRC 4         /* IC per cell (Arm82 SRC_UNIT) */
+#define W4B64_CELL 16       /* bytes per (8 OC × 4 IC) nibble cell */
+#define W4B64_LU (W4B64_BLK / W4B64_SRC)  /* 16 cells per IC-block */
+/* 每 (hu, block): lu*16 权 + 8×f32 scale + 8×f32 zero */
+#define W4B64_PANEL_BYTES (W4B64_LU * W4B64_CELL + 2 * W4B64_HP * 4)
+/* 兼容旧宏名(行主序已废); 请用 w4b64_bytes(out,in) */
+#define W4B64_BLK_BYTES W4B64_PANEL_BYTES
 
 #define ARCH_LLAMA 0
 #define ARCH_QWEN 1

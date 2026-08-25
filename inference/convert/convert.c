@@ -340,7 +340,6 @@ int conv_items_apply_dtype(ConvItem* items, int n, uint32_t n_blocks, uint32_t o
     for (p2 = 0; p2 < n; p2++) {
         ConvItem* it = &items[p2];
         uint32_t out_r = 0, in_c = 0;
-        size_t rowb;
         uint8_t* packed;
         if (it->dtype != DT_Q4K || it->ndim != 2) continue;
         if (!llf_slot_linear_ok(it->layer, it->slot, n_blocks)) continue;
@@ -353,26 +352,28 @@ int conv_items_apply_dtype(ConvItem* items, int n, uint32_t n_blocks, uint32_t o
             else continue;
         }
         if ((in_c % W4B64_BLK) != 0) continue;
-        rowb = w4b64_row_bytes(in_c);
-        packed = (uint8_t*)ymalloc((size_t)out_r * rowb);
-        if (!packed) {
-            snprintf(err, errlen, "oom packing %s", it->name);
-            return -1;
+        {
+            size_t nbytes = w4b64_bytes(out_r, in_c);
+            packed = (uint8_t*)ymalloc(nbytes);
+            if (!packed) {
+                snprintf(err, errlen, "oom packing %s", it->name);
+                return -1;
+            }
+            if (w4b64_pack_mat_q4k(packed, it->src + it->src_off, out_r, in_c) != 0) {
+                free(packed);
+                continue;
+            }
+            if (owned_push(owned, n_owned, packed) != 0) {
+                free(packed);
+                snprintf(err, errlen, "oom");
+                return -1;
+            }
+            it->src = packed;
+            it->src_off = 0;
+            it->dtype = DT_W4B64;
+            it->nbytes = (uint64_t)nbytes;
+            n_remap++;
         }
-        if (w4b64_pack_mat_q4k(packed, it->src + it->src_off, out_r, in_c) != 0) {
-            free(packed);
-            continue;
-        }
-        if (owned_push(owned, n_owned, packed) != 0) {
-            free(packed);
-            snprintf(err, errlen, "oom");
-            return -1;
-        }
-        it->src = packed;
-        it->src_off = 0;
-        it->dtype = DT_W4B64;
-        it->nbytes = (uint64_t)out_r * rowb;
-        n_remap++;
     }
     if (n_remap > 0 && h) h->dtype = DT_W4B64;
     return n_remap;

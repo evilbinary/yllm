@@ -12,12 +12,19 @@ void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 
-/* W4B64: 行字节; in 须整除 64 */
+/* W4B64 Arm82: 整矩阵字节数; out/in 须分别整除 8/64 */
+size_t w4b64_bytes(uint32_t out, uint32_t in);
+/* 兼容旧 API: 等价 w4b64_bytes(1,in) 的行主序假象已废, 返回 0; 请用 w4b64_bytes */
 size_t w4b64_row_bytes(uint32_t in);
-/* 从 f32 行主序 [out×in] 打包; dst 需 out * w4b64_row_bytes(in) */
+/* 从 f32 行主序 [out×in] 打包为 Arm82 W4 */
 int w4b64_pack_mat_f32(uint8_t* dst, const float* src, uint32_t out, uint32_t in);
-/* 从 Q4_K 行主序打包为 W4B64 */
+/* 从 Q4_K 行主序打包为 Arm82 W4 */
 int w4b64_pack_mat_q4k(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in);
+/* Arm82 → Arm86 (i8mm SRC_UNIT=8) 就地/分缓冲 permute */
+int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in);
+/* 运行时优先 i8mm(若硬件支持); 1=开 0=关; 返回实际是否启用 */
+int w4b64_set_prefer_i8mm(int on);
+int w4b64_prefer_i8mm(void);
 /* Q6_K matmul 前激活量化(与 matmul_q6k 一致) */
 void matvec_q8k_quant(const float* x, float* xq, uint32_t n);
 
