@@ -56,7 +56,7 @@ endif()
 if(ANDROID_ABI STREQUAL "arm64-v8a")
   target_compile_options(yllm PRIVATE
     -O3 -ffast-math -fno-finite-math-only
-    -march=armv8.2-a+dotprod
+    -march=armv8.2-a+dotprod+i8mm
     -fopenmp)
   target_link_options(yllm PRIVATE -fopenmp -static-openmp)
 endif()

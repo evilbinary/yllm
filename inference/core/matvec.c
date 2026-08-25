@@ -1283,12 +1283,13 @@ int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out,
     return 0;
 }
 
-static void w4_act_quant_block(const float* x, int8_t* xq, float* xs, uint32_t nb)
+static void w4_act_quant_block(const float* x, int8_t* xq, float* xs, int32_t* xsum, uint32_t nb)
 {
     uint32_t b, i;
     for (b = 0; b < nb; b++) {
         const float* xb = x + (size_t)b * W4B64_BLK;
         float amax = 0.0f;
+        int32_t sum = 0;
         for (i = 0; i < W4B64_BLK; i++) {
             float a = fabsf(xb[i]);
             if (a > amax) amax = a;
@@ -1301,12 +1302,14 @@ static void w4_act_quant_block(const float* x, int8_t* xq, float* xs, uint32_t n
             if (q < -127) q = -127;
             if (q > 127) q = 127;
             xq[(size_t)b * W4B64_BLK + i] = (int8_t)q;
+            sum += q;
         }
+        xsum[b] = sum;
     }
 }
 
-/* Scalar Arm82 GEMV oracle (MNN 16x4_w4 形态, UNIT=8 SRC=4) */
-static void matmul_w4b64_arm82_scalar(float* y, const int8_t* xq, const float* xs,
+/* Scalar Arm82 GEMV: nibble=(q+8), iacc 后再减 8*xsum */
+static void matmul_w4b64_arm82_scalar(float* y, const int8_t* xq, const float* xs, const int32_t* xsum,
                                      const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t hu = (out + 7u) / 8u;
@@ -1320,20 +1323,18 @@ static void matmul_w4b64_arm82_scalar(float* y, const int8_t* xq, const float* x
         for (bl = 0; bl < bn; bl++) {
             const uint8_t* panel = w + ((size_t)h * bn + bl) * W4B64_PANEL_BYTES;
             const float* wscale = (const float*)(panel + W4B64_LU * 16);
-            const float* wzero = wscale + 8;
             const int8_t* xp = xq + (size_t)bl * W4B64_BLK;
             float xsc = xs[bl];
             int32_t iacc[8];
-            float xsum = 0.0f;
+            int32_t corr = 8 * xsum[bl];
             memset(iacc, 0, sizeof(iacc));
-            for (j = 0; j < W4B64_BLK; j++) xsum += (float)xp[j];
             for (j = 0; j < W4B64_LU; j++) {
                 const uint8_t* cell = panel + (size_t)j * 16;
                 const int8_t* x4 = xp + j * 4;
                 int8_t w8[32];
                 for (oc_i = 0; oc_i < 16; oc_i++) {
-                    w8[oc_i] = (int8_t)((cell[oc_i] >> 4) - 8);
-                    w8[oc_i + 16] = (int8_t)((cell[oc_i] & 15) - 8);
+                    w8[oc_i] = (int8_t)(cell[oc_i] >> 4);
+                    w8[oc_i + 16] = (int8_t)(cell[oc_i] & 15);
                 }
                 for (oc_i = 0; oc_i < 8; oc_i++) {
                     const int8_t* wj = w8 + oc_i * 4;
@@ -1343,7 +1344,7 @@ static void matmul_w4b64_arm82_scalar(float* y, const int8_t* xq, const float* x
             }
             for (oc_i = 0; oc_i < 8; oc_i++) {
                 if (oc0 + oc_i >= out) continue;
-                acc[oc_i] += ((float)iacc[oc_i] * wscale[oc_i] + xsum * wzero[oc_i]) * xsc;
+                acc[oc_i] += (float)(iacc[oc_i] - corr) * wscale[oc_i] * xsc;
             }
         }
         for (oc_i = 0; oc_i < 8; oc_i++) {
@@ -1353,15 +1354,14 @@ static void matmul_w4b64_arm82_scalar(float* y, const int8_t* xq, const float* x
 }
 
 #if defined(__aarch64__)
-/* Arm82 GEMV: NEON 拆 nibble + sdot 累加, int32 累加器常驻寄存器 */
-static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
+/* nibble 保持 0..15; 块末 iacc -= 8*xsum。lane-sdot 一次吃 16 IC。 */
+static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs, const int32_t* xsum,
                                    const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t hu = (out + 7u) / 8u;
     uint32_t bn = in / W4B64_BLK;
     uint32_t h;
     const uint8x16_t mask15 = vdupq_n_u8(15);
-    const int8x16_t eight = vdupq_n_s8(8);
 #pragma omp parallel for schedule(static)
     for (h = 0; h < hu; h++) {
         float32x4_t acc_hi = vdupq_n_f32(0.0f);
@@ -1371,47 +1371,42 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
         for (bl = 0; bl < bn; bl++) {
             const uint8_t* panel = w + ((size_t)h * bn + bl) * W4B64_PANEL_BYTES;
             const float* wscale = (const float*)(panel + W4B64_LU * 16);
-            const float* wzero = wscale + 8;
             const int8_t* xp = xq + (size_t)bl * W4B64_BLK;
             float xsc = xs[bl];
             int32x4_t iacc_hi = vdupq_n_s32(0);
             int32x4_t iacc_lo = vdupq_n_s32(0);
-            float xsum = 0.0f;
-            {
-                int32x4_t s0 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp))));
-                int32x4_t s1 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp))));
-                int32x4_t s2 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 8))));
-                int32x4_t s3 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 8))));
-                int32x4_t s4 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 16))));
-                int32x4_t s5 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 16))));
-                int32x4_t s6 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 24))));
-                int32x4_t s7 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 24))));
-                int32x4_t t = vaddq_s32(vaddq_s32(vaddq_s32(s0, s1), vaddq_s32(s2, s3)),
-                                        vaddq_s32(vaddq_s32(s4, s5), vaddq_s32(s6, s7)));
-                /* 后 32 个 */
-                s0 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 32))));
-                s1 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 32))));
-                s2 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 40))));
-                s3 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 40))));
-                s4 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 48))));
-                s5 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 48))));
-                s6 = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(xp + 56))));
-                s7 = vmovl_s16(vget_high_s16(vmovl_s8(vld1_s8(xp + 56))));
-                t = vaddq_s32(t, vaddq_s32(vaddq_s32(vaddq_s32(s0, s1), vaddq_s32(s2, s3)),
-                                           vaddq_s32(vaddq_s32(s4, s5), vaddq_s32(s6, s7))));
-                xsum = (float)vaddvq_s32(t);
+            int32x4_t corr = vdupq_n_s32(8 * xsum[bl]);
+#if defined(__ARM_FEATURE_DOTPROD)
+            for (j = 0; j < W4B64_LU; j += 4) {
+                int8x16_t xv = vld1q_s8(xp + j * 4);
+                uint8x16_t c0 = vld1q_u8(panel + (size_t)j * 16);
+                uint8x16_t c1 = vld1q_u8(panel + (size_t)(j + 1) * 16);
+                uint8x16_t c2 = vld1q_u8(panel + (size_t)(j + 2) * 16);
+                uint8x16_t c3 = vld1q_u8(panel + (size_t)(j + 3) * 16);
+                int8x16_t h0 = vreinterpretq_s8_u8(vshrq_n_u8(c0, 4));
+                int8x16_t l0 = vreinterpretq_s8_u8(vandq_u8(c0, mask15));
+                int8x16_t h1 = vreinterpretq_s8_u8(vshrq_n_u8(c1, 4));
+                int8x16_t l1 = vreinterpretq_s8_u8(vandq_u8(c1, mask15));
+                int8x16_t h2 = vreinterpretq_s8_u8(vshrq_n_u8(c2, 4));
+                int8x16_t l2 = vreinterpretq_s8_u8(vandq_u8(c2, mask15));
+                int8x16_t h3 = vreinterpretq_s8_u8(vshrq_n_u8(c3, 4));
+                int8x16_t l3 = vreinterpretq_s8_u8(vandq_u8(c3, mask15));
+                iacc_hi = vdotq_laneq_s32(iacc_hi, h0, xv, 0);
+                iacc_lo = vdotq_laneq_s32(iacc_lo, l0, xv, 0);
+                iacc_hi = vdotq_laneq_s32(iacc_hi, h1, xv, 1);
+                iacc_lo = vdotq_laneq_s32(iacc_lo, l1, xv, 1);
+                iacc_hi = vdotq_laneq_s32(iacc_hi, h2, xv, 2);
+                iacc_lo = vdotq_laneq_s32(iacc_lo, l2, xv, 2);
+                iacc_hi = vdotq_laneq_s32(iacc_hi, h3, xv, 3);
+                iacc_lo = vdotq_laneq_s32(iacc_lo, l3, xv, 3);
             }
+#else
             for (j = 0; j < W4B64_LU; j++) {
                 const uint8_t* cell = panel + (size_t)j * 16;
-                /* 同一 int32 复制到 4 道 → int8 上看成 4 份相同 x[4] */
                 int8x16_t xv = vreinterpretq_s8_s32(vld1q_dup_s32((const int32_t*)(xp + j * 4)));
                 uint8x16_t c = vld1q_u8(cell);
-                int8x16_t wh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), eight);
-                int8x16_t wl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(c, mask15)), eight);
-#if defined(__ARM_FEATURE_DOTPROD)
-                iacc_hi = vdotq_s32(iacc_hi, wh, xv);
-                iacc_lo = vdotq_s32(iacc_lo, wl, xv);
-#else
+                int8x16_t wh = vreinterpretq_s8_u8(vshrq_n_u8(c, 4));
+                int8x16_t wl = vreinterpretq_s8_u8(vandq_u8(c, mask15));
                 {
                     int32_t thi[4], tlo[4];
                     int oc2, ic2;
@@ -1429,17 +1424,16 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
                     iacc_hi = vld1q_s32(thi);
                     iacc_lo = vld1q_s32(tlo);
                 }
-#endif
+                (void)xv;
             }
+#endif
+            iacc_hi = vsubq_s32(iacc_hi, corr);
+            iacc_lo = vsubq_s32(iacc_lo, corr);
             {
                 float32x4_t fi = vmulq_n_f32(vcvtq_f32_s32(iacc_hi), xsc);
                 float32x4_t fj = vmulq_n_f32(vcvtq_f32_s32(iacc_lo), xsc);
-                float32x4_t zs = vmulq_n_f32(vld1q_f32(wzero), xsum * xsc);
-                float32x4_t zt = vmulq_n_f32(vld1q_f32(wzero + 4), xsum * xsc);
                 acc_hi = vmlaq_f32(acc_hi, fi, vld1q_f32(wscale));
                 acc_lo = vmlaq_f32(acc_lo, fj, vld1q_f32(wscale + 4));
-                acc_hi = vaddq_f32(acc_hi, zs);
-                acc_lo = vaddq_f32(acc_lo, zt);
             }
         }
         if (oc0 + 8u <= out) {
@@ -1457,13 +1451,12 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-/* i8mm stub: 尚未接真 smmla; 不应被 prefer 选中 */
-static void matmul_w4b64_arm86_smmla(float* y, const int8_t* xq, const float* xs,
+static void matmul_w4b64_arm86_smmla(float* y, const int8_t* xq, const float* xs, const int32_t* xsum,
                                     const uint8_t* w, uint32_t out, uint32_t in)
 {
-    matmul_w4b64_arm82_sdot(y, xq, xs, w, out, in);
+    matmul_w4b64_arm82_sdot(y, xq, xs, xsum, w, out, in);
 }
-#endif /* MATMUL_INT8 */
+#endif
 #endif /* aarch64 */
 
 void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
@@ -1471,23 +1464,25 @@ void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     uint32_t nb = in / W4B64_BLK;
     int8_t* xq;
     float* xs;
+    int32_t* xsum;
     if (!w4b64_bytes(out, in) || nb == 0) {
         memset(y, 0, (size_t)out * 4);
         return;
     }
     xq = (int8_t*)alloca((size_t)in);
     xs = (float*)alloca((size_t)nb * 4);
-    w4_act_quant_block(x, xq, xs, nb);
+    xsum = (int32_t*)alloca((size_t)nb * 4);
+    w4_act_quant_block(x, xq, xs, xsum, nb);
 #if defined(__aarch64__)
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     if (w4b64_prefer_i8mm()) {
-        matmul_w4b64_arm86_smmla(y, xq, xs, w, out, in);
+        matmul_w4b64_arm86_smmla(y, xq, xs, xsum, w, out, in);
         return;
     }
 #endif
-    matmul_w4b64_arm82_sdot(y, xq, xs, w, out, in);
+    matmul_w4b64_arm82_sdot(y, xq, xs, xsum, w, out, in);
 #else
-    matmul_w4b64_arm82_scalar(y, xq, xs, w, out, in);
+    matmul_w4b64_arm82_scalar(y, xq, xs, xsum, w, out, in);
 #endif
 }
 
@@ -1564,130 +1559,138 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
         }
         xq = (int8_t*)ymalloc((size_t)B * in);
         xs = (float*)ymalloc((size_t)B * nb64 * 4);
-        if (!xq || !xs) {
-            free(xq); free(xs);
-            for (g = 0; g < B; g++)
-                matmul_w4b64(y + (size_t)g * out, x + (size_t)g * in, w, out, in);
-            return;
-        }
-        for (g = 0; g < B; g++)
-            w4_act_quant_block(x + (size_t)g * in, xq + (size_t)g * in, xs + (size_t)g * nb64, nb64);
-#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
         {
-            const uint8x16_t mask15 = vdupq_n_u8(15);
-            const int8x16_t eight = vdupq_n_s8(8);
-#pragma omp parallel for schedule(static)
-            for (h = 0; h < hu; h++) {
-                float32x4_t acc_hi[64], acc_lo[64];
-                uint32_t oc0 = h * 8u;
-                for (g = 0; g < B; g++) {
-                    acc_hi[g] = vdupq_n_f32(0.0f);
-                    acc_lo[g] = vdupq_n_f32(0.0f);
+            int32_t* xsum = (int32_t*)ymalloc((size_t)B * nb64 * 4);
+            if (!xq || !xs || !xsum) {
+                free(xq); free(xs); free(xsum);
+                for (g = 0; g < B; g++)
+                    matmul_w4b64(y + (size_t)g * out, x + (size_t)g * in, w, out, in);
+                return;
+            }
+            for (g = 0; g < B; g++)
+                w4_act_quant_block(x + (size_t)g * in, xq + (size_t)g * in, xs + (size_t)g * nb64,
+                                   xsum + (size_t)g * nb64, nb64);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+            {
+                const uint8x16_t mask15 = vdupq_n_u8(15);
+#pragma omp parallel for schedule(static) private(g, bl, j, oc_i)
+                for (h = 0; h < hu; h++) {
+                    float32x4_t acc_hi[64], acc_lo[64];
+                    uint32_t oc0 = h * 8u;
+                    for (g = 0; g < B; g++) {
+                        acc_hi[g] = vdupq_n_f32(0.0f);
+                        acc_lo[g] = vdupq_n_f32(0.0f);
+                    }
+                    for (bl = 0; bl < nb64; bl++) {
+                        const uint8_t* panel = w + ((size_t)h * nb64 + bl) * W4B64_PANEL_BYTES;
+                        const float* wscale = (const float*)(panel + W4B64_LU * 16);
+                        int32x4_t iacc_hi[64], iacc_lo[64];
+                        for (g = 0; g < B; g++) {
+                            iacc_hi[g] = vdupq_n_s32(0);
+                            iacc_lo[g] = vdupq_n_s32(0);
+                        }
+                        for (j = 0; j < W4B64_LU; j++) {
+                            uint8x16_t c = vld1q_u8(panel + (size_t)j * 16);
+                            int8x16_t wh = vreinterpretq_s8_u8(vshrq_n_u8(c, 4));
+                            int8x16_t wl = vreinterpretq_s8_u8(vandq_u8(c, mask15));
+                            g = 0;
+                            while (g + 4 <= B) {
+                                int8_t pk[16];
+                                int8x16_t xv;
+                                memcpy(pk, xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 4, 4);
+                                memcpy(pk + 4, xq + (size_t)(g + 1) * in + (size_t)bl * W4B64_BLK + j * 4, 4);
+                                memcpy(pk + 8, xq + (size_t)(g + 2) * in + (size_t)bl * W4B64_BLK + j * 4, 4);
+                                memcpy(pk + 12, xq + (size_t)(g + 3) * in + (size_t)bl * W4B64_BLK + j * 4, 4);
+                                xv = vld1q_s8(pk);
+                                iacc_hi[g] = vdotq_laneq_s32(iacc_hi[g], wh, xv, 0);
+                                iacc_lo[g] = vdotq_laneq_s32(iacc_lo[g], wl, xv, 0);
+                                iacc_hi[g + 1] = vdotq_laneq_s32(iacc_hi[g + 1], wh, xv, 1);
+                                iacc_lo[g + 1] = vdotq_laneq_s32(iacc_lo[g + 1], wl, xv, 1);
+                                iacc_hi[g + 2] = vdotq_laneq_s32(iacc_hi[g + 2], wh, xv, 2);
+                                iacc_lo[g + 2] = vdotq_laneq_s32(iacc_lo[g + 2], wl, xv, 2);
+                                iacc_hi[g + 3] = vdotq_laneq_s32(iacc_hi[g + 3], wh, xv, 3);
+                                iacc_lo[g + 3] = vdotq_laneq_s32(iacc_lo[g + 3], wl, xv, 3);
+                                g += 4;
+                            }
+                            for (; g < B; g++) {
+                                const int8_t* x4 = xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 4;
+                                int8x16_t xv = vreinterpretq_s8_s32(vld1q_dup_s32((const int32_t*)x4));
+                                iacc_hi[g] = vdotq_s32(iacc_hi[g], wh, xv);
+                                iacc_lo[g] = vdotq_s32(iacc_lo[g], wl, xv);
+                            }
+                        }
+                        for (g = 0; g < B; g++) {
+                            float xsc = xs[(size_t)g * nb64 + bl];
+                            int32x4_t corr = vdupq_n_s32(8 * xsum[(size_t)g * nb64 + bl]);
+                            float32x4_t fi = vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(iacc_hi[g], corr)), xsc);
+                            float32x4_t fj = vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(iacc_lo[g], corr)), xsc);
+                            acc_hi[g] = vmlaq_f32(acc_hi[g], fi, vld1q_f32(wscale));
+                            acc_lo[g] = vmlaq_f32(acc_lo[g], fj, vld1q_f32(wscale + 4));
+                        }
+                    }
+                    for (g = 0; g < B; g++) {
+                        if (oc0 + 8u <= out) {
+                            vst1q_f32(y + (size_t)g * out + oc0, acc_hi[g]);
+                            vst1q_f32(y + (size_t)g * out + oc0 + 4, acc_lo[g]);
+                        } else {
+                            float tmp[8];
+                            vst1q_f32(tmp, acc_hi[g]);
+                            vst1q_f32(tmp + 4, acc_lo[g]);
+                            for (oc_i = 0; oc_i < 8; oc_i++)
+                                if (oc0 + oc_i < out)
+                                    y[(size_t)g * out + oc0 + oc_i] = tmp[oc_i];
+                        }
+                    }
                 }
+            }
+#else
+#pragma omp parallel for schedule(static) private(g, bl, j, oc_i)
+            for (h = 0; h < hu; h++) {
+                float acc[64][8];
+                uint32_t oc0 = h * 8u;
+                memset(acc, 0, sizeof(acc));
                 for (bl = 0; bl < nb64; bl++) {
                     const uint8_t* panel = w + ((size_t)h * nb64 + bl) * W4B64_PANEL_BYTES;
                     const float* wscale = (const float*)(panel + W4B64_LU * 16);
-                    const float* wzero = wscale + 8;
-                    int32x4_t iacc_hi[64], iacc_lo[64];
-                    float xsum[64];
-                    for (g = 0; g < B; g++) {
-                        const int8_t* xp = xq + (size_t)g * in + (size_t)bl * W4B64_BLK;
-                        int32_t s = 0;
-                        iacc_hi[g] = vdupq_n_s32(0);
-                        iacc_lo[g] = vdupq_n_s32(0);
-                        for (j = 0; j < W4B64_BLK; j++) s += (int32_t)xp[j];
-                        xsum[g] = (float)s;
-                    }
+                    int32_t iacc[64][8];
+                    memset(iacc, 0, sizeof(iacc));
                     for (j = 0; j < W4B64_LU; j++) {
-                        uint8x16_t c = vld1q_u8(panel + (size_t)j * 16);
-                        int8x16_t wh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), eight);
-                        int8x16_t wl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(c, mask15)), eight);
+                        const uint8_t* cell = panel + (size_t)j * 16;
+                        int8_t w8[32];
+                        uint32_t ic_i;
+                        for (oc_i = 0; oc_i < 16; oc_i++) {
+                            w8[oc_i] = (int8_t)(cell[oc_i] >> 4);
+                            w8[oc_i + 16] = (int8_t)(cell[oc_i] & 15);
+                        }
                         for (g = 0; g < B; g++) {
                             const int8_t* x4 = xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 4;
-                            int8x16_t xv = vreinterpretq_s8_s32(vld1q_dup_s32((const int32_t*)x4));
-                            iacc_hi[g] = vdotq_s32(iacc_hi[g], wh, xv);
-                            iacc_lo[g] = vdotq_s32(iacc_lo[g], wl, xv);
+                            for (oc_i = 0; oc_i < 8; oc_i++) {
+                                const int8_t* wj = w8 + oc_i * 4;
+                                for (ic_i = 0; ic_i < 4; ic_i++)
+                                    iacc[g][oc_i] += (int32_t)x4[ic_i] * (int32_t)wj[ic_i];
+                            }
                         }
                     }
                     for (g = 0; g < B; g++) {
                         float xsc = xs[(size_t)g * nb64 + bl];
-                        float32x4_t fi = vmulq_n_f32(vcvtq_f32_s32(iacc_hi[g]), xsc);
-                        float32x4_t fj = vmulq_n_f32(vcvtq_f32_s32(iacc_lo[g]), xsc);
-                        float32x4_t zs = vmulq_n_f32(vld1q_f32(wzero), xsum[g] * xsc);
-                        float32x4_t zt = vmulq_n_f32(vld1q_f32(wzero + 4), xsum[g] * xsc);
-                        acc_hi[g] = vmlaq_f32(acc_hi[g], fi, vld1q_f32(wscale));
-                        acc_lo[g] = vmlaq_f32(acc_lo[g], fj, vld1q_f32(wscale + 4));
-                        acc_hi[g] = vaddq_f32(acc_hi[g], zs);
-                        acc_lo[g] = vaddq_f32(acc_lo[g], zt);
-                    }
-                }
-                for (g = 0; g < B; g++) {
-                    if (oc0 + 8u <= out) {
-                        vst1q_f32(y + (size_t)g * out + oc0, acc_hi[g]);
-                        vst1q_f32(y + (size_t)g * out + oc0 + 4, acc_lo[g]);
-                    } else {
-                        float tmp[8];
-                        vst1q_f32(tmp, acc_hi[g]);
-                        vst1q_f32(tmp + 4, acc_lo[g]);
-                        for (oc_i = 0; oc_i < 8; oc_i++)
-                            if (oc0 + oc_i < out)
-                                y[(size_t)g * out + oc0 + oc_i] = tmp[oc_i];
-                    }
-                }
-            }
-        }
-#else
-#pragma omp parallel for schedule(static)
-        for (h = 0; h < hu; h++) {
-            float acc[64][8];
-            uint32_t oc0 = h * 8u;
-            memset(acc, 0, sizeof(acc));
-            for (bl = 0; bl < nb64; bl++) {
-                const uint8_t* panel = w + ((size_t)h * nb64 + bl) * W4B64_PANEL_BYTES;
-                const float* wscale = (const float*)(panel + W4B64_LU * 16);
-                const float* wzero = wscale + 8;
-                int32_t iacc[64][8];
-                float xsum[64];
-                memset(iacc, 0, sizeof(iacc));
-                for (g = 0; g < B; g++) {
-                    const int8_t* xp = xq + (size_t)g * in + (size_t)bl * W4B64_BLK;
-                    xsum[g] = 0.0f;
-                    for (j = 0; j < W4B64_BLK; j++) xsum[g] += (float)xp[j];
-                }
-                for (j = 0; j < W4B64_LU; j++) {
-                    const uint8_t* cell = panel + (size_t)j * 16;
-                    int8_t w8[32];
-                    uint32_t ic_i;
-                    for (oc_i = 0; oc_i < 16; oc_i++) {
-                        w8[oc_i] = (int8_t)((cell[oc_i] >> 4) - 8);
-                        w8[oc_i + 16] = (int8_t)((cell[oc_i] & 15) - 8);
-                    }
-                    for (g = 0; g < B; g++) {
-                        const int8_t* x4 = xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 4;
+                        int32_t corr = 8 * xsum[(size_t)g * nb64 + bl];
                         for (oc_i = 0; oc_i < 8; oc_i++) {
-                            const int8_t* wj = w8 + oc_i * 4;
-                            for (ic_i = 0; ic_i < 4; ic_i++)
-                                iacc[g][oc_i] += (int32_t)x4[ic_i] * (int32_t)wj[ic_i];
+                            if (oc0 + oc_i >= out) continue;
+                            acc[g][oc_i] += (float)(iacc[g][oc_i] - corr) * wscale[oc_i] * xsc;
                         }
                     }
                 }
-                for (g = 0; g < B; g++) {
-                    float xsc = xs[(size_t)g * nb64 + bl];
-                    for (oc_i = 0; oc_i < 8; oc_i++) {
-                        if (oc0 + oc_i >= out) continue;
-                        acc[g][oc_i] += ((float)iacc[g][oc_i] * wscale[oc_i] + xsum[g] * wzero[oc_i]) * xsc;
-                    }
-                }
+                for (g = 0; g < B; g++)
+                    for (oc_i = 0; oc_i < 8; oc_i++)
+                        if (oc0 + oc_i < out)
+                            y[(size_t)g * out + oc0 + oc_i] = acc[g][oc_i];
             }
-            for (g = 0; g < B; g++)
-                for (oc_i = 0; oc_i < 8; oc_i++)
-                    if (oc0 + oc_i < out)
-                        y[(size_t)g * out + oc0 + oc_i] = acc[g][oc_i];
-        }
 #endif
-        free(xq);
-        free(xs);
-        return;
+            free(xq);
+            free(xs);
+            free(xsum);
+            return;
+        }
     }
     if (dtype == DT_F32 || dtype == DT_F16) {
         /* f32/f16: 逐 token 点积 */
