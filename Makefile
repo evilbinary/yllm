@@ -654,10 +654,10 @@ server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (gemma4-e2b ranks=2 local=1 → 本机 rank0 :9410)"
-	@echo "手机先起 rank1, 例:"
-	@echo "  ./yllm rank --model gemma-4-E2B-it-Q4_K_M.llf --vocab gemma4.vocab.txt \\"
-	@echo "    --model-name gemma4-e2b --port 9411 --supervisor 192.168.1.161:9500 \\"
-	@echo "    --id rank-1 --rank 1 --ranks 2 --peers 192.168.1.161,192.168.2.199"
+	@echo "远端 rank1(无需 --peers), 见 docs/serve-cli.md, 例:"
+	@echo "  LD_LIBRARY_PATH=. ./yllm rank --model gemma-4-E2B-it-Q4_K_M.llf --vocab gemma4.vocab.txt \\"
+	@echo "    --model-name gemma4-e2b --port 9411 --rank 1 --ranks 2 \\"
+	@echo "    --supervisor 192.168.1.161:9500 --id rank-1 --budget 1024MB"
 	@echo "然后: make infer-gemma4-e2b"
 
 server-gemma4-e4b: $(BIN_AVX2) $(G4_E4B_LLF)

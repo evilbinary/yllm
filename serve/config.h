@@ -28,7 +28,7 @@ typedef struct {
     char name[CFG_STR_MAX];   /* 模型注册名(router 路由用) */
     char model[CFG_STR_MAX];  /* llf 路径 */
     char vocab[CFG_STR_MAX];  /* vocab 路径 */
-    char peers[CFG_STR_MAX];  /* 组内各段节点 IP(逗号分隔, 段号顺序; worker 段 spawn 时下发) */
+    char peers[CFG_STR_MAX];  /* 组内各段节点 IP(可选; 缺省由 QUERY_RANKS/LEASE 发现) */
     int  ranks;               /* 该模型的 rank 段数(总) */
     int  local;               /* 本机拉起的段数(默认 = ranks; 0 = 全部外部; 1 = 只 rank0 本地) */
     int  dist_fp16;           /* 段间激活 fp16 传输(带宽减半, 引入量化误差) */
@@ -75,7 +75,7 @@ typedef struct {
 
     /* rank 协作(多段) */
     int  rank_idx;                      /* --rank 段号(0..ranks-1) */
-    char peers[CFG_STR_MAX];            /* 组内各段节点 IP(逗号分隔; worker 段命令行下发) */
+    char peers[CFG_STR_MAX];            /* 组内各段节点 IP(可选覆盖; 缺省自动发现) */
     int  dist_fp16;                     /* 段间激活 fp16 传输(带宽减半, 引入量化误差) */
 
     /* 推理参数(rank 用) */

@@ -78,7 +78,11 @@ set(YLLM_CLI_SRCS
 )
 
 add_executable(yllm_cli ${YLLM_CLI_SRCS})
-set_target_properties(yllm_cli PROPERTIES OUTPUT_NAME yllm)
+set_target_properties(yllm_cli PROPERTIES
+  OUTPUT_NAME yllm
+  BUILD_RPATH "\$ORIGIN"
+  INSTALL_RPATH "\$ORIGIN"
+)
 target_include_directories(yllm_cli PRIVATE ${INFER_INC} ${SERVE} ${YLLM_ROOT})
 target_compile_definitions(yllm_cli PRIVATE
   YLLM_BATCH_PREFILL=1
@@ -89,6 +93,8 @@ if(YLLM_VULKAN)
   target_compile_definitions(yllm_cli PRIVATE YLLM_VULKAN=1)
 endif()
 target_link_libraries(yllm_cli yllm ${LOG_LIB})
+# 可执行文件旁放 libyllm.so 即可加载(Termux 无需再设 LD_LIBRARY_PATH)
+target_link_options(yllm_cli PRIVATE "-Wl,-rpath,\$ORIGIN")
 
 # 兼容旧入口
 add_executable(yllm_gen ${CMAKE_CURRENT_SOURCE_DIR}/gen_main.c)

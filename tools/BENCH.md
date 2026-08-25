@@ -68,16 +68,18 @@ OMP_NUM_THREADS=T setsid sh -c '<cd> && ./build/avx2/yllm rank \
   --model ... --vocab ... --model-name tinyllama \
   --port 9410+r --rank r --ranks N \
   --supervisor 192.168.1.161:9500 --id rank-r \
-  --peers <win_ip>,<lin_ip>... --cache-dir sessions \
+  --cache-dir sessions \
   --log logs/tinyllama-rank-r.log' </dev/null
 ```
 `setsid sh -c '... &' </dev/null` 用于让 ssh 立即返回(rank 常驻进程不会挂住 ssh 通道)。
+`--peers` 可选; 不传则经 supervisor `QUERY_RANKS` 自动发现。
 
 ### 关键点(已排过的坑)
 
 - **租约按 model-name 分组**: 远程 rank 必须传 `--model-name tinyllama`, 否则进不了该模型租约池。
-- **peers 自动生成**: 本机段(supervisor 拉起 rank0)默认 `127.0.0.1,127.0.0.1`;
-  跨机时 rank0 的 peers 由 server 下发的 LEASE(`peers=192.168.1.161,192.168.0.23`)在每次 INFER 中携带覆盖。
+- **peers 自动发现**: 同机全段 spawn 仍可带 `--peers`(OpenMP 限核); 跨机/混部不传。
+  rank0 的 peers 由 LEASE 随 INFER 下发; worker 向 supervisor `QUERY_RANKS` 凑齐各段 IP。
+  `--peers` 仅作可选覆盖。
 - **会话模式必须带 seg/segs/peers**: `server.c` 的 `forward_infer_sess` 现在会把
   `seg=0 segs=%d peers=%s` 拼进 INFER 参数;此前缺失导致 rank0 一直用启动时的 `127.0.0.1`
   peers 去连远端 rank1 而挂死(已修复, 需要重新编译 Windows 二进制)。

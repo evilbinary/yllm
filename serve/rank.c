@@ -76,6 +76,8 @@ typedef struct {
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
 
+static int rank_ensure_peers(Rank* r);
+
 /* ---- socket 辅助(与 dist_worker 同款) ---- */
 
 static void ws_init_rank(void)
@@ -574,6 +576,7 @@ static int run_rank(int port, Rank* r)
     if (r->dist_rank > 0 && r->dist_ranks > 1) {
         if (r->node.sv_enabled) ythread_create(&hb, worker_hb_thread, r);
         while (!r->quit) {
+            if (rank_ensure_peers(r) != 0) break;
             DistSess wsess;
             memset(&wsess, 0, sizeof(wsess));
             wsess.my_pos = r->cache_pos;
@@ -659,6 +662,82 @@ static int peers_all_local(const char* peers)
     return 1;
 }
 
+/* 向 supervisor QUERY_RANKS, 按管理口端口升序拼 peers CSV(与 LEASE 一致)。
+ * 返回 peer 数; 失败 -1。out 仅 IP(无端口)。 */
+static int rank_query_peers(Rank* r, char* out, size_t outsz)
+{
+    if (!r->node.sv_enabled || outsz == 0) return -1;
+    out[0] = '\0';
+    int fd = sock_connect(r->node.sv_host, r->node.sv_port, 3);
+    if (fd < 0) return -1;
+    sock_set_timeout(fd, 5);
+    char qargs[256];
+    snprintf(qargs, sizeof(qargs), "model=%s", r->node.model);
+    frame_send(fd, PROTO_QUERY_RANKS, qargs);
+    char addrs[64][128];
+    int ports[64];
+    int n = 0;
+    for (;;) {
+        Frame f;
+        if (frame_recv(fd, &f) < 0) break;
+        if (strcmp(f.cmd, PROTO_RANK_INFO) == 0) {
+            const char* a = proto_get(f.args, "addr");
+            if (!a || !a[0] || n >= 64) continue;
+            snprintf(addrs[n], sizeof(addrs[n]), "%s", a);
+            {
+                const char* colon = strrchr(addrs[n], ':');
+                ports[n] = colon ? atoi(colon + 1) : 0;
+            }
+            n++;
+        } else if (strcmp(f.cmd, PROTO_QUERY_DONE) == 0) {
+            break;
+        }
+    }
+    sock_close(fd);
+    {
+        int i, j;
+        for (i = 0; i < n; i++)
+            for (j = i + 1; j < n; j++)
+                if (ports[j] < ports[i]) {
+                    int tp = ports[i]; ports[i] = ports[j]; ports[j] = tp;
+                    char ta[128];
+                    snprintf(ta, sizeof(ta), "%s", addrs[i]);
+                    snprintf(addrs[i], sizeof(addrs[i]), "%s", addrs[j]);
+                    snprintf(addrs[j], sizeof(addrs[j]), "%s", ta);
+                }
+        for (i = 0; i < n; i++) {
+            char* colon = strchr(addrs[i], ':');
+            if (colon) *colon = '\0';
+            if (i) strncat(out, ",", outsz - strlen(out) - 1);
+            strncat(out, addrs[i], outsz - strlen(out) - 1);
+        }
+    }
+    return n;
+}
+
+/* worker/缺 peers 时: 轮询 supervisor 直到凑齐 dist_ranks 段 */
+static int rank_ensure_peers(Rank* r)
+{
+    if (r->addrs_csv[0] || r->dist_ranks <= 1) return 0;
+    if (!r->node.sv_enabled) {
+        ylog_error("rank: multi-rank needs --peers or --supervisor (auto-discover)");
+        return -1;
+    }
+    while (!r->quit) {
+        char peers[1024];
+        int n = rank_query_peers(r, peers, sizeof(peers));
+        if (n >= r->dist_ranks && peers[0]) {
+            snprintf(r->addrs_csv, sizeof(r->addrs_csv), "%s", peers);
+            ylog_info("rank: peers auto-discovered %s (%d ranks)", r->addrs_csv, n);
+            return 0;
+        }
+        ylog_info("rank: waiting peers via supervisor (%d/%d ready)",
+                  n < 0 ? 0 : n, r->dist_ranks);
+        sock_sleep_ms(1000);
+    }
+    return -1;
+}
+
 /* budget auto: 预算 = min(模型大小, 可用内存 - 余量) */
 static uint64_t rank_auto_budget(ServeConfig* cfg)
 {
@@ -711,7 +790,10 @@ int cmd_rank(ServeConfig* cfg)
 #ifdef _OPENMP
     if (getenv("OMP_NUM_THREADS") == NULL) {
         int nr = cfg->ranks > 1 ? cfg->ranks : 1;
-        if (nr > 1 && !peers_all_local(cfg->peers))
+        /* 有 peers 且跨机 / 无 peers 的远端 worker: 本机通常只跑一段, 跑满核 */
+        if (nr > 1 && cfg->peers[0] && !peers_all_local(cfg->peers))
+            nr = 1;
+        else if (nr > 1 && !cfg->peers[0] && cfg->rank_idx > 0)
             nr = 1;
         int n = omp_get_num_procs();
         if (n < 1) n = 1;
@@ -812,7 +894,7 @@ int cmd_rank(ServeConfig* cfg)
     }
 
     /* 多段协作: 协作口基址 = serve 基准(自己的 --port - 段号) + 偏移, 全组统一;
-     * 成员地址: worker 段来自命令(--peers, sv 自动下发); rank0 以 INFER 数据为准(启动时的兜底) */
+     * 成员地址: --peers 可选覆盖; 否则 worker 经 QUERY_RANKS 发现, rank0 以 INFER/LEASE 为准 */
     r.dist_rank = cfg->rank_idx;
     r.dist_ranks = cfg->ranks > 1 ? cfg->ranks : 1;
     r.dist_fp16 = cfg->dist_fp16;

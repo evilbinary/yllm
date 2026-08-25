@@ -123,15 +123,19 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
     char cmd[4096];
     uint16_t rport = (uint16_t)(model_rank_base(s, mi) + r);
     int ranks = mc->ranks > 0 ? mc->ranks : 1;
-    /* peers 自动生成(本机 IP × 总段数): 同机部署零配置; rank0 以 INFER 数据为准, 远程段手工起时自带 */
-    char peers[512] = "";
+    /* 同机全段: 下发 --peers 供 OpenMP 限核; 跨机/混部不传, 由 QUERY_RANKS/LEASE 发现 */
+    char peers_arg[600] = "";
     {
-        char lip[64] = "127.0.0.1";
-        sock_local_ip(lip, sizeof(lip));
-        int i;
-        for (i = 0; i < ranks; i++) {
-            if (i) strncat(peers, ",", sizeof(peers) - strlen(peers) - 1);
-            strncat(peers, lip, sizeof(peers) - strlen(peers) - 1);
+        int local = mc->local < 0 ? ranks : (mc->local < ranks ? mc->local : ranks);
+        if (local >= ranks && ranks > 1) {
+            char peers[512] = "", lip[64] = "127.0.0.1";
+            int i;
+            sock_local_ip(lip, sizeof(lip));
+            for (i = 0; i < ranks; i++) {
+                if (i) strncat(peers, ",", sizeof(peers) - strlen(peers) - 1);
+                strncat(peers, lip, sizeof(peers) - strlen(peers) - 1);
+            }
+            snprintf(peers_arg, sizeof(peers_arg), " --peers %s", peers);
         }
     }
     char bud[128];
@@ -141,11 +145,11 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
         snprintf(bud, sizeof(bud), "--budget auto");
     snprintf(cmd, sizeof(cmd),
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
-             "--supervisor %s:%u --id rank-%d --rank %d --ranks %d --peers %s "
+             "--supervisor %s:%u --id rank-%d --rank %d --ranks %d%s "
              "--dist-fp16 %d %s "
              "--cache-dir \"%s\" --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
-             mi * model_stride(s) + r, r, ranks, peers, mc->dist_fp16, bud,
+             mi * model_stride(s) + r, r, ranks, peers_arg, mc->dist_fp16, bud,
              s->cache_dir[0] ? s->cache_dir : ".", mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u cmd=%s", r, mc->name, rport, cmd);
     int pid = spawn_proc(cmd);
@@ -303,6 +307,26 @@ static void handle_heartbeat(Supervisor* s, int fd, const char* args)
         if (n.model[0]) snprintf(sv->node.model, sizeof(sv->node.model), "%s", n.model);
         if (n.addr[0])  snprintf(sv->node.addr, sizeof(sv->node.addr), "%s", n.addr);
         sv->node.last_hb = n.last_hb;
+    }
+    /* 回环 addr → 用 TCP 对端 IP(跨机心跳自动发现真实地址) */
+    if (sv->node.addr[0]) {
+        char* colon = strchr(sv->node.addr, ':');
+        size_t iplen = colon ? (size_t)(colon - sv->node.addr) : strlen(sv->node.addr);
+        if (iplen == 9 && strncmp(sv->node.addr, "127.0.0.1", 9) == 0) {
+            struct sockaddr_storage ss;
+            socklen_t sl = sizeof(ss);
+            memset(&ss, 0, sizeof(ss));
+            if (getpeername(fd, (struct sockaddr*)&ss, &sl) == 0 && ss.ss_family == AF_INET) {
+                char pip[64];
+                snprintf(pip, sizeof(pip), "%s",
+                         inet_ntoa(((struct sockaddr_in*)&ss)->sin_addr));
+                if (strcmp(pip, "127.0.0.1") != 0) {
+                    char portbuf[32] = "";
+                    if (colon) snprintf(portbuf, sizeof(portbuf), "%s", colon);
+                    snprintf(sv->node.addr, sizeof(sv->node.addr), "%s%s", pip, portbuf);
+                }
+            }
+        }
     }
     /* 只把 server 同步给 router; rank/router 只记录 */
     if (strcmp(sv->node.type, "server") == 0)
