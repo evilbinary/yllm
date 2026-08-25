@@ -1755,11 +1755,30 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
             {
                 const uint8x16_t mask15 = vdupq_n_u8(15);
-#pragma omp parallel for schedule(static) private(g, bl, j, oc_i)
+                uint32_t np4 = (B + 3u) / 4u;
+                uint32_t Bp = np4 * 4u;
+                /* 栈上交错: xpk[bl][j][p] = 4 token × 4 IC; B<=64 → np4<=16 */
+                int8_t xpk[nb64][W4B64_LU][np4][16];
+                uint32_t p;
+                memset(xpk, 0, sizeof(xpk));
+                for (bl = 0; bl < nb64; bl++) {
+                    for (j = 0; j < W4B64_LU; j++) {
+                        size_t off = (size_t)bl * W4B64_BLK + j * 4;
+                        for (p = 0; p < np4; p++) {
+                            uint32_t g0 = p * 4u;
+                            int32_t* pk = (int32_t*)xpk[bl][j][p];
+                            pk[0] = (g0 < B) ? *(const int32_t*)(xq + (size_t)g0 * in + off) : 0;
+                            pk[1] = (g0 + 1 < B) ? *(const int32_t*)(xq + (size_t)(g0 + 1) * in + off) : 0;
+                            pk[2] = (g0 + 2 < B) ? *(const int32_t*)(xq + (size_t)(g0 + 2) * in + off) : 0;
+                            pk[3] = (g0 + 3 < B) ? *(const int32_t*)(xq + (size_t)(g0 + 3) * in + off) : 0;
+                        }
+                    }
+                }
+#pragma omp parallel for schedule(static) private(g, bl, j, oc_i, p)
                 for (h = 0; h < hu; h++) {
                     float32x4_t acc_hi[64], acc_lo[64];
                     uint32_t oc0 = h * 8u;
-                    for (g = 0; g < B; g++) {
+                    for (g = 0; g < Bp; g++) {
                         acc_hi[g] = vdupq_n_f32(0.0f);
                         acc_lo[g] = vdupq_n_f32(0.0f);
                     }
@@ -1767,7 +1786,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                         const uint8_t* panel = w + ((size_t)h * nb64 + bl) * W4B64_PANEL_BYTES;
                         const float* wscale = (const float*)(panel + W4B64_LU * 16);
                         int32x4_t iacc_hi[64], iacc_lo[64];
-                        for (g = 0; g < B; g++) {
+                        for (g = 0; g < Bp; g++) {
                             iacc_hi[g] = vdupq_n_s32(0);
                             iacc_lo[g] = vdupq_n_s32(0);
                         }
@@ -1775,30 +1794,17 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                             uint8x16_t c = vld1q_u8(panel + (size_t)j * 16);
                             int8x16_t wh = vreinterpretq_s8_u8(vshrq_n_u8(c, 4));
                             int8x16_t wl = vreinterpretq_s8_u8(vandq_u8(c, mask15));
-                            g = 0;
-                            while (g + 4 <= B) {
-                                int8_t pk[16];
-                                int8x16_t xv;
-                                memcpy(pk, xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 4, 4);
-                                memcpy(pk + 4, xq + (size_t)(g + 1) * in + (size_t)bl * W4B64_BLK + j * 4, 4);
-                                memcpy(pk + 8, xq + (size_t)(g + 2) * in + (size_t)bl * W4B64_BLK + j * 4, 4);
-                                memcpy(pk + 12, xq + (size_t)(g + 3) * in + (size_t)bl * W4B64_BLK + j * 4, 4);
-                                xv = vld1q_s8(pk);
-                                iacc_hi[g] = vdotq_laneq_s32(iacc_hi[g], wh, xv, 0);
-                                iacc_lo[g] = vdotq_laneq_s32(iacc_lo[g], wl, xv, 0);
-                                iacc_hi[g + 1] = vdotq_laneq_s32(iacc_hi[g + 1], wh, xv, 1);
-                                iacc_lo[g + 1] = vdotq_laneq_s32(iacc_lo[g + 1], wl, xv, 1);
-                                iacc_hi[g + 2] = vdotq_laneq_s32(iacc_hi[g + 2], wh, xv, 2);
-                                iacc_lo[g + 2] = vdotq_laneq_s32(iacc_lo[g + 2], wl, xv, 2);
-                                iacc_hi[g + 3] = vdotq_laneq_s32(iacc_hi[g + 3], wh, xv, 3);
-                                iacc_lo[g + 3] = vdotq_laneq_s32(iacc_lo[g + 3], wl, xv, 3);
-                                g += 4;
-                            }
-                            for (; g < B; g++) {
-                                const int8_t* x4 = xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 4;
-                                int8x16_t xv = vreinterpretq_s8_s32(vld1q_dup_s32((const int32_t*)x4));
-                                iacc_hi[g] = vdotq_s32(iacc_hi[g], wh, xv);
-                                iacc_lo[g] = vdotq_s32(iacc_lo[g], wl, xv);
+                            for (p = 0; p < np4; p++) {
+                                int8x16_t xv = vld1q_s8(xpk[bl][j][p]);
+                                uint32_t g0 = p * 4u;
+                                iacc_hi[g0] = vdotq_laneq_s32(iacc_hi[g0], wh, xv, 0);
+                                iacc_lo[g0] = vdotq_laneq_s32(iacc_lo[g0], wl, xv, 0);
+                                iacc_hi[g0 + 1] = vdotq_laneq_s32(iacc_hi[g0 + 1], wh, xv, 1);
+                                iacc_lo[g0 + 1] = vdotq_laneq_s32(iacc_lo[g0 + 1], wl, xv, 1);
+                                iacc_hi[g0 + 2] = vdotq_laneq_s32(iacc_hi[g0 + 2], wh, xv, 2);
+                                iacc_lo[g0 + 2] = vdotq_laneq_s32(iacc_lo[g0 + 2], wl, xv, 2);
+                                iacc_hi[g0 + 3] = vdotq_laneq_s32(iacc_hi[g0 + 3], wh, xv, 3);
+                                iacc_lo[g0 + 3] = vdotq_laneq_s32(iacc_lo[g0 + 3], wl, xv, 3);
                             }
                         }
                         for (g = 0; g < B; g++) {
