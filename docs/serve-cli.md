@@ -187,9 +187,15 @@ tail -f logs/rank-0.log            # rank 日志
 
 ```sh
 make hub / make serve / make rank / make server / make router / make supervisor   # 启动
-make status / make infer [prompt...] / make ctl ... / make sync-serve / make sync-push
+make hub SERVER_MODEL=gemma4-e2b     # 只拉起 serve.yaml 中指定模型(yllm hub --model)
+make infer SERVER_MODEL=gemma4-e2b   # 经 router 发请求(模型名须匹配 serve.yaml name)
+make status / make ctl ... / make sync-serve / make sync-push
 make serve-stop                          # 杀进程(强停)
 ```
+
+两机 PP(`models[].ranks: 2` + `local: 1`):本机 `make hub SERVER_MODEL=...` 只起 rank0;
+远端手工起 rank1(`--rank 1 --ranks 2 --peers <本机IP>,<远端IP> --supervisor <本机IP>:9500`),
+见上文「两机部署示例」与 `serve.yaml` 的 `local` 说明。
 
 ## OpenAI 兼容 HTTP API(端口 8000)
 

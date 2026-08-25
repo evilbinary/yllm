@@ -653,7 +653,12 @@ server-qwen38: server-qwen3.8-27b
 server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml, model=gemma4-e2b); 用 make infer-gemma4-e2b 发请求 (HTTP 127.0.0.1:8000)"
+	@echo "hub started (gemma4-e2b ranks=2 local=1 → 本机 rank0 :9410)"
+	@echo "手机先起 rank1, 例:"
+	@echo "  ./yllm rank --model gemma-4-E2B-it-Q4_K_M.llf --vocab gemma4.vocab.txt \\"
+	@echo "    --model-name gemma4-e2b --port 9411 --supervisor 192.168.1.161:9500 \\"
+	@echo "    --id rank-1 --rank 1 --ranks 2 --peers 192.168.1.161,192.168.2.199"
+	@echo "然后: make infer-gemma4-e2b"
 
 server-gemma4-e4b: $(BIN_AVX2) $(G4_E4B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
@@ -692,14 +697,18 @@ infer-gemma4-e4b: $(BIN)
 # 用法:
 #   make serve            # supervisor --config serve.yaml 一键拉起 rank+server
 #   make hub              # 合并模式: supervisor+router+server 同进程(推荐)
+#   make hub SERVER_MODEL=gemma4-e2b   # 只拉起指定模型(serve.yaml name)
 #   make serve-avx2       # 同上, avx2 版本
 #   make serve-stop       # 停掉 serve 相关进程
-#   make infer            # 客户端经 router 发请求
+#   make infer            # 客户端经 router 发请求(SERVER_MODEL=...)
 # 分开模式(各自独立进程, 同一份 config):
 #   make supervisor / make router / make server / make rank
 
 SERVE_CONFIG ?= serve.yaml
 SERVE_LOGDIR ?= logs
+# 模型名须匹配 serve.yaml 的 name; hub/infer 共用
+SERVER_MODEL ?= tinyllama
+SERVE_PROMPT ?= Once upon a time
 
 serve: $(BIN) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
@@ -714,11 +723,15 @@ serve-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	@echo "serve started (avx2)"
 
 # 合并模式: supervisor+router+server 同进程, 自动拉起 rank; 之后 make infer 即可
-hub: $(BIN_AVX2) $(MODEL_LLF)
+#   make hub                              # 默认 SERVER_MODEL=tinyllama
+#   make hub SERVER_MODEL=gemma4-e2b     # 只拉起指定模型(= yllm hub --model ...)
+#   make hub SERVER_MODEL=               # 不传 --model, 拉起 yaml 全部本机模型(慎用)
+hub: $(BIN_AVX2)
 	@mkdir -p $(SERVE_LOGDIR)
-	@echo "== hub --config $(SERVE_CONFIG) (avx2, 三合一) =="
-	@nohup $(BIN_AVX2) hub --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (--config $(SERVE_CONFIG)); 用 make infer 发请求"
+	@echo "== hub --config $(SERVE_CONFIG)$(if $(SERVER_MODEL), --model $(SERVER_MODEL),) (avx2) =="
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config $(SERVE_CONFIG) \
+		$(if $(SERVER_MODEL),--model $(SERVER_MODEL),) > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started$(if $(SERVER_MODEL), (model=$(SERVER_MODEL)),); 用 make infer 发请求"
 
 # 分开模式(独立进程, 同一份 config)
 supervisor: $(BIN)
@@ -742,9 +755,7 @@ rank: $(BIN) $(MODEL_LLF)
 	@echo "rank started (--config $(SERVE_CONFIG))"
 
 # 客户端: 经 router 发请求(prompt 不含引号)
-# SERVER_MODEL 需匹配 serve.yaml 的 model-name
-SERVER_MODEL ?= tinyllama
-SERVE_PROMPT ?= Once upon a time
+# SERVER_MODEL / SERVE_PROMPT 见上方 SERVE_* 节
 # 支持 `make infer hello world` 把多余参数当 prompt
 ifneq ($(filter-out infer,$(MAKECMDGOALS)),)
 SERVE_PROMPT := $(filter-out infer,$(MAKECMDGOALS))

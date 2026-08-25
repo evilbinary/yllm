@@ -4,15 +4,16 @@
 #   yllm supervisor --config serve.yaml         # 分开模式 supervisor
 #   yllm ctl start / yllm ctl stop / yllm ctl status
 # 多模型: models 列表, 每个模型独立一组 rank(端口 rank-port-base + mi*stride)和一个 server(server-port + mi*stride)
-# stride = 所有模型 ranks 的最大值; 下面 ranks 全为 1, stride=1:
-#   mi=0 qwen3.8        rank 9410 / server 9420(外部部署)
-#   mi=1 qwen2.5        rank 9411 / server 9421(本机 7b)
-#   mi=2 tinyllama      rank 9412 / server 9422(本机)
-#   mi=3 qwen3-vl-2b    rank 9413 / server 9423(本机)
-#   mi=4 gemma4-e2b     rank 9414 / server 9424(本机)
-#   mi=5 gemma4-e4b     rank 9415 / server 9425(本机)
-#   mi=6 qwen2.5-1.5b   rank 9416 / server 9426(本机)
-#   mi=7 qwen3-8b       rank 9417 / server 9427(本机)
+# stride = 所有模型 ranks 的最大值; gemma4-e2b ranks=2 → stride=2:
+#   mi=0 qwen3.8        rank 9410 / server 9420(外部)
+#   mi=1 qwen2.5        rank 9412 / server 9422
+#   mi=2 tinyllama      rank 9414 / server 9424
+#   mi=3 qwen3-vl-2b    rank 9416 / server 9426
+#   mi=4 gemma4-e2b     rank 9418-9419 / server 9428 (local=1: 本机 rank0, 手机 rank1)
+#   mi=5 gemma4-e4b     rank 9420 / server 9430
+#   mi=6 qwen2.5-1.5b   rank 9422 / server 9432
+#   mi=7 qwen3-8b       rank 9424 / server 9434
+# hub --model gemma4-e2b 过滤后仅该模型(mi=0): rank 9410/9411, pipe 9510
 # 注意: make hub 不带 --model 会尝试拉起全部本机模型; 日常请用 make server-<name>
 
 # 日志
@@ -31,46 +32,33 @@ rank-port-base: 9410   # 模型0 rank 推理口基址
 http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
 cache-dir: ./sessions   # 会话缓存落盘目录(空 = 纯内存; server 存 token 列表, rank 存 KV)
 budget: 1024MB            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n>KB(如 2048MB / 1.5G)
-# device: cpu              # 推理设备: cpu | cuda | vulkan(见 design-mobile.md)
-# gpu: 0                   # CUDA/Vulkan device index
-# gpu-weights: auto        # CUDA 线性权: auto|q4k(原生省显存) | fp16(解量化更快)
-# gpu-layers: -1           # 单进程混合: 前 N 个 transformer block(+embed) 在 GPU, 其余 CPU; -1=全 GPU
-# gpu-stream: 0            # 1=权常驻 host 打包, 按层 prefetch H2D(省显存、多 H2D)
 
 # 拓扑
-sv-host: 127.0.0.1     # supervisor 地址(rank/server 心跳目标)
-router-addrs: 127.0.0.1:9400   # supervisor 通知的 router 列表
+sv-host: 127.0.0.1     # 本机 hub 用; 远程 rank 须显式 --supervisor <本机LAN>:9500
+router-addrs: 127.0.0.1:9400
 servers: 1
 
 # 行为
-auto-heal: 0           # qwen3.8 rank 在远程, 本机不重拉(外部 rank 死亡由远端 supervisor 管)
-strategy: least        # 路由策略: least | round-robin
-
-# 租用策略(server 向 sv 租用 rank 的方式)
-#   request: 每次推理 LEASE/RELEASE(用完即释放)
-#   timed:   定时租用, 到期自动回池(lease-duration 秒)
-#   permanent: 永久租用, 直到 server 退出/死亡
+auto-heal: 0
+strategy: least
 lease-strategy: request
 
 # ---- 多模型 ----
-# 每个模型独立一组 rank + 一个 server。
-# ranks: 该模型启动的 rank 推理进程数(>=1 由 supervisor/hub 自动拉起)。
-#        ranks: 0 = 该模型 rank 由外部机器承担(分布式部署), 本机不拉起。
-# local: 本机拉起的段数(-1 未指定 = 全部; 0 = 全部外部; N = 前 N 段本地)。
+# ranks: 总段数; local: 本机拉起段数(0=全外部; N=前 N 段本地)
 models:
   - name: qwen3.8
     model: models/qwen3.8-27b.llf
     vocab: models/qwen3.vocab.txt
-    ranks: 1           # 总段数(单 rank, 全部在远程: 远程单机 1.8 tok/s > 双机 0.89)
-    local: 0           # 本机拉起的段数(0 = 全部外部部署; 远程手工起 rank, 端口 9410)
+    ranks: 1
+    local: 0
   - name: qwen2.5
     model: models/qwen2.5-7b.llf
     vocab: models/qwen2.5-7b.vocab.txt
-    ranks: 1           # 本模型 rank 进程数(全部本机)
+    ranks: 1
   - name: tinyllama
     model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
     vocab: models/tinyllama.vocab.txt
-    ranks: 1           # 本模型 rank 进程数(全部本机)
+    ranks: 1
   - name: qwen3-vl-2b
     model: models/qwen3-vl-2b.llf
     vocab: models/qwen3-vl-2b.vocab.txt
@@ -78,7 +66,8 @@ models:
   - name: gemma4-e2b
     model: models/gemma-4-E2B-it-Q4_K_M.llf
     vocab: models/gemma4.vocab.txt
-    ranks: 1
+    ranks: 2           # PP 两段
+    local: 1           # 本机 hub 只拉 rank0; rank1 手机手工起
   - name: gemma4-e4b
     model: models/gemma-4-E4B-it-Q4_K_M.llf
     vocab: models/gemma4-e4b.vocab.txt
