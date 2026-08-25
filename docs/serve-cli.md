@@ -133,24 +133,77 @@ yllm router --config serve.yaml --send "tinyllama 64 Hello"
 `--send` 格式:`"<model> <max_tokens> <prompt>"`,模型名需匹配 serve.yaml 的 `model-name`。
 集群返回流式 token,末尾 `DONE <tokens> <ms>`。
 
-## 两机部署示例(本机 hub + 远端 rank)
+## 两机 PP: 本机 hub + 远端 rank(gemma4-e2b)
 
-控制面(本地)与推理面(远端)分离:远端只跑 rank(权重常驻),本机只做路由/管理。
+`serve.yaml` 里该模型是 `ranks: 2` + `local: 1`:本机 hub 只拉 **rank0**,手机手工起 **rank1**。
+`hub --model gemma4-e2b` 过滤后仅这一组,端口固定为 rank **9410/9411**(协作口 **9510/9511**)。
+
+`--peers` 不用传: rank0 由 LEASE/INFER 下发; rank1 向 supervisor `QUERY_RANKS` 自动发现。
+
+### 本机(Windows)
 
 ```sh
-# 本机(管理+控制面)
-build/avx2/yllm hub --port 9500 --router-port 9400 --server-port 9420 \
-    --server-model tinyllama --server-leader 192.168.0.23:9410 --log logs/hub.log
-
-# 远端(推理节点, 心跳发本机 supervisor)
-build/avx2/yllm rank --model model.llf --vocab vocab.txt --port 9410 \
-    --supervisor 192.168.1.161:9500 --id rank-r0 --log logs/rank.log
-
-# 客户端(本机)
-build/avx2/yllm router --port 9400 --send "tinyllama 30 Once upon a time"
+make hub SERVER_MODEL=gemma4-e2b          # 等价 yllm hub --config serve.yaml --model gemma4-e2b
+# 或: make server-gemma4-e2b
 ```
 
-生产环境推荐用 `serve.yaml` 的 `models[].ranks / local` 描述拓扑(`ranks` 总段数,`local` 本机拉起的段数,`local: 0` 表示全部外部部署),用 `yllm hub --config` 拉起。
+yaml `name` 是 `gemma4-e2b`(不是文件名 `gemma-4-E2B-...`)。
+
+### 远端(Android / Termux)
+
+二进制与 `libyllm.so` 放在同一目录(Termux 需 `LD_LIBRARY_PATH=.`)。起之前确认没有第二份 `yllm rank`(否则协作口 9511 `cannot listen`)。
+
+```sh
+cd ~/yllm-android
+# 部署: scp build/android-cpu/yllm build/android-cpu/libyllm.so 到本目录
+pkill -f 'yllm rank' || true
+
+LD_LIBRARY_PATH=. ./yllm rank \
+  --model gemma-4-E2B-it-Q4_K_M.llf \
+  --vocab gemma4.vocab.txt \
+  --model-name gemma4-e2b \
+  --port 9411 \
+  --rank 1 --ranks 2 \
+  --supervisor 192.168.1.161:9500 \
+  --id rank-1 \
+  --budget 1024MB \
+  --log ~/yllm-rank1.log
+```
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `--model` / `--vocab` | 手机上的 llf / 词表 | 路径相对工作目录 |
+| `--model-name` | `gemma4-e2b` | 必须与 yaml `name` 一致,否则进不了租约池 |
+| `--port` | `9411` | 本段管理口(rank0 为 9410) |
+| `--rank` / `--ranks` | `1` / `2` | 段号 / 总段数 |
+| `--supervisor` | `<PC局域网IP>:9500` | 不要写 `127.0.0.1` |
+| `--id` | `rank-1` | 节点 id |
+| `--peers` | (省略) | 自动发现 |
+| `--budget` / `--log` | 可选 | 默认 auto / 标准输出 |
+
+协作口 = `--port - --rank + 100` → rank1 听 **9511**,rank0 听 **9510**。防火墙需放行 9411 与 9511。
+
+后台常驻:
+
+```sh
+cd ~/yllm-android
+setsid env LD_LIBRARY_PATH=. ./yllm rank \
+  --model gemma-4-E2B-it-Q4_K_M.llf --vocab gemma4.vocab.txt \
+  --model-name gemma4-e2b --port 9411 --rank 1 --ranks 2 \
+  --supervisor 192.168.1.161:9500 --id rank-1 --budget 1024MB \
+  --log ~/yllm-rank1.log </dev/null >/dev/null 2>&1 &
+```
+
+### 发请求 / 看状态(本机)
+
+```sh
+make infer SERVER_MODEL=gemma4-e2b        # 或 make infer-gemma4-e2b
+make status                               # rank-0/rank-1 均 ready, LEASE ranks=2
+```
+
+`ctl status` 里应看到 `rank-1 addr=<手机IP>:9411`; LEASE `peers=<PC IP>,<手机 IP>`。
+
+其它模型同样: yaml 写 `ranks`/`local`,本机 `make hub SERVER_MODEL=<name>`,远端 rank 改 `--model-name`/`--port`/`--rank`/`--ranks` 即可。
 
 ## 文件分发(sync)
 
@@ -188,14 +241,14 @@ tail -f logs/rank-0.log            # rank 日志
 ```sh
 make hub / make serve / make rank / make server / make router / make supervisor   # 启动
 make hub SERVER_MODEL=gemma4-e2b     # 只拉起 serve.yaml 中指定模型(yllm hub --model)
+make server-gemma4-e2b               # 同上(快捷目标; 会打印远端 rank1 命令)
 make infer SERVER_MODEL=gemma4-e2b   # 经 router 发请求(模型名须匹配 serve.yaml name)
+make infer-gemma4-e2b                # 同上
 make status / make ctl ... / make sync-serve / make sync-push
 make serve-stop                          # 杀进程(强停)
 ```
 
-两机 PP(`models[].ranks: 2` + `local: 1`):本机 `make hub SERVER_MODEL=...` 只起 rank0;
-远端手工起 rank1(`--rank 1 --ranks 2 --peers <本机IP>,<远端IP> --supervisor <本机IP>:9500`),
-见上文「两机部署示例」与 `serve.yaml` 的 `local` 说明。
+两机 PP 见上文「两机 PP: 本机 hub + 远端 rank」。
 
 ## OpenAI 兼容 HTTP API(端口 8000)
 
