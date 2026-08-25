@@ -4,8 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+#if !defined(_WIN32)
+#include <alloca.h>
+#endif
+#ifndef _WIN32
+#include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 /* 批量 prefill: 默认开启; 编译期关闭用 -DYLLM_BATCH_PREFILL=0 */
@@ -16,11 +24,7 @@
  * gemma4 用层外×token 内循环吃权缓存, B≥2 即有收益) */
 #define PREFILL_BATCH_MIN 16
 #define PREFILL_BATCH_MIN_GEMMA4 2
-#include <math.h>
-#ifndef _WIN32
-#include <sys/resource.h>
-#include <unistd.h>
-#endif
+
 typedef struct {
     Ws* ws;
     uint32_t next;
@@ -1562,13 +1566,29 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     }
 
     rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
-    matmul(q, x2, base + mt[SLOT_Q].offset, q_dim, hidden, mt[SLOT_Q].dtype);
-    if (has_kv) {
-        matmul(k, x2, base + mt[SLOT_K].offset, kvd, hidden, mt[SLOT_K].dtype);
-        if (mt[SLOT_V].size > 0)
-            matmul(v, x2, base + mt[SLOT_V].offset, kvd, hidden, mt[SLOT_V].dtype);
-        else
-            memcpy(v, k, (size_t)kvd * 4);
+    if (mt[SLOT_Q].dtype == DT_W4B64) {
+        uint32_t nb = hidden / W4B64_BLK;
+        int8_t* xq = (int8_t*)alloca((size_t)hidden);
+        float* xs = (float*)alloca((size_t)nb * 4);
+        int32_t* xsum = (int32_t*)alloca((size_t)nb * 4);
+        w4b64_act_quant(x2, xq, xs, xsum, hidden);
+        matmul_w4b64_xq(q, xq, xs, xsum, base + mt[SLOT_Q].offset, q_dim, hidden);
+        if (has_kv) {
+            matmul_w4b64_xq(k, xq, xs, xsum, base + mt[SLOT_K].offset, kvd, hidden);
+            if (mt[SLOT_V].size > 0)
+                matmul_w4b64_xq(v, xq, xs, xsum, base + mt[SLOT_V].offset, kvd, hidden);
+            else
+                memcpy(v, k, (size_t)kvd * 4);
+        }
+    } else {
+        matmul(q, x2, base + mt[SLOT_Q].offset, q_dim, hidden, mt[SLOT_Q].dtype);
+        if (has_kv) {
+            matmul(k, x2, base + mt[SLOT_K].offset, kvd, hidden, mt[SLOT_K].dtype);
+            if (mt[SLOT_V].size > 0)
+                matmul(v, x2, base + mt[SLOT_V].offset, kvd, hidden, mt[SLOT_V].dtype);
+            else
+                memcpy(v, k, (size_t)kvd * 4);
+        }
     }
     /* 注意力 bias(qwen2.5 gguf 带有非零 bias) */
     if (mt[SLOT_QBIAS].size > 0) {
@@ -1686,8 +1706,18 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
         {
             float* fg = e->ffn;
             float* fu = e->ffn + inter;
-            matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
-            matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+            if (mt[SLOT_GATE].dtype == DT_W4B64) {
+                uint32_t nb = hidden / W4B64_BLK;
+                int8_t* xq = (int8_t*)alloca((size_t)hidden);
+                float* xs = (float*)alloca((size_t)nb * 4);
+                int32_t* xsum = (int32_t*)alloca((size_t)nb * 4);
+                w4b64_act_quant(x2, xq, xs, xsum, hidden);
+                matmul_w4b64_xq(fg, xq, xs, xsum, base + mt[SLOT_GATE].offset, inter, hidden);
+                matmul_w4b64_xq(fu, xq, xs, xsum, base + mt[SLOT_UP].offset, inter, hidden);
+            } else {
+                matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+                matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+            }
             geglu(x2, fg, fu, inter);
         }
         matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
@@ -1919,6 +1949,15 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
     Worker* w = (Worker*)ws->worker;
     const LlfHeader* h = &m->h;
     uint32_t i;
+    static int prof_init;
+    static uint64_t prof_blk_ns, prof_head_ns, prof_n;
+    int do_prof = 0;
+    if (!prof_init) {
+        prof_init = 1;
+        do_prof = getenv("YLLM_PROF") != NULL;
+        if (!do_prof) prof_init = 2; /* off */
+    } else if (prof_init == 1)
+        do_prof = 1;
     if (ws->budget > 0) {
         sched_refresh_resident(ws);
         sched_adapt_budget(ws);
@@ -1934,9 +1973,16 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
         cuda_mark_x_host(e);
     }
     for (i = e->layer_begin; i < e->layer_end; i++) {
+        uint64_t t0 = 0;
         if (i == 0) continue; /* embed 已在上方处理 */
+        if (do_prof) t0 = ynow_ns();
         sched_ensure(ws, i);
         forward_layer(e, i, token, pos);
+        if (do_prof) {
+            uint64_t dt = ynow_ns() - t0;
+            if (i <= h->n_blocks) prof_blk_ns += dt;
+            else                   prof_head_ns += dt;
+        }
         if (getenv("YLLM_NANDBG") && i == 33)
             fprintf(stderr, "[nandbg] x after layer33 pos %u: %g %g %g %g\n", pos,
                     (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
@@ -1993,6 +2039,20 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
             }
         }
         sched_release_budget(ws, i);
+    }
+    if (do_prof) {
+        prof_n++;
+        /* decode 多 token 后打印一次平均拆分 */
+        if (prof_n == 8 || (prof_n > 8 && (prof_n % 16) == 0)) {
+            double inv = 1e-6 / (double)prof_n;
+            fprintf(stderr,
+                    "[prof] n=%llu blocks=%.2fms head=%.2fms (%.0f%% head)\n",
+                    (unsigned long long)prof_n,
+                    (double)prof_blk_ns * inv,
+                    (double)prof_head_ns * inv,
+                    100.0 * (double)prof_head_ns /
+                        (double)(prof_blk_ns + prof_head_ns + 1));
+        }
     }
     if (x_out) {
         cuda_sync_x_to_host(e);

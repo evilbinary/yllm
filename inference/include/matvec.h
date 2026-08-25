@@ -11,6 +11,10 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
+/* 已量化激活的 W4 GEMV(同 x 多次 matmul 时复用, 省 quant) */
+void matmul_w4b64_xq(float* y, const int8_t* xq, const float* xs, const int32_t* xsum,
+                     const uint8_t* w, uint32_t out, uint32_t in);
+void w4b64_act_quant(const float* x, int8_t* xq, float* xs, int32_t* xsum, uint32_t in);
 
 /* W4B64 Arm82: 整矩阵字节数; out/in 须分别整除 8/64 */
 size_t w4b64_bytes(uint32_t out, uint32_t in);

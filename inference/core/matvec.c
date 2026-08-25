@@ -1718,6 +1718,32 @@ static void matmul_w4b64_arm86_smmla(float* y, const int8_t* xq, const float* xs
 #endif /* MATMUL_INT8 */
 #endif /* aarch64 */
 
+void matmul_w4b64_xq(float* y, const int8_t* xq, const float* xs, const int32_t* xsum,
+                     const uint8_t* w, uint32_t out, uint32_t in)
+{
+    if (!w4b64_bytes(out, in)) {
+        memset(y, 0, (size_t)out * 4);
+        return;
+    }
+#if defined(__aarch64__)
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    if (w4b64_prefer_i8mm()) {
+        matmul_w4b64_arm86_smmla(y, xq, xs, xsum, w, out, in);
+        return;
+    }
+#endif
+    matmul_w4b64_arm82_sdot(y, xq, xs, xsum, w, out, in);
+#else
+    matmul_w4b64_arm82_scalar(y, xq, xs, xsum, w, out, in);
+#endif
+}
+
+void w4b64_act_quant(const float* x, int8_t* xq, float* xs, int32_t* xsum, uint32_t in)
+{
+    uint32_t nb = in / W4B64_BLK;
+    if (nb) w4_act_quant_block(x, xq, xs, xsum, nb);
+}
+
 void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t nb = in / W4B64_BLK;
@@ -1732,17 +1758,7 @@ void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     xs = (float*)alloca((size_t)nb * 4);
     xsum = (int32_t*)alloca((size_t)nb * 4);
     w4_act_quant_block(x, xq, xs, xsum, nb);
-#if defined(__aarch64__)
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-    if (w4b64_prefer_i8mm()) {
-        matmul_w4b64_arm86_smmla(y, xq, xs, xsum, w, out, in);
-        return;
-    }
-#endif
-    matmul_w4b64_arm82_sdot(y, xq, xs, xsum, w, out, in);
-#else
-    matmul_w4b64_arm82_scalar(y, xq, xs, xsum, w, out, in);
-#endif
+    matmul_w4b64_xq(y, xq, xs, xsum, w, out, in);
 }
 
 void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
