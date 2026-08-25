@@ -439,7 +439,7 @@ static uint8_t* q8_0_to_f16(const uint8_t* src, uint64_t nelem)
     return out;
 }
 
-static int gg_slot_for(const char* name, int* layer)
+static int gg_slot_for(const char* name, int* layer, int is_gemma4)
 {
     /* qwen2 风格命名: model.embed_tokens / model.layers.{i}.self_attn.{q,k,v,o}_proj
        / model.layers.{i}.mlp.{gate,up,down}_proj / model.norm / lm_head */
@@ -495,6 +495,8 @@ static int gg_slot_for(const char* name, int* layer)
             { "attn_v.weight", SLOT_V },
             { "attn_output.weight", SLOT_O },
             { "ffn_norm.weight", SLOT_NORM2 },
+            /* qwen35: post_attention_norm 是 FFN 前 RMSNorm → SLOT_NORM2
+               gemma4: 同名张量是 attention 后 sandwich → SLOT_NORM3 */
             { "post_attention_norm.weight", SLOT_NORM3 },
             { "post_ffw_norm.weight", SLOT_NORM4 },
             { "layer_output_scale.weight", SLOT_LAYER_SCALE },
@@ -523,7 +525,13 @@ static int gg_slot_for(const char* name, int* layer)
         };
         size_t i;
         for (i = 0; i < sizeof(tab_blk) / sizeof(tab_blk[0]); i++) {
-            if (strcmp(p, tab_blk[i].suf) == 0) { *layer = n; return tab_blk[i].slot; }
+            if (strcmp(p, tab_blk[i].suf) == 0) {
+                *layer = n;
+                if (!is_gemma4 && tab_blk[i].slot == SLOT_NORM3 &&
+                    strcmp(p, "post_attention_norm.weight") == 0)
+                    return SLOT_NORM2;
+                return tab_blk[i].slot;
+            }
         }
     }
     return -1;
@@ -760,13 +768,13 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     }
 
     ConvItem* items = (ConvItem*)ymalloc((size_t)list.n * 2 * sizeof(ConvItem));
-    uint8_t* qg_bufs[32] = { 0 };  /* attn_q 交错重排临时缓冲(llf_emit 后释放) */
+    uint8_t* qg_bufs[128] = { 0 };  /* attn_q 重排 / MTP 去量化 / bf16 临时缓冲 */
     int qg_n = 0;
     int n = 0;
     int have_rf = 0;
     for (i = 0; i < (uint64_t)list.n; i++) {
         int layer;
-        int slot = gg_slot_for(list.t[i].name, &layer);
+        int slot = gg_slot_for(list.t[i].name, &layer, is_gemma4);
         if (slot == SP_EMBED) {
             items[n].layer = 0; items[n].slot = 0;
             /* gemma4 tied embedding: embed == lm_head, 先写 embed, 然后额外写 output */
@@ -801,11 +809,15 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         /* MTP 权重(小, 55MB): 量化(Q8_0=gtype8)直接去量化成 F16 存 llf, 便于 engine 使用 */
         if (slot >= SP_MTP_EH && slot <= SP_MTP_HEAD_NORM && t->gtype == 8) {
             uint64_t mnelem = 1;
+            uint8_t* nb;
             for (d = 0; d < t->ndims; d++) mnelem *= t->dims[d];
-            items[n].src = q8_0_to_f16(items[n].src, mnelem);
+            nb = q8_0_to_f16(items[n].src, mnelem);
+            items[n].src = nb;
             items[n].src_off = 0;
             items[n].dtype = DT_F16;
             items[n].nbytes = mnelem * 2;
+            if (qg_n < (int)(sizeof(qg_bufs) / sizeof(qg_bufs[0])))
+                qg_bufs[qg_n++] = nb;
         }
         if (items[n].dtype == DT_BF16) {
             uint64_t mnelem = 1;
@@ -816,7 +828,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             items[n].src_off = 0;
             items[n].dtype = DT_F16;
             items[n].nbytes = mnelem * 2;
-            if (qg_n < 32) qg_bufs[qg_n++] = nb;
+            if (qg_n < (int)(sizeof(qg_bufs) / sizeof(qg_bufs[0]))) qg_bufs[qg_n++] = nb;
         }
         n++;
         /* gemma4 tied embedding: 写完 embed 后额外写一份 output(lm_head) 指向同一数据 */
@@ -848,7 +860,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                     memcpy(nb + g_dst * rowb, src + g_src * rowb, (size_t)rowb);
                 }
             }
-            if (qg_n < 32) qg_bufs[qg_n++] = nb;
+            if (qg_n < (int)(sizeof(qg_bufs) / sizeof(qg_bufs[0]))) qg_bufs[qg_n++] = nb;
             items[n - 1].shape[1] = (uint32_t)qdim;
             items[n - 1].nbytes = qdim * rowb;
             items[n - 1].src = nb;
@@ -880,6 +892,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     {
         int p2;
         int missing = 0;
+        char miss[128] = "";
         /* gemma4: 每层必需 4 norm + Q/K/V/O + Gate/Up/Down */
         if (is_gemma4) {
         static const int g4req[] = { SLOT_NORM1, SLOT_NORM2, SLOT_NORM3, SLOT_NORM4,
@@ -895,7 +908,11 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                     for (p2 = 0; p2 < n; p2++) {
                         if (items[p2].layer == i && items[p2].slot == (uint32_t)g4req[si]) { found = 1; break; }
                     }
-                    if (!found) { missing = 1; break; }
+                    if (!found) {
+                        missing = 1;
+                        snprintf(miss, sizeof(miss), "layer %u slot %d", (unsigned)i, g4req[si]);
+                        break;
+                    }
                 }
                 if (!missing && (i - 1) < kv_from) {
                     int has_k = 0, has_v = 0;
@@ -903,7 +920,10 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                         if (items[p2].layer == i && items[p2].slot == SLOT_K) has_k = 1;
                         if (items[p2].layer == i && items[p2].slot == SLOT_V) has_v = 1;
                     }
-                    if (!has_k || !has_v) missing = 1;
+                    if (!has_k || !has_v) {
+                        missing = 1;
+                        snprintf(miss, sizeof(miss), "layer %u k/v", (unsigned)i);
+                    }
                 }
                 if (!missing && g.n_embd_per_layer > 0) {
                     int has_g = 0, has_p = 0, has_n = 0;
@@ -912,7 +932,10 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                         if (items[p2].layer == i && items[p2].slot == SLOT_PLE_PROJ) has_p = 1;
                         if (items[p2].layer == i && items[p2].slot == SLOT_PLE_POST) has_n = 1;
                     }
-                    if (!has_g || !has_p || !has_n) missing = 1;
+                    if (!has_g || !has_p || !has_n) {
+                        missing = 1;
+                        snprintf(miss, sizeof(miss), "layer %u ple gate/proj/post", (unsigned)i);
+                    }
                 }
             }
             if (!missing && g.n_embd_per_layer > 0) {
@@ -922,7 +945,10 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                     if (items[p2].layer == 0 && items[p2].slot == SLOT_PLE_MPROJ) has_mp = 1;
                     if (items[p2].layer == 0 && items[p2].slot == SLOT_PLE_PNORM) has_pn = 1;
                 }
-                if (!has_tok || !has_mp || !has_pn) missing = 1;
+                if (!has_tok || !has_mp || !has_pn) {
+                    missing = 1;
+                    snprintf(miss, sizeof(miss), "embed ple tok/mproj/pnorm");
+                }
             }
         } else {
         /* 公共必需: ffn 三件套 + 两个 norm */
@@ -934,7 +960,12 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                 for (p2 = 0; p2 < n; p2++) {
                     if (items[p2].layer == i && items[p2].slot == (uint32_t)common[s2]) { found = 1; break; }
                 }
-                if (!found) { missing = 1; break; }
+                if (!found) {
+                    missing = 1;
+                    snprintf(miss, sizeof(miss), "layer %u slot %d (norm/ffn)",
+                             (unsigned)i, common[s2]);
+                    break;
+                }
             }
             if (missing) break;
             if (is_qwen35) {
@@ -944,7 +975,10 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                     if (items[p2].layer == i && items[p2].slot == SLOT_QKV) has_qkv = 1;
                     if (items[p2].layer == i && items[p2].slot == SLOT_Q)   has_q = 1;
                 }
-                if (!has_qkv && !has_q) missing = 1;
+                if (!has_qkv && !has_q) {
+                    missing = 1;
+                    snprintf(miss, sizeof(miss), "layer %u qkv/q", (unsigned)i);
+                }
             } else {
                 static const int attn[4] = { SLOT_Q, SLOT_K, SLOT_V, SLOT_O };
                 for (s2 = 0; s2 < 4 && !missing; s2++) {
@@ -952,7 +986,11 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                     for (p2 = 0; p2 < n; p2++) {
                         if (items[p2].layer == i && items[p2].slot == (uint32_t)attn[s2]) { found = 1; break; }
                     }
-                    if (!found) missing = 1;
+                    if (!found) {
+                        missing = 1;
+                        snprintf(miss, sizeof(miss), "layer %u attn slot %d",
+                                 (unsigned)i, attn[s2]);
+                    }
                 }
             }
         }
@@ -961,7 +999,8 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
             free(list.t); free(items); wmap_close(&gmap);
             for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
-            snprintf(err, errlen, "some transformer tensors missing from gguf");
+            snprintf(err, errlen, "some transformer tensors missing from gguf (%s)",
+                     miss[0] ? miss : "?");
             return -1;
         }
     }
