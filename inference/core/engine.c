@@ -634,10 +634,11 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
 #elif defined(__ARM_FEATURE_MATMUL_INT8)
         i8mm = 1;
 #endif
-        /* 现有 Arm82→zip→smmla 仍慢于 lane-sdot, 有 i8mm 也先走 sdot */
+        w4b64_set_hw_i8mm(i8mm);
+        /* GEMV 复制 x 的 smmla 慢于 sdot; batch 可 zip-once 再 smmla */
         w4b64_set_prefer_i8mm(0);
         if (i8mm)
-            ylog_info("w4: ARM i8mm present, using Arm82 sdot");
+            ylog_info("w4: ARM i8mm: batch smmla, decode sdot");
         else
             ylog_info("w4: using Arm82 sdot");
     }

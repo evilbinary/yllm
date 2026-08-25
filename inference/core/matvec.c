@@ -1135,8 +1135,9 @@ size_t w4b64_row_bytes(uint32_t in)
     return 0;
 }
 
-/* 默认关: 现有 arm86_smmla 仍是标量 stub, 开了会比 sdot 更慢 */
+/* prefer: GEMV 是否走 smmla(复制 x, 通常更慢). hw: 芯片有 i8mm, batch 可走 smmla */
 static int g_w4_prefer_i8mm = 0;
+static int g_w4_hw_i8mm = 0;
 
 int w4b64_prefer_i8mm(void)
 {
@@ -1152,6 +1153,21 @@ int w4b64_set_prefer_i8mm(int on)
 {
     g_w4_prefer_i8mm = on ? 1 : 0;
     return w4b64_prefer_i8mm();
+}
+
+void w4b64_set_hw_i8mm(int on)
+{
+    g_w4_hw_i8mm = on ? 1 : 0;
+}
+
+int w4b64_has_i8mm(void)
+{
+#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+    return g_w4_hw_i8mm;
+#else
+    (void)g_w4_hw_i8mm;
+    return 0;
+#endif
 }
 
 /* 对称 int4: q in [-8,7], 存 nibble=q+8; scale = amax/8 */
@@ -1288,14 +1304,51 @@ static void w4_act_quant_block(const float* x, int8_t* xq, float* xs, int32_t* x
     uint32_t b, i;
     for (b = 0; b < nb; b++) {
         const float* xb = x + (size_t)b * W4B64_BLK;
-        float amax = 0.0f;
+        float amax;
+        float scale, inv;
         int32_t sum = 0;
+#if defined(__aarch64__)
+        {
+            float32x4_t amaxv = vdupq_n_f32(0.0f);
+            int32x4_t sumv = vdupq_n_s32(0);
+            int32x4_t qmin = vdupq_n_s32(-127);
+            int32x4_t qmax = vdupq_n_s32(127);
+            float32x4_t vinv;
+            for (i = 0; i < W4B64_BLK; i += 16) {
+                amaxv = vmaxq_f32(amaxv, vabsq_f32(vld1q_f32(xb + i)));
+                amaxv = vmaxq_f32(amaxv, vabsq_f32(vld1q_f32(xb + i + 4)));
+                amaxv = vmaxq_f32(amaxv, vabsq_f32(vld1q_f32(xb + i + 8)));
+                amaxv = vmaxq_f32(amaxv, vabsq_f32(vld1q_f32(xb + i + 12)));
+            }
+            amax = vmaxvq_f32(amaxv);
+            scale = (amax > 1e-8f) ? (amax / 127.0f) : 1.0f;
+            inv = 1.0f / scale;
+            xs[b] = scale;
+            vinv = vdupq_n_f32(inv);
+            for (i = 0; i < W4B64_BLK; i += 16) {
+                int32x4_t q0 = vmaxq_s32(vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i), vinv)), qmax), qmin);
+                int32x4_t q1 = vmaxq_s32(vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i + 4), vinv)), qmax), qmin);
+                int32x4_t q2 = vmaxq_s32(vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i + 8), vinv)), qmax), qmin);
+                int32x4_t q3 = vmaxq_s32(vminq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + i + 12), vinv)), qmax), qmin);
+                int16x8_t n0 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+                int16x8_t n1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+                vst1q_s8(xq + (size_t)b * W4B64_BLK + i,
+                         vcombine_s8(vqmovn_s16(n0), vqmovn_s16(n1)));
+                sumv = vaddq_s32(sumv, q0);
+                sumv = vaddq_s32(sumv, q1);
+                sumv = vaddq_s32(sumv, q2);
+                sumv = vaddq_s32(sumv, q3);
+            }
+            xsum[b] = vaddvq_s32(sumv);
+        }
+#else
+        amax = 0.0f;
         for (i = 0; i < W4B64_BLK; i++) {
             float a = fabsf(xb[i]);
             if (a > amax) amax = a;
         }
-        float scale = (amax > 1e-8f) ? (amax / 127.0f) : 1.0f;
-        float inv = 1.0f / scale;
+        scale = (amax > 1e-8f) ? (amax / 127.0f) : 1.0f;
+        inv = 1.0f / scale;
         xs[b] = scale;
         for (i = 0; i < W4B64_BLK; i++) {
             int q = (int)lrintf(xb[i] * inv);
@@ -1305,6 +1358,7 @@ static void w4_act_quant_block(const float* x, int8_t* xq, float* xs, int32_t* x
             sum += q;
         }
         xsum[b] = sum;
+#endif
     }
 }
 
@@ -1360,26 +1414,22 @@ static inline void w4_sdot_4cells_xv(int32x4_t* ihi, int32x4_t* ilo,
                                      const uint8_t* panel, int8x16_t xv,
                                      uint32_t j, uint8x16_t mask15)
 {
-    uint8x16_t c0 = vld1q_u8(panel + (size_t)j * 16);
-    uint8x16_t c1 = vld1q_u8(panel + (size_t)(j + 1) * 16);
-    uint8x16_t c2 = vld1q_u8(panel + (size_t)(j + 2) * 16);
-    uint8x16_t c3 = vld1q_u8(panel + (size_t)(j + 3) * 16);
-    int8x16_t h0 = vreinterpretq_s8_u8(vshrq_n_u8(c0, 4));
-    int8x16_t l0 = vreinterpretq_s8_u8(vandq_u8(c0, mask15));
-    int8x16_t h1 = vreinterpretq_s8_u8(vshrq_n_u8(c1, 4));
-    int8x16_t l1 = vreinterpretq_s8_u8(vandq_u8(c1, mask15));
-    int8x16_t h2 = vreinterpretq_s8_u8(vshrq_n_u8(c2, 4));
-    int8x16_t l2 = vreinterpretq_s8_u8(vandq_u8(c2, mask15));
-    int8x16_t h3 = vreinterpretq_s8_u8(vshrq_n_u8(c3, 4));
-    int8x16_t l3 = vreinterpretq_s8_u8(vandq_u8(c3, mask15));
-    *ihi = vdotq_laneq_s32(*ihi, h0, xv, 0);
-    *ilo = vdotq_laneq_s32(*ilo, l0, xv, 0);
-    *ihi = vdotq_laneq_s32(*ihi, h1, xv, 1);
-    *ilo = vdotq_laneq_s32(*ilo, l1, xv, 1);
-    *ihi = vdotq_laneq_s32(*ihi, h2, xv, 2);
-    *ilo = vdotq_laneq_s32(*ilo, l2, xv, 2);
-    *ihi = vdotq_laneq_s32(*ihi, h3, xv, 3);
-    *ilo = vdotq_laneq_s32(*ilo, l3, xv, 3);
+    uint8x16_t c;
+    int32x4_t hi = *ihi, lo = *ilo;
+    c = vld1q_u8(panel + (size_t)j * 16);
+    hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), xv, 0);
+    lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c, mask15)), xv, 0);
+    c = vld1q_u8(panel + (size_t)(j + 1) * 16);
+    hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), xv, 1);
+    lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c, mask15)), xv, 1);
+    c = vld1q_u8(panel + (size_t)(j + 2) * 16);
+    hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), xv, 2);
+    lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c, mask15)), xv, 2);
+    c = vld1q_u8(panel + (size_t)(j + 3) * 16);
+    hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), xv, 3);
+    lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c, mask15)), xv, 3);
+    *ihi = hi;
+    *ilo = lo;
 }
 
 static inline void w4_store_oc8(float* y, uint32_t oc0, uint32_t out,
@@ -1423,6 +1473,8 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
             int32x4_t iacc_lo = vdupq_n_s32(0);
             int32x4_t corr = vdupq_n_s32(8 * xsum[bl]);
             __builtin_prefetch(panel + W4B64_PANEL_BYTES, 0, 3);
+            __builtin_prefetch(panel + 2 * W4B64_PANEL_BYTES, 0, 2);
+            __builtin_prefetch(panel + 3 * W4B64_PANEL_BYTES, 0, 2);
             for (j = 0; j < W4B64_LU; j += 4) {
                 int8x16_t xv = vld1q_s8(xp + j * 4);
                 w4_sdot_4cells_xv(&iacc_hi, &iacc_lo, panel, xv, j, mask15);
@@ -1692,9 +1744,27 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
             w4_act_quant_block(x + (size_t)g * in, xq + (size_t)g * in, xs + (size_t)g * nb64,
                                xsum + (size_t)g * nb64, nb64);
 #if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
-            if (w4b64_prefer_i8mm()) {
+            /* zip 一次一对 cell, 4-token 的 iacc 留在寄存器; 避免 8 pair 全展开把 Q 寄存器打满 */
+            if (w4b64_has_i8mm()) {
                 const uint8x16_t mask15 = vdupq_n_u8(15);
-#pragma omp parallel for schedule(static) private(g, bl, j, oc_i)
+                uint32_t np2 = (B + 1u) / 2u;
+                int8_t xpk8[nb64][np2][8][16];
+                uint32_t p;
+                memset(xpk8, 0, sizeof(xpk8));
+                for (bl = 0; bl < nb64; bl++) {
+                    for (p = 0; p < np2; p++) {
+                        uint32_t g0 = p * 2u;
+                        for (j = 0; j < 8; j++) {
+                            size_t off = (size_t)bl * W4B64_BLK + (size_t)j * 8;
+                            int8_t* dst = xpk8[bl][p][j];
+                            if (g0 < B)
+                                memcpy(dst, xq + (size_t)g0 * in + off, 8);
+                            if (g0 + 1u < B)
+                                memcpy(dst + 8, xq + (size_t)(g0 + 1) * in + off, 8);
+                        }
+                    }
+                }
+#pragma omp parallel for schedule(static) private(g, bl, j, oc_i, p)
                 for (h = 0; h < hu; h++) {
                     float32x4_t acc_hi[64], acc_lo[64];
                     uint32_t oc0 = h * 8u;
@@ -1705,72 +1775,106 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                     for (bl = 0; bl < nb64; bl++) {
                         const uint8_t* panel = w + ((size_t)h * nb64 + bl) * W4B64_PANEL_BYTES;
                         const float* wscale = (const float*)(panel + W4B64_LU * 16);
-                        int32x4_t a01[32], a23[32], a45[32], a67[32];
-                        uint32_t np = (B + 1u) / 2u;
-                        uint32_t p;
-                        for (p = 0; p < np; p++) {
-                            a01[p] = vdupq_n_s32(0);
-                            a23[p] = vdupq_n_s32(0);
-                            a45[p] = vdupq_n_s32(0);
-                            a67[p] = vdupq_n_s32(0);
-                        }
-                        for (j = 0; j < 8; j++) {
-                            uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
-                            uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
-                            uint8x16_t v0, v1;
-                            int8x16_t wh01, wh23, wl45, wl67;
-                            w4_arm82_pair_zip(c0, c1, &v0, &v1);
-                            wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
-                            wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
-                            wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
-                            wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
-                            g = 0;
-                            p = 0;
-                            while (g + 2 <= B) {
-                                int8x16_t xa = vcombine_s8(
-                                    vld1_s8(xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 8),
-                                    vld1_s8(xq + (size_t)(g + 1) * in + (size_t)bl * W4B64_BLK + j * 8));
-                                a01[p] = w4_smmla(a01[p], xa, wh01);
-                                a23[p] = w4_smmla(a23[p], xa, wh23);
-                                a45[p] = w4_smmla(a45[p], xa, wl45);
-                                a67[p] = w4_smmla(a67[p], xa, wl67);
-                                g += 2;
-                                p++;
-                            }
-                            if (g < B) {
-                                int8x8_t x8 = vld1_s8(xq + (size_t)g * in + (size_t)bl * W4B64_BLK + j * 8);
-                                int8x16_t xa = vcombine_s8(x8, x8);
-                                a01[p] = w4_smmla(a01[p], xa, wh01);
-                                a23[p] = w4_smmla(a23[p], xa, wh23);
-                                a45[p] = w4_smmla(a45[p], xa, wl45);
-                                a67[p] = w4_smmla(a67[p], xa, wl67);
-                            }
-                        }
-                        g = 0;
+                        float32x4_t ws_hi = vld1q_f32(wscale);
+                        float32x4_t ws_lo = vld1q_f32(wscale + 4);
+                        __builtin_prefetch(panel + W4B64_PANEL_BYTES, 0, 3);
+                        __builtin_prefetch(panel + 2 * W4B64_PANEL_BYTES, 0, 2);
                         p = 0;
-                        while (g + 2 <= B) {
-                            int32x4_t t0h = w4_smmla_e0(a01[p], a23[p]);
-                            int32x4_t t1h = w4_smmla_e1(a01[p], a23[p]);
-                            int32x4_t t0l = w4_smmla_e0(a45[p], a67[p]);
-                            int32x4_t t1l = w4_smmla_e1(a45[p], a67[p]);
-                            float xsc0 = xs[(size_t)g * nb64 + bl];
-                            float xsc1 = xs[(size_t)(g + 1) * nb64 + bl];
-                            int32x4_t c0 = vdupq_n_s32(8 * xsum[(size_t)g * nb64 + bl]);
-                            int32x4_t c1 = vdupq_n_s32(8 * xsum[(size_t)(g + 1) * nb64 + bl]);
-                            acc_hi[g] = vmlaq_f32(acc_hi[g], vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(t0h, c0)), xsc0), vld1q_f32(wscale));
-                            acc_lo[g] = vmlaq_f32(acc_lo[g], vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(t0l, c0)), xsc0), vld1q_f32(wscale + 4));
-                            acc_hi[g + 1] = vmlaq_f32(acc_hi[g + 1], vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(t1h, c1)), xsc1), vld1q_f32(wscale));
-                            acc_lo[g + 1] = vmlaq_f32(acc_lo[g + 1], vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(t1l, c1)), xsc1), vld1q_f32(wscale + 4));
-                            g += 2;
-                            p++;
+                        while (p + 2 <= np2) {
+                            uint32_t g0 = p * 2u;
+                            int32x4_t a01 = vdupq_n_s32(0), a23 = vdupq_n_s32(0);
+                            int32x4_t a45 = vdupq_n_s32(0), a67 = vdupq_n_s32(0);
+                            int32x4_t b01 = vdupq_n_s32(0), b23 = vdupq_n_s32(0);
+                            int32x4_t b45 = vdupq_n_s32(0), b67 = vdupq_n_s32(0);
+                            for (j = 0; j < 8; j++) {
+                                uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
+                                uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
+                                uint8x16_t v0, v1;
+                                int8x16_t wh01, wh23, wl45, wl67;
+                                int8x16_t xa = vld1q_s8(xpk8[bl][p][j]);
+                                int8x16_t xb = vld1q_s8(xpk8[bl][p + 1][j]);
+                                w4_arm82_pair_zip(c0, c1, &v0, &v1);
+                                wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
+                                wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
+                                wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
+                                wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
+                                a01 = w4_smmla(a01, xa, wh01);
+                                a23 = w4_smmla(a23, xa, wh23);
+                                a45 = w4_smmla(a45, xa, wl45);
+                                a67 = w4_smmla(a67, xa, wl67);
+                                b01 = w4_smmla(b01, xb, wh01);
+                                b23 = w4_smmla(b23, xb, wh23);
+                                b45 = w4_smmla(b45, xb, wl45);
+                                b67 = w4_smmla(b67, xb, wl67);
+                            }
+                            {
+                                uint32_t t;
+                                int32x4_t th[2], tl[2], uh[2], ul[2];
+                                th[0] = w4_smmla_e0(a01, a23); th[1] = w4_smmla_e1(a01, a23);
+                                tl[0] = w4_smmla_e0(a45, a67); tl[1] = w4_smmla_e1(a45, a67);
+                                uh[0] = w4_smmla_e0(b01, b23); uh[1] = w4_smmla_e1(b01, b23);
+                                ul[0] = w4_smmla_e0(b45, b67); ul[1] = w4_smmla_e1(b45, b67);
+                                for (t = 0; t < 2 && g0 + t < B; t++) {
+                                    float xsc = xs[(size_t)(g0 + t) * nb64 + bl];
+                                    int32x4_t corr = vdupq_n_s32(8 * xsum[(size_t)(g0 + t) * nb64 + bl]);
+                                    acc_hi[g0 + t] = vmlaq_f32(acc_hi[g0 + t],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(th[t], corr)), xsc), ws_hi);
+                                    acc_lo[g0 + t] = vmlaq_f32(acc_lo[g0 + t],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(tl[t], corr)), xsc), ws_lo);
+                                }
+                                for (t = 0; t < 2 && g0 + 2 + t < B; t++) {
+                                    float xsc = xs[(size_t)(g0 + 2 + t) * nb64 + bl];
+                                    int32x4_t corr = vdupq_n_s32(8 * xsum[(size_t)(g0 + 2 + t) * nb64 + bl]);
+                                    acc_hi[g0 + 2 + t] = vmlaq_f32(acc_hi[g0 + 2 + t],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(uh[t], corr)), xsc), ws_hi);
+                                    acc_lo[g0 + 2 + t] = vmlaq_f32(acc_lo[g0 + 2 + t],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(ul[t], corr)), xsc), ws_lo);
+                                }
+                            }
+                            p += 2;
                         }
-                        if (g < B) {
-                            int32x4_t ihi = vcombine_s32(vget_low_s32(a01[p]), vget_low_s32(a23[p]));
-                            int32x4_t ilo = vcombine_s32(vget_low_s32(a45[p]), vget_low_s32(a67[p]));
-                            float xsc = xs[(size_t)g * nb64 + bl];
-                            int32x4_t corr = vdupq_n_s32(8 * xsum[(size_t)g * nb64 + bl]);
-                            acc_hi[g] = vmlaq_f32(acc_hi[g], vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(ihi, corr)), xsc), vld1q_f32(wscale));
-                            acc_lo[g] = vmlaq_f32(acc_lo[g], vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(ilo, corr)), xsc), vld1q_f32(wscale + 4));
+                        if (p < np2) {
+                            uint32_t g0 = p * 2u;
+                            int32x4_t a01 = vdupq_n_s32(0), a23 = vdupq_n_s32(0);
+                            int32x4_t a45 = vdupq_n_s32(0), a67 = vdupq_n_s32(0);
+                            for (j = 0; j < 8; j++) {
+                                uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
+                                uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
+                                uint8x16_t v0, v1;
+                                int8x16_t xa = vld1q_s8(xpk8[bl][p][j]);
+                                int8x16_t wh01, wh23, wl45, wl67;
+                                w4_arm82_pair_zip(c0, c1, &v0, &v1);
+                                wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
+                                wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
+                                wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
+                                wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
+                                a01 = w4_smmla(a01, xa, wh01);
+                                a23 = w4_smmla(a23, xa, wh23);
+                                a45 = w4_smmla(a45, xa, wl45);
+                                a67 = w4_smmla(a67, xa, wl67);
+                            }
+                            {
+                                int32x4_t th0 = w4_smmla_e0(a01, a23);
+                                int32x4_t th1 = w4_smmla_e1(a01, a23);
+                                int32x4_t tl0 = w4_smmla_e0(a45, a67);
+                                int32x4_t tl1 = w4_smmla_e1(a45, a67);
+                                if (g0 < B) {
+                                    float xsc = xs[(size_t)g0 * nb64 + bl];
+                                    int32x4_t corr = vdupq_n_s32(8 * xsum[(size_t)g0 * nb64 + bl]);
+                                    acc_hi[g0] = vmlaq_f32(acc_hi[g0],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(th0, corr)), xsc), ws_hi);
+                                    acc_lo[g0] = vmlaq_f32(acc_lo[g0],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(tl0, corr)), xsc), ws_lo);
+                                }
+                                if (g0 + 1u < B) {
+                                    float xsc = xs[(size_t)(g0 + 1) * nb64 + bl];
+                                    int32x4_t corr = vdupq_n_s32(8 * xsum[(size_t)(g0 + 1) * nb64 + bl]);
+                                    acc_hi[g0 + 1] = vmlaq_f32(acc_hi[g0 + 1],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(th1, corr)), xsc), ws_hi);
+                                    acc_lo[g0 + 1] = vmlaq_f32(acc_lo[g0 + 1],
+                                        vmulq_n_f32(vcvtq_f32_s32(vsubq_s32(tl1, corr)), xsc), ws_lo);
+                                }
+                            }
                         }
                     }
                     for (g = 0; g < B; g++) {
@@ -1826,6 +1930,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                         float32x4_t ws_hi = vld1q_f32(wscale);
                         float32x4_t ws_lo = vld1q_f32(wscale + 4);
                         __builtin_prefetch(panel + W4B64_PANEL_BYTES, 0, 3);
+                        __builtin_prefetch(panel + 2 * W4B64_PANEL_BYTES, 0, 2);
                         for (p = 0; p < np4; p++) {
                             int32x4_t ih0 = vdupq_n_s32(0), ih1 = vdupq_n_s32(0);
                             int32x4_t ih2 = vdupq_n_s32(0), ih3 = vdupq_n_s32(0);

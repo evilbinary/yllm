@@ -25,6 +25,9 @@ int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out,
 /* 运行时优先 i8mm(若硬件支持); 1=开 0=关; 返回实际是否启用 */
 int w4b64_set_prefer_i8mm(int on);
 int w4b64_prefer_i8mm(void);
+/* 硬件是否有 i8mm(batch GEMM 用); 与 prefer(GEMV) 分开 */
+void w4b64_set_hw_i8mm(int on);
+int w4b64_has_i8mm(void);
 /* Q6_K matmul 前激活量化(与 matmul_q6k 一致) */
 void matvec_q8k_quant(const float* x, float* xq, uint32_t n);
 
