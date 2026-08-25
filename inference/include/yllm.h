@@ -66,6 +66,7 @@ void ymutex_create(void** m);
 void ymutex_lock(void* m);
 void ymutex_unlock(void* m);
 void ymutex_destroy(void* m);
+uint64_t yproc_rss(void); /* 进程 RSS, 未知则 0 */
 int yfile_size(const char* path, uint64_t* size);
 int wmap_open(const char* path, WMap* m);
 void wmap_close(WMap* m);

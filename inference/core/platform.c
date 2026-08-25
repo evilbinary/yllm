@@ -243,7 +243,8 @@ int yfile_size(const char* path, uint64_t* size)
 #ifdef _WIN32
     wchar_t wp[2048];
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 2048);
-    HANDLE hf = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hf = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hf == INVALID_HANDLE_VALUE) return -1;
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(hf, &sz)) { CloseHandle(hf); return -1; }
@@ -258,6 +259,38 @@ int yfile_size(const char* path, uint64_t* size)
 #endif
 }
 
+#ifdef _WIN32
+typedef struct {
+    PVOID VirtualAddress;
+    SIZE_T NumberOfBytes;
+} YWinMemRange;
+
+static int win_prefetch(void* addr, size_t n)
+{
+    typedef BOOL (WINAPI *PrefetchFn)(HANDLE, ULONG_PTR, YWinMemRange*, ULONG);
+    static PrefetchFn fn;
+    static int inited;
+    const size_t chunk = (size_t)128 * 1024 * 1024;
+    if (!inited) {
+        HMODULE k = GetModuleHandleW(L"kernel32.dll");
+        if (k) fn = (PrefetchFn)GetProcAddress(k, "PrefetchVirtualMemory");
+        inited = 1;
+    }
+    if (!fn || !addr || n == 0) return -1;
+    uint8_t* p = (uint8_t*)addr;
+    while (n > 0) {
+        YWinMemRange r;
+        size_t m = n < chunk ? n : chunk;
+        r.VirtualAddress = p;
+        r.NumberOfBytes = m;
+        if (!fn(GetCurrentProcess(), 1, &r, 0)) return -1;
+        p += m;
+        n -= m;
+    }
+    return 0;
+}
+#endif
+
 int wmap_open(const char* path, WMap* m)
 {
     memset(m, 0, sizeof(WMap));
@@ -265,17 +298,22 @@ int wmap_open(const char* path, WMap* m)
 #ifdef _WIN32
     wchar_t wp[2048];
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 2048);
-    m->hfile = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    m->hfile = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (m->hfile == INVALID_HANDLE_VALUE) return -1;
     m->hmap = CreateFileMappingW((HANDLE)m->hfile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!m->hmap) { CloseHandle((HANDLE)m->hfile); m->hfile = NULL; return -1; }
     m->base = MapViewOfFile((HANDLE)m->hmap, FILE_MAP_READ, 0, 0, 0);
     if (!m->base) { CloseHandle((HANDLE)m->hmap); CloseHandle((HANDLE)m->hfile); m->hmap = NULL; m->hfile = NULL; return -1; }
+    win_prefetch(m->base, (size_t)m->size);
 #else
     m->fd = open(path, O_RDONLY);
     if (m->fd < 0) return -1;
     m->base = mmap(NULL, m->size, PROT_READ, MAP_SHARED, m->fd, 0);
     if (m->base == MAP_FAILED) { close(m->fd); m->fd = -1; return -1; }
+#ifdef __linux__
+    madvise(m->base, (size_t)m->size, MADV_WILLNEED);
+#endif
 #endif
     return 0;
 }
@@ -295,14 +333,15 @@ void wmap_close(WMap* m)
 
 void ws_prefetch(const Ws* ws, uint32_t layer)
 {
-#ifdef __linux__
     uint64_t off = ws->model.dir[layer].offset;
     uint64_t sz = ws->model.dir[layer].size;
-    if (sz == 0) return;
+    if (sz == 0 || !ws->map.base) return;
+#ifdef __linux__
     madvise((char*)ws->map.base + off, (size_t)sz, MADV_WILLNEED);
+#elif defined(_WIN32)
+    win_prefetch((char*)ws->map.base + off, (size_t)sz);
 #else
-    (void)ws;
-    (void)layer;
+    (void)off;
 #endif
 }
 
@@ -331,11 +370,13 @@ void ws_release(const Ws* ws, uint32_t layer)
 #if YLLM_TENSOR_STREAM
 void ws_prefetch_range(const Ws* ws, uint64_t off, uint64_t sz)
 {
+    if (sz == 0 || !ws->map.base) return;
 #ifdef __linux__
-    if (sz == 0) return;
     madvise((char*)ws->map.base + off, (size_t)sz, MADV_WILLNEED);
+#elif defined(_WIN32)
+    win_prefetch((char*)ws->map.base + off, (size_t)sz);
 #else
-    (void)ws; (void)off; (void)sz;
+    (void)off;
 #endif
 }
 
@@ -495,4 +536,49 @@ uint64_t yrng(uint64_t* s)
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
     return z ^ (z >> 31);
+}
+
+uint64_t yproc_rss(void)
+{
+#ifdef __linux__
+    long v = 0;
+    FILE* f = fopen("/proc/self/status", "r");
+    char l[256];
+    if (f) {
+        while (fgets(l, sizeof l, f))
+            if (!strncmp(l, "VmRSS:", 6)) { sscanf(l + 6, "%ld", &v); break; }
+        fclose(f);
+    }
+    if (v > 0) return (uint64_t)v * 1024;
+#endif
+#ifdef _WIN32
+    {
+        typedef struct {
+            DWORD cb;
+            DWORD PageFaultCount;
+            SIZE_T PeakWorkingSetSize;
+            SIZE_T WorkingSetSize;
+            SIZE_T QuotaPeakPagedPoolUsage;
+            SIZE_T QuotaPagedPoolUsage;
+            SIZE_T QuotaPeakNonPagedPoolUsage;
+            SIZE_T QuotaNonPagedPoolUsage;
+            SIZE_T PagefileUsage;
+            SIZE_T PeakPagefileUsage;
+        } YPmc;
+        typedef BOOL (WINAPI *GpmiFn)(HANDLE, YPmc*, DWORD);
+        static GpmiFn gpmi;
+        static int inited;
+        YPmc pmc;
+        if (!inited) {
+            HMODULE p = LoadLibraryW(L"psapi.dll");
+            if (p) gpmi = (GpmiFn)GetProcAddress(p, "GetProcessMemoryInfo");
+            inited = 1;
+        }
+        memset(&pmc, 0, sizeof(pmc));
+        pmc.cb = sizeof(pmc);
+        if (gpmi && gpmi(GetCurrentProcess(), &pmc, sizeof(pmc)))
+            return (uint64_t)pmc.WorkingSetSize;
+    }
+#endif
+    return 0;
 }

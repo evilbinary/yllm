@@ -2047,17 +2047,7 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
 
 uint64_t engine_resident(const Engine* e)
 {
-#ifdef __linux__
-    /* mincore 对 MAP_SHARED 页缓存恒为 present(假象), 直接读真实 RSS */
-    long v = 0;
-    FILE* f = fopen("/proc/self/status", "r");
-    char l[256];
-    if (f) {
-        while (fgets(l, sizeof l, f))
-            if (!strncmp(l, "VmRSS:", 6)) { sscanf(l + 6, "%ld", &v); break; }
-        fclose(f);
-    }
-    if (v > 0) return (uint64_t)v * 1024;
-#endif
+    uint64_t rss = yproc_rss();
+    if (rss > 0) return rss;
     return e->ws.resident;
 }
