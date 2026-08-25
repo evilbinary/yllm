@@ -634,10 +634,11 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
 #elif defined(__ARM_FEATURE_MATMUL_INT8)
         i8mm = 1;
 #endif
-        /* smmla 核未就绪: 即使 HW 有 i8mm 也强制走 Arm82 sdot */
-        w4b64_set_prefer_i8mm(0);
-        if (i8mm) ylog_info("w4: ARM i8mm present, using Arm82 sdot (smmla pending)");
-        else ylog_info("w4: using Arm82 sdot");
+        w4b64_set_prefer_i8mm(i8mm);
+        if (i8mm)
+            ylog_info("w4: ARM i8mm smmla enabled");
+        else
+            ylog_info("w4: using Arm82 sdot");
     }
 #endif
     if (m->h.arch == ARCH_GEMMA4) {
