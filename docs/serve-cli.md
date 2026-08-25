@@ -92,11 +92,10 @@ yllm ctl --target sv --cmd SCALE --need-groups 2
 ## 模型转换与运行
 
 ```sh
-# 从 GGUF 转换(默认 --dtype q4km; 要 W4 加 --dtype w4)
-yllm convert --gguf model.Q4_K_M.gguf --out model.llf --vocab vocab.txt --seq 2048
-yllm convert --gguf model.Q4_K_M.gguf --out model-w4.llf --dtype w4 --vocab vocab.txt --seq 2048
-# LLF 重打包
-yllm convert --llf model.llf --out model-w4.llf --dtype w4
+# 输入路径自动识别格式; 默认 --dtype q4km; 要 W4 加 --dtype w4
+yllm convert model.Q4_K_M.gguf --out model.llf --vocab vocab.txt --seq 2048
+yllm convert model.Q4_K_M.gguf --out model-w4.llf --dtype w4 --vocab vocab.txt --seq 2048
+yllm convert model.llf --out model-w4.llf --dtype w4
 
 # 生成 dummy 模型
 yllm convert --out dummy.llf --blocks 2 --hidden 64 --heads 4 --vocab-size 32000

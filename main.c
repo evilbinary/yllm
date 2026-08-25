@@ -43,6 +43,32 @@ static int parse_args(int argc, char** argv, int start, Arg* args, int maxn)
     return n;
 }
 
+/* --key val 与位置参数交错; 位置参数写入 pos[] */
+static int parse_args_mixed(int argc, char** argv, int start, Arg* args, int maxn,
+                            const char** pos, int maxpos, int* npos)
+{
+    int n = 0, i = start;
+    *npos = 0;
+    while (i < argc) {
+        if (argv[i][0] == '-') {
+            if (i + 1 >= argc || n >= maxn) break;
+            args[n].key = argv[i];
+            while (*args[n].key == '-') args[n].key++;
+            args[n].val = argv[i + 1];
+            n++;
+            i += 2;
+        } else {
+            if (*npos >= maxpos) {
+                i++;
+                continue;
+            }
+            pos[(*npos)++] = argv[i];
+            i++;
+        }
+    }
+    return n;
+}
+
 static int on_token_cb(uint32_t id, void* ctx)
 {
     Vocab* v = (Vocab*)ctx;
@@ -82,10 +108,61 @@ static const char* dtype_name(uint32_t d)
     return "?";
 }
 
+static int ext_ieq(const char* path, const char* ext)
+{
+    size_t np, ne;
+    const char* a;
+    const char* b;
+    if (!path || !ext) return 0;
+    np = strlen(path);
+    ne = strlen(ext);
+    if (np < ne) return 0;
+    a = path + np - ne;
+    b = ext;
+    for (; *b; a++, b++) {
+        int ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+        if (ca != cb) return 0;
+    }
+    return 1;
+}
+
+/* 返回 "gguf" | "llf" | "safetensors"; 失败写 err 并返回 NULL */
+static const char* detect_convert_fmt(const char* path, char* err, size_t errlen)
+{
+    FILE* f;
+    unsigned char mag[16];
+    size_t nread;
+
+    if (!path || !*path) {
+        snprintf(err, errlen, "empty input path");
+        return NULL;
+    }
+    if (ext_ieq(path, ".gguf")) return "gguf";
+    if (ext_ieq(path, ".llf")) return "llf";
+    if (ext_ieq(path, ".safetensors")) return "safetensors";
+
+    f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, errlen, "cannot open %s", path);
+        return NULL;
+    }
+    nread = fread(mag, 1, sizeof(mag), f);
+    fclose(f);
+    if (nread >= 4 && memcmp(mag, "GGUF", 4) == 0) return "gguf";
+    if (nread >= 8 && memcmp(mag, YLLM_MAGIC, 8) == 0) return "llf";
+    if (nread >= 9 && mag[8] == '{') return "safetensors";
+    snprintf(err, errlen, "cannot detect format of %s (use --gguf/--llf/--safetensors)", path);
+    return NULL;
+}
+
 static int cmd_convert(int argc, char** argv)
 {
     Arg a[16];
-    int n = parse_args(argc, argv, 2, a, 16);
+    const char* pos[4];
+    int npos = 0;
+    int n = parse_args_mixed(argc, argv, 2, a, 16, pos, 4, &npos);
     const char* st = opt(a, n, "safetensors", NULL);
     const char* gguf = opt(a, n, "gguf", NULL);
     const char* llf_in = opt(a, n, "llf", NULL);
@@ -107,14 +184,34 @@ static int cmd_convert(int argc, char** argv)
         ylog_error("bad --dtype '%s' (want q4km|w4|fp16)", dtype_s);
         return 1;
     }
+    if (npos > 1) {
+        ylog_error("too many input files (want one path)");
+        return 1;
+    }
+    if (npos > 0 && n_src > 0) {
+        ylog_error("use <file> or --gguf/--llf/--safetensors, not both");
+        return 1;
+    }
     if (n_src > 1) {
         ylog_error("specify only one of --gguf / --llf / --safetensors");
         return 1;
     }
+    if (npos == 1 && n_src == 0) {
+        const char* in = pos[0];
+        const char* fmt = detect_convert_fmt(in, err, sizeof(err));
+        if (!fmt) {
+            ylog_error("%s", err);
+            return 1;
+        }
+        if (strcmp(fmt, "gguf") == 0) gguf = in;
+        else if (strcmp(fmt, "llf") == 0) llf_in = in;
+        else st = in;
+        printf("convert: detected %s (%s)\n", fmt, in);
+    }
 
     if (llf_in && out) {
         if (out_dtype != DT_Q4K && out_dtype != DT_W4B64) {
-            ylog_error("--llf rempack only supports --dtype q4km|w4");
+            ylog_error("llf rempack only supports --dtype q4km|w4");
             return 1;
         }
         if (convert_llf_repack(llf_in, out, out_dtype, err, sizeof(err)) != 0) {
@@ -127,7 +224,7 @@ static int cmd_convert(int argc, char** argv)
     }
     if (gguf && out) {
         if (out_dtype != DT_Q4K && out_dtype != DT_W4B64) {
-            ylog_error("--gguf only supports --dtype q4km|w4");
+            ylog_error("gguf convert only supports --dtype q4km|w4");
             return 1;
         }
         if (convert_model("gguf", gguf, out, vocab_out, seq, out_dtype, err, sizeof(err)) != 0) {
@@ -141,7 +238,7 @@ static int cmd_convert(int argc, char** argv)
     }
     if (st && out) {
         if (out_dtype == DT_W4B64) {
-            ylog_error("--safetensors only writes fp16 (omit --dtype or use --dtype fp16)");
+            ylog_error("safetensors only writes fp16 (omit --dtype or use --dtype fp16)");
             return 1;
         }
         if (convert_model("safetensors", st, out, vocab_out, seq, DT_F16, err, sizeof(err)) != 0) {
@@ -168,7 +265,7 @@ static int cmd_convert(int argc, char** argv)
         }
         return 0;
     }
-    if (vocab_out && !st) {
+    if (vocab_out && !st && !gguf && !llf_in) {
         if (dummy_vocab(vocab_out, vocab, err, sizeof(err)) != 0) {
             ylog_error("vocab failed: %s", err);
             return 1;
@@ -178,12 +275,11 @@ static int cmd_convert(int argc, char** argv)
     }
     fprintf(stderr,
             "usage:\n"
-            "  yllm convert --gguf <in.gguf> --out <out.llf> [--dtype q4km|w4] [--vocab V] [--seq N]\n"
-            "  yllm convert --llf  <in.llf>  --out <out.llf> [--dtype q4km|w4]\n"
-            "  yllm convert --safetensors <in> --out <out.llf> [--seq N]\n"
+            "  yllm convert <in.gguf|.llf|.safetensors> --out <out.llf> [--dtype q4km|w4] [--vocab V] [--seq N]\n"
+            "  yllm convert --gguf|--llf|--safetensors <file> --out <out.llf> ...  (显式格式)\n"
             "  yllm convert --out <dummy.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab-size V --seq S]\n"
             "\n"
-            "  --dtype  default q4km; w4 = linear Q4_K rempack to W4B64\n");
+            "  输入路径自动识别格式; --dtype 默认 q4km, w4=线性权打成 W4B64\n");
     return 1;
 }
 
