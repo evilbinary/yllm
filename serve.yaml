@@ -5,9 +5,15 @@
 #   yllm ctl start / yllm ctl stop / yllm ctl status
 # 多模型: models 列表, 每个模型独立一组 rank(端口 rank-port-base + mi*stride)和一个 server(server-port + mi*stride)
 # stride = 所有模型 ranks 的最大值; 下面 ranks 全为 1, stride=1:
-#   mi=0 qwen38       rank 9410 / server 9420(外部部署)
-#   mi=1 qwen2.5-7b   rank 9411 / server 9421(本机)
-#   mi=2 tinyllama    rank 9412 / server 9422(本机)
+#   mi=0 qwen3.8        rank 9410 / server 9420(外部部署)
+#   mi=1 qwen2.5        rank 9411 / server 9421(本机 7b)
+#   mi=2 tinyllama      rank 9412 / server 9422(本机)
+#   mi=3 qwen3-vl-2b    rank 9413 / server 9423(本机)
+#   mi=4 gemma4-e2b     rank 9414 / server 9424(本机)
+#   mi=5 gemma4-e4b     rank 9415 / server 9425(本机)
+#   mi=6 qwen2.5-1.5b   rank 9416 / server 9426(本机)
+#   mi=7 qwen3-8b       rank 9417 / server 9427(本机)
+# 注意: make hub 不带 --model 会尝试拉起全部本机模型; 日常请用 make server-<name>
 
 # 日志
 log: logs/serve.log
@@ -37,7 +43,7 @@ router-addrs: 127.0.0.1:9400   # supervisor 通知的 router 列表
 servers: 1
 
 # 行为
-auto-heal: 0           # qwen38 rank 在远程, 本机不重拉(外部 rank 死亡由远端 supervisor 管)
+auto-heal: 0           # qwen3.8 rank 在远程, 本机不重拉(外部 rank 死亡由远端 supervisor 管)
 strategy: least        # 路由策略: least | round-robin
 
 # 租用策略(server 向 sv 租用 rank 的方式)
@@ -65,3 +71,23 @@ models:
     model: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.llf
     vocab: models/tinyllama.vocab.txt
     ranks: 1           # 本模型 rank 进程数(全部本机)
+  - name: qwen3-vl-2b
+    model: models/qwen3-vl-2b.llf
+    vocab: models/qwen3-vl-2b.vocab.txt
+    ranks: 1
+  - name: gemma4-e2b
+    model: models/gemma-4-E2B-it-Q4_K_M.llf
+    vocab: models/gemma4.vocab.txt
+    ranks: 1
+  - name: gemma4-e4b
+    model: models/gemma-4-E4B-it-Q4_K_M.llf
+    vocab: models/gemma4-e4b.vocab.txt
+    ranks: 1
+  - name: qwen2.5-1.5b
+    model: models/qwen2.5-1.5b.llf
+    vocab: models/qwen2.5.vocab.txt
+    ranks: 1
+  - name: qwen3-8b
+    model: models/qwen3-8b.llf
+    vocab: models/qwen3-8b.vocab.txt
+    ranks: 1

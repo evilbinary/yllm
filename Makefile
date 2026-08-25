@@ -616,33 +616,76 @@ chat-qwen3.8-27b-avx2-vulkan: vulkan $(Q3_27B_LLF)
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
-#   make server-qwen2.5-7b   # 只起 qwen2.5(本机 rank)
-#   make server-qwen38       # 只起 qwen38(远程 rank, 需先远程手工起)
-#   make server-tinyllama    # 只起 tinyllama(本机 rank)
-server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
-	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
-
-server-qwen38: $(BIN_AVX2) $(Q3_27B_LLF)
-	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen38 > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml, model=qwen38); 用 make infer-qwen38 发请求 (HTTP 127.0.0.1:8000)"
-
+#   make server-<name> / make infer-<name>  与 chat-* 一一对应
+#   make server-qwen38  兼容旧名(= server-qwen3.8-27b, yaml name=qwen3.8)
 server-tinyllama: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=tinyllama); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
 
-# 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 model-name)
+server-qwen2.5-1.5b: $(BIN_AVX2) $(Q25_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5-1.5b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen2.5-1.5b); 用 make infer-qwen2.5-1.5b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-qwen3-8b: $(BIN_AVX2) $(Q3_8B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen3-8b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen3-8b); 用 make infer-qwen3-8b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-qwen3-vl-2b: $(BIN_AVX2) $(Q3VL_2B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen3-vl-2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen3-vl-2b); 用 make infer-qwen3-vl-2b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-qwen3.8-27b: $(BIN_AVX2) $(Q3_27B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen3.8 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=qwen3.8); 用 make infer-qwen3.8-27b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-qwen38: server-qwen3.8-27b
+
+server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=gemma4-e2b); 用 make infer-gemma4-e2b 发请求 (HTTP 127.0.0.1:8000)"
+
+server-gemma4-e4b: $(BIN_AVX2) $(G4_E4B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e4b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=gemma4-e4b); 用 make infer-gemma4-e4b 发请求 (HTTP 127.0.0.1:8000)"
+
+# 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 name)
+infer-tinyllama: $(BIN)
+	$(BIN) router --config serve.yaml --send "tinyllama $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-qwen2.5-1.5b: $(BIN)
+	$(BIN) router --config serve.yaml --send "qwen2.5-1.5b $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
 infer-qwen2.5-7b: $(BIN)
 	$(BIN) router --config serve.yaml --send "qwen2.5 $(CHAT_TOKENS) $(SERVE_PROMPT)"
 
-infer-qwen38: $(BIN)
-	$(BIN) router --config serve.yaml --send "qwen38 $(CHAT_TOKENS) $(SERVE_PROMPT)"
+infer-qwen3-8b: $(BIN)
+	$(BIN) router --config serve.yaml --send "qwen3-8b $(CHAT_TOKENS) $(SERVE_PROMPT)"
 
-infer-tinyllama: $(BIN)
-	$(BIN) router --config serve.yaml --send "tinyllama $(CHAT_TOKENS) $(SERVE_PROMPT)"
+infer-qwen3-vl-2b: $(BIN)
+	$(BIN) router --config serve.yaml --send "qwen3-vl-2b $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-qwen3.8-27b: $(BIN)
+	$(BIN) router --config serve.yaml --send "qwen3.8 $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-qwen38: infer-qwen3.8-27b
+
+infer-gemma4-e2b: $(BIN)
+	$(BIN) router --config serve.yaml --send "gemma4-e2b $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-gemma4-e4b: $(BIN)
+	$(BIN) router --config serve.yaml --send "gemma4-e4b $(CHAT_TOKENS) $(SERVE_PROMPT)"
 
 # ---- 常驻推理服务(serve 层) ----
 # 统一配置: serve.yaml(所有角色共用)
@@ -841,4 +884,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda vulkan android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-avx2-vulkan chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b
