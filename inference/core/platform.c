@@ -21,6 +21,7 @@
 #endif
 #if defined(__linux__)
 #include <sched.h>
+#include <dirent.h>
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -88,6 +89,45 @@ void ymsleep(uint32_t ms)
 #endif
 }
 
+#if defined(__linux__)
+static cpu_set_t g_cpu_bigset;
+static int g_cpu_have_bigset;
+
+static void cpu_bind_current(void)
+{
+    if (g_cpu_have_bigset)
+        sched_setaffinity(0, sizeof(g_cpu_bigset), &g_cpu_bigset);
+}
+
+static void cpu_bind_all_tids(void)
+{
+    DIR* d;
+    struct dirent* de;
+    if (!g_cpu_have_bigset) return;
+    d = opendir("/proc/self/task");
+    if (!d) return;
+    while ((de = readdir(d)) != NULL) {
+        int tid = atoi(de->d_name);
+        if (tid > 0)
+            sched_setaffinity((pid_t)tid, sizeof(g_cpu_bigset), &g_cpu_bigset);
+    }
+    closedir(d);
+}
+
+static unsigned long cpu_cur_khz(int cpu)
+{
+    char path[96];
+    FILE* f;
+    unsigned long hz = 0;
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    if (fscanf(f, "%lu", &hz) != 1) hz = 0;
+    fclose(f);
+    return hz;
+}
+#endif
+
 void yllm_tune_cpu(void)
 {
     static int once;
@@ -119,27 +159,40 @@ void yllm_tune_cpu(void)
         }
         if (maxf > minf) {
             unsigned long thresh = minf + (maxf - minf) / 2;
-            cpu_set_t set;
             int nbig = 0;
+            int first_big = -1, last_big = -1;
             char buf[128];
             int off = 0;
-            CPU_ZERO(&set);
+            CPU_ZERO(&g_cpu_bigset);
             buf[0] = 0;
             for (i = 0; i < n; i++) {
                 if (khz[i] >= thresh) {
-                    CPU_SET(i, &set);
+                    CPU_SET(i, &g_cpu_bigset);
                     nbig++;
+                    if (first_big < 0) first_big = i;
+                    last_big = i;
                     if (off < (int)sizeof(buf) - 8)
                         off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%s%d", off ? "," : "", i);
                 }
             }
-            if (nbig > 0 && nbig < n && sched_setaffinity(0, sizeof(set), &set) == 0) {
+            if (nbig > 0 && nbig < n) {
+                g_cpu_have_bigset = 1;
+                cpu_bind_current();
 #ifdef _OPENMP
                 if (!getenv("OMP_NUM_THREADS"))
                     omp_set_num_threads(nbig);
+                omp_set_dynamic(0);
+                /* OpenMP 工作线程在首次 parallel 才创建; 只绑主线程会落到小核 */
+#pragma omp parallel
+                {
+                    cpu_bind_current();
+                }
 #endif
-                ylog_info("cpu: affinity [%s] (%d/%d cores, %lu-%lu kHz)",
-                          buf, nbig, n, minf, maxf);
+                cpu_bind_all_tids();
+                ylog_info("cpu: affinity [%s] (%d/%d cores, %lu-%lu kHz, now %lu/%lu)",
+                          buf, nbig, n, minf, maxf,
+                          first_big >= 0 ? cpu_cur_khz(first_big) : 0,
+                          last_big >= 0 ? cpu_cur_khz(last_big) : 0);
             }
         }
     }
@@ -179,6 +232,9 @@ typedef struct { void (*fn)(void*); void* arg; } YTArg;
 static void* yt_main(void* p)
 {
     YTArg* a = (YTArg*)p;
+#if defined(__linux__)
+    cpu_bind_current();
+#endif
     a->fn(a->arg);
     free(a);
     return NULL;
