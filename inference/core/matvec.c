@@ -717,31 +717,160 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         y[oo] = acc;
     }
 #elif defined(__aarch64__)
+    /* decode 热路径: 与 AVX2 对齐 — 激活 int8 量化一次, 预计算各组 Σxq,
+     * 双输出行共用 x 向量(减带宽/ALU)。 */
     int8_t* xq8 = (int8_t*)alloca((size_t)in);
     float* xs = (float*)alloca((size_t)nb * 4);
+    float* sxg = (float*)alloca((size_t)nb * 8 * 4);
     q8k_quant_i8(x, xq8, xs, in);
+    {
+        uint32_t b, g;
+        for (b = 0; b < nb; b++) {
+            const int8_t* xp = xq8 + (size_t)b * 256;
+            for (g = 0; g < 8; g++) {
+                int32x4_t z = vdupq_n_s32(0);
+                z = neon_sumacc_s8(z, vld1q_s8(xp + g * 32));
+                z = neon_sumacc_s8(z, vld1q_s8(xp + g * 32 + 16));
+                sxg[(size_t)b * 8 + g] = (float)vaddvq_s32(z);
+            }
+        }
+    }
     const uint8x16_t nibble = vdupq_n_u8(0x0F);
+    uint32_t n2 = out & ~1u;
     #pragma omp parallel for schedule(static)
-    for (oo = 0; oo < out; oo++) {
+    for (oo = 0; oo < n2; oo += 2) {
+        const uint8_t* row0 = w + (size_t)oo * rowb;
+        const uint8_t* row1 = row0 + rowb;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float c0 = 0.0f, c1 = 0.0f;
+        uint32_t b;
+        if (oo + 3 < out) {
+            __builtin_prefetch(row1 + rowb, 0, 3);
+            __builtin_prefetch(row1 + 2 * rowb, 0, 3);
+        }
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk0 = row0 + (size_t)b * 144;
+            const uint8_t* blk1 = row1 + (size_t)b * 144;
+            const int8_t* xp = xq8 + (size_t)b * 256;
+            const float* sxb = sxg + (size_t)b * 8;
+            const uint8_t* q0 = blk0 + 16;
+            const uint8_t* q1 = blk1 + 16;
+            float d0, dm0, d1, dm1;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            {
+                float16x4_t h0 = vld1_f16((const __fp16*)blk0);
+                float16x4_t h1 = vld1_f16((const __fp16*)blk1);
+                float32x4_t f0 = vcvt_f32_f16(h0);
+                float32x4_t f1 = vcvt_f32_f16(h1);
+                d0 = vgetq_lane_f32(f0, 0); dm0 = vgetq_lane_f32(f0, 1);
+                d1 = vgetq_lane_f32(f1, 0); dm1 = vgetq_lane_f32(f1, 1);
+            }
+#else
+            d0 = f16_to_f32(((const uint16_t*)blk0)[0]);
+            dm0 = f16_to_f32(((const uint16_t*)blk0)[1]);
+            d1 = f16_to_f32(((const uint16_t*)blk1)[0]);
+            dm1 = f16_to_f32(((const uint16_t*)blk1)[1]);
+#endif
+            float dsc0 = d0 * xs[b], msc0 = dm0 * xs[b];
+            float dsc1 = d1 * xs[b], msc1 = dm1 * xs[b];
+            float ds0[8], ms0[8], ds1[8], ms1[8];
+            {
+                const uint8_t* s0 = blk0 + 4;
+                const uint8_t* s1 = blk1 + 4;
+                int ii;
+                uint8_t sc0[8], mn0[8], sc1[8], mn1[8];
+                sc0[0] = s0[0] & 63; mn0[0] = s0[4] & 63;
+                sc0[1] = s0[1] & 63; mn0[1] = s0[5] & 63;
+                sc0[2] = s0[2] & 63; mn0[2] = s0[6] & 63;
+                sc0[3] = s0[3] & 63; mn0[3] = s0[7] & 63;
+                sc0[4] = (s0[8] & 15) | ((s0[0] >> 6) << 4);
+                mn0[4] = (s0[8] >> 4) | ((s0[4] >> 6) << 4);
+                sc0[5] = (s0[9] & 15) | ((s0[1] >> 6) << 4);
+                mn0[5] = (s0[9] >> 4) | ((s0[5] >> 6) << 4);
+                sc0[6] = (s0[10] & 15) | ((s0[2] >> 6) << 4);
+                mn0[6] = (s0[10] >> 4) | ((s0[6] >> 6) << 4);
+                sc0[7] = (s0[11] & 15) | ((s0[3] >> 6) << 4);
+                mn0[7] = (s0[11] >> 4) | ((s0[7] >> 6) << 4);
+                sc1[0] = s1[0] & 63; mn1[0] = s1[4] & 63;
+                sc1[1] = s1[1] & 63; mn1[1] = s1[5] & 63;
+                sc1[2] = s1[2] & 63; mn1[2] = s1[6] & 63;
+                sc1[3] = s1[3] & 63; mn1[3] = s1[7] & 63;
+                sc1[4] = (s1[8] & 15) | ((s1[0] >> 6) << 4);
+                mn1[4] = (s1[8] >> 4) | ((s1[4] >> 6) << 4);
+                sc1[5] = (s1[9] & 15) | ((s1[1] >> 6) << 4);
+                mn1[5] = (s1[9] >> 4) | ((s1[5] >> 6) << 4);
+                sc1[6] = (s1[10] & 15) | ((s1[2] >> 6) << 4);
+                mn1[6] = (s1[10] >> 4) | ((s1[6] >> 6) << 4);
+                sc1[7] = (s1[11] & 15) | ((s1[3] >> 6) << 4);
+                mn1[7] = (s1[11] >> 4) | ((s1[7] >> 6) << 4);
+                for (ii = 0; ii < 8; ii++) {
+                    ds0[ii] = dsc0 * sc0[ii]; ms0[ii] = msc0 * mn0[ii];
+                    ds1[ii] = dsc1 * sc1[ii]; ms1[ii] = msc1 * mn1[ii];
+                }
+            }
+            int is = 0;
+            int j;
+            for (j = 0; j < 4; j++) {
+                int8x16_t x0 = vld1q_s8(xp);
+                int8x16_t x1 = vld1q_s8(xp + 16);
+                int8x16_t x2 = vld1q_s8(xp + 32);
+                int8x16_t x3 = vld1q_s8(xp + 48);
+                uint8x16_t qa0 = vld1q_u8(q0);
+                uint8x16_t qa1 = vld1q_u8(q0 + 16);
+                uint8x16_t qb0 = vld1q_u8(q1);
+                uint8x16_t qb1 = vld1q_u8(q1 + 16);
+                uint8x16_t lo_a0 = vandq_u8(qa0, nibble);
+                uint8x16_t lo_a1 = vandq_u8(qa1, nibble);
+                uint8x16_t hi_a0 = vshrq_n_u8(qa0, 4);
+                uint8x16_t hi_a1 = vshrq_n_u8(qa1, 4);
+                uint8x16_t lo_b0 = vandq_u8(qb0, nibble);
+                uint8x16_t lo_b1 = vandq_u8(qb1, nibble);
+                uint8x16_t hi_b0 = vshrq_n_u8(qb0, 4);
+                uint8x16_t hi_b1 = vshrq_n_u8(qb1, 4);
+                int32x4_t z = vdupq_n_s32(0);
+                int32x4_t dlo0 = neon_dotacc_u8s8(neon_dotacc_u8s8(z, lo_a0, x0), lo_a1, x1);
+                int32x4_t dhi0 = neon_dotacc_u8s8(neon_dotacc_u8s8(z, hi_a0, x2), hi_a1, x3);
+                int32x4_t dlo1 = neon_dotacc_u8s8(neon_dotacc_u8s8(z, lo_b0, x0), lo_b1, x1);
+                int32x4_t dhi1 = neon_dotacc_u8s8(neon_dotacc_u8s8(z, hi_b0, x2), hi_b1, x3);
+                acc0 = vfmaq_n_f32(acc0, vcvtq_f32_s32(dlo0), ds0[is]);
+                acc0 = vfmaq_n_f32(acc0, vcvtq_f32_s32(dhi0), ds0[is + 1]);
+                acc1 = vfmaq_n_f32(acc1, vcvtq_f32_s32(dlo1), ds1[is]);
+                acc1 = vfmaq_n_f32(acc1, vcvtq_f32_s32(dhi1), ds1[is + 1]);
+                /* min 修正是标量 Σxq；不可 vdup 到 4 lane 再 hsum(会×4) */
+                c0 -= sxb[is] * ms0[is] + sxb[is + 1] * ms0[is + 1];
+                c1 -= sxb[is] * ms1[is] + sxb[is + 1] * ms1[is + 1];
+                xp += 64;
+                q0 += 32;
+                q1 += 32;
+                is += 2;
+            }
+        }
+        y[oo] = neon_hsum_f32(acc0) + c0;
+        y[oo + 1] = neon_hsum_f32(acc1) + c1;
+    }
+    if (out & 1u) {
+        oo = out - 1u;
         const uint8_t* row = w + (size_t)oo * rowb;
         float32x4_t acc = vdupq_n_f32(0.0f);
+        float c = 0.0f;
         uint32_t b;
-        if (oo + 1 < out) __builtin_prefetch(row + rowb, 0, 3);
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 144;
             const int8_t* xp = xq8 + (size_t)b * 256;
+            const float* sxb = sxg + (size_t)b * 8;
             const uint8_t* q = blk + 16;
             const uint8_t* scp = blk + 4;
-            __builtin_prefetch(blk + 288, 0, 3);
             float d = f16_to_f32(((const uint16_t*)blk)[0]);
             float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
-            float dsc = d * xs[b];
-            float msc = dmin * xs[b];
+            float dsc = d * xs[b], msc = dmin * xs[b];
+            float ds[8], ms[8];
             uint8_t sc8[8], mn8[8];
-            sc8[0] = scp[0] & 63;  mn8[0] = scp[4] & 63;
-            sc8[1] = scp[1] & 63;  mn8[1] = scp[5] & 63;
-            sc8[2] = scp[2] & 63;  mn8[2] = scp[6] & 63;
-            sc8[3] = scp[3] & 63;  mn8[3] = scp[7] & 63;
+            int ii, j, is = 0;
+            sc8[0] = scp[0] & 63; mn8[0] = scp[4] & 63;
+            sc8[1] = scp[1] & 63; mn8[1] = scp[5] & 63;
+            sc8[2] = scp[2] & 63; mn8[2] = scp[6] & 63;
+            sc8[3] = scp[3] & 63; mn8[3] = scp[7] & 63;
             sc8[4] = (scp[8] & 15) | ((scp[0] >> 6) << 4);
             mn8[4] = (scp[8] >> 4) | ((scp[4] >> 6) << 4);
             sc8[5] = (scp[9] & 15) | ((scp[1] >> 6) << 4);
@@ -750,37 +879,28 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             mn8[6] = (scp[10] >> 4) | ((scp[6] >> 6) << 4);
             sc8[7] = (scp[11] & 15) | ((scp[3] >> 6) << 4);
             mn8[7] = (scp[11] >> 4) | ((scp[7] >> 6) << 4);
-            float ds[8], ms[8];
-            int ii;
             for (ii = 0; ii < 8; ii++) { ds[ii] = dsc * sc8[ii]; ms[ii] = msc * mn8[ii]; }
-            int is = 0;
-            int j;
             for (j = 0; j < 4; j++) {
-                uint8x16_t q0 = vld1q_u8(q);
-                uint8x16_t q1 = vld1q_u8(q + 16);
+                uint8x16_t qq0 = vld1q_u8(q);
+                uint8x16_t qq1 = vld1q_u8(q + 16);
                 int8x16_t x0 = vld1q_s8(xp);
                 int8x16_t x1 = vld1q_s8(xp + 16);
                 int8x16_t x2 = vld1q_s8(xp + 32);
                 int8x16_t x3 = vld1q_s8(xp + 48);
-                uint8x16_t lo0 = vandq_u8(q0, nibble);
-                uint8x16_t lo1 = vandq_u8(q1, nibble);
-                uint8x16_t hi0 = vshrq_n_u8(q0, 4);
-                uint8x16_t hi1 = vshrq_n_u8(q1, 4);
                 int32x4_t z = vdupq_n_s32(0);
-                int32x4_t dlo = neon_dotacc_u8s8(neon_dotacc_u8s8(z, lo0, x0), lo1, x1);
-                int32x4_t dhi = neon_dotacc_u8s8(neon_dotacc_u8s8(z, hi0, x2), hi1, x3);
-                int32x4_t slo = neon_sumacc_s8(neon_sumacc_s8(z, x0), x1);
-                int32x4_t shi = neon_sumacc_s8(neon_sumacc_s8(z, x2), x3);
+                int32x4_t dlo = neon_dotacc_u8s8(
+                    neon_dotacc_u8s8(z, vandq_u8(qq0, nibble), x0), vandq_u8(qq1, nibble), x1);
+                int32x4_t dhi = neon_dotacc_u8s8(
+                    neon_dotacc_u8s8(z, vshrq_n_u8(qq0, 4), x2), vshrq_n_u8(qq1, 4), x3);
                 acc = vfmaq_n_f32(acc, vcvtq_f32_s32(dlo), ds[is]);
-                acc = vfmsq_n_f32(acc, vcvtq_f32_s32(slo), ms[is]);
                 acc = vfmaq_n_f32(acc, vcvtq_f32_s32(dhi), ds[is + 1]);
-                acc = vfmsq_n_f32(acc, vcvtq_f32_s32(shi), ms[is + 1]);
+                c -= sxb[is] * ms[is] + sxb[is + 1] * ms[is + 1];
                 xp += 64;
-                q  += 32;
+                q += 32;
                 is += 2;
             }
         }
-        y[oo] = neon_hsum_f32(acc);
+        y[oo] = neon_hsum_f32(acc) + c;
     }
 #else
     float* xq = (float*)alloca((size_t)in * 4);
