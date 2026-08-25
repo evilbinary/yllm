@@ -60,6 +60,7 @@ static int cmd_convert(int argc, char** argv)
     int n = parse_args(argc, argv, 2, a, 16);
     const char* in = opt(a, n, "safetensors", NULL);
     const char* gguf = opt(a, n, "gguf", NULL);
+    const char* llf_w4 = opt(a, n, "llf-w4", NULL);
     const char* out = opt(a, n, "out", NULL);
     const char* vocab_out = opt(a, n, "vocab", NULL);
     uint32_t seq = (uint32_t)atoi(opt(a, n, "seq", "2048"));
@@ -71,6 +72,15 @@ static int cmd_convert(int argc, char** argv)
     uint32_t seed = (uint32_t)atoi(opt(a, n, "seed", "42"));
     char err[1024];
 
+    if (llf_w4 && out) {
+        if (convert_llf_w4(llf_w4, out, err, sizeof(err)) != 0) {
+            ylog_error("convert failed: %s", err);
+            return 1;
+        }
+        printf("converted %s -> %s (W4B64 rempack)\n", llf_w4, out);
+        llf_check(out, err, sizeof(err));
+        return 0;
+    }
     if (gguf && out) {
         if (convert_model("gguf", gguf, out, vocab_out, seq, err, sizeof(err)) != 0) {
             ylog_error("convert failed: %s", err);
@@ -115,6 +125,7 @@ static int cmd_convert(int argc, char** argv)
     }
     fprintf(stderr, "usage: yllm convert --safetensors <file> --out <file.llf> [--seq 2048]\n");
     fprintf(stderr, "   or: yllm convert --gguf <file.gguf> --out <file.llf> [--vocab <file.txt>] [--seq 2048]\n");
+    fprintf(stderr, "   or: yllm convert --llf-w4 <file.llf> --out <file.llf>  (Q4_K linear -> W4B64)\n");
     fprintf(stderr, "   or: yllm convert --out <file.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab-size V --seq S --seed N] [--vocab <file.txt>]\n");
     return 1;
 }

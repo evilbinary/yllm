@@ -10,6 +10,14 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
+void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
+
+/* W4B64: 行字节; in 须整除 64 */
+size_t w4b64_row_bytes(uint32_t in);
+/* 从 f32 行主序 [out×in] 打包; dst 需 out * w4b64_row_bytes(in) */
+int w4b64_pack_mat_f32(uint8_t* dst, const float* src, uint32_t out, uint32_t in);
+/* 从 Q4_K 行主序打包为 W4B64 */
+int w4b64_pack_mat_q4k(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in);
 /* Q6_K matmul 前激活量化(与 matmul_q6k 一致) */
 void matvec_q8k_quant(const float* x, float* xq, uint32_t n);
 

@@ -519,8 +519,16 @@ int dequant_mat_f16(uint16_t* dst, const uint8_t* w, uint32_t out, uint32_t in, 
             f32_to_f16_buf(row, drow, in);
             continue;
         }
-        if (in % 256 != 0) { free(row); return -1; }
+        if (in % 256 != 0 && dtype != DT_W4B64) { free(row); return -1; }
         uint32_t b;
+        if (dtype == DT_W4B64) {
+            if (dequant_mat_f32(row, w + (size_t)oo * w4b64_row_bytes(in), 1, in, DT_W4B64) != 0) {
+                free(row);
+                return -1;
+            }
+            f32_to_f16_buf(row, drow, in);
+            continue;
+        }
         if (dtype == DT_Q4K) {
             const uint8_t* r = w + (size_t)oo * nb * 144;
             for (b = 0; b < nb; b++) q4k_block(row + (size_t)b * 256, r + (size_t)b * 144, 0);
@@ -568,8 +576,29 @@ int dequant_mat_f32(float* dst, const uint8_t* w, uint32_t out, uint32_t in, uin
             for (i = 0; i < in; i++) drow[i] = f16_to_f32(bf16_to_f16(bp[i]));
             continue;
         }
-        if (in % 256 != 0) return -1;
+        if (in % 256 != 0 && dtype != DT_W4B64) return -1;
         uint32_t b;
+        if (dtype == DT_W4B64) {
+            size_t rowb;
+            uint32_t nb64;
+            if ((in % W4B64_BLK) != 0) return -1;
+            rowb = w4b64_row_bytes(in);
+            nb64 = in / W4B64_BLK;
+            {
+                const uint8_t* r = w + (size_t)oo * rowb;
+                uint32_t bb, ii;
+                for (bb = 0; bb < nb64; bb++) {
+                    const uint8_t* blk = r + (size_t)bb * W4B64_BLK_BYTES;
+                    float sc = f16_to_f32(((const uint16_t*)blk)[0]);
+                    const uint8_t* qs = blk + 2;
+                    for (ii = 0; ii < 32; ii++) {
+                        drow[(size_t)bb * 64 + 2 * ii] = sc * (float)((int)(qs[ii] & 15) - 8);
+                        drow[(size_t)bb * 64 + 2 * ii + 1] = sc * (float)((int)(qs[ii] >> 4) - 8);
+                    }
+                }
+            }
+            continue;
+        }
         if (dtype == DT_Q4K) {
             const uint8_t* r = w + (size_t)oo * nb * 144;
             for (b = 0; b < nb; b++) q4k_block(drow + (size_t)b * 256, r + (size_t)b * 144, 0);
@@ -1075,6 +1104,171 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 #endif
 }
 
+size_t w4b64_row_bytes(uint32_t in)
+{
+    if (in == 0 || (in % W4B64_BLK) != 0) return 0;
+    return (size_t)(in / W4B64_BLK) * W4B64_BLK_BYTES;
+}
+
+static void w4b64_pack_row(uint8_t* dst, const float* x, uint32_t in)
+{
+    uint32_t nb = in / W4B64_BLK, b, i;
+    for (b = 0; b < nb; b++) {
+        const float* xb = x + (size_t)b * W4B64_BLK;
+        float amax = 0.0f;
+        for (i = 0; i < W4B64_BLK; i++) {
+            float a = fabsf(xb[i]);
+            if (a > amax) amax = a;
+        }
+        float scale = (amax > 1e-8f) ? (amax / 8.0f) : 1.0f;
+        float inv = 1.0f / scale;
+        ((uint16_t*)dst)[0] = f32_to_f16(scale);
+        uint8_t* qs = dst + 2;
+        for (i = 0; i < 32; i++) {
+            int q0 = (int)lrintf(xb[2u * i] * inv);
+            int q1 = (int)lrintf(xb[2u * i + 1] * inv);
+            if (q0 < -8) q0 = -8;
+            if (q0 > 7) q0 = 7;
+            if (q1 < -8) q1 = -8;
+            if (q1 > 7) q1 = 7;
+            qs[i] = (uint8_t)((q0 + 8) | ((q1 + 8) << 4));
+        }
+        dst += W4B64_BLK_BYTES;
+    }
+}
+
+int w4b64_pack_mat_f32(uint8_t* dst, const float* src, uint32_t out, uint32_t in)
+{
+    size_t rowb = w4b64_row_bytes(in);
+    uint32_t oo;
+    if (!dst || !src || !rowb) return -1;
+    for (oo = 0; oo < out; oo++)
+        w4b64_pack_row(dst + (size_t)oo * rowb, src + (size_t)oo * in, in);
+    return 0;
+}
+
+int w4b64_pack_mat_q4k(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in)
+{
+    size_t rowb = w4b64_row_bytes(in);
+    uint32_t nb4 = in / 256;
+    uint32_t oo, b;
+    float* row;
+    if (!dst || !src || !rowb || (in % 256) != 0) return -1;
+    row = (float*)ymalloc((size_t)in * 4);
+    if (!row) return -1;
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* r = src + (size_t)oo * nb4 * 144;
+        for (b = 0; b < nb4; b++)
+            q4k_block(row + (size_t)b * 256, r + (size_t)b * 144, 0);
+        w4b64_pack_row(dst + (size_t)oo * rowb, row, in);
+    }
+    free(row);
+    return 0;
+}
+
+void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    uint32_t nb = in / W4B64_BLK;
+    size_t rowb = (size_t)nb * W4B64_BLK_BYTES;
+    uint32_t b, i;
+    int8_t* xq;
+    float* xs;
+    if ((in % W4B64_BLK) != 0 || nb == 0) {
+        memset(y, 0, (size_t)out * 4);
+        return;
+    }
+    xq = (int8_t*)alloca((size_t)in);
+    xs = (float*)alloca((size_t)nb * 4);
+    for (b = 0; b < nb; b++) {
+        const float* xb = x + (size_t)b * W4B64_BLK;
+        float amax = 0.0f;
+        for (i = 0; i < W4B64_BLK; i++) {
+            float a = fabsf(xb[i]);
+            if (a > amax) amax = a;
+        }
+        float scale = (amax > 1e-8f) ? (amax / 127.0f) : 1.0f;
+        float inv = 1.0f / scale;
+        xs[b] = scale;
+        for (i = 0; i < W4B64_BLK; i++) {
+            int q = (int)lrintf(xb[i] * inv);
+            if (q < -127) q = -127;
+            if (q > 127) q = 127;
+            xq[(size_t)b * W4B64_BLK + i] = (int8_t)q;
+        }
+    }
+#if defined(__aarch64__)
+#pragma omp parallel for schedule(static)
+    for (uint32_t oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t bb;
+        for (bb = 0; bb < nb; bb++) {
+            const uint8_t* blk = row + (size_t)bb * W4B64_BLK_BYTES;
+            float sw = f16_to_f32(((const uint16_t*)blk)[0]) * xs[bb];
+            const uint8_t* qs = blk + 2;
+            const int8_t* xp = xq + (size_t)bb * W4B64_BLK;
+            int8_t we[64];
+            int32x4_t dot = vdupq_n_s32(0);
+            uint32_t k;
+            for (k = 0; k < 32; k++) {
+                we[2 * k] = (int8_t)((qs[k] & 15) - 8);
+                we[2 * k + 1] = (int8_t)((qs[k] >> 4) - 8);
+            }
+            {
+                int8x16_t w0 = vld1q_s8(we);
+                int8x16_t w1 = vld1q_s8(we + 16);
+                int8x16_t w2 = vld1q_s8(we + 32);
+                int8x16_t w3 = vld1q_s8(we + 48);
+#if defined(__ARM_FEATURE_DOTPROD)
+                dot = vdotq_s32(dot, w0, vld1q_s8(xp));
+                dot = vdotq_s32(dot, w1, vld1q_s8(xp + 16));
+                dot = vdotq_s32(dot, w2, vld1q_s8(xp + 32));
+                dot = vdotq_s32(dot, w3, vld1q_s8(xp + 48));
+#else
+                {
+                    int16x8_t p0 = vmull_s8(vget_low_s8(w0), vget_low_s8(vld1q_s8(xp)));
+                    int16x8_t p1 = vmull_high_s8(w0, vld1q_s8(xp));
+                    dot = vaddq_s32(dot, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+                    p0 = vmull_s8(vget_low_s8(w1), vget_low_s8(vld1q_s8(xp + 16)));
+                    p1 = vmull_high_s8(w1, vld1q_s8(xp + 16));
+                    dot = vaddq_s32(dot, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+                    p0 = vmull_s8(vget_low_s8(w2), vget_low_s8(vld1q_s8(xp + 32)));
+                    p1 = vmull_high_s8(w2, vld1q_s8(xp + 32));
+                    dot = vaddq_s32(dot, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+                    p0 = vmull_s8(vget_low_s8(w3), vget_low_s8(vld1q_s8(xp + 48)));
+                    p1 = vmull_high_s8(w3, vld1q_s8(xp + 48));
+                    dot = vaddq_s32(dot, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+                }
+#endif
+            }
+            acc += sw * (float)vaddvq_s32(dot);
+        }
+        y[oo] = acc;
+    }
+#else
+#pragma omp parallel for schedule(static)
+    for (uint32_t oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t bb, ii;
+        for (bb = 0; bb < nb; bb++) {
+            const uint8_t* blk = row + (size_t)bb * W4B64_BLK_BYTES;
+            float sw = f16_to_f32(((const uint16_t*)blk)[0]) * xs[bb];
+            const uint8_t* qs = blk + 2;
+            const int8_t* xp = xq + (size_t)bb * W4B64_BLK;
+            int32_t dot = 0;
+            for (ii = 0; ii < 32; ii++) {
+                int w0 = (int)(qs[ii] & 15) - 8;
+                int w1 = (int)(qs[ii] >> 4) - 8;
+                dot += w0 * (int)xp[2 * ii] + w1 * (int)xp[2 * ii + 1];
+            }
+            acc += sw * (float)dot;
+        }
+        y[oo] = acc;
+    }
+#endif
+}
+
 void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
 {
     switch (dtype) {
@@ -1083,6 +1277,7 @@ void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t i
     case DT_Q6K: matmul_q6k(y, x, w, out, in); break;
     case DT_Q5K: matmul_q5k(y, x, w, out, in); break;
     case DT_IQ4XS: matmul_iq4xs(y, x, w, out, in); break;
+    case DT_W4B64: matmul_w4b64(y, x, w, out, in); break;
     default: matmul_f16(y, x, w, out, in); break;
     }
 }
@@ -1095,6 +1290,7 @@ void matmul_rows(float* y, const float* x, const uint8_t* w,
     case DT_Q4K:   matmul_q4k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
     case DT_Q6K:   matmul_q6k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 210), n_rows, in); break;
     case DT_IQ4XS: matmul_iq4xs(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
+    case DT_W4B64: matmul_w4b64(y, x, w + (size_t)row_begin * w4b64_row_bytes(in), n_rows, in); break;
     default:       matmul(y, x, w, n_rows, in, dtype); break;
     }
 }
@@ -1105,6 +1301,7 @@ size_t matmul_row_bytes(uint32_t dtype, uint32_t in)
     case DT_Q4K:
     case DT_IQ4XS: return (size_t)(in / 256) * 144;
     case DT_Q6K:   return (size_t)(in / 256) * 210;
+    case DT_W4B64: return w4b64_row_bytes(in);
     default:       return 0;   /* F16/F32 列主序, 行不连续, 不支持行分块 */
     }
 }

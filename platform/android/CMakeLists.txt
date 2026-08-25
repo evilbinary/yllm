@@ -12,6 +12,7 @@ set(INFER_INC
 )
 
 option(YLLM_VULKAN "Build Vulkan device backend" OFF)
+option(YLLM_W4 "Convert/prefer W4B64 for linear Q4_K weights" ON)
 
 set(YLLM_CORE_SRCS
   ${INFER}/core/platform.c
@@ -43,6 +44,11 @@ target_compile_definitions(yllm PRIVATE
   YLLM_SESS_DEBUG=0
   _DEFAULT_SOURCE
 )
+if(YLLM_W4)
+  target_compile_definitions(yllm PRIVATE YLLM_W4=1)
+else()
+  target_compile_definitions(yllm PRIVATE YLLM_W4=0)
+endif()
 if(YLLM_VULKAN)
   target_compile_definitions(yllm PRIVATE YLLM_VULKAN=1)
   find_library(VULKAN_LIB vulkan)
@@ -84,6 +90,11 @@ target_compile_definitions(yllm_cli PRIVATE
   YLLM_SESS_DEBUG=0
   _DEFAULT_SOURCE
 )
+if(YLLM_W4)
+  target_compile_definitions(yllm_cli PRIVATE YLLM_W4=1)
+else()
+  target_compile_definitions(yllm_cli PRIVATE YLLM_W4=0)
+endif()
 if(YLLM_VULKAN)
   target_compile_definitions(yllm_cli PRIVATE YLLM_VULKAN=1)
 endif()

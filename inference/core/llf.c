@@ -13,6 +13,7 @@ const char* llf_dtype_name(uint32_t dtype)
     case DT_Q6K: return "q6_k";
     case DT_IQ4XS: return "iq4_xs";
     case DT_Q5K: return "q5_k";
+    case DT_W4B64: return "w4_b64";
     default: return "?";
     }
 }

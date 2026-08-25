@@ -93,6 +93,7 @@ int convert_model(const char* fmt, const char* in, const char* out, const char* 
                   uint32_t max_seq, char* err, size_t errlen);
 int convert_dummy(const char* out_path, uint32_t blocks, uint32_t hidden, uint32_t heads,
                   uint32_t kv_heads, uint32_t vocab, uint32_t seq, uint32_t seed, char* err, size_t errlen);
+int convert_llf_w4(const char* in_path, const char* out_path, char* err, size_t errlen);
 int dummy_vocab(const char* out_path, uint32_t vocab, char* err, size_t errlen);
 
 /* ---- tokenizer ---- */
