@@ -635,12 +635,20 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         i8mm = 1;
 #endif
         w4b64_set_hw_i8mm(i8mm);
-        /* GEMV 复制 x 的 smmla 慢于 sdot; batch 可 zip-once 再 smmla */
-        w4b64_set_prefer_i8mm(0);
-        if (i8mm)
-            ylog_info("w4: ARM i8mm: batch smmla, decode sdot");
-        else
-            ylog_info("w4: using Arm82 sdot");
+        {
+            int arm86 = (m->h.reserved[LLF_W4_LAYOUT_OFF] == LLF_W4_LAYOUT_ARM86);
+            w4b64_set_layout_arm86(arm86);
+            /* GEMV 即使用 Arm86 无 zip, smmla 仍慢于 sdot; 仅 batch 走 smmla */
+            w4b64_set_prefer_i8mm(0);
+            if (i8mm && arm86)
+                ylog_info("w4: Arm86: batch smmla (no zip), decode sdot+unz");
+            else if (i8mm)
+                ylog_info("w4: ARM i8mm: batch smmla, decode sdot");
+            else if (arm86)
+                ylog_info("w4: Arm86 file, decode sdot+unz");
+            else
+                ylog_info("w4: using Arm82 sdot");
+        }
     }
 #endif
     if (m->h.arch == ARCH_GEMMA4) {

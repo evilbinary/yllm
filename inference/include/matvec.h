@@ -20,8 +20,11 @@ size_t w4b64_row_bytes(uint32_t in);
 int w4b64_pack_mat_f32(uint8_t* dst, const float* src, uint32_t out, uint32_t in);
 /* 从 Q4_K 行主序打包为 Arm82 W4 */
 int w4b64_pack_mat_q4k(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in);
-/* Arm82 → Arm86 (i8mm SRC_UNIT=8) 就地/分缓冲 permute */
+/* Arm82 ↔ Arm86 (i8mm SRC_UNIT=8) 就地/分缓冲 permute */
 int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in);
+int w4b64_permute_arm86_to_arm82(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in);
+void w4b64_set_layout_arm86(int on);
+int w4b64_layout_arm86(void);
 /* 运行时优先 i8mm(若硬件支持); 1=开 0=关; 返回实际是否启用 */
 int w4b64_set_prefer_i8mm(int on);
 int w4b64_prefer_i8mm(void);

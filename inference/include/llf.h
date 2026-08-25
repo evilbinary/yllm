@@ -18,8 +18,12 @@
 #define DT_Q6K 4
 #define DT_IQ4XS 5
 #define DT_Q5K 6
-#define DT_W4B64 7   /* int4 block-64, MNN Arm82 tile; 见 matvec w4b64_* */
+#define DT_W4B64 7   /* int4 block-64, MNN Arm82/Arm86 tile; 见 matvec w4b64_* */
 #define DT_KEEP 0xFFFFFFFFu  /* convert: 保持源 dtype, 不重打包 */
+/* LlfHeader.reserved[40]: W4 权布局. Gemma4Ext 占 reserved[0..39] */
+#define LLF_W4_LAYOUT_OFF 40
+#define LLF_W4_LAYOUT_ARM82 0  /* SRC=4, GEMV 用 sdot */
+#define LLF_W4_LAYOUT_ARM86 1  /* 预 zip, i8mm smmla 无运行时 zip */
 
 #define W4B64_BLK 64
 #define W4B64_HP 8          /* OC tile (Arm82 UNIT) */

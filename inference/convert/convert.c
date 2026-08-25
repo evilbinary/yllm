@@ -13,6 +13,10 @@ uint64_t align_up(uint64_t v, uint64_t a)
 #define YFSEEK(f, off) _fseeki64((f), (__int64)(off), SEEK_SET)
 #else
 #define YFSEEK(f, off) fseeko((f), (off_t)(off), SEEK_SET)
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #endif
 
 static void write_at(FILE* f, uint64_t off, const void* data, size_t n)
@@ -338,47 +342,166 @@ int conv_items_apply_dtype(ConvItem* items, int n, uint32_t n_blocks, uint32_t o
         snprintf(err, errlen, "unsupported --dtype (use q4km|w4)");
         return -1;
     }
-    for (p2 = 0; p2 < n; p2++) {
-        ConvItem* it = &items[p2];
-        uint32_t out_r = 0, in_c = 0;
-        uint8_t* packed;
-        if (it->dtype != DT_Q4K || it->ndim != 2) continue;
-        if (!llf_slot_linear_ok(it->layer, it->slot, n_blocks)) continue;
-        {
-            uint32_t a = it->shape[0], b = it->shape[1];
-            uint64_t ra = (a % 256u == 0) ? (uint64_t)(a / 256) * 144 : 0;
-            uint64_t rb = (b % 256u == 0) ? (uint64_t)(b / 256) * 144 : 0;
-            if (ra && it->nbytes == (uint64_t)b * ra) { in_c = a; out_r = b; }
-            else if (rb && it->nbytes == (uint64_t)a * rb) { in_c = b; out_r = a; }
-            else continue;
-        }
-        if ((in_c % W4B64_BLK) != 0) continue;
-        {
-            size_t nbytes = w4b64_bytes(out_r, in_c);
-            packed = (uint8_t*)ymalloc(nbytes);
-            if (!packed) {
-                snprintf(err, errlen, "oom packing %s", it->name);
-                return -1;
-            }
-            if (w4b64_pack_mat_q4k(packed, it->src + it->src_off, out_r, in_c) != 0) {
-                free(packed);
+    {
+        int already_arm86 = h && h->reserved[LLF_W4_LAYOUT_OFF] == LLF_W4_LAYOUT_ARM86;
+        for (p2 = 0; p2 < n; p2++) {
+            ConvItem* it = &items[p2];
+            uint32_t out_r = 0, in_c = 0;
+            uint8_t* packed;
+            if (it->ndim != 2) continue;
+            if (!llf_slot_linear_ok(it->layer, it->slot, n_blocks)) continue;
+            if (it->dtype == DT_W4B64) {
+                size_t nbytes;
+                if (already_arm86) continue;
+                {
+                    uint32_t a = it->shape[0], b = it->shape[1];
+                    if (w4b64_bytes(a, b) == it->nbytes) { out_r = a; in_c = b; }
+                    else if (w4b64_bytes(b, a) == it->nbytes) { out_r = b; in_c = a; }
+                    else continue;
+                }
+                nbytes = (size_t)it->nbytes;
+                packed = (uint8_t*)ymalloc(nbytes);
+                if (!packed) {
+                    snprintf(err, errlen, "oom packing %s", it->name);
+                    return -1;
+                }
+                memcpy(packed, it->src + it->src_off, nbytes);
+                if (w4b64_permute_arm82_to_arm86(packed, packed, out_r, in_c) != 0) {
+                    free(packed);
+                    continue;
+                }
+                if (owned_push(owned, n_owned, packed) != 0) {
+                    free(packed);
+                    snprintf(err, errlen, "oom");
+                    return -1;
+                }
+                it->src = packed;
+                it->src_off = 0;
+                n_remap++;
                 continue;
             }
-            if (owned_push(owned, n_owned, packed) != 0) {
-                free(packed);
-                snprintf(err, errlen, "oom");
-                return -1;
+            if (it->dtype != DT_Q4K) continue;
+            {
+                uint32_t a = it->shape[0], b = it->shape[1];
+                uint64_t ra = (a % 256u == 0) ? (uint64_t)(a / 256) * 144 : 0;
+                uint64_t rb = (b % 256u == 0) ? (uint64_t)(b / 256) * 144 : 0;
+                if (ra && it->nbytes == (uint64_t)b * ra) { in_c = a; out_r = b; }
+                else if (rb && it->nbytes == (uint64_t)a * rb) { in_c = b; out_r = a; }
+                else continue;
             }
-            it->src = packed;
-            it->src_off = 0;
-            it->dtype = DT_W4B64;
-            it->nbytes = (uint64_t)nbytes;
-            n_remap++;
+            if ((in_c % W4B64_BLK) != 0) continue;
+            {
+                size_t nbytes = w4b64_bytes(out_r, in_c);
+                packed = (uint8_t*)ymalloc(nbytes);
+                if (!packed) {
+                    snprintf(err, errlen, "oom packing %s", it->name);
+                    return -1;
+                }
+                if (w4b64_pack_mat_q4k(packed, it->src + it->src_off, out_r, in_c) != 0) {
+                    free(packed);
+                    continue;
+                }
+                if (w4b64_permute_arm82_to_arm86(packed, packed, out_r, in_c) != 0) {
+                    free(packed);
+                    snprintf(err, errlen, "W4 Arm86 permute failed %s", it->name);
+                    return -1;
+                }
+                if (owned_push(owned, n_owned, packed) != 0) {
+                    free(packed);
+                    snprintf(err, errlen, "oom");
+                    return -1;
+                }
+                it->src = packed;
+                it->src_off = 0;
+                it->dtype = DT_W4B64;
+                it->nbytes = (uint64_t)nbytes;
+                n_remap++;
+            }
+        }
+        if (h && (n_remap > 0 || already_arm86)) {
+            h->dtype = DT_W4B64;
+            h->reserved[LLF_W4_LAYOUT_OFF] = LLF_W4_LAYOUT_ARM86;
         }
     }
-    if (n_remap > 0 && h) h->dtype = DT_W4B64;
     return n_remap;
 }
+
+#ifndef _WIN32
+static int convert_w4_arm86_inplace(const char* path, char* err, size_t errlen)
+{
+    int fd, li, n_done = 0;
+    struct stat st;
+    void* base;
+    WMap map;
+    LlModel m;
+    LlfHeader* hh;
+    fd = open(path, O_RDWR);
+    if (fd < 0) {
+        snprintf(err, errlen, "cannot open rw %s", path);
+        return -1;
+    }
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        snprintf(err, errlen, "fstat %s", path);
+        return -1;
+    }
+    base = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        snprintf(err, errlen, "mmap rw %s", path);
+        return -1;
+    }
+    memset(&map, 0, sizeof(map));
+    map.base = base;
+    map.size = (uint64_t)st.st_size;
+    map.fd = fd;
+    if (llf_read(&map, &m) != 0) {
+        munmap(base, (size_t)st.st_size);
+        close(fd);
+        snprintf(err, errlen, "bad llf %s", path);
+        return -1;
+    }
+    hh = (LlfHeader*)base;
+    if (hh->reserved[LLF_W4_LAYOUT_OFF] == LLF_W4_LAYOUT_ARM86) {
+        printf("convert: already Arm86 W4\n");
+        free(m.base_idx);
+        munmap(base, (size_t)st.st_size);
+        close(fd);
+        return 0;
+    }
+    for (li = 0; li < (int)m.n_layers; li++) {
+        uint32_t ti;
+        for (ti = 0; ti < BLOCK_TENSORS_MTP; ti++) {
+            LlfTensorMeta* tm = &m.metas[m.base_idx[li] + ti];
+            uint32_t out_r, in_c;
+            uint8_t* p;
+            if (tm->dtype != DT_W4B64 || tm->size == 0 || tm->ndim != 2) continue;
+            {
+                uint32_t a = tm->shape[0], b = tm->shape[1];
+                if (w4b64_bytes(a, b) == tm->size) { out_r = a; in_c = b; }
+                else if (w4b64_bytes(b, a) == tm->size) { out_r = b; in_c = a; }
+                else continue;
+            }
+            p = (uint8_t*)base + m.dir[li].offset + tm->offset;
+            if (w4b64_permute_arm82_to_arm86(p, p, out_r, in_c) != 0) {
+                free(m.base_idx);
+                munmap(base, (size_t)st.st_size);
+                close(fd);
+                snprintf(err, errlen, "permute failed %s", tm->name);
+                return -1;
+            }
+            n_done++;
+        }
+    }
+    hh->reserved[LLF_W4_LAYOUT_OFF] = LLF_W4_LAYOUT_ARM86;
+    msync(base, (size_t)st.st_size, MS_SYNC);
+    printf("convert: in-place Arm86 permute %d W4 tensors in %s\n", n_done, path);
+    free(m.base_idx);
+    munmap(base, (size_t)st.st_size);
+    close(fd);
+    return 0;
+}
+#endif
 
 int convert_llf_repack(const char* in_path, const char* out_path, uint32_t out_dtype,
                        char* err, size_t errlen)
@@ -404,6 +527,21 @@ int convert_llf_repack(const char* in_path, const char* out_path, uint32_t out_d
         return -1;
     }
     h = m.h;
+#ifndef _WIN32
+    if (out_dtype == DT_W4B64 && h.dtype == DT_W4B64) {
+        if (h.reserved[LLF_W4_LAYOUT_OFF] == LLF_W4_LAYOUT_ARM86) {
+            printf("convert: %s already Arm86 W4\n", in_path);
+            free(m.base_idx);
+            wmap_close(&map);
+            return 0;
+        }
+        if (strcmp(in_path, out_path) == 0) {
+            free(m.base_idx);
+            wmap_close(&map);
+            return convert_w4_arm86_inplace(in_path, err, errlen);
+        }
+    }
+#endif
     for (li = 0; li < (int)m.n_layers; li++) {
         for (ti = 0; ti < BLOCK_TENSORS_MTP; ti++) {
             LlfTensorMeta* tm = &m.metas[m.base_idx[li] + ti];

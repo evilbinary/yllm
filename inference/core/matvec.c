@@ -1135,9 +1135,10 @@ size_t w4b64_row_bytes(uint32_t in)
     return 0;
 }
 
-/* prefer: GEMV 是否走 smmla(复制 x, 通常更慢). hw: 芯片有 i8mm, batch 可走 smmla */
+/* prefer: GEMV 是否走 smmla. hw: 芯片有 i8mm. layout: 文件已是 Arm86 预 zip */
 static int g_w4_prefer_i8mm = 0;
 static int g_w4_hw_i8mm = 0;
+static int g_w4_layout_arm86 = 0;
 
 int w4b64_prefer_i8mm(void)
 {
@@ -1168,6 +1169,16 @@ int w4b64_has_i8mm(void)
     (void)g_w4_hw_i8mm;
     return 0;
 #endif
+}
+
+void w4b64_set_layout_arm86(int on)
+{
+    g_w4_layout_arm86 = on ? 1 : 0;
+}
+
+int w4b64_layout_arm86(void)
+{
+    return g_w4_layout_arm86;
 }
 
 /* 对称 int4: q in [-8,7], 存 nibble=q+8; scale = amax/8 */
@@ -1267,11 +1278,32 @@ int w4b64_pack_mat_q4k(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t 
     return rc;
 }
 
-/* Arm86 cell (32B, SRC=8): pack from two Arm82 cells (IC0-3 + IC4-7) for same OC tile.
- * Layout for smmla: high nibbles of first/second 16B → OC pairs; lows → OC+4 pairs. */
-int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in)
+/* Arm86 cell (32B, SRC=8): Arm82 两格 zip 成 smmla 布局。
+ * vzip1/vzip2 按 32-bit lane: v0=[a0,b0,a1,b1] v1=[a2,b2,a3,b3] */
+static void w4_zip_pair_bytes(const uint8_t* c0, const uint8_t* c1, uint8_t* v0, uint8_t* v1)
 {
-    /* Arm86 panel: lu86=8 cells×32B + 64B scales = 320 same as Arm82 panel size */
+    uint32_t a[4], b[4], d0[4], d1[4];
+    memcpy(a, c0, 16);
+    memcpy(b, c1, 16);
+    d0[0] = a[0]; d0[1] = b[0]; d0[2] = a[1]; d0[3] = b[1];
+    d1[0] = a[2]; d1[1] = b[2]; d1[2] = a[3]; d1[3] = b[3];
+    memcpy(v0, d0, 16);
+    memcpy(v1, d1, 16);
+}
+
+static void w4_uzp_pair_bytes(const uint8_t* v0, const uint8_t* v1, uint8_t* c0, uint8_t* c1)
+{
+    uint32_t d0[4], d1[4], a[4], b[4];
+    memcpy(d0, v0, 16);
+    memcpy(d1, v1, 16);
+    a[0] = d0[0]; a[1] = d0[2]; a[2] = d1[0]; a[3] = d1[2];
+    b[0] = d0[1]; b[1] = d0[3]; b[2] = d1[1]; b[3] = d1[3];
+    memcpy(c0, a, 16);
+    memcpy(c1, b, 16);
+}
+
+static int w4b64_permute_pairs(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in, int to_arm86)
+{
     uint32_t hu, bn, h, bl, j;
     size_t need = w4b64_bytes(out, in);
     if (!dst || !src || !need) return -1;
@@ -1281,22 +1313,29 @@ int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out,
         for (bl = 0; bl < bn; bl++) {
             const uint8_t* sp = src + ((size_t)h * bn + bl) * W4B64_PANEL_BYTES;
             uint8_t* dp = dst + ((size_t)h * bn + bl) * W4B64_PANEL_BYTES;
-            /* 8 Arm86 cells from 16 Arm82 cells (pair j,j+1) */
+            uint8_t tmp[32];
             for (j = 0; j < 8; j++) {
-                const uint8_t* c0 = sp + (size_t)(2 * j) * 16;
-                const uint8_t* c1 = sp + (size_t)(2 * j + 1) * 16;
-                uint8_t* dcell = dp + (size_t)j * 32;
-                /* Expand to signed then repack Arm86-style for smmla:
-                 * bytes[0..15]: hi nibble OC0/1 interleaved with IC; use MNN Arm86 mapping:
-                 * For simplicity store as: first 16B = c0 (OC hi/lo for IC0-3),
-                 * second 16B = c1 — smmla kernel will unpack accordingly. */
-                memcpy(dcell, c0, 16);
-                memcpy(dcell + 16, c1, 16);
+                const uint8_t* p0 = sp + (size_t)(2 * j) * 16;
+                const uint8_t* p1 = sp + (size_t)(2 * j + 1) * 16;
+                if (to_arm86) w4_zip_pair_bytes(p0, p1, tmp, tmp + 16);
+                else w4_uzp_pair_bytes(p0, p1, tmp, tmp + 16);
+                memcpy(dp + (size_t)(2 * j) * 16, tmp, 32);
             }
-            memcpy(dp + 8 * 32, sp + W4B64_LU * 16, 64);
+            if (dp != sp)
+                memcpy(dp + W4B64_LU * 16, sp + W4B64_LU * 16, 64);
         }
     }
     return 0;
+}
+
+int w4b64_permute_arm82_to_arm86(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in)
+{
+    return w4b64_permute_pairs(dst, src, out, in, 1);
+}
+
+int w4b64_permute_arm86_to_arm82(uint8_t* dst, const uint8_t* src, uint32_t out, uint32_t in)
+{
+    return w4b64_permute_pairs(dst, src, out, in, 0);
 }
 
 static void w4_act_quant_block(const float* x, int8_t* xq, float* xs, int32_t* xsum, uint32_t nb)
@@ -1410,12 +1449,40 @@ static void matmul_w4b64_arm82_scalar(float* y, const int8_t* xq, const float* x
 #if defined(__aarch64__)
 #if defined(__ARM_FEATURE_DOTPROD)
 /* 4 cells × 同一 xv(16 IC): 更新一组 8 OC 的 iacc */
+static inline void w4_arm86_pair_uzp(uint8x16_t v0, uint8x16_t v1, uint8x16_t* c0, uint8x16_t* c1)
+{
+    int32x4_t a = vreinterpretq_s32_u8(v0);
+    int32x4_t b = vreinterpretq_s32_u8(v1);
+    *c0 = vreinterpretq_u8_s32(vuzp1q_s32(a, b));
+    *c1 = vreinterpretq_u8_s32(vuzp2q_s32(a, b));
+}
+
 static inline void w4_sdot_4cells_xv(int32x4_t* ihi, int32x4_t* ilo,
                                      const uint8_t* panel, int8x16_t xv,
-                                     uint32_t j, uint8x16_t mask15)
+                                     uint32_t j, uint8x16_t mask15, int arm86)
 {
     uint8x16_t c;
     int32x4_t hi = *ihi, lo = *ilo;
+    if (arm86) {
+        uint8x16_t v0 = vld1q_u8(panel + (size_t)j * 16);
+        uint8x16_t v1 = vld1q_u8(panel + (size_t)(j + 1) * 16);
+        uint8x16_t c0, c1, c2, c3;
+        w4_arm86_pair_uzp(v0, v1, &c0, &c1);
+        v0 = vld1q_u8(panel + (size_t)(j + 2) * 16);
+        v1 = vld1q_u8(panel + (size_t)(j + 3) * 16);
+        w4_arm86_pair_uzp(v0, v1, &c2, &c3);
+        hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c0, 4)), xv, 0);
+        lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c0, mask15)), xv, 0);
+        hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c1, 4)), xv, 1);
+        lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c1, mask15)), xv, 1);
+        hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c2, 4)), xv, 2);
+        lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c2, mask15)), xv, 2);
+        hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c3, 4)), xv, 3);
+        lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c3, mask15)), xv, 3);
+        *ihi = hi;
+        *ilo = lo;
+        return;
+    }
     c = vld1q_u8(panel + (size_t)j * 16);
     hi = vdotq_laneq_s32(hi, vreinterpretq_s8_u8(vshrq_n_u8(c, 4)), xv, 0);
     lo = vdotq_laneq_s32(lo, vreinterpretq_s8_u8(vandq_u8(c, mask15)), xv, 0);
@@ -1457,6 +1524,7 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
     uint32_t bn = in / W4B64_BLK;
     uint32_t h;
     const uint8x16_t mask15 = vdupq_n_u8(15);
+    int arm86 = w4b64_layout_arm86();
 #if defined(__ARM_FEATURE_DOTPROD)
 #pragma omp parallel for schedule(static)
     for (h = 0; h < hu; h++) {
@@ -1477,7 +1545,7 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
             __builtin_prefetch(panel + 3 * W4B64_PANEL_BYTES, 0, 2);
             for (j = 0; j < W4B64_LU; j += 4) {
                 int8x16_t xv = vld1q_s8(xp + j * 4);
-                w4_sdot_4cells_xv(&iacc_hi, &iacc_lo, panel, xv, j, mask15);
+                w4_sdot_4cells_xv(&iacc_hi, &iacc_lo, panel, xv, j, mask15, arm86);
             }
             iacc_hi = vsubq_s32(iacc_hi, corr);
             iacc_lo = vsubq_s32(iacc_lo, corr);
@@ -1564,6 +1632,24 @@ static inline void w4_arm82_pair_zip(uint8x16_t c0, uint8x16_t c1, uint8x16_t* v
     *v1 = vreinterpretq_u8_s32(vzip2q_s32(a, b));
 }
 
+static inline void w4_smmla_load_w(const uint8_t* panel, uint32_t j, uint8x16_t mask15, int arm86,
+                                   int8x16_t* wh01, int8x16_t* wh23, int8x16_t* wl45, int8x16_t* wl67)
+{
+    uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
+    uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
+    uint8x16_t v0, v1;
+    if (arm86) {
+        v0 = c0;
+        v1 = c1;
+    } else {
+        w4_arm82_pair_zip(c0, c1, &v0, &v1);
+    }
+    *wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
+    *wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
+    *wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
+    *wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
+}
+
 static inline int32x4_t w4_smmla_e0(int32x4_t p01, int32x4_t p23)
 {
     return vreinterpretq_s32_s64(vuzp1q_s64(vreinterpretq_s64_s32(p01), vreinterpretq_s64_s32(p23)));
@@ -1595,19 +1681,13 @@ static void matmul_w4b64_arm86_smmla(float* y, const int8_t* xq, const float* xs
             int32x4_t a01 = vdupq_n_s32(0), a23 = vdupq_n_s32(0);
             int32x4_t a45 = vdupq_n_s32(0), a67 = vdupq_n_s32(0);
             int32x4_t corr = vdupq_n_s32(8 * xsum[bl]);
+            int arm86 = w4b64_layout_arm86();
             __builtin_prefetch(panel + W4B64_PANEL_BYTES, 0, 3);
             for (j = 0; j < 8; j++) {
-                uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
-                uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
-                uint8x16_t v0, v1;
                 int8x8_t x8 = vld1_s8(xp + j * 8);
                 int8x16_t xa = vcombine_s8(x8, x8);
                 int8x16_t wh01, wh23, wl45, wl67;
-                w4_arm82_pair_zip(c0, c1, &v0, &v1);
-                wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
-                wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
-                wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
-                wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
+                w4_smmla_load_w(panel, j, mask15, arm86, &wh01, &wh23, &wl45, &wl67);
                 a01 = w4_smmla(a01, xa, wh01);
                 a23 = w4_smmla(a23, xa, wh23);
                 a45 = w4_smmla(a45, xa, wl45);
@@ -1750,6 +1830,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                 uint32_t np2 = (B + 1u) / 2u;
                 int8_t xpk8[nb64][np2][8][16];
                 uint32_t p;
+                int arm86 = w4b64_layout_arm86();
                 memset(xpk8, 0, sizeof(xpk8));
                 for (bl = 0; bl < nb64; bl++) {
                     for (p = 0; p < np2; p++) {
@@ -1787,17 +1868,10 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                             int32x4_t b01 = vdupq_n_s32(0), b23 = vdupq_n_s32(0);
                             int32x4_t b45 = vdupq_n_s32(0), b67 = vdupq_n_s32(0);
                             for (j = 0; j < 8; j++) {
-                                uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
-                                uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
-                                uint8x16_t v0, v1;
                                 int8x16_t wh01, wh23, wl45, wl67;
                                 int8x16_t xa = vld1q_s8(xpk8[bl][p][j]);
                                 int8x16_t xb = vld1q_s8(xpk8[bl][p + 1][j]);
-                                w4_arm82_pair_zip(c0, c1, &v0, &v1);
-                                wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
-                                wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
-                                wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
-                                wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
+                                w4_smmla_load_w(panel, j, mask15, arm86, &wh01, &wh23, &wl45, &wl67);
                                 a01 = w4_smmla(a01, xa, wh01);
                                 a23 = w4_smmla(a23, xa, wh23);
                                 a45 = w4_smmla(a45, xa, wl45);
@@ -1838,16 +1912,9 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                             int32x4_t a01 = vdupq_n_s32(0), a23 = vdupq_n_s32(0);
                             int32x4_t a45 = vdupq_n_s32(0), a67 = vdupq_n_s32(0);
                             for (j = 0; j < 8; j++) {
-                                uint8x16_t c0 = vld1q_u8(panel + (size_t)(2 * j) * 16);
-                                uint8x16_t c1 = vld1q_u8(panel + (size_t)(2 * j + 1) * 16);
-                                uint8x16_t v0, v1;
                                 int8x16_t xa = vld1q_s8(xpk8[bl][p][j]);
                                 int8x16_t wh01, wh23, wl45, wl67;
-                                w4_arm82_pair_zip(c0, c1, &v0, &v1);
-                                wh01 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
-                                wh23 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
-                                wl45 = vreinterpretq_s8_u8(vandq_u8(v0, mask15));
-                                wl67 = vreinterpretq_s8_u8(vandq_u8(v1, mask15));
+                                w4_smmla_load_w(panel, j, mask15, arm86, &wh01, &wh23, &wl45, &wl67);
                                 a01 = w4_smmla(a01, xa, wh01);
                                 a23 = w4_smmla(a23, xa, wh23);
                                 a45 = w4_smmla(a45, xa, wl45);
