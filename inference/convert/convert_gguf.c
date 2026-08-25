@@ -616,18 +616,19 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
     if (!g.arch || (strcmp(g.arch, "llama") != 0 && strcmp(g.arch, "qwen2") != 0 &&
-                    strcmp(g.arch, "qwen3") != 0 && strcmp(g.arch, "qwen35") != 0 &&
-                    strcmp(g.arch, "gemma4") != 0)) {
-        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama', 'qwen2/qwen3/qwen35' and 'gemma4' supported)", g.arch ? g.arch : "?");
+                    strcmp(g.arch, "qwen3") != 0 && strcmp(g.arch, "qwen3vl") != 0 &&
+                    strcmp(g.arch, "qwen35") != 0 && strcmp(g.arch, "gemma4") != 0)) {
+        snprintf(err, errlen, "unsupported architecture '%s' (only 'llama', 'qwen2/qwen3/qwen3vl/qwen35' and 'gemma4' supported)", g.arch ? g.arch : "?");
         for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
         free(g.tokens);
         free(g.scores);
         free(g.arch); wmap_close(&gmap);
         return -1;
     }
-    /* qwen2/qwen3/qwen35: 同构(interleaved RoPE, 无 head 输出 bias; qwen3 连 attention bias 都没有,
-     * 代码按 tensor 是否存在自动跳过) */
-    int is_qwen = g.arch && (strcmp(g.arch, "qwen2") == 0 || strcmp(g.arch, "qwen3") == 0);
+    /* qwen2/qwen3/qwen3vl/qwen35: 同构(interleaved RoPE, 无 head 输出 bias; qwen3 连 attention bias 都没有,
+     * 代码按 tensor 是否存在自动跳过)。qwen3vl 文本侧同 qwen3(本 GGUF 常无 vision 权 / tied lm_head) */
+    int is_qwen = g.arch && (strcmp(g.arch, "qwen2") == 0 || strcmp(g.arch, "qwen3") == 0 ||
+                             strcmp(g.arch, "qwen3vl") == 0);
     int is_qwen35 = g.arch && strcmp(g.arch, "qwen35") == 0;
     int is_gemma4 = g.arch && strcmp(g.arch, "gemma4") == 0;
     free(g.arch);
@@ -838,13 +839,6 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             if (qg_n < (int)(sizeof(qg_bufs) / sizeof(qg_bufs[0]))) qg_bufs[qg_n++] = nb;
         }
         n++;
-        /* gemma4 tied embedding: 写完 embed 后额外写一份 output(lm_head) 指向同一数据 */
-        if (is_gemma4 && slot == SP_EMBED) {
-            items[n] = items[n - 1];
-            items[n].layer = g.n_blocks + 2;
-            snprintf(items[n].name, sizeof(items[n].name), "output.weight");
-            n++;
-        }
         if (is_qwen35 && slot == SLOT_Q && t->ndims == 2 &&
             t->dims[1] == 2 * (uint64_t)g.heads * (g.key_length ? g.key_length : g.hidden / g.heads)) {
             /* qwen35 attention 层: attn_q = [q|gate] 拼接(输出维 2×qdim)。
@@ -883,6 +877,22 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             items[n].src = nb + qdim * rowb;
             items[n].src_off = 0;
             n++;
+        }
+    }
+    /* tied embedding: 无独立 output.weight 时用 token_embd 兼 lm_head(gemma4 / qwen3vl 等) */
+    if (is_gemma4 || is_qwen) {
+        int have_out = 0, emb = -1;
+        int p2;
+        for (p2 = 0; p2 < n; p2++) {
+            if (items[p2].layer == g.n_blocks + 2 && items[p2].slot == 0) have_out = 1;
+            if (items[p2].layer == 0 && items[p2].slot == 0) emb = p2;
+        }
+        if (!have_out && emb >= 0) {
+            items[n] = items[emb];
+            items[n].layer = g.n_blocks + 2;
+            snprintf(items[n].name, sizeof(items[n].name), "output.weight");
+            n++;
+            printf("gguf: tied embedding -> output.weight\n");
         }
     }
     if (n == 0) { free(items); free(list.t); wmap_close(&gmap); snprintf(err, errlen, "no recognized tensors"); return -1; }

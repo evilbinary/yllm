@@ -567,6 +567,25 @@ chat-qwen3-8b-avx2-vulkan: vulkan $(Q3_8B_LLF)
 	$(RUN_VULKAN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
+# ---- qwen3-vl-2b(文本侧; GGUF arch=qwen3vl, 常无独立 lm_head / 无 vision 权) ----
+Q3VL_2B_GGUF  ?= models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf
+Q3VL_2B_LLF   ?= models/qwen3-vl-2b.llf
+Q3VL_2B_VOCAB ?= models/qwen3-vl-2b.vocab.txt
+
+$(Q3VL_2B_LLF): $(Q3VL_2B_GGUF) | $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(Q3VL_2B_GGUF) --out $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --seq 4096
+
+chat-qwen3-vl-2b: $(BIN) $(Q3VL_2B_LLF)
+	$(RUN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3-vl-2b-avx2: $(BIN_AVX2) $(Q3VL_2B_LLF)
+	$(RUN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-qwen3-vl-2b-avx2-vulkan: vulkan $(Q3VL_2B_LLF)
+	$(RUN_VULKAN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 # ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
 Q3_27B_GGUF  ?= models/Qwen3.8-27B-Q4_K_M.gguf
 Q3_27B_LLF   ?= models/qwen3.8-27b.llf
@@ -822,4 +841,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
+.PHONY: all avx2 cuda vulkan android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b-avx2-vulkan gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-qwen2.5-7b server-qwen38 server-tinyllama infer-qwen2.5-7b infer-qwen38 infer-tinyllama
