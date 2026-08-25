@@ -83,8 +83,9 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         uint64_t loff = align_up(first, LLF_ALIGN);
         uint64_t lend = 0;
         uint32_t s2;
-        for (s2 = 0; s2 < per[i]; s2++) {
+    for (s2 = 0; s2 < BLOCK_TENSORS_MTP; s2++) {
             LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS_MTP + s2];
+            if (tm->size == 0 && !tm->name[0]) continue;
             tm->offset += loff - first;
             if (loff + tm->offset + tm->size > lend) lend = loff + tm->offset + tm->size;
         }

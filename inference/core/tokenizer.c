@@ -506,22 +506,30 @@ static void build_byte_ids(Vocab* v)
     }
 }
 
-/* qwen2 特殊 token:<|im_start|> 等, 编码前整体匹配 */
+/* qwen 特殊 token: 编码前整体匹配(含 thinking 启停, 切成 BPE 会让模型看到乱码) */
+static const char* k_qwen_specials[] = {
+    "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+    "<think>", "</think>",
+    "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>",
+    NULL
+};
+
 static int special_token_id(const Vocab* v, const char* text)
 {
-    static const char* specials[] = {
-        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
-        "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>"
-    };
     size_t i;
-    for (i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
-        if (strncmp(text, specials[i], strlen(specials[i])) == 0) {
+    int best_id = -1;
+    size_t best_len = 0;
+    for (i = 0; k_qwen_specials[i]; i++) {
+        size_t n = strlen(k_qwen_specials[i]);
+        if (n > best_len && strncmp(text, k_qwen_specials[i], n) == 0) {
             int id = -1;
-            if (vocab_bsearch_sorted(v, v->sorted, specials[i], strlen(specials[i]), &id) == 0)
-                return id;
+            if (vocab_bsearch_sorted(v, v->sorted, k_qwen_specials[i], n, &id) == 0) {
+                best_id = id;
+                best_len = n;
+            }
         }
     }
-    return -1;
+    return best_id;
 }
 
 /* byte-level BPE encode using tokenizer.ggml.merges ranks (qwen2 etc.) */
@@ -540,16 +548,20 @@ static int vocab_encode_merges(Vocab* v, const char* text, uint32_t* ids, int ma
         int sid = special_token_id(v, text + i);
         if (sid >= 0) {
             const char* sp = NULL;
-            static const char* specials[] = {
-                "<|im_start|>", "<|im_end|>", "<|endoftext|>",
-                "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>"
-            };
-            size_t k;
-            for (k = 0; k < sizeof(specials) / sizeof(specials[0]); k++) {
-                if (strncmp(text + i, specials[k], strlen(specials[k])) == 0) { sp = specials[k]; break; }
+            size_t k, nsp = 0;
+            for (k = 0; k_qwen_specials[k]; k++) {
+                size_t n = strlen(k_qwen_specials[k]);
+                if (n > nsp && strncmp(text + i, k_qwen_specials[k], n) == 0) {
+                    int id = -1;
+                    if (vocab_bsearch_sorted(v, v->sorted, k_qwen_specials[k], n, &id) == 0 && id == sid) {
+                        sp = k_qwen_specials[k];
+                        nsp = n;
+                    }
+                }
             }
+            if (!sp) { i += 1; continue; }
             if (ns < (uint32_t)max) syms[ns++] = (uint32_t)sid;
-            i += strlen(sp);
+            i += nsp;
             continue;
         }
         /* 多字节 UTF-8 直接命中 */
@@ -918,6 +930,7 @@ static int chat_spec_len_at(const char* p, const char** which)
         "<|tool_call>", "<tool_call|>",
         "<|turn>", "<turn|>",
         "<|tool>", "<tool|>",
+        "<think>", "</think>",
         "<bos>", "<eos>", "<pad>", "<unk>",
         NULL
     };
@@ -1005,9 +1018,12 @@ static void chat_render_generic(Vocab* v, const ChatMsg* msgs, int n_msgs,
             chat_append_ids(v, "\n", ids, max, n_out);
         }
     }
-    if (im)
+    if (im) {
         chat_append_ids(v, "<|im_start|>assistant\n", ids, max, n_out);
-    else
+        /* Qwen3.5/3.8 thinking: 模板默认注入 <think>\\n, 否则模型离分布会吐乱码 */
+        if (chat_vocab_has_token(v, "<think>"))
+            chat_append_ids(v, "<think>\n", ids, max, n_out);
+    } else
         chat_append_ids(v, "assistant: ", ids, max, n_out);
 }
 
