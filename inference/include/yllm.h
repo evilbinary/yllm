@@ -146,13 +146,14 @@ typedef struct Engine {
     /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
     float* pb;      /* [PB_MAX × hidden]  输入/残差 */
     float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */
-    float* pbq;     /* [PB_MAX × hidden]  query */
+    float* pbq;     /* [PB_MAX × pbq_dim] query; gemma4 全局层 pbq_dim=n_heads*hd>hidden */
     float* pbk;     /* [PB_MAX × kv_dim]  key */
     float* pbv;     /* [PB_MAX × kv_dim]  value */
     float* pbg;     /* [PB_MAX × inter]   gate */
     float* pbu;     /* [PB_MAX × inter]   up */
     float* pba;     /* [PB_MAX × n_heads × max_seq] 注意力分数 */
     uint32_t pb_cap;    /* 当前分配的批容量 */
+    uint32_t pbq_dim;   /* pbq 每 token 宽度(≥ hidden) */
     uint64_t stat_reads;
     uint64_t stat_releases;
     uint64_t stat_faults;

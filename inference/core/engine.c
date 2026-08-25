@@ -141,6 +141,57 @@ static void gemma4_prepare_ple(Engine* e, uint32_t token)
     }
 }
 
+/* prefill: tok embed 仍按 token, mproj 对 B 个激活只反量化一次 */
+static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t B)
+{
+    if (!e->n_ple || !e->ple_batch || !e->ple_work || B == 0) return;
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* ebase = (const uint8_t*)ws->map.base + m->dir[0].offset;
+    const LlfTensorMeta* em = &m->metas[m->base_idx[0]];
+    const LlfTensorMeta* tok = &em[SLOT_PLE_TOK];
+    const LlfTensorMeta* mproj = &em[SLOT_PLE_MPROJ];
+    const LlfTensorMeta* pnorm = &em[SLOT_PLE_PNORM];
+    uint32_t n_ple = e->n_ple;
+    uint32_t nblk = h->n_blocks;
+    uint32_t width = n_ple * nblk;
+    uint32_t b, j, il;
+    float eps, ts, ps, isc;
+    if (tok->size == 0 || mproj->size == 0) return;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    ts = sqrtf((float)n_ple);
+    ps = 1.0f / sqrtf((float)h->hidden);
+    isc = 1.0f / sqrtf(2.0f);
+    for (b = 0; b < B; b++) {
+        float* pe = e->ple_batch + (size_t)b * width;
+        switch (tok->dtype) {
+        case DT_F32: embed_f32(pe, ebase + tok->offset, tokens[b], width); break;
+        case DT_Q4K: embed_q4k(pe, ebase + tok->offset, tokens[b], width); break;
+        case DT_Q6K: embed_q6k(pe, ebase + tok->offset, tokens[b], width); break;
+        case DT_Q5K: embed_q5k(pe, ebase + tok->offset, tokens[b], width); break;
+        default: embed_f16(pe, ebase + tok->offset, tokens[b], width); break;
+        }
+        for (j = 0; j < width; j++) pe[j] *= ts;
+    }
+    matmul_batch(e->ple_work, e->pb, ebase + mproj->offset, width, h->hidden, mproj->dtype, B);
+    for (b = 0; b < B; b++) {
+        float* sl0 = e->ple_work + (size_t)b * width;
+        float* pe = e->ple_batch + (size_t)b * width;
+        for (j = 0; j < width; j++) sl0[j] *= ps;
+        for (il = 0; il < nblk; il++) {
+            float* sl = sl0 + (size_t)il * n_ple;
+            float* pel = pe + (size_t)il * n_ple;
+            if (pnorm->size > 0)
+                rmsnorm(sl, sl, ebase + pnorm->offset, n_ple, eps, pnorm->dtype);
+            else
+                rmsnorm_unit(sl, sl, n_ple, eps);
+            for (j = 0; j < n_ple; j++)
+                pel[j] = (sl[j] + pel[j]) * isc;
+        }
+    }
+}
+
 static int cmp_prob_desc(const void* a, const void* b)
 {
     float pa = ((const ProbIdx*)a)->prob;
@@ -472,10 +523,22 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     {
         uint32_t PB_MAX = 64;
         uint32_t kv_dim2 = m->h.n_kv_heads * m->h.head_dim;
+        uint32_t q_dim_max = hidden;
+        if (m->h.arch == ARCH_GEMMA4 && hidden > 0) {
+            uint32_t li;
+            for (li = 1; li <= m->h.n_blocks; li++) {
+                const LlfTensorMeta* mt = &m->metas[m->base_idx[li]];
+                if (mt[SLOT_Q].ndim >= 2) {
+                    uint32_t qd = mt[SLOT_Q].shape[0] * mt[SLOT_Q].shape[1] / hidden;
+                    if (qd > q_dim_max) q_dim_max = qd;
+                }
+            }
+        }
         e->pb_cap = PB_MAX;
+        e->pbq_dim = q_dim_max;
         e->pb  = (float*)ycalloc((size_t)PB_MAX * hidden, 4);
         e->pb2 = (float*)ycalloc((size_t)PB_MAX * hidden, 4);
-        e->pbq = (float*)ycalloc((size_t)PB_MAX * hidden, 4);
+        e->pbq = (float*)ycalloc((size_t)PB_MAX * q_dim_max, 4);
         e->pbk = (float*)ycalloc((size_t)PB_MAX * kv_dim2, 4);
         e->pbv = (float*)ycalloc((size_t)PB_MAX * kv_dim2, 4);
         e->pbg = (float*)ycalloc((size_t)PB_MAX * inter, 4);
@@ -484,6 +547,8 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         if (m->h.arch == ARCH_GEMMA4 && e->n_ple > 0) {
             size_t psz = (size_t)e->n_ple * m->h.n_blocks;
             e->ple_batch = (float*)ycalloc((size_t)PB_MAX * psz, 4);
+            free(e->ple_work);
+            e->ple_work = (float*)ycalloc((size_t)PB_MAX * psz, 4);
         }
     }
 
@@ -890,13 +955,8 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             for (b2 = 0; b2 < nb; b2++)
                 for (j = 0; j < hidden; j++)
                     e->pb[(size_t)b2 * hidden + j] *= scale;
-            if (e->ple && e->ple_batch && ple_stride > 0) {
-                for (b2 = 0; b2 < nb; b2++) {
-                    memcpy(e->x, e->pb + (size_t)b2 * hidden, (size_t)hidden * 4);
-                    gemma4_prepare_ple(e, tokens[off + b2]);
-                    memcpy(e->ple_batch + (size_t)b2 * ple_stride, e->ple, ple_stride * 4);
-                }
-            }
+            if (e->ple_batch && ple_stride > 0)
+                gemma4_prepare_ple_batch(e, tokens + off, nb);
         }
         uint32_t i;
         uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
@@ -1027,8 +1087,7 @@ static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start,
         kvd = mt[SLOT_K].shape[0] * mt[SLOT_K].shape[1] / hidden;
 
     /* 缓冲不够或尺寸异常时退回逐 token */
-    if (q_dim > hidden || inter > e->inter ||
-        (size_t)B * q_dim > (size_t)e->pb_cap * h->n_heads * e->max_seq) {
+    if (q_dim > e->pbq_dim || inter > e->inter || B > e->pb_cap) {
         for (b = 0; b < B; b++) {
             memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
             if (e->ple && e->ple_batch && ple_stride)
@@ -1142,24 +1201,32 @@ static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start,
         float* x = e->pb + (size_t)b * hidden;
         float* ao = e->pb2 + (size_t)b * hidden;
         float* x2 = e->hb;
-        float ls = 1.0f;
-        uint32_t j;
         rmsnorm(x2, ao, base + mt[SLOT_NORM4].offset, hidden, eps, mt[SLOT_NORM4].dtype);
         add_inplace(x, x2, hidden);
-        if (e->ple && e->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0) {
-            uint32_t n_ple = e->n_ple;
-            float* gate = e->ple_work;
-            if (e->ple_batch && ple_stride)
-                memcpy(e->ple, e->ple_batch + (size_t)b * ple_stride, ple_stride * 4);
-            matmul(gate, x, base + mt[SLOT_PLE_GATE].offset, n_ple, hidden, mt[SLOT_PLE_GATE].dtype);
+    }
+    if (e->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0 && e->ple_batch && ple_stride) {
+        uint32_t n_ple = e->n_ple;
+        uint32_t j;
+        matmul_batch(e->pbg, e->pb, base + mt[SLOT_PLE_GATE].offset, n_ple, hidden, mt[SLOT_PLE_GATE].dtype, B);
+        for (b = 0; b < B; b++) {
+            float* gate = e->pbg + (size_t)b * n_ple;
+            const float* pe = e->ple_batch + (size_t)b * ple_stride + (size_t)il * n_ple;
             gelu_inplace(gate, n_ple);
-            for (j = 0; j < n_ple; j++)
-                gate[j] *= e->ple[(size_t)il * n_ple + j];
-            matmul(ao, gate, base + mt[SLOT_PLE_PROJ].offset, hidden, n_ple, mt[SLOT_PLE_PROJ].dtype);
+            for (j = 0; j < n_ple; j++) gate[j] *= pe[j];
+        }
+        matmul_batch(e->pb2, e->pbg, base + mt[SLOT_PLE_PROJ].offset, hidden, n_ple, mt[SLOT_PLE_PROJ].dtype, B);
+        for (b = 0; b < B; b++) {
+            float* x = e->pb + (size_t)b * hidden;
+            float* ao = e->pb2 + (size_t)b * hidden;
             if (mt[SLOT_PLE_POST].size > 0)
                 rmsnorm(ao, ao, base + mt[SLOT_PLE_POST].offset, hidden, eps, mt[SLOT_PLE_POST].dtype);
             add_inplace(x, ao, hidden);
         }
+    }
+    for (b = 0; b < B; b++) {
+        float* x = e->pb + (size_t)b * hidden;
+        float ls = 1.0f;
+        uint32_t j;
         if (mt[SLOT_LAYER_SCALE].size > 0) {
             const uint8_t* lsptr = base + mt[SLOT_LAYER_SCALE].offset;
             if (mt[SLOT_LAYER_SCALE].dtype == DT_F32) memcpy(&ls, lsptr, 4);
