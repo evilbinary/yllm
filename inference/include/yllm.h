@@ -132,9 +132,12 @@ typedef struct Engine {
     /* gemma4 per-layer embedding: [n_blocks × n_ple] */
     float* ple;
     float* ple_work;
+    float* ple_batch; /* prefill: [pb_cap × n_blocks × n_ple], per-token PLE */
     uint32_t n_ple;
-    float* rope_ff;          /* gemma4 全局层 rope_freqs, F32 [n_rope_ff] */
+    float* rope_ff;          /* gemma4 全局层 inv_freq[n_rope_ff] (已乘 theta / factor) */
     uint32_t n_rope_ff;
+    float* rope_if_swa;      /* SWA 层 inv_freq */
+    uint32_t n_rope_if_swa;
     /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
     float* pb;      /* [PB_MAX × hidden]  输入/残差 */
     float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */

@@ -1217,6 +1217,24 @@ void rope_inplace_qwen_ff(float* v, uint32_t d, uint32_t pos, float theta, const
     }
 }
 
+void rope_inplace_neox_if(float* v, uint32_t d, uint32_t pos, const float* inv_freq)
+{
+    uint32_t half, j;
+    float pf;
+    if (pos == 0 || !inv_freq) return;
+    half = d / 2;
+    pf = (float)pos;
+    for (j = 0; j < half; j++) {
+        float ang = inv_freq[j] * pf;
+        float c = cosf(ang);
+        float s = sinf(ang);
+        float a = v[j];
+        float b = v[j + half];
+        v[j] = a * c - b * s;
+        v[j + half] = a * s + b * c;
+    }
+}
+
 /* qwen2 interleaved RoPE: v[i] 与 v[i+half] 配对(llama 是 v[2j]/v[2j+1]) */
 void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta)
 {

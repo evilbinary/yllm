@@ -64,6 +64,19 @@ static float gemma4_rope_theta(const LlfHeader* h, const LlfGemma4Ext* ext, uint
     return swa;
 }
 
+static void gemma4_fill_inv_freq(float* out, uint32_t n, uint32_t d, float theta, int fold_self)
+{
+    uint32_t j;
+    for (j = 0; j < n; j++) {
+        float f = powf(theta, -2.0f * (float)j / (float)d);
+        if (fold_self) {
+            float x = out[j];
+            if (x > 0.0f) f /= x;
+        }
+        out[j] = f;
+    }
+}
+
 static float llf_gemma4_attn_cap(const LlfHeader* h)
 {
     LlfGemma4Ext ext;
@@ -384,6 +397,8 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->ple_work = NULL;
     e->rope_ff = NULL;
     e->n_rope_ff = 0;
+    e->rope_if_swa = NULL;
+    e->n_rope_if_swa = 0;
     if (m->h.arch == ARCH_GEMMA4) {
         LlfGemma4Ext g4;
         llf_gemma4_ext(&m->h, &g4);
@@ -416,6 +431,36 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
                         e->n_rope_ff = 0;
                     }
                 }
+            }
+        }
+        {
+            float theta_g;
+            uint32_t hd_g = m->h.head_dim ? m->h.head_dim : 1;
+            uint32_t hd_s = 0, li, swa_il = 0;
+            memcpy(&theta_g, &m->h.rope_theta_bits, 4);
+            if (e->rope_ff && e->n_rope_ff > 0) {
+                uint32_t d = e->n_rope_ff * 2u;
+                gemma4_fill_inv_freq(e->rope_ff, e->n_rope_ff, d, theta_g, 1);
+            } else if (hd_g >= 2) {
+                e->n_rope_ff = hd_g / 2;
+                e->rope_ff = (float*)ymalloc((size_t)e->n_rope_ff * 4);
+                gemma4_fill_inv_freq(e->rope_ff, e->n_rope_ff, hd_g, theta_g, 0);
+            }
+            for (li = 1; li <= m->h.n_blocks; li++) {
+                const LlfTensorMeta* mt = &m->metas[m->base_idx[li]];
+                if (!gemma4_is_swa(&g4, li - 1)) continue;
+                if (mt[SLOT_Q].ndim >= 2 && hidden > 0 && m->h.n_heads) {
+                    uint32_t qd = mt[SLOT_Q].shape[0] * mt[SLOT_Q].shape[1] / hidden;
+                    hd_s = qd / m->h.n_heads;
+                }
+                swa_il = li - 1;
+                break;
+            }
+            if (hd_s >= 2) {
+                float ths = gemma4_rope_theta(&m->h, &g4, swa_il);
+                e->n_rope_if_swa = hd_s / 2;
+                e->rope_if_swa = (float*)ymalloc((size_t)e->n_rope_if_swa * 4);
+                gemma4_fill_inv_freq(e->rope_if_swa, e->n_rope_if_swa, hd_s, ths, 0);
             }
         }
     }
@@ -587,6 +632,7 @@ void engine_free(Engine* e)
     if (e->ple) free(e->ple);
     if (e->ple_work) free(e->ple_work);
     if (e->rope_ff) free(e->rope_ff);
+    if (e->rope_if_swa) free(e->rope_if_swa);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
     if (e->ws.res) free(e->ws.res);
@@ -1263,15 +1309,21 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
     uint16_t* vcache = kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh;
-    const float* rope_ff = NULL;
-    if (h->arch == ARCH_GEMMA4 && e->rope_ff && e->n_rope_ff >= hd / 2 &&
-        !gemma4_is_swa(&g4, il))
-        rope_ff = e->rope_ff;
+    const float* rope_if = NULL;
+    if (h->arch == ARCH_GEMMA4) {
+        int swa = gemma4_is_swa(&g4, il);
+        if (swa && e->rope_if_swa && e->n_rope_if_swa == hd / 2)
+            rope_if = e->rope_if_swa;
+        else if (!swa && e->rope_ff && e->n_rope_ff == hd / 2)
+            rope_if = e->rope_ff;
+    }
     for (hh = 0; hh < h->n_heads; hh++) {
         if (h->arch == ARCH_QWEN)
             rope_inplace_qwen(q + (size_t)hh * hd, hd, pos, theta);
+        else if (h->arch == ARCH_GEMMA4 && rope_if)
+            rope_inplace_neox_if(q + (size_t)hh * hd, hd, pos, rope_if);
         else if (h->arch == ARCH_GEMMA4)
-            rope_inplace_qwen_ff(q + (size_t)hh * hd, hd, pos, theta, rope_ff);
+            rope_inplace_qwen_ff(q + (size_t)hh * hd, hd, pos, theta, NULL);
         else
             rope_inplace(q + (size_t)hh * hd, hd, pos, theta);
     }
@@ -1279,8 +1331,10 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
         for (hh = 0; hh < h->n_kv_heads; hh++) {
             if (h->arch == ARCH_QWEN)
                 rope_inplace_qwen(k + (size_t)hh * hd, hd, pos, theta);
+            else if (h->arch == ARCH_GEMMA4 && rope_if)
+                rope_inplace_neox_if(k + (size_t)hh * hd, hd, pos, rope_if);
             else if (h->arch == ARCH_GEMMA4)
-                rope_inplace_qwen_ff(k + (size_t)hh * hd, hd, pos, theta, rope_ff);
+                rope_inplace_qwen_ff(k + (size_t)hh * hd, hd, pos, theta, NULL);
             else
                 rope_inplace(k + (size_t)hh * hd, hd, pos, theta);
         }
@@ -1298,7 +1352,8 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
         if (gemma4_is_swa(&g4, il) && g4.swa_window > 0 && pos + 1 > g4.swa_window)
             s0 = pos + 1 - g4.swa_window;
     }
-    #pragma omp parallel for schedule(static)
+    /* 短序列 8 头 fork/join 比计算还贵 */
+    #pragma omp parallel for schedule(static) if((int)(pos + 1) >= 64)
     for (hh = 0; hh < h->n_heads; hh++) {
         float* att_h = att + (size_t)hh * e->max_seq;
         uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
@@ -1902,9 +1957,57 @@ int engine_sample(Engine* e, uint32_t vocab, float temp, float top_p, uint64_t* 
     }
     float m = logits[0];
     for (i = 1; i < vocab; i++) if (logits[i] > m) m = logits[i];
+    /* gemma4 等 26 万词表: 全量 expf + qsort 每 token 能吃掉数十毫秒。
+     * 只对 max 附近 (~e^-20) 的候选做 softmax / nucleus, 分布几乎不变。 */
+    if (vocab >= 32768u) {
+        const float cut = 20.0f;
+        uint32_t n = 0, cap = 1024, j, keep;
+        float s = 0.0f, cum, r, acc;
+        ProbIdx* cand = (ProbIdx*)ymalloc((size_t)cap * sizeof(ProbIdx));
+        if (!cand) return -1;
+        for (i = 0; i < vocab; i++) {
+            float z = logits[i] - m;
+            if (z < -cut) continue;
+            if (n == cap) {
+                uint32_t ncap = cap * 2u;
+                ProbIdx* p = (ProbIdx*)realloc(cand, (size_t)ncap * sizeof(ProbIdx));
+                if (!p) { free(cand); return -1; }
+                cand = p;
+                cap = ncap;
+            }
+            cand[n].prob = expf(z);
+            cand[n].index = (int)i;
+            n++;
+        }
+        if (n == 0) { *out = 0; free(cand); return 0; }
+        for (j = 0; j < n; j++) s += cand[j].prob;
+        for (j = 0; j < n; j++) cand[j].prob /= s;
+        keep = n;
+        cum = 1.0f;
+        if (top_p < 1.0f && n > 1) {
+            qsort(cand, (size_t)n, sizeof(ProbIdx), cmp_prob_desc);
+            cum = 0.0f;
+            keep = n;
+            for (j = 0; j < n; j++) {
+                cum += cand[j].prob;
+                if (cum >= top_p) { keep = j + 1; break; }
+            }
+        }
+        r = ((float)(yrng(rng) >> 40) / 16777216.0f) * cum;
+        acc = 0.0f;
+        for (j = 0; j < keep; j++) {
+            acc += cand[j].prob;
+            if (r < acc) { *out = (uint32_t)cand[j].index; free(cand); return 0; }
+        }
+        *out = (uint32_t)cand[keep - 1].index;
+        free(cand);
+        return 0;
+    }
+    {
     float s = 0.0f;
     for (i = 0; i < vocab; i++) { logits[i] = expf(logits[i] - m); s += logits[i]; }
     for (i = 0; i < vocab; i++) logits[i] /= s;
+    }
     if (top_p < 1.0f) {
         ProbIdx* sorted = (ProbIdx*)ymalloc((size_t)vocab * sizeof(ProbIdx));
         uint32_t j;

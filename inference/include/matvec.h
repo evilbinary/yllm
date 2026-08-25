@@ -33,6 +33,8 @@ void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta);
 void rope_inplace_qwen(float* v, uint32_t d, uint32_t pos, float theta);
 /* NEOX RoPE, 可选 freq_factors[d/2]: ang = pos * theta^(-2j/d) / factor[j] (llama.cpp ggml_rope_ext) */
 void rope_inplace_qwen_ff(float* v, uint32_t d, uint32_t pos, float theta, const float* freq_factors);
+/* NEOX, 预计算 inv_freq[j] = theta^(-2j/d) [/ factor]; pos=0 为恒等 */
+void rope_inplace_neox_if(float* v, uint32_t d, uint32_t pos, const float* inv_freq);
 void rope_inplace_mrope(float* v, uint32_t head_dim, uint32_t n_dims, uint32_t pos, float theta);
 void l2norm_inplace(float* v, uint32_t n, float eps);
 void conv1d_update(float* state, const float* x, const uint8_t* w, uint32_t dim, uint32_t kwidth);
