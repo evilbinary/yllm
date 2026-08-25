@@ -12,8 +12,10 @@
 #ifndef YLLM_BATCH_PREFILL
 #define YLLM_BATCH_PREFILL 1
 #endif
-/* 批量收益拐点(实测: tinyllama/qwen3 均在 B≈16 后才优于顺序) */
+/* 批量收益拐点(实测: tinyllama/qwen3 均在 B≈16 后才优于顺序;
+ * gemma4 用层外×token 内循环吃权缓存, B≥2 即有收益) */
 #define PREFILL_BATCH_MIN 16
+#define PREFILL_BATCH_MIN_GEMMA4 2
 #include <math.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -295,6 +297,7 @@ static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos);
 static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
 static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos);
 static int fwd_block_qwen35_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
+static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
 #if YLLM_TENSOR_STREAM
 /* 页对齐的 lm_head 分块行数: 最大 C <= max_rows 使 C*行字节 % 4096 == 0。
  * 非量化(整行矩阵)返回 0 → 不分块整算。 */
@@ -395,6 +398,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->n_ple = 0;
     e->ple = NULL;
     e->ple_work = NULL;
+    e->ple_batch = NULL;
     e->rope_ff = NULL;
     e->n_rope_ff = 0;
     e->rope_if_swa = NULL;
@@ -477,6 +481,10 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         e->pbg = (float*)ycalloc((size_t)PB_MAX * inter, 4);
         e->pbu = (float*)ycalloc((size_t)PB_MAX * inter, 4);
         e->pba = (float*)ymalloc((size_t)PB_MAX * m->h.n_heads * e->max_seq * 4);
+        if (m->h.arch == ARCH_GEMMA4 && e->n_ple > 0) {
+            size_t psz = (size_t)e->n_ple * m->h.n_blocks;
+            e->ple_batch = (float*)ycalloc((size_t)PB_MAX * psz, 4);
+        }
     }
 
     /* qwen35 混合架构: 分配 GDN 状态/conv 延迟线/临时工作区 */
@@ -631,6 +639,7 @@ void engine_free(Engine* e)
     if (e->scratch) free(e->scratch);
     if (e->ple) free(e->ple);
     if (e->ple_work) free(e->ple_work);
+    if (e->ple_batch) free(e->ple_batch);
     if (e->rope_ff) free(e->rope_ff);
     if (e->rope_if_swa) free(e->rope_if_swa);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
@@ -817,26 +826,19 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
-    /* gemma4 PLE/共享 KV 依赖逐 token 路径 */
-    if (h->arch == ARCH_GEMMA4) {
-        int i;
-        for (i = 0; i < n; i++) {
-            if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
-                return -1;
-        }
-        return 0;
-    }
     uint32_t hidden = h->hidden;
     uint32_t hidx0 = m->base_idx[0];
     const LlfTensorMeta* tm = &m->metas[hidx0];
     const uint8_t* base = (const uint8_t*)ws->map.base;
     uint32_t B = e->pb_cap ? e->pb_cap : 16;
+    uint32_t batch_min = (h->arch == ARCH_GEMMA4) ? PREFILL_BATCH_MIN_GEMMA4 : PREFILL_BATCH_MIN;
+    size_t ple_stride = (e->n_ple > 0) ? (size_t)e->n_ple * h->n_blocks : 0;
     int off = 0;
     while (off < n) {
         uint32_t nb = (uint32_t)(n - off);
         if (nb > B) nb = B;
-        /* 小批(< 16)批量收益不抵反量化/调度开销, 回退顺序逐 token */
-        if (nb < PREFILL_BATCH_MIN) {
+        /* 小批批量收益不抵反量化/调度开销, 回退顺序逐 token */
+        if (nb < batch_min) {
             uint32_t i;
             for (i = 0; i < nb; i++)
                 engine_forward(e, tokens[off + i], (uint32_t)(start_pos + off + i));
@@ -856,13 +858,20 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
             }
         }
-        /* gemma4: 每个 embed 向量乘以 sqrt(hidden) */
+        /* gemma4: embed × sqrt(hidden), 再为每个 token 准备 PLE */
         if (h->arch == ARCH_GEMMA4) {
             float scale = sqrtf((float)hidden);
             uint32_t b2, j;
             for (b2 = 0; b2 < nb; b2++)
                 for (j = 0; j < hidden; j++)
                     e->pb[(size_t)b2 * hidden + j] *= scale;
+            if (e->ple && e->ple_batch && ple_stride > 0) {
+                for (b2 = 0; b2 < nb; b2++) {
+                    memcpy(e->x, e->pb + (size_t)b2 * hidden, (size_t)hidden * 4);
+                    gemma4_prepare_ple(e, tokens[off + b2]);
+                    memcpy(e->ple_batch + (size_t)b2 * ple_stride, e->ple, ple_stride * 4);
+                }
+            }
         }
         uint32_t i;
         uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
@@ -945,6 +954,22 @@ static uint32_t gdn_index_of(const LlModel* m, uint32_t layer)
         if (mt[SLOT_SSM_CONV1D].size > 0) cnt++;
     }
     return cnt ? cnt - 1 : 0;
+}
+
+/* gemma4 批量前向: 层外×token 内(吃权缓存); 每 token 恢复 PLE 后走单层前向 */
+static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
+{
+    uint32_t hidden = e->ws.model.h.hidden;
+    size_t ple_stride = (e->n_ple > 0) ? (size_t)e->n_ple * e->ws.model.h.n_blocks : 0;
+    uint32_t b;
+    for (b = 0; b < B; b++) {
+        memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
+        if (e->ple && e->ple_batch && ple_stride > 0)
+            memcpy(e->ple, e->ple_batch + (size_t)b * ple_stride, ple_stride * 4);
+        if (e->fwd_block(e, layer, pos_start + b) != 0) return -1;
+        memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
+    }
+    return 0;
 }
 
 /* qwen35 混合架构批量前向: GDN 状态在层内连续, 退化为逐 token */
@@ -1431,8 +1456,8 @@ void engine_attach_cpu_fwd(Engine* e)
         e->fwd_block_batch = fwd_block_qwen35_batch;
     } else if (e->arch == ARCH_GEMMA4) {
         e->fwd_block = forward_block_default;
-        /* gemma4 batch: 逐 token 调用单层前向(batch 路径尚不兼容 q_dim != hidden) */
-        e->fwd_block_batch = fwd_block_qwen35_batch;
+        /* 层外×token 内 + per-token PLE; 真 matmul_batch 待 q_dim/shared-KV 适配 */
+        e->fwd_block_batch = fwd_block_gemma4_batch;
     } else {
         e->fwd_block = forward_block_default;
         e->fwd_block_batch = forward_block_batch_default;
