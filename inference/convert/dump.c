@@ -1,7 +1,7 @@
-/* llfdump: LLF / GGUF / Safetensors 模型文件内容查看器
+/* dump: LLF / GGUF / Safetensors 模型文件查看 (yllm file <path>)
  *
- *   build/llfdump <file>         自动按魔数识别格式并 dump
- *   build/llfdump <file> -v      详细模式(逐张量)
+ *   yllm file <file>       自动按魔数识别并打印摘要
+ *   yllm file <file> -v    详细(逐张量)
  */
 #include "yllm.h"
 #include "llf.h"
@@ -41,6 +41,8 @@ static const char* llf_dtype_name_c(uint32_t dt)
     case DT_Q4K: return "q4_k";
     case DT_Q6K: return "q6_k";
     case DT_IQ4XS: return "iq4_xs";
+    case DT_Q5K: return "q5_k";
+    case DT_W4B64: return "w4_b64";
     default: return "?";
     }
 }
@@ -49,18 +51,20 @@ static const char* llf_arch_name_c(uint32_t a)
     switch (a) {
     case ARCH_LLAMA: return "llama";
     case ARCH_QWEN: return "qwen2";
+    case ARCH_QWEN35: return "qwen3.5";
+    case ARCH_GEMMA4: return "gemma4";
     default: return "?";
     }
 }
 
 static int dump_llf(const uint8_t* data, uint64_t fsize)
 {
-    if (fsize < LLF_HEADER_SIZE) { fprintf(stderr, "llfdump: file too small for LLF header\n"); return 1; }
+    if (fsize < LLF_HEADER_SIZE) { fprintf(stderr, "file: too small for LLF header\n"); return 1; }
     const LlfHeader* h = (const LlfHeader*)data;
     float eps, theta;
     memcpy(&eps, &h->norm_eps_bits, 4);
     memcpy(&theta, &h->rope_theta_bits, 4);
-    printf("== LLF 文件: %s ==\n", g_fname);
+    printf("== LLF: %s ==\n", g_fname);
     printf("magic=%.8s version=%u arch=%s\n", h->magic, h->version, llf_arch_name_c(h->arch));
     printf("blocks=%u vocab=%u hidden=%u heads=%u kv_heads=%u head_dim=%u\n",
            h->n_blocks, h->vocab, h->hidden, h->n_heads, h->n_kv_heads, h->head_dim);
@@ -70,11 +74,11 @@ static int dump_llf(const uint8_t* data, uint64_t fsize)
 
     uint32_t n_layers = h->n_blocks + 3;
     uint64_t dir_off = LLF_HEADER_SIZE;
-    uint64_t need = dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE +
-                    (uint64_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE;
-    if (need > fsize) { fprintf(stderr, "llfdump: LLF metadata section out of range\n"); return 1; }
+    uint64_t meta_bytes = (uint64_t)n_layers * BLOCK_TENSORS_MTP * LLF_TENSOR_META_SIZE;
+    uint64_t need = dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE + meta_bytes;
+    if (need > fsize) { fprintf(stderr, "file: LLF metadata section out of range\n"); return 1; }
     const LlfLayerDir* dir = (const LlfLayerDir*)(data + dir_off);
-    const LlfTensorMeta* metas = (const LlfTensorMeta*)(data + need - (uint64_t)n_layers * BLOCK_TENSORS * LLF_TENSOR_META_SIZE);
+    const LlfTensorMeta* metas = (const LlfTensorMeta*)(data + dir_off + (uint64_t)n_layers * LLF_DIR_ENTRY_SIZE);
     char b1[32], b2[32];
     uint32_t i;
     for (i = 0; i < n_layers; i++) {
@@ -83,15 +87,15 @@ static int dump_llf(const uint8_t* data, uint64_t fsize)
         char dtbuf[128];
         dtbuf[0] = 0;
         {
-            uint32_t dtc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-            uint32_t j;
-            for (j = 0; j < dir[i].n_tensors && j < BLOCK_TENSORS; j++) {
-                const LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + j];
+            uint32_t dtc[16];
+            uint32_t j, k;
+            memset(dtc, 0, sizeof(dtc));
+            for (j = 0; j < dir[i].n_tensors && j < BLOCK_TENSORS_MTP; j++) {
+                const LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS_MTP + j];
                 if (tm->size == 0 && tm->offset == 0 && tm->name[0] == 0) continue;
-                if (tm->dtype < 8) dtc[tm->dtype]++;
+                if (tm->dtype < 16) dtc[tm->dtype]++;
             }
-            uint32_t k;
-            for (k = 0; k < 8; k++) {
+            for (k = 0; k < 16; k++) {
                 if (dtc[k]) {
                     char tmp[32];
                     snprintf(tmp, sizeof(tmp), "%s%sx%u", dtbuf[0] ? " " : "", llf_dtype_name_c(k), dtc[k]);
@@ -113,8 +117,8 @@ static int dump_llf(const uint8_t* data, uint64_t fsize)
         }
         if (!g_verbose) continue;
         uint32_t j;
-        for (j = 0; j < BLOCK_TENSORS; j++) {
-            const LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS + j];
+        for (j = 0; j < BLOCK_TENSORS_MTP; j++) {
+            const LlfTensorMeta* tm = &metas[(size_t)i * BLOCK_TENSORS_MTP + j];
             if (tm->size == 0 && tm->offset == 0 && tm->name[0] == 0) continue;
             fmtsize(tm->size, b2, sizeof(b2));
             if (g_verbose > 1)
@@ -395,44 +399,54 @@ static int dump_safetensors(const uint8_t* data, uint64_t fsize)
     return 0;
 }
 
-int main(int argc, char** argv)
+int yllm_file_dump(const char* path, int verbose)
 {
-    if (argc < 2) {
-        fprintf(stderr, "usage: llfdump <file.llf|file.gguf|file.safetensors> [-v|-vv]\n");
-        return 1;
-    }
-    g_fname = NULL;
-    int i;
-    for (i = 1; i < argc; i++) {
-        if (argv[i][0] == '-') {
-            if (strcmp(argv[i], "-v") == 0) g_verbose = 1;
-            else if (strcmp(argv[i], "-vv") == 0) g_verbose = 2;
-            else { fprintf(stderr, "llfdump: unknown option %s\n", argv[i]); return 1; }
-        } else if (!g_fname) {
-            g_fname = argv[i];
-        }
-    }
-    if (!g_fname) {
-        fprintf(stderr, "usage: llfdump <file.llf|file.gguf|file.safetensors> [-v|-vv]\n");
-        return 1;
-    }
-
     WMap gmap;
-    if (wmap_open(g_fname, &gmap) != 0) { fprintf(stderr, "llfdump: cannot open %s\n", g_fname); return 1; }
-    uint8_t* data = (uint8_t*)gmap.base;
-    uint64_t fsize = gmap.size;
-
+    uint8_t* data;
+    uint64_t fsize;
     int rc;
-    if (fsize >= 8 && memcmp(data, "YLLMLLF1", 8) == 0) {
+    if (!path || !*path) {
+        fprintf(stderr, "usage: yllm file <path> [-v|-vv]\n");
+        return 1;
+    }
+    g_fname = path;
+    g_verbose = verbose;
+    if (wmap_open(path, &gmap) != 0) {
+        fprintf(stderr, "file: cannot open %s\n", path);
+        return 1;
+    }
+    data = (uint8_t*)gmap.base;
+    fsize = gmap.size;
+
+    if (fsize >= 8 && memcmp(data, YLLM_MAGIC, 8) == 0) {
         rc = dump_llf(data, fsize);
     } else if (fsize >= 4 && memcmp(data, "GGUF", 4) == 0) {
         rc = dump_gguf(data, fsize);
-    } else if (fsize >= 8) {
+    } else if (fsize >= 9 && data[8] == '{') {
         rc = dump_safetensors(data, fsize);
     } else {
-        fprintf(stderr, "llfdump: unknown format\n");
+        fprintf(stderr, "file: unknown format (%s)\n", path);
         rc = 1;
     }
     wmap_close(&gmap);
     return rc;
 }
+
+#ifdef LLFDUMP_MAIN
+int main(int argc, char** argv)
+{
+    const char* path = NULL;
+    int verbose = 0;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (argv[i][0] == '-') {
+            if (strcmp(argv[i], "-v") == 0) verbose = 1;
+            else if (strcmp(argv[i], "-vv") == 0) verbose = 2;
+            else { fprintf(stderr, "llfdump: unknown option %s\n", argv[i]); return 1; }
+        } else if (!path) {
+            path = argv[i];
+        }
+    }
+    return yllm_file_dump(path, verbose);
+}
+#endif

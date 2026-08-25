@@ -97,6 +97,8 @@ int convert_dummy(const char* out_path, uint32_t blocks, uint32_t hidden, uint32
 int convert_llf_repack(const char* in_path, const char* out_path, uint32_t out_dtype,
                        char* err, size_t errlen);
 int dummy_vocab(const char* out_path, uint32_t vocab, char* err, size_t errlen);
+/* 查看模型文件格式/内容: LLF / GGUF / Safetensors; verbose: 0/1/2 */
+int yllm_file_dump(const char* path, int verbose);
 
 /* ---- tokenizer ---- */
 int vocab_load(const char* path, Vocab* v);

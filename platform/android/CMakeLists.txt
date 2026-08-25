@@ -20,6 +20,7 @@ set(YLLM_CORE_SRCS
   ${INFER}/convert/convert.c
   ${INFER}/convert/convert_safetensors.c
   ${INFER}/convert/convert_gguf.c
+  ${INFER}/convert/dump.c
   ${INFER}/core/tokenizer.c
   ${INFER}/core/matvec.c
   ${INFER}/core/engine.c

@@ -29,11 +29,13 @@ HDR_PUBLIC := inference/include/yllm.h inference/include/llf.h inference/include
 SRC := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
 	inference/convert/convert.c inference/convert/convert_safetensors.c inference/convert/convert_gguf.c \
+	inference/convert/dump.c \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/core/cache.c inference/core/dist.c inference/device/device_cpu.c
 TEST_ENGINE_CORE := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
 	inference/convert/convert.c inference/convert/convert_safetensors.c inference/convert/convert_gguf.c \
+	inference/convert/dump.c \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/device/device_cpu.c
 
@@ -734,11 +736,11 @@ else
 	echo "serve processes stopped"
 endif
 
-# ---- 模型文件 dump 工具(LLF / GGUF / Safetensors) ----
+# ---- 模型文件 dump (也可: yllm file <path>; 独立二进制仍可用 make dump) ----
 DUMP_BIN := $(OBJDIR)/llfdump
 
-$(DUMP_BIN): tools/dump.c inference/core/llf.c inference/core/platform.c inference/include/llf.h inference/include/yllm.h | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
+$(DUMP_BIN): inference/convert/dump.c inference/core/llf.c inference/core/platform.c inference/include/llf.h inference/include/yllm.h | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -DLLFDUMP_MAIN -o $@ $^ $(LDFLAGS) $(LIBS)
 
 dump: $(DUMP_BIN)
 

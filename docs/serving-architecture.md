@@ -558,7 +558,7 @@ yllm/
 │   ├── tokenizer.c               # 分词
 │   ├── engine.c engine.h         # 推理引擎(engine_generate, 权重mmap/KV/前向)
 │   ├── dist.c  dist.h            # 分布式层流水线(rank间推理协作, 属推理执行)
-│   └── convert.c convert_gguf.c convert_safetensors.c  # 模型转换(离线)
+│   └── convert.c convert_gguf.c convert_safetensors.c dump.c  # 模型转换 / file 查看
 │
 ├── serve/                        # 服务层(网络/调度/生命周期, 依赖 inference)
 │   ├── protocol.h                # 帧协议统一定义(rank/server/router 共用)
@@ -569,10 +569,7 @@ yllm/
 │   ├── supervisor.c              # yllm supervisor: 管理节点(机器清单/rank池/租约/拉起/自愈/更新)
 │   └── sync.c                    # 文件分发(模型/二进制推送, 日志拉回)
 │
-├── tools/                        # 命令行工具(独立小工具)
-│   └── dump.c                    # llfdump
-│
-├── main.c                        # 入口: yllm <convert|check|gen|chat|rank|server|router|supervisor|dump>
+├── main.c                        # 入口: yllm <convert|file|check|gen|chat|rank|server|router|supervisor|...>
 │
 ├── docs/                         # 设计文档
 ├── tests/                        # 单测
@@ -585,7 +582,6 @@ yllm/
 | ------------- | ---------------------------------------------------- | ----------------------------------- | ------------------- |
 | **inference** | 模型文件/引擎/分词/内核/分布式推理/转换                               | 只依赖 C 标准库 + 自身                      | 网络服务、调度、生命周期、服务层协议帧 |
 | **serve**     | rank/server/router/supervisor/HTTP/sync + protocol.h | **依赖 inference**(调 engine/dist/llf) | 模型格式、推理算法           |
-| **tools**     | dump 等                                               | 依赖 inference                        | —                   |
 
 依赖方向单向:`main.c → serve → inference`。inference 不感知 serve 存在,可独立编译成库单独测试。
 

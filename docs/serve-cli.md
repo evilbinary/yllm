@@ -100,6 +100,10 @@ yllm convert model.llf --out model-w4.llf --dtype w4
 # 生成 dummy 模型
 yllm convert --out dummy.llf --blocks 2 --hidden 64 --heads 4 --vocab-size 32000
 
+# 查看模型文件格式(LLF/GGUF/safetensors)
+yllm file model.llf
+yllm file model.gguf -v
+
 # 校验 / 生成 / 聊天
 yllm check --model model.llf
 yllm gen   --model model.llf --vocab vocab.txt --prompt "Hello" --tokens 64

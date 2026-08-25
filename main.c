@@ -300,6 +300,32 @@ static int cmd_check(int argc, char** argv)
     return 0;
 }
 
+static int cmd_file(int argc, char** argv)
+{
+    const char* path = NULL;
+    int verbose = 0;
+    int i;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) verbose = 1;
+        else if (strcmp(argv[i], "-vv") == 0) verbose = 2;
+        else if (argv[i][0] == '-' && i + 1 < argc &&
+                 (strcmp(argv[i], "--model") == 0 || strcmp(argv[i], "-m") == 0)) {
+            path = argv[++i];
+        } else if (argv[i][0] != '-') {
+            if (path) {
+                fprintf(stderr, "usage: yllm file <path> [-v|-vv]\n");
+                return 1;
+            }
+            path = argv[i];
+        }
+    }
+    if (!path) {
+        fprintf(stderr, "usage: yllm file <path> [-v|-vv]\n");
+        return 1;
+    }
+    return yllm_file_dump(path, verbose);
+}
+
 /* 系统可用内存(MemAvailable, Linux): 内核估算的可分配内存, 含可回收页缓存 */
 static uint64_t mem_available_bytes(void)
 {
@@ -641,7 +667,7 @@ static int cmd_chat(int argc, char** argv)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: yllm <convert|check|gen|chat|rank|server|router|supervisor|hub|ctl|sync> [options]\n");
+        fprintf(stderr, "usage: yllm <convert|file|check|gen|chat|rank|server|router|supervisor|hub|ctl|sync> [options]\n");
         return 1;
     }
     /* serve 角色统一走 ServeConfig(解析一次, 分发) */
@@ -699,6 +725,7 @@ int main(int argc, char** argv)
     int rc;
     if (strcmp(argv[1], "sync") == 0) rc = cmd_sync(argc, argv);
     else if (strcmp(argv[1], "convert") == 0) rc = cmd_convert(argc, argv);
+    else if (strcmp(argv[1], "file") == 0) rc = cmd_file(argc, argv);
     else if (strcmp(argv[1], "check") == 0) rc = cmd_check(argc, argv);
     else if (strcmp(argv[1], "gen") == 0) rc = cmd_gen(argc, argv);
     else if (strcmp(argv[1], "chat") == 0) rc = cmd_chat(argc, argv);
