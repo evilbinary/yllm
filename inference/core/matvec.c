@@ -1679,24 +1679,18 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
         uint32_t hu = (out + 7u) / 8u;
         int8_t* xq;
         float* xs;
+        int32_t* xsum;
         uint32_t g, h, bl, j, oc_i;
         if (!w4b64_bytes(out, in) || B == 0 || B > 64) {
             memset(y, 0, (size_t)B * out * 4);
             return;
         }
-        xq = (int8_t*)ymalloc((size_t)B * in);
-        xs = (float*)ymalloc((size_t)B * nb64 * 4);
-        {
-            int32_t* xsum = (int32_t*)ymalloc((size_t)B * nb64 * 4);
-            if (!xq || !xs || !xsum) {
-                free(xq); free(xs); free(xsum);
-                for (g = 0; g < B; g++)
-                    matmul_w4b64(y + (size_t)g * out, x + (size_t)g * in, w, out, in);
-                return;
-            }
-            for (g = 0; g < B; g++)
-                w4_act_quant_block(x + (size_t)g * in, xq + (size_t)g * in, xs + (size_t)g * nb64,
-                                   xsum + (size_t)g * nb64, nb64);
+        xq = (int8_t*)alloca((size_t)B * in);
+        xs = (float*)alloca((size_t)B * nb64 * 4);
+        xsum = (int32_t*)alloca((size_t)B * nb64 * 4);
+        for (g = 0; g < B; g++)
+            w4_act_quant_block(x + (size_t)g * in, xq + (size_t)g * in, xs + (size_t)g * nb64,
+                               xsum + (size_t)g * nb64, nb64);
 #if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
             if (w4b64_prefer_i8mm()) {
                 const uint8x16_t mask15 = vdupq_n_u8(15);
@@ -1793,9 +1787,6 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                         }
                     }
                 }
-                free(xq);
-                free(xs);
-                free(xsum);
                 return;
             }
 #endif
@@ -1951,11 +1942,7 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                             y[(size_t)g * out + oc0 + oc_i] = acc[g][oc_i];
             }
 #endif
-            free(xq);
-            free(xs);
-            free(xsum);
-            return;
-        }
+        return;
     }
     if (dtype == DT_F32 || dtype == DT_F16) {
         /* f32/f16: 逐 token 点积 */
