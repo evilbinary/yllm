@@ -20,6 +20,12 @@ typedef struct {
 int conv_item_compare(const void* a, const void* b);
 uint64_t align_up(uint64_t v, uint64_t a);
 
+/* 按 out_dtype 重打包线性权重: DT_Q4K=保持Q4K(W4→Q4K 未实现); DT_W4B64=Q4K→W4。
+ * 新分配缓冲追加到 *owned / *n_owned(调用方 free); 成功返回重打包张量数, 失败 -1。 */
+int conv_items_apply_dtype(ConvItem* items, int n, uint32_t n_blocks, uint32_t out_dtype,
+                           uint8_t*** owned, int* n_owned, LlfHeader* h,
+                           char* err, size_t errlen);
+
 /* 布局 + 写 header/dir/metas + 数据复制,完成后调用方无需再写文件 */
 int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
              char* err, size_t errlen);

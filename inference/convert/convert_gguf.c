@@ -530,7 +530,7 @@ static int gg_slot_for(const char* name, int* layer)
 }
 
 int convert_gguf(const char* in_path, const char* out_path, const char* vocab_out,
-                 uint32_t max_seq, char* err, size_t errlen)
+                 uint32_t max_seq, uint32_t out_dtype, char* err, size_t errlen)
 {
     /* 省内存模式: 只读 mmap 整个 gguf, 不整读进堆(17GB 模型避免 OOM) */
     WMap gmap;
@@ -1023,55 +1023,24 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
         return -1;
     }
 
-#if YLLM_W4
-    /* 线性 Q4_K → W4B64(默认开启; make YLLM_W4=0 关闭) */
+    uint8_t** dtype_owned = NULL;
+    int dtype_n_owned = 0;
     {
-        int p2;
-        static const uint32_t k_w4_slots[] = {
-            SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_GATE, SLOT_UP, SLOT_DOWN,
-            SLOT_PLE_GATE, SLOT_PLE_PROJ, SLOT_PLE_MPROJ, SLOT_QGATE, SLOT_SSM_OUT
-        };
-        for (p2 = 0; p2 < n; p2++) {
-            ConvItem* it = &items[p2];
-            uint32_t out_r = 0, in_c = 0, s, ok = 0;
-            size_t rowb;
-            uint8_t* packed;
-            if (it->dtype != DT_Q4K || it->ndim != 2) continue;
-            if (it->layer == 0 && it->slot == 0) continue; /* embed 仍用 Q4_K */
-            if (it->layer == g.n_blocks + 1) continue;     /* final norm */
-            for (s = 0; s < sizeof(k_w4_slots) / sizeof(k_w4_slots[0]); s++) {
-                if (it->slot == k_w4_slots[s]) { ok = 1; break; }
-            }
-            if (!ok && !(it->layer == g.n_blocks + 2 && it->slot == 0)) continue;
-            {
-                uint32_t a = it->shape[0], b = it->shape[1];
-                uint64_t ra = (a % 256u == 0) ? (uint64_t)(a / 256) * 144 : 0;
-                uint64_t rb = (b % 256u == 0) ? (uint64_t)(b / 256) * 144 : 0;
-                if (ra && it->nbytes == (uint64_t)b * ra) { in_c = a; out_r = b; }
-                else if (rb && it->nbytes == (uint64_t)a * rb) { in_c = b; out_r = a; }
-                else continue;
-            }
-            if ((in_c % W4B64_BLK) != 0) continue;
-            rowb = w4b64_row_bytes(in_c);
-            packed = (uint8_t*)ymalloc((size_t)out_r * rowb);
-            if (!packed) continue;
-            if (w4b64_pack_mat_q4k(packed, it->src + it->src_off, out_r, in_c) != 0) {
-                free(packed);
-                continue;
-            }
-            if (qg_n < 32) qg_bufs[qg_n++] = packed;
-            else {
-                /* 缓冲表满: 仍替换但泄漏到进程结束(转换工具一次性) */
-            }
-            it->src = packed;
-            it->src_off = 0;
-            it->dtype = DT_W4B64;
-            it->nbytes = (uint64_t)out_r * rowb;
+        int n_remap = conv_items_apply_dtype(items, n, g.n_blocks, out_dtype,
+                                             &dtype_owned, &dtype_n_owned, &h, err, errlen);
+        if (n_remap < 0) {
+            for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
+            free(list.t); free(items); wmap_close(&gmap);
+            for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
+            for (i = 0; i < (uint32_t)dtype_n_owned; i++) free(dtype_owned[i]);
+            free(dtype_owned);
+            return -1;
         }
-        h.dtype = DT_W4B64;
-        printf("convert: YLLM_W4=1, linear Q4_K remapped to W4B64\n");
+        if (n_remap > 0)
+            printf("convert: remapped %d linear tensors to W4B64 (--dtype w4)\n", n_remap);
+        else if (out_dtype == DT_Q4K)
+            printf("convert: dtype q4km (Q4_K)\n");
     }
-#endif
 
     int rc = llf_emit(out_path, &h, items, n, err, errlen);
 
@@ -1140,6 +1109,8 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
     free(list.t);
     for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
+    for (i = 0; i < (uint32_t)dtype_n_owned; i++) free(dtype_owned[i]);
+    free(dtype_owned);
     free(items);
     wmap_close(&gmap);
     return rc;

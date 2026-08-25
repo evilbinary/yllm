@@ -19,11 +19,7 @@
 #define DT_IQ4XS 5
 #define DT_Q5K 6
 #define DT_W4B64 7   /* int4 block-64, 行主序; 见 matvec w4b64_* */
-
-/* 编译期: 1=gguf/llf 转换默认把线性 Q4_K 打成 W4B64; make YLLM_W4=0 关闭 */
-#ifndef YLLM_W4
-#define YLLM_W4 1
-#endif
+#define DT_KEEP 0xFFFFFFFFu  /* convert: 保持源 dtype, 不重打包 */
 
 #define W4B64_BLK 64
 #define W4B64_BLK_BYTES 34  /* f16 scale + 32B nibbles */

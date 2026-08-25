@@ -119,11 +119,9 @@ LIBS += $(PLATLIBS)
 # ---- 标量版本(默认) ----
 # 批量 prefill(编译期开关): 默认开启, 用 make BATCH_PREFILL=0 关闭
 BATCH_PREFILL ?= 1
-# W4B64: 转换默认把线性 Q4_K 打成 int4-b64; make YLLM_W4=0 关闭
-YLLM_W4 ?= 1
 # 会话数据包调试: make YLLM_SESS_DEBUG=1 开启(0 默认关闭)
 YLLM_SESS_DEBUG ?= 0
-CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) -DYLLM_W4=$(YLLM_W4) -DYLLM_SESS_DEBUG=$(YLLM_SESS_DEBUG) $(PLATDEF) $(OMPFLAG)
+CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) -DYLLM_SESS_DEBUG=$(YLLM_SESS_DEBUG) $(PLATDEF) $(OMPFLAG)
 ifeq ($(YLLM_CUDA),1)
   ifeq ($(YLLM_CUDA_HOST),1)
     CFLAGS_BASE += -DYLLM_CUDA=1 -DYLLM_CUDA_HOST=1

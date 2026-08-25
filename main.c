@@ -54,15 +54,44 @@ static int on_token_cb(uint32_t id, void* ctx)
     return 0;
 }
 
+static int parse_convert_dtype(const char* s, uint32_t* out)
+{
+    /* 规范名: q4km | w4 | fp16; 其余为别名 */
+    if (!s || !*s) { *out = DT_Q4K; return 0; }
+    if (strcmp(s, "q4km") == 0 || strcmp(s, "q4k") == 0 ||
+        strcmp(s, "q4_k") == 0 || strcmp(s, "q4_k_m") == 0) {
+        *out = DT_Q4K;
+        return 0;
+    }
+    if (strcmp(s, "w4") == 0 || strcmp(s, "w4b64") == 0) {
+        *out = DT_W4B64;
+        return 0;
+    }
+    if (strcmp(s, "fp16") == 0 || strcmp(s, "f16") == 0) {
+        *out = DT_F16;
+        return 0;
+    }
+    return -1;
+}
+
+static const char* dtype_name(uint32_t d)
+{
+    if (d == DT_Q4K) return "q4km";
+    if (d == DT_W4B64) return "w4";
+    if (d == DT_F16) return "fp16";
+    return "?";
+}
+
 static int cmd_convert(int argc, char** argv)
 {
     Arg a[16];
     int n = parse_args(argc, argv, 2, a, 16);
-    const char* in = opt(a, n, "safetensors", NULL);
+    const char* st = opt(a, n, "safetensors", NULL);
     const char* gguf = opt(a, n, "gguf", NULL);
-    const char* llf_w4 = opt(a, n, "llf-w4", NULL);
+    const char* llf_in = opt(a, n, "llf", NULL);
     const char* out = opt(a, n, "out", NULL);
     const char* vocab_out = opt(a, n, "vocab", NULL);
+    const char* dtype_s = opt(a, n, "dtype", "q4km"); /* 默认 Q4_K_M */
     uint32_t seq = (uint32_t)atoi(opt(a, n, "seq", "2048"));
     uint32_t blocks = (uint32_t)atoi(opt(a, n, "blocks", "2"));
     uint32_t hidden = (uint32_t)atoi(opt(a, n, "hidden", "64"));
@@ -70,32 +99,56 @@ static int cmd_convert(int argc, char** argv)
     uint32_t kv_heads = (uint32_t)atoi(opt(a, n, "kv-heads", "2"));
     uint32_t vocab = (uint32_t)atoi(opt(a, n, "vocab-size", "1024"));
     uint32_t seed = (uint32_t)atoi(opt(a, n, "seed", "42"));
+    uint32_t out_dtype = DT_Q4K;
+    int n_src = (gguf != NULL) + (llf_in != NULL) + (st != NULL);
     char err[1024];
 
-    if (llf_w4 && out) {
-        if (convert_llf_w4(llf_w4, out, err, sizeof(err)) != 0) {
+    if (parse_convert_dtype(dtype_s, &out_dtype) != 0) {
+        ylog_error("bad --dtype '%s' (want q4km|w4|fp16)", dtype_s);
+        return 1;
+    }
+    if (n_src > 1) {
+        ylog_error("specify only one of --gguf / --llf / --safetensors");
+        return 1;
+    }
+
+    if (llf_in && out) {
+        if (out_dtype != DT_Q4K && out_dtype != DT_W4B64) {
+            ylog_error("--llf rempack only supports --dtype q4km|w4");
+            return 1;
+        }
+        if (convert_llf_repack(llf_in, out, out_dtype, err, sizeof(err)) != 0) {
             ylog_error("convert failed: %s", err);
             return 1;
         }
-        printf("converted %s -> %s (W4B64 rempack)\n", llf_w4, out);
+        printf("converted %s -> %s (dtype %s)\n", llf_in, out, dtype_name(out_dtype));
         llf_check(out, err, sizeof(err));
         return 0;
     }
     if (gguf && out) {
-        if (convert_model("gguf", gguf, out, vocab_out, seq, err, sizeof(err)) != 0) {
+        if (out_dtype != DT_Q4K && out_dtype != DT_W4B64) {
+            ylog_error("--gguf only supports --dtype q4km|w4");
+            return 1;
+        }
+        if (convert_model("gguf", gguf, out, vocab_out, seq, out_dtype, err, sizeof(err)) != 0) {
             ylog_error("convert failed: %s", err);
             return 1;
         }
-        printf("converted %s -> %s (max_seq %u)\n", gguf, out, seq);
+        printf("converted %s -> %s (dtype %s, max_seq %u)\n",
+               gguf, out, dtype_name(out_dtype), seq);
         llf_check(out, err, sizeof(err));
         return 0;
     }
-    if (in && out) {
-        if (convert_model("safetensors", in, out, vocab_out, seq, err, sizeof(err)) != 0) {
+    if (st && out) {
+        if (out_dtype == DT_W4B64) {
+            ylog_error("--safetensors only writes fp16 (omit --dtype or use --dtype fp16)");
+            return 1;
+        }
+        if (convert_model("safetensors", st, out, vocab_out, seq, DT_F16, err, sizeof(err)) != 0) {
             ylog_error("convert failed: %s", err);
             return 1;
         }
-        printf("converted %s -> %s (dtype fp16, max_seq %u)\n", in, out, seq);
+        printf("converted %s -> %s (dtype fp16, max_seq %u)\n", st, out, seq);
         llf_check(out, err, sizeof(err));
         return 0;
     }
@@ -115,7 +168,7 @@ static int cmd_convert(int argc, char** argv)
         }
         return 0;
     }
-    if (vocab_out && !in) {
+    if (vocab_out && !st) {
         if (dummy_vocab(vocab_out, vocab, err, sizeof(err)) != 0) {
             ylog_error("vocab failed: %s", err);
             return 1;
@@ -123,10 +176,14 @@ static int cmd_convert(int argc, char** argv)
         printf("vocab written: %s\n", vocab_out);
         return 0;
     }
-    fprintf(stderr, "usage: yllm convert --safetensors <file> --out <file.llf> [--seq 2048]\n");
-    fprintf(stderr, "   or: yllm convert --gguf <file.gguf> --out <file.llf> [--vocab <file.txt>] [--seq 2048]\n");
-    fprintf(stderr, "   or: yllm convert --llf-w4 <file.llf> --out <file.llf>  (Q4_K linear -> W4B64)\n");
-    fprintf(stderr, "   or: yllm convert --out <file.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab-size V --seq S --seed N] [--vocab <file.txt>]\n");
+    fprintf(stderr,
+            "usage:\n"
+            "  yllm convert --gguf <in.gguf> --out <out.llf> [--dtype q4km|w4] [--vocab V] [--seq N]\n"
+            "  yllm convert --llf  <in.llf>  --out <out.llf> [--dtype q4km|w4]\n"
+            "  yllm convert --safetensors <in> --out <out.llf> [--seq N]\n"
+            "  yllm convert --out <dummy.llf> [--blocks B --hidden H --heads Hh --kv-heads K --vocab-size V --seq S]\n"
+            "\n"
+            "  --dtype  default q4km; w4 = linear Q4_K rempack to W4B64\n");
     return 1;
 }
 

@@ -88,12 +88,14 @@ void bf16_to_f16_buf(const uint16_t* src, uint16_t* dst, size_t n);
 /* ---- 转换层 ---- */
 int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_seq, char* err, size_t errlen);
 int convert_gguf(const char* in_path, const char* out_path, const char* vocab_out,
-                 uint32_t max_seq, char* err, size_t errlen);
+                 uint32_t max_seq, uint32_t out_dtype, char* err, size_t errlen);
 int convert_model(const char* fmt, const char* in, const char* out, const char* vocab_out,
-                  uint32_t max_seq, char* err, size_t errlen);
+                  uint32_t max_seq, uint32_t out_dtype, char* err, size_t errlen);
 int convert_dummy(const char* out_path, uint32_t blocks, uint32_t hidden, uint32_t heads,
                   uint32_t kv_heads, uint32_t vocab, uint32_t seq, uint32_t seed, char* err, size_t errlen);
-int convert_llf_w4(const char* in_path, const char* out_path, char* err, size_t errlen);
+/* LLF 重打包: out_dtype=DT_W4B64|DT_Q4K */
+int convert_llf_repack(const char* in_path, const char* out_path, uint32_t out_dtype,
+                       char* err, size_t errlen);
 int dummy_vocab(const char* out_path, uint32_t vocab, char* err, size_t errlen);
 
 /* ---- tokenizer ---- */

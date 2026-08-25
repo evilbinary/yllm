@@ -147,13 +147,14 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
 }
 
 int convert_model(const char* fmt, const char* in, const char* out, const char* vocab_out,
-                  uint32_t max_seq, char* err, size_t errlen)
+                  uint32_t max_seq, uint32_t out_dtype, char* err, size_t errlen)
 {
     if (strcmp(fmt, "safetensors") == 0) {
+        (void)out_dtype; /* 仅 fp16 */
         return convert_safetensors(in, out, max_seq, err, errlen);
     }
     if (strcmp(fmt, "gguf") == 0) {
-        return convert_gguf(in, out, vocab_out, max_seq, err, errlen);
+        return convert_gguf(in, out, vocab_out, max_seq, out_dtype, err, errlen);
     }
     snprintf(err, errlen, "unknown source format '%s'", fmt);
     return -1;
@@ -290,34 +291,107 @@ int dummy_vocab(const char* out_path, uint32_t vocab, char* err, size_t errlen)
     return 0;
 }
 
-static int llf_slot_w4_ok(uint32_t layer, uint32_t slot, uint32_t n_blocks)
+static int llf_slot_linear_ok(uint32_t layer, uint32_t slot, uint32_t n_blocks)
 {
     static const uint32_t k_slots[] = {
         SLOT_Q, SLOT_K, SLOT_V, SLOT_O, SLOT_GATE, SLOT_UP, SLOT_DOWN,
         SLOT_PLE_GATE, SLOT_PLE_PROJ, SLOT_PLE_MPROJ, SLOT_QGATE, SLOT_SSM_OUT
     };
     uint32_t s;
-    if (layer == 0 && slot == 0) return 0;
-    if (layer == n_blocks + 1) return 0;
-    if (layer == n_blocks + 2 && slot == 0) return 1;
+    if (layer == 0 && slot == 0) return 0;           /* embed */
+    if (layer == n_blocks + 1) return 0;              /* final norm */
+    if (layer == n_blocks + 2 && slot == 0) return 1; /* output */
     for (s = 0; s < sizeof(k_slots) / sizeof(k_slots[0]); s++)
         if (slot == k_slots[s]) return 1;
     return 0;
 }
 
-int convert_llf_w4(const char* in_path, const char* out_path, char* err, size_t errlen)
+static int owned_push(uint8_t*** owned, int* n_owned, uint8_t* p)
 {
-#if !YLLM_W4
-    snprintf(err, errlen, "built with YLLM_W4=0");
-    return -1;
-#else
+    uint8_t** no = (uint8_t**)realloc(*owned, (size_t)(*n_owned + 1) * sizeof(uint8_t*));
+    if (!no) return -1;
+    *owned = no;
+    (*owned)[(*n_owned)++] = p;
+    return 0;
+}
+
+int conv_items_apply_dtype(ConvItem* items, int n, uint32_t n_blocks, uint32_t out_dtype,
+                           uint8_t*** owned, int* n_owned, LlfHeader* h,
+                           char* err, size_t errlen)
+{
+    int p2, n_remap = 0;
+    if (out_dtype == DT_KEEP) return 0;
+    if (out_dtype == DT_Q4K) {
+        for (p2 = 0; p2 < n; p2++) {
+            ConvItem* it = &items[p2];
+            if (it->dtype == DT_W4B64 && it->ndim == 2 &&
+                llf_slot_linear_ok(it->layer, it->slot, n_blocks)) {
+                snprintf(err, errlen, "W4B64 -> Q4_K rempack not implemented (tensor %s)", it->name);
+                return -1;
+            }
+        }
+        if (h) h->dtype = DT_Q4K;
+        return 0;
+    }
+    if (out_dtype != DT_W4B64) {
+        snprintf(err, errlen, "unsupported --dtype (use q4km|w4)");
+        return -1;
+    }
+    for (p2 = 0; p2 < n; p2++) {
+        ConvItem* it = &items[p2];
+        uint32_t out_r = 0, in_c = 0;
+        size_t rowb;
+        uint8_t* packed;
+        if (it->dtype != DT_Q4K || it->ndim != 2) continue;
+        if (!llf_slot_linear_ok(it->layer, it->slot, n_blocks)) continue;
+        {
+            uint32_t a = it->shape[0], b = it->shape[1];
+            uint64_t ra = (a % 256u == 0) ? (uint64_t)(a / 256) * 144 : 0;
+            uint64_t rb = (b % 256u == 0) ? (uint64_t)(b / 256) * 144 : 0;
+            if (ra && it->nbytes == (uint64_t)b * ra) { in_c = a; out_r = b; }
+            else if (rb && it->nbytes == (uint64_t)a * rb) { in_c = b; out_r = a; }
+            else continue;
+        }
+        if ((in_c % W4B64_BLK) != 0) continue;
+        rowb = w4b64_row_bytes(in_c);
+        packed = (uint8_t*)ymalloc((size_t)out_r * rowb);
+        if (!packed) {
+            snprintf(err, errlen, "oom packing %s", it->name);
+            return -1;
+        }
+        if (w4b64_pack_mat_q4k(packed, it->src + it->src_off, out_r, in_c) != 0) {
+            free(packed);
+            continue;
+        }
+        if (owned_push(owned, n_owned, packed) != 0) {
+            free(packed);
+            snprintf(err, errlen, "oom");
+            return -1;
+        }
+        it->src = packed;
+        it->src_off = 0;
+        it->dtype = DT_W4B64;
+        it->nbytes = (uint64_t)out_r * rowb;
+        n_remap++;
+    }
+    if (n_remap > 0 && h) h->dtype = DT_W4B64;
+    return n_remap;
+}
+
+int convert_llf_repack(const char* in_path, const char* out_path, uint32_t out_dtype,
+                       char* err, size_t errlen)
+{
     WMap map;
     LlModel m;
     ConvItem* items = NULL;
-    int n = 0, cap = 0, li, ti, rc;
+    int n = 0, cap = 0, li, ti, rc, n_remap;
     uint8_t** owned = NULL;
     int n_owned = 0;
     LlfHeader h;
+    if (out_dtype != DT_Q4K && out_dtype != DT_W4B64) {
+        snprintf(err, errlen, "--llf rempack only supports --dtype q4km|w4");
+        return -1;
+    }
     if (wmap_open(in_path, &map) != 0) {
         snprintf(err, errlen, "cannot open %s", in_path);
         return -1;
@@ -336,19 +410,20 @@ int convert_llf_w4(const char* in_path, const char* out_path, char* err, size_t 
             if (n + 1 > cap) {
                 int ncap = cap ? cap * 2 : 64;
                 ConvItem* ni = (ConvItem*)realloc(items, (size_t)ncap * sizeof(ConvItem));
-                uint8_t** no = (uint8_t**)realloc(owned, (size_t)ncap * sizeof(uint8_t*));
-                if (!ni || !no) {
-                    free(ni); free(no); free(items); free(owned);
+                if (!ni) {
+                    free(items);
+                    for (ti = 0; ti < n_owned; ti++) free(owned[ti]);
+                    free(owned);
                     if (m.base_idx) free(m.base_idx);
                     wmap_close(&map);
                     snprintf(err, errlen, "oom");
                     return -1;
                 }
-                items = ni; owned = no; cap = ncap;
+                items = ni;
+                cap = ncap;
             }
             it = &items[n];
             memset(it, 0, sizeof(*it));
-            owned[n] = NULL;
             it->layer = (uint32_t)li;
             it->slot = (uint32_t)ti;
             it->dtype = tm->dtype;
@@ -358,40 +433,24 @@ int convert_llf_w4(const char* in_path, const char* out_path, char* err, size_t 
             snprintf(it->name, sizeof(it->name), "%s", tm->name);
             it->src = (const uint8_t*)map.base + m.dir[li].offset + tm->offset;
             it->src_off = 0;
-            if (tm->dtype == DT_Q4K && tm->ndim == 2 && llf_slot_w4_ok((uint32_t)li, (uint32_t)ti, m.h.n_blocks)) {
-                uint32_t a = tm->shape[0], b = tm->shape[1], out_r = 0, in_c = 0;
-                uint64_t ra = (a % 256u == 0) ? (uint64_t)(a / 256) * 144 : 0;
-                uint64_t rb = (b % 256u == 0) ? (uint64_t)(b / 256) * 144 : 0;
-                uint8_t* packed;
-                size_t rowb;
-                if (ra && tm->size == (uint64_t)b * ra) { in_c = a; out_r = b; }
-                else if (rb && tm->size == (uint64_t)a * rb) { in_c = b; out_r = a; }
-                if (out_r && in_c && (in_c % W4B64_BLK) == 0) {
-                    rowb = w4b64_row_bytes(in_c);
-                    packed = (uint8_t*)ymalloc((size_t)out_r * rowb);
-                    if (packed && w4b64_pack_mat_q4k(packed, it->src, out_r, in_c) == 0) {
-                        it->src = packed;
-                        it->dtype = DT_W4B64;
-                        it->nbytes = (uint64_t)out_r * rowb;
-                        owned[n] = packed;
-                        n_owned++;
-                    } else {
-                        free(packed);
-                    }
-                }
-            }
             n++;
         }
     }
-    if (n_owned > 0) h.dtype = DT_W4B64;
+    n_remap = conv_items_apply_dtype(items, n, m.h.n_blocks, out_dtype, &owned, &n_owned, &h, err, errlen);
+    if (n_remap < 0) {
+        for (ti = 0; ti < n_owned; ti++) free(owned[ti]);
+        free(owned); free(items);
+        if (m.base_idx) free(m.base_idx);
+        wmap_close(&map);
+        return -1;
+    }
     rc = llf_emit(out_path, &h, items, n, err, errlen);
-    for (ti = 0; ti < n; ti++) free(owned[ti]);
+    for (ti = 0; ti < n_owned; ti++) free(owned[ti]);
     free(owned);
     free(items);
     if (m.base_idx) free(m.base_idx);
     wmap_close(&map);
     if (rc == 0)
-        printf("convert_llf_w4: remapped %d tensors, wrote %s\n", n_owned, out_path);
+        printf("convert_llf_repack: remapped %d tensors, wrote %s\n", n_remap, out_path);
     return rc;
-#endif
 }
