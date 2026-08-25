@@ -830,7 +830,8 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
 }
 
 /* 按字节均衡切层: 各 rank 领一个块区间, 末 rank 略少分块(norm+head)。
- * 写入 engine 的层范围供 dist_gen 各段使用。 */
+ * gemma4 shared-KV: 尾部 shared 层与其 KV 来源层必须同属末 rank, 否则跨机
+ * 读到空 KV → 输出乱码。钉扎点 = kv_from-1(覆盖 SWA/非 SWA 两种来源层)。 */
 int dist_split_layers(Engine* e, int rank, int ranks)
 {
     uint32_t blocks = e->ws.model.h.n_blocks;
@@ -838,52 +839,80 @@ int dist_split_layers(Engine* e, int rank, int ranks)
         ylog_error("ranks %d > blocks %u", ranks, blocks);
         return -1;
     }
+    uint32_t pin_layer = 0; /* 0=无钉扎; else 末 rank 起始 layer(含 embed 编号) */
+    if (e->ws.model.h.arch == ARCH_GEMMA4) {
+        uint32_t n_shared = 0;
+        memcpy(&n_shared, e->ws.model.h.reserved + 16, sizeof(n_shared));
+        if (n_shared > 0 && n_shared < blocks) {
+            uint32_t kv_from = blocks - n_shared;
+            /* 共享层读 kv_layer=kv_from(非SWA) 或 kv_from-1(SWA); 末段从 kv_from-1 起 */
+            pin_layer = kv_from > 1 ? kv_from - 1 : 1;
+            ylog_info("dist_split_layers: gemma4 shared_kv=%u kv_from=%u pin_layer=%u",
+                      n_shared, kv_from, pin_layer);
+        }
+    }
+    /* 前段可分块数(dir 下标 1..split_hi); 有钉扎时末 rank 独占 [pin_layer, end) */
+    uint32_t split_hi = pin_layer > 0 ? (pin_layer - 1) : blocks;
+    int early_ranks = pin_layer > 0 ? (ranks > 1 ? ranks - 1 : 1) : ranks;
+    if (split_hi < 1) {
+        ylog_error("dist_split_layers: no blocks before pin_layer=%u", pin_layer);
+        return -1;
+    }
+    if ((uint32_t)early_ranks > split_hi) {
+        ylog_error("dist_split_layers: early ranks %d > blocks before pin %u", early_ranks, split_hi);
+        return -1;
+    }
     uint32_t b;
     uint64_t total = 0;
-    for (b = 1; b <= blocks; b++) total += e->ws.model.dir[b].size;
+    for (b = 1; b <= split_hi; b++) total += e->ws.model.dir[b].size;
     /* 可选按算力加权切层: YLLM_DIST_WEIGHTS="w0,w1,.." 为各 rank 相对权重
      * (总字节占比), 用于异构机器(如本机 6 核 + 远程 28 核)均衡负载。
-     * 缺省或参数不合法时退化为按字节均分。 */
+     * 缺省或参数不合法时退化为按字节均分。有钉扎时权重只作用于前 early_ranks 段。 */
     float wcum[64];
     int i, have_w = 0;
     const char* ws = getenv("YLLM_DIST_WEIGHTS");
-    if (ws && *ws && ranks <= 64) {
+    if (ws && *ws && early_ranks <= 64) {
         float w[64];
         int cnt = 0;
         const char* p = ws;
-        while (*p && cnt < ranks) {
+        while (*p && cnt < early_ranks) {
             w[cnt++] = (float)atof(p);
             while (*p && *p != ',') p++;
             if (*p == ',') p++;
         }
-        if (cnt == ranks) {
+        if (cnt == early_ranks) {
             float sum = 0;
-            for (i = 0; i < ranks; i++) sum += w[i];
+            for (i = 0; i < early_ranks; i++) sum += w[i];
             if (sum > 0) {
                 wcum[0] = w[0] / sum;
-                for (i = 1; i < ranks; i++) wcum[i] = wcum[i - 1] + w[i] / sum;
-                wcum[ranks - 1] = 1.0f;
+                for (i = 1; i < early_ranks; i++) wcum[i] = wcum[i - 1] + w[i] / sum;
+                wcum[early_ranks - 1] = 1.0f;
                 have_w = 1;
             }
         }
     }
     if (!have_w)
-        for (i = 0; i < ranks; i++) wcum[i] = (float)(i + 1) / (float)ranks;
-    uint32_t bs[64]; /* 每个 rank 的起始 block */
+        for (i = 0; i < early_ranks; i++) wcum[i] = (float)(i + 1) / (float)early_ranks;
+    uint32_t bs[64]; /* 每个 rank 的起始 layer(块层从 1 起) */
     bs[0] = 1;
     uint64_t acc = 0;
     int r = 1;
-    for (b = 1; b <= blocks && r < ranks; b++) {
+    for (b = 1; b <= split_hi && r < early_ranks; b++) {
         acc += e->ws.model.dir[b].size;
         if (acc >= (uint64_t)((double)total * wcum[r - 1])) { bs[r] = b + 1; r++; }
     }
-    while (r < ranks) { bs[r] = blocks + 1; r++; }
+    while (r < early_ranks) { bs[r] = split_hi + 1; r++; }
+    if (pin_layer > 0) {
+        bs[ranks - 1] = pin_layer;
+        for (r = early_ranks; r < ranks - 1; r++) bs[r] = pin_layer; /* 不应发生 */
+    }
     if (bs[ranks - 1] > blocks + 1) bs[ranks - 1] = blocks + 1;
     uint32_t begin = bs[rank];
     uint32_t end = rank + 1 < ranks ? bs[rank + 1] : e->ws.model.n_layers;
     if (rank == 0) begin = 0; /* rank0 含 embed */
     engine_set_layers(e, begin, end);
-    ylog_info("dist_split_layers: rank %d/%d layers [%u,%u) of %u (blocks %u)",
-              rank, ranks, begin, end, e->ws.model.n_layers, blocks);
+    ylog_info("dist_split_layers: rank %d/%d layers [%u,%u) of %u (blocks %u%s)",
+              rank, ranks, begin, end, e->ws.model.n_layers, blocks,
+              pin_layer ? ", gemma4-pin" : "");
     return 0;
 }

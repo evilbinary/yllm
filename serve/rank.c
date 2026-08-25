@@ -182,8 +182,8 @@ static int handle_stat(int fd, Rank* r)
     Engine* e = &r->engine;
     uint64_t uptime = r->uptime_s ? (uint64_t)(time(NULL) - (time_t)r->uptime_s) : 0;
     double kv_mb = (double)engine_resident(e) / 1048576.0;
-    send_line(fd, "OK inflight=0 kv_mb=%.1f prefix_hits=0 uptime_s=%llu", kv_mb,
-              (unsigned long long)uptime);
+    send_line(fd, "OK inflight=0 kv_mb=%.1f prefix_hits=0 uptime_s=%llu layers[%u,%u)",
+              kv_mb, (unsigned long long)uptime, e->layer_begin, e->layer_end);
     return 0;
 }
 

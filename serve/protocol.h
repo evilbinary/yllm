@@ -40,8 +40,8 @@
  * 存活/就绪探测(server 心跳、supervisor 自愈检测用) */
 #define PROTO_PING "PING"
 
-/* STAT\n → OK inflight=<n> kv_mb=<f> prefix_hits=<n> uptime_s=<t>\n
- * 状态上报(供 server 路由决策: 忙闲 / KV 占用) */
+/* STAT\n → OK inflight=<n> kv_mb=<f> prefix_hits=<n> uptime_s=<t> layers[<begin>,<end>)\n
+ * 状态上报(供 server 路由决策: 忙闲 / KV 占用; layers 为本段 PP 层区间) */
 #define PROTO_STAT "STAT"
 
 /* INFER <max_tokens> <n_bytes> seg=<r> segs=<n> peers=<ip1,ip2,...>\n<prompt bytes>
