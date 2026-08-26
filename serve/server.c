@@ -19,6 +19,9 @@
 #include "server.h"
 #include "../inference/include/yllm.h"
 #include "../inference/include/log.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -110,9 +113,29 @@ static void sess_file_name(char* out, size_t outsz, const char* key, const char*
     }
 }
 
+/* rank 拒绝续接(kv 缺失/pos 不对): 应全量或按新会话重建 */
+static int sess_err_needs_rebuild(const char* out)
+{
+    const char* m = proto_error_msg(out);
+    if (!m || !m[0]) return 0;
+    return strstr(m, "resume") != NULL
+        || strstr(m, "kv not cached") != NULL
+        || strstr(m, "session not cached") != NULL
+        || strstr(m, "session kv") != NULL;
+}
+
+static void server_unlink_rank0_kv(Server* s, const char* key)
+{
+    if (!s->cache_dir[0] || !key || !key[0]) return;
+    char path[512];
+    cache_path(path, sizeof(path), s->cache_dir, key, ".r0.kv");
+    if (remove(path) == 0)
+        ylog_info("server: stale kv removed %s", path);
+}
+
 /* 会话 INFER: INFER_SESS <max_tokens> <nbytes> key=<key>\n<新消息文本>
  * server 侧: 词表渲染新消息 → 会话缓存累积 → 只发增量 token 给 rank(key/resume)。
- * rank 状态未知(重启)时自动全量重发。 */
+ * rank 状态未知/kv 损坏时: 先全量重发; 仍失败则按新会话重渲染当前消息。 */
 static void forward_infer_sess(int client_fd, Server* s, const char* args)
 {
     int max_tokens = 0;
@@ -158,9 +181,9 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     else resume = sv->n;   /* 缓存含尾部 eos, 与 rank kv 逐 token 对齐 */
     uint32_t* tokens = (uint32_t*)ymalloc(65536 * 4);
     int n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, first ? 1 : 0);
-    free(msg);
     if (n <= 0) {
         free(tokens);
+        free(msg);
         pthread_mutex_unlock(&s->sess_lock);
         sock_send_line(client_fd, PROTO_ERROR " server: render failed");
         return;
@@ -168,19 +191,28 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     sess_commit(sv, tokens, (uint32_t)n);
     pthread_mutex_unlock(&s->sess_lock);
 
-    int sent = 0;
+    int sent = 0;    /* 1=已改走 resume=0 全量(或重置后的整段) */
+    int fresh = 0;   /* 1=历史已丢弃, 当前消息按新会话 */
     int retry = 0;
     for (;;) {
         int fd = sock_connect(s->leader_host, s->leader_port, 5);
-        if (fd < 0) { free(tokens); sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader"); return; }
+        if (fd < 0) {
+            free(tokens); free(msg);
+            sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader");
+            return;
+        }
         sock_set_timeout(fd, (int)(srv_timeout_ms() / 1000));
         uint32_t sr = sent ? 0 : resume;
         const uint32_t* st = tokens;
         uint32_t sn = (uint32_t)n;
-        if (sent) {   /* 全量重发: 用缓存 tokens */
+        if (sent) {   /* 全量重发 / 重置后: 用缓存 tokens */
             pthread_mutex_lock(&s->sess_lock);
             SessVal* rv = sess_get(&s->sess, key);
-            if (!rv) { pthread_mutex_unlock(&s->sess_lock); sock_close(fd); free(tokens); return; }
+            if (!rv) {
+                pthread_mutex_unlock(&s->sess_lock);
+                sock_close(fd); free(tokens); free(msg);
+                return;
+            }
             st = rv->tokens;
             sn = rv->n;
             pthread_mutex_unlock(&s->sess_lock);
@@ -200,7 +232,8 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
                  ftemp, ftop_p);
         frame_send(fd, PROTO_INFER, fargs);
         sock_send_n(fd, st, (size_t)sn * 4);
-        ylog_info("server: sess key=%s resume=%u +%u tokens -> rank", key, sr, sn);
+        ylog_info("server: sess key=%s resume=%u +%u tokens -> rank%s",
+                  key, sr, sn, fresh ? " (fresh)" : (sent ? " (full)" : ""));
 #if YLLM_SESS_DEBUG
         { /* 抓包: 完整帧行 + 全部增量 token(id + 文本) */
             char ids[1024], txt[1024];
@@ -228,12 +261,54 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         char out[SRV_MAX_LINE];
         int done = 0, rc = 0;
         while (!done) {
-int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
+            int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
             if (sel <= 0) { sock_send_line(client_fd, PROTO_ERROR " server: leader timeout"); rc = -1; break; }
             int nn = sock_recv_line(fd, out, sizeof(out));
             if (nn < 0) { rc = -1; break; }
             if (proto_is_error(out)) {
-                if (!sent) { sock_close(fd); sent = 1; rc = -2; break; }  /* 全量重试 */
+                int rebuild = sess_err_needs_rebuild(out);
+                if (rebuild && !sent) {
+                    /* kv/resume 坏: 清本地 r0.kv, 同会话全量重发 */
+                    sock_close(fd);
+                    server_unlink_rank0_kv(s, key);
+                    ylog_warn("server: sess %s kv/resume broken (%s), full resend",
+                              key, proto_error_msg(out));
+                    sent = 1;
+                    rc = -2;
+                    break;
+                }
+                if (rebuild && sent && !fresh) {
+                    /* 全量仍无法续接: 丢弃历史, 当前消息按新会话 */
+                    sock_close(fd);
+                    server_unlink_rank0_kv(s, key);
+                    pthread_mutex_lock(&s->sess_lock);
+                    SessVal* rv = sess_get(&s->sess, key);
+                    if (rv) {
+                        sess_truncate(rv, 0);
+                        n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, 1);
+                        if (n > 0) sess_commit(rv, tokens, (uint32_t)n);
+                        if (s->cache_dir[0]) {
+                            char path[512];
+                            sess_file_name(path + snprintf(path, sizeof(path), "%s/", s->cache_dir),
+                                           sizeof(path), key, ".sess");
+                            remove(path);
+                        }
+                    } else {
+                        n = -1;
+                    }
+                    pthread_mutex_unlock(&s->sess_lock);
+                    if (n <= 0) {
+                        free(tokens); free(msg);
+                        sock_send_line(client_fd, PROTO_ERROR " server: sess reset render failed");
+                        return;
+                    }
+                    ylog_warn("server: sess %s reset as new (%d tokens)", key, n);
+                    fresh = 1;
+                    resume = 0;
+                    rc = -2;
+                    break;
+                }
+                if (!sent) { sock_close(fd); sent = 1; rc = -2; break; }  /* 其它错误: 全量重试 */
                 if (retry < 5) {
                     /* 生成前失败(未产出 token): 退避重试, 等 worker 段就绪 */
                     sock_close(fd);
@@ -292,6 +367,7 @@ int sel = sock_wait_readable(fd, (int)srv_timeout_ms());
         sock_close(fd);
         if (rc == -2) continue;
         free(tokens);
+        free(msg);
         return;
     }
 }

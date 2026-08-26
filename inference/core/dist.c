@@ -759,8 +759,15 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                         ylog_warn("dist worker: full resend (pos %u -> 0)", sess->my_pos);
                         sess->my_pos = 0;
                     } else {
-                        ylog_warn("dist worker: sess pos mismatch (%u vs %u), need full resend",
+                        ylog_warn("dist worker: sess pos mismatch (%u vs %u), drop kv",
                                   spos, sess->my_pos);
+                        if (sess->cache_dir && skey[0]) {
+                            char path[512], ext[32];
+                            snprintf(ext, sizeof(ext), ".r%d.kv", rank);
+                            cache_path(path, sizeof(path), sess->cache_dir, skey, ext);
+                            remove(path);
+                        }
+                        sess->my_pos = 0;
                         rc = -1;
                     }
                 }

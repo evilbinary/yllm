@@ -252,6 +252,25 @@ static void cache_kv_path(char* out, size_t outsz, const char* dir, const char* 
         snprintf(out, outsz, "%s", base);
 }
 
+/* 每轮推理成功后落盘: 重启后续接依赖与 .sess 对齐的 .rN.kv */
+static void rank_save_sess_kv(Rank* r)
+{
+    if (!r->cache_dir[0] || !r->cache_key[0] || r->cache_pos == 0) return;
+    char path[512];
+    cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
+    if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
+        ylog_info("rank: session %s kv saved (%u tokens) -> %s", r->cache_key, r->cache_pos, path);
+}
+
+static void rank_unlink_sess_kv(Rank* r, const char* key)
+{
+    if (!r->cache_dir[0] || !key || !key[0]) return;
+    char path[512];
+    cache_kv_path(path, sizeof(path), r->cache_dir, key, r->dist_rank);
+    if (remove(path) == 0)
+        ylog_info("rank: stale kv removed %s", path);
+}
+
 static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tokens,
                                 uint32_t resume, const uint32_t* delta, uint32_t ndelta)
 {
@@ -287,7 +306,11 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
                 r->cache_pos = loaded;
                 ylog_info("rank: session %s kv restored (%u tokens) from %s", key, loaded, path);
             } else {
-                ylog_warn("rank: session %s kv load failed/pos mismatch (%u vs %u)", key, loaded, resume);
+                /* 坏/过期 kv: 删掉, 让 server 走 resume=0 全量重建(同会话, 无需用户新开) */
+                ylog_warn("rank: session %s kv load failed/pos mismatch (%u vs %u), drop kv",
+                          key, loaded, resume);
+                rank_unlink_sess_kv(r, key);
+                r->cache_pos = 0;
                 send_line(fd, PROTO_ERROR " session kv not cached on this rank, resume must be 0");
                 return 0;
             }
@@ -303,9 +326,14 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
             ylog_warn("rank: full resend (pos %u -> 0)", r->cache_pos);
             r->cache_pos = 0;
         } else {
-            ylog_warn("rank: resume mismatch: rank has %u, got %u", r->cache_pos, resume);
-            send_line(fd, PROTO_ERROR " resume mismatch: rank has %u, got %u", r->cache_pos, resume);
-            return 0;
+            {
+                uint32_t have = r->cache_pos;
+                ylog_warn("rank: resume mismatch: rank has %u, got %u; drop kv", have, resume);
+                rank_unlink_sess_kv(r, key);
+                r->cache_pos = 0;
+                send_line(fd, PROTO_ERROR " resume mismatch: rank has %u, got %u", have, resume);
+                return 0;
+            }
         }
     }
     if ((uint64_t)r->cache_pos + ndelta > r->engine.max_seq) {
@@ -345,6 +373,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
             send_line(fd, PROTO_ERROR " dist generate failed");
             return 0;
         }
+        rank_save_sess_kv(r);
         send_line(fd, PROTO_DONE " %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
         return 0;
     }
@@ -388,6 +417,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
            (double)ngen * 1000.0 / (double)(ynow_ms() - t_dec0 > 0 ? ynow_ms() - t_dec0 : 1));
     ylog_info("rank: session=%s generate ok (%u delta + %u gen tokens, %llu ms)",
               key, ndelta, ngen, (unsigned long long)(ynow_ms() - t0));
+    rank_save_sess_kv(r);
     pthread_mutex_unlock(&r->engine_lock);
     r->node.state = NODE_STATE_READY;
     r->node.inflight--;
