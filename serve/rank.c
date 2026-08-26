@@ -49,6 +49,15 @@
 #endif
 
 #define RANK_MAX_LINE 8192
+#define RANK_JOB_CAP 8
+#define RANK_WORK_MAX 8
+
+typedef struct {
+    int fd;
+    char args[256];
+    char* payload;
+    long nbytes;
+} RankJob;
 
 typedef struct {
     Engine engine;
@@ -60,23 +69,36 @@ typedef struct {
     /* 统一节点身份(心跳发 supervisor, 生命周期归 supervisor) */
     Node node;
     pthread_mutex_t engine_lock;   /* 引擎单实例: INFER 互斥, PING/STAT 不阻塞 */
-    volatile int quit;   /* QUIT 后主循环退出, 心跳线程一并退出 */
+    volatile int quit;   /* QUIT/DRAIN 后主循环退出, 心跳线程一并退出 */
     /* 组内协作(多段流水线) */
     int dist_rank;       /* 段号 0..ranks-1 */
     int dist_ranks;      /* 总段数(1 = 单机, 不走协作) */
     uint16_t pipe_base;  /* 协作口基址 = rank_port_base + RANK_PIPE_OFFSET */
     char addrs_csv[1024];/* 组内各段节点 IP(逗号分隔, 段号顺序) */
     int dist_fp16;
-    int serve_port;      /* 本段 serve 口(worker 段也监听, 供 PING/STAT/DRAIN 管理) */
+    int serve_port;      /* 本段 serve 口(IO 线程独占 listen) */
     /* 会话模式最小记账: 引擎 KV 归属的会话 + 已推进位置 */
     char cache_key[64];
     uint32_t cache_pos;
     char cache_dir[256];   /* KV 落盘目录(空 = 纯内存) */
+    /* IO 分发 + work 队列 */
+    int work_mode;         /* 0=serial 1=parallel */
+    int work_threads;      /* serial→1; parallel→N */
+    pthread_mutex_t q_mu;
+    pthread_cond_t q_cv;
+    RankJob jobs[RANK_JOB_CAP];
+    int q_head, q_tail, q_len;
+    int in_flight;
+    int draining;
+    int drain_fd;          /* DRAIN 连接: 排空后再回 OK; -1=无 */
+    volatile int io_stop;  /* IO 线程退出(排空完成或 listen 失败) */
+    double kv_mb_cache;    /* hb 刷新, STAT 免抢 engine */
 } Rank;
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
 
 static int rank_ensure_peers(Rank* r);
+static int rank_query_peers(Rank* r, char* out, size_t outsz);
 
 /* ---- socket 辅助(与 dist_worker 同款) ---- */
 
@@ -181,14 +203,26 @@ static int handle_stat(int fd, Rank* r)
 {
     Engine* e = &r->engine;
     uint64_t uptime = r->uptime_s ? (uint64_t)(time(NULL) - (time_t)r->uptime_s) : 0;
-    double kv_mb = (double)engine_resident(e) / 1048576.0;
     int omp_n = 1;
 #ifdef _OPENMP
     omp_n = omp_get_max_threads();
     if (omp_n < 1) omp_n = 1;
 #endif
-    send_line(fd, "OK inflight=0 kv_mb=%.1f prefix_hits=0 uptime_s=%llu layers[%u,%u) omp=%d",
-              kv_mb, (unsigned long long)uptime, e->layer_begin, e->layer_end, omp_n);
+    int inflight, queued, mode, nwork;
+    pthread_mutex_lock(&r->q_mu);
+    inflight = r->in_flight;
+    queued = r->q_len;
+    mode = r->work_mode;
+    nwork = r->work_threads;
+    pthread_mutex_unlock(&r->q_mu);
+    double kv_mb = r->kv_mb_cache;
+    if (kv_mb <= 0.0)
+        kv_mb = (double)engine_resident(e) / 1048576.0;
+    send_line(fd,
+              "OK inflight=%d queued=%d work=%s threads=%d kv_mb=%.1f prefix_hits=0 "
+              "uptime_s=%llu layers[%u,%u) omp=%d",
+              inflight, queued, mode ? "parallel" : "serial", nwork, kv_mb,
+              (unsigned long long)uptime, e->layer_begin, e->layer_end, omp_n);
     return 0;
 }
 
@@ -341,9 +375,6 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         return 0;
     }
 
-    r->node.state = NODE_STATE_BUSY;
-    r->node.inflight++;
-    node_heartbeat(&r->node);
     pthread_mutex_lock(&r->engine_lock);
 
     tim.n_prefill = ndelta;
@@ -365,9 +396,6 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         tim.decode_ms = ynow_ms() - t0;
         ylog_info("rank: sess %s pp done rc=%d (resume=%u end=%u, %d tokens)", key, rc2, resume, sess.pos, tc.n_tokens);
         pthread_mutex_unlock(&r->engine_lock);
-        r->node.state = NODE_STATE_READY;
-        r->node.inflight--;
-        node_heartbeat(&r->node);
         if (rc2 != 0) {
             /* 失败不得伪装成功: server 收到 ERR 后走全量重发/退避重试 */
             send_line(fd, PROTO_ERROR " dist generate failed");
@@ -419,20 +447,23 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
               key, ndelta, ngen, (unsigned long long)(ynow_ms() - t0));
     rank_save_sess_kv(r);
     pthread_mutex_unlock(&r->engine_lock);
-    r->node.state = NODE_STATE_READY;
-    r->node.inflight--;
-    node_heartbeat(&r->node);
 
     send_line(fd, PROTO_DONE " %u %u %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
     return 0;
 }
 
-static int handle_infer(int fd, Rank* r, char* args)
+static int handle_infer(int fd, Rank* r, char* args, char* pb, long nbytes)
 {
     int max_tokens = 0;
-    long nbytes = 0;
-    if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
+    long nbytes_arg = 0;
+    if (sscanf(args, "%d %ld", &max_tokens, &nbytes_arg) != 2 || max_tokens <= 0 || nbytes_arg < 0) {
         send_line(fd, PROTO_ERROR " bad INFER args");
+        free(pb);
+        return 0;
+    }
+    if (nbytes != nbytes_arg) {
+        send_line(fd, PROTO_ERROR " payload size mismatch");
+        free(pb);
         return 0;
     }
     /* 组内 rank 信息随请求携带(server 从 sv 租用获得): 按数据办事 */
@@ -451,11 +482,7 @@ static int handle_infer(int fd, Rank* r, char* args)
         if (tp) r->temp = (float)atof(tp);
         if (pp) r->top_p = (float)atof(pp);
     }
-    /* 每请求独立缓冲(线程化后不可共享 r->ids) */
-    char* pb = (char*)ymalloc((size_t)nbytes + 8192);
     if (!pb) { send_line(fd, PROTO_ERROR " oom"); return 0; }
-    if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) { free(pb); ylog_warn("rank: recv payload FAILED"); return -1; }
-    pb[nbytes] = '\0';
     /* 会话模式: 带 key= 字段时 payload 为增量 token 二进制(server 已渲染, 不 tokenize) */
     {
         const char* key = proto_get(args, "key");
@@ -501,10 +528,6 @@ static int handle_infer(int fd, Rank* r, char* args)
     tc.vocab = &r->vocab;
     tc.n_tokens = 0;
     tc.cache_frame = 0;   /* 普通 INFER: 发 T 帧(server/route 只认 "T " 前缀) */
-    /* 通知 supervisor: 本 rank 进入 BUSY(推理中), 供调度/状态展示 */
-    r->node.state = NODE_STATE_BUSY;
-    r->node.inflight++;
-    node_heartbeat(&r->node);
     /* 引擎单实例: 串行执行推理; 并发 INFER 在此排队, PING/STAT 无需等锁 */
     pthread_mutex_lock(&r->engine_lock);
     int rc;
@@ -522,10 +545,6 @@ static int handle_infer(int fd, Rank* r, char* args)
     ylog_info("rank: generate rc=%d (%d tokens, %llu ms)",
               rc, tc.n_tokens, (unsigned long long)(ynow_ms() - t0));
     pthread_mutex_unlock(&r->engine_lock);
-    /* 推理结束: 恢复 READY 并通知 supervisor */
-    r->node.state = NODE_STATE_READY;
-    r->node.inflight--;
-    node_heartbeat(&r->node);
     free(ids);
     uint64_t ms = ynow_ms() - t0;
     if (rc != 0) {
@@ -539,139 +558,291 @@ static int handle_infer(int fd, Rank* r, char* args)
     return 0;
 }
 
-static int handle_frame(int fd, Rank* r, const Frame* f)
+/* 刷新 supervisor 可见负载(须持 q_mu) */
+static void rank_refresh_load_locked(Rank* r)
 {
-    if (strcmp(f->cmd, PROTO_PING) == 0) return handle_ping(fd, r);
-    if (strcmp(f->cmd, PROTO_STAT) == 0) return handle_stat(fd, r);
-    if (strcmp(f->cmd, PROTO_INFER) == 0) return handle_infer(fd, r, (char*)f->args);
-    if (strcmp(f->cmd, PROTO_DRAIN) == 0 || strcmp(f->cmd, PROTO_QUIT) == 0) {
-        /* 先打断可能在跑的 worker 轮次, 再持锁落盘, 最后回 OK。
-         * 否则 ctl exit 在 OK 后强杀时 KV 可能还没写完 → 重启 sess/kv 不一致。 */
-        r->quit = 1;
-        pthread_mutex_lock(&r->engine_lock);
-        rank_save_sess_kv(r);
-        pthread_mutex_unlock(&r->engine_lock);
-        send_line(fd, "OK");
-        ylog_info("rank: %s ok (kv saved, exiting)", f->cmd);
-        return 2;
-    }
-    send_line(fd, PROTO_ERROR " unknown cmd");
-    return 0;
+    r->node.inflight = r->in_flight + r->q_len;
+    r->node.state = (r->node.inflight > 0) ? NODE_STATE_BUSY : NODE_STATE_READY;
 }
 
-/* ---- 主循环 ---- */
+static void rank_try_finish_drain(Rank* r)
+{
+    int dfd;
+    pthread_mutex_lock(&r->q_mu);
+    if (!r->draining || r->q_len > 0 || r->in_flight > 0 || r->drain_fd < 0) {
+        pthread_mutex_unlock(&r->q_mu);
+        return;
+    }
+    dfd = r->drain_fd;
+    r->drain_fd = -1;
+    pthread_mutex_unlock(&r->q_mu);
 
-/* 独立心跳线程: 生成长达数分钟也不被 supervisor 误判 DEAD */
+    pthread_mutex_lock(&r->engine_lock);
+    rank_save_sess_kv(r);
+    pthread_mutex_unlock(&r->engine_lock);
+    send_line(dfd, "OK");
+    ylog_info("rank: DRAIN/QUIT ok (kv saved, exiting)");
+    sock_close(dfd);
+    r->quit = 1;
+    r->io_stop = 1;
+}
+
+/* IO 线程: 独占 listen; PING/STAT 同步; INFER 入队; DRAIN 挂起至排空 */
+static void rank_io_thread(void* arg)
+{
+    Rank* r = (Rank*)arg;
+    int port = r->serve_port > 0 ? r->serve_port : 0;
+    int srv = sock_listen((uint16_t)port, 8);
+    if (srv < 0) {
+        ylog_error("rank: listen %d failed", port);
+        r->quit = 1;
+        r->io_stop = 1;
+        pthread_cond_broadcast(&r->q_cv);
+        return;
+    }
+    ylog_info("rank: io listen on %u (dispatch; work=%s threads=%d)",
+              port, r->work_mode ? "parallel" : "serial", r->work_threads);
+
+    while (!r->io_stop) {
+        rank_try_finish_drain(r);
+        if (r->io_stop) break;
+
+        int fd = sock_accept_with_timeout(srv, 200);
+        if (fd < 0) continue;
+
+        Frame f;
+        if (frame_recv(fd, &f) < 0) {
+            sock_close(fd);
+            continue;
+        }
+
+        if (strcmp(f.cmd, PROTO_PING) == 0) {
+            handle_ping(fd, r);
+            sock_close(fd);
+            continue;
+        }
+        if (strcmp(f.cmd, PROTO_STAT) == 0) {
+            handle_stat(fd, r);
+            sock_close(fd);
+            continue;
+        }
+        if (strcmp(f.cmd, PROTO_DRAIN) == 0 || strcmp(f.cmd, PROTO_QUIT) == 0) {
+            pthread_mutex_lock(&r->q_mu);
+            if (r->drain_fd >= 0) {
+                pthread_mutex_unlock(&r->q_mu);
+                send_line(fd, PROTO_ERROR " already draining");
+                sock_close(fd);
+                continue;
+            }
+            r->draining = 1;
+            r->quit = 1; /* 打断 pipe dist_gen; infer work 排空后退出 */
+            r->drain_fd = fd;
+            pthread_cond_broadcast(&r->q_cv);
+            pthread_mutex_unlock(&r->q_mu);
+            ylog_info("rank: %s accepted, waiting queue drain", f.cmd);
+            rank_try_finish_drain(r);
+            continue;
+        }
+        if (strcmp(f.cmd, PROTO_INFER) != 0) {
+            send_line(fd, PROTO_ERROR " unknown cmd");
+            sock_close(fd);
+            continue;
+        }
+
+        /* worker 段不接 INFER(数据面走 pipe) */
+        if (r->dist_rank > 0 && r->dist_ranks > 1) {
+            send_line(fd, PROTO_ERROR " worker rank does not accept INFER");
+            sock_close(fd);
+            continue;
+        }
+
+        int max_tokens = 0;
+        long nbytes = 0;
+        if (sscanf(f.args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
+            send_line(fd, PROTO_ERROR " bad INFER args");
+            sock_close(fd);
+            continue;
+        }
+
+        pthread_mutex_lock(&r->q_mu);
+        if (r->draining) {
+            pthread_mutex_unlock(&r->q_mu);
+            send_line(fd, PROTO_ERROR " draining");
+            sock_close(fd);
+            continue;
+        }
+        if (r->q_len >= RANK_JOB_CAP) {
+            pthread_mutex_unlock(&r->q_mu);
+            send_line(fd, PROTO_ERROR " queue full");
+            sock_close(fd);
+            continue;
+        }
+        pthread_mutex_unlock(&r->q_mu);
+
+        char* pb = (char*)ymalloc((size_t)nbytes + 1);
+        if (!pb) {
+            send_line(fd, PROTO_ERROR " oom");
+            sock_close(fd);
+            continue;
+        }
+        if (xrecv_rank(fd, pb, (size_t)nbytes) != 0) {
+            free(pb);
+            ylog_warn("rank: recv payload FAILED");
+            sock_close(fd);
+            continue;
+        }
+        pb[nbytes] = '\0';
+
+        pthread_mutex_lock(&r->q_mu);
+        if (r->draining || r->q_len >= RANK_JOB_CAP) {
+            pthread_mutex_unlock(&r->q_mu);
+            free(pb);
+            send_line(fd, PROTO_ERROR " queue full");
+            sock_close(fd);
+            continue;
+        }
+        RankJob* job = &r->jobs[r->q_tail];
+        job->fd = fd;
+        snprintf(job->args, sizeof(job->args), "%s", f.args);
+        job->payload = pb;
+        job->nbytes = nbytes;
+        r->q_tail = (r->q_tail + 1) % RANK_JOB_CAP;
+        r->q_len++;
+        rank_refresh_load_locked(r);
+        pthread_cond_signal(&r->q_cv);
+        pthread_mutex_unlock(&r->q_mu);
+        node_heartbeat(&r->node);
+        /* fd 所有权交给 work, IO 不再 close */
+    }
+
+    sock_close(srv);
+    pthread_cond_broadcast(&r->q_cv);
+}
+
+/* rank0 work: 从队列取 INFER, 在本线程回包(不打断 IO) */
+static void rank_infer_work_thread(void* arg)
+{
+    Rank* r = (Rank*)arg;
+    for (;;) {
+        RankJob job;
+        pthread_mutex_lock(&r->q_mu);
+        while (r->q_len == 0 && !r->quit)
+            pthread_cond_wait(&r->q_cv, &r->q_mu);
+        if (r->q_len == 0) {
+            pthread_mutex_unlock(&r->q_mu);
+            break;
+        }
+        job = r->jobs[r->q_head];
+        memset(&r->jobs[r->q_head], 0, sizeof(RankJob));
+        r->q_head = (r->q_head + 1) % RANK_JOB_CAP;
+        r->q_len--;
+        r->in_flight++;
+        rank_refresh_load_locked(r);
+        pthread_mutex_unlock(&r->q_mu);
+        node_heartbeat(&r->node);
+
+        handle_infer(job.fd, r, job.args, job.payload, job.nbytes);
+        sock_close(job.fd);
+
+        pthread_mutex_lock(&r->q_mu);
+        r->in_flight--;
+        rank_refresh_load_locked(r);
+        pthread_cond_broadcast(&r->q_cv);
+        pthread_mutex_unlock(&r->q_mu);
+        node_heartbeat(&r->node);
+        rank_try_finish_drain(r);
+    }
+}
+
+/* worker 段: pipe 上 dist_gen 循环(不吃 INFER 队列) */
+static void rank_pipe_work_thread(void* arg)
+{
+    Rank* r = (Rank*)arg;
+    while (!r->quit) {
+        if (rank_ensure_peers(r) != 0) break;
+        DistSess wsess;
+        memset(&wsess, 0, sizeof(wsess));
+        wsess.my_pos = r->cache_pos;
+        wsess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
+        wsess.quit = &r->quit;
+        pthread_mutex_lock(&r->engine_lock);
+        int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
+                          r->temp, r->top_p, r->seed,
+                          r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
+                          ynow_ms(), NULL, NULL, &wsess);
+        if (wsess.key[0])
+            snprintf(r->cache_key, sizeof(r->cache_key), "%s", wsess.key);
+        r->cache_pos = wsess.my_pos;
+        rank_save_sess_kv(r);
+        pthread_mutex_unlock(&r->engine_lock);
+        if (r->quit) break;
+        if (rc != 0) {
+            ylog_warn("rank: pipeline round failed (rc=%d), retry", rc);
+            sock_sleep_ms(1000);
+        }
+    }
+    pthread_mutex_lock(&r->engine_lock);
+    rank_save_sess_kv(r);
+    pthread_mutex_unlock(&r->engine_lock);
+    rank_try_finish_drain(r);
+}
+
+/* 独立心跳: 不碰 serve listen */
 static void rank_hb_thread(void* arg)
 {
     Rank* r = (Rank*)arg;
     while (!r->quit) {
         sock_sleep_ms(2000);
         if (r->node.sv_enabled) {
-            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
+            r->kv_mb_cache = (double)engine_resident(&r->engine) / 1048576.0;
+            r->node.kv_mb = r->kv_mb_cache;
             node_heartbeat(&r->node);
         }
     }
 }
 
-/* worker 段心跳线程: 管理口(PING/STAT/DRAIN/QUIT)优先 accept + 每 2s 心跳。
- * worker 主线程阻塞在 dist 等激活, 管理口由本线程承载, 进程内仍仅 2 线程。 */
-static void worker_hb_thread(void* arg)
-{
-    Rank* r = (Rank*)arg;
-    int srv = r->serve_port > 0 ? sock_listen((uint16_t)r->serve_port, 8) : -1;
-    if (srv >= 0)
-        ylog_info("rank: worker serve port %u up (管理口)", r->serve_port);
-    uint64_t last_hb = 0;
-    while (!r->quit) {
-        /* 管理口优先(短超时 accept, 保证 PING/STAT 及时响应) */
-        if (srv >= 0) {
-            int i;
-            for (i = 0; i < 4 && !r->quit; i++) {
-                int fd = sock_accept_with_timeout(srv, 200);
-                if (fd < 0) break;
-                Frame f;
-                if (frame_recv(fd, &f) >= 0)
-                    handle_frame(fd, r, &f);
-                sock_close(fd);
-            }
-        }
-        /* 心跳节律(2s, 用时间判断, 不被管理口阻塞) */
-        uint64_t now = (uint64_t)time(NULL);
-        if (r->node.sv_enabled && now - last_hb >= 2) {
-            last_hb = now;
-            r->node.kv_mb = (double)engine_resident(&r->engine) / 1048576.0;
-            node_heartbeat(&r->node);
-        }
-        if (!r->quit) sock_sleep_ms(50);
-    }
-    if (srv >= 0) sock_close(srv);
-}
-
-/* 主循环: worker 段(rank>0) = dist 等激活循环(serve 管理口由心跳线程承载);
- * rank0 = 监听 serve 口, 串行处理连接(推理是一个过程, 不并发)。
- * 进程内仅主线程 + 心跳线程。 */
+/* 主循环: io 独占 listen + hb + work(串行1/并行N 或 worker pipe) */
 static int run_rank(int port, Rank* r)
 {
     ws_init_rank();
+    r->serve_port = port;
+    r->drain_fd = -1;
+    pthread_mutex_init(&r->q_mu, NULL);
+    pthread_cond_init(&r->q_cv, NULL);
+
     void* hb = NULL;
+    void* io = NULL;
+    void* works[RANK_WORK_MAX];
+    int nw = 0;
+    int i;
+    memset(works, 0, sizeof(works));
+
     if (r->node.sv_enabled) ythread_create(&hb, rank_hb_thread, r);
+    ythread_create(&io, rank_io_thread, r);
 
     if (r->dist_rank > 0 && r->dist_ranks > 1) {
-        if (r->node.sv_enabled) ythread_create(&hb, worker_hb_thread, r);
-        while (!r->quit) {
-            if (rank_ensure_peers(r) != 0) break;
-            DistSess wsess;
-            memset(&wsess, 0, sizeof(wsess));
-            wsess.my_pos = r->cache_pos;
-            wsess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
-            wsess.quit = &r->quit;
-            pthread_mutex_lock(&r->engine_lock);
-            int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
-                              r->temp, r->top_p, r->seed,
-                              r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
-                              ynow_ms(), NULL, NULL, &wsess);
-            /* 会话状态回写(worker 各段缓存记账) */
-            if (wsess.key[0])
-                snprintf(r->cache_key, sizeof(r->cache_key), "%s", wsess.key);
-            r->cache_pos = wsess.my_pos;
-            /* 每会话结束即落盘(与 rank0 一致): 否则多会话时退出仅剩最后
-             * 活跃会话, 其余会话的 .rN.kv 丢失, 重启后 worker 无法续接 */
-            rank_save_sess_kv(r);
-            pthread_mutex_unlock(&r->engine_lock);
-            if (r->quit) break;
-            if (rc != 0) {
-                ylog_warn("rank: pipeline round failed (rc=%d), retry", rc);
-                sock_sleep_ms(1000);
-            }
-        }
-        /* 退出兜底落盘(DRAIN/QUIT 已保存过则再写一次无害) */
-        pthread_mutex_lock(&r->engine_lock);
-        rank_save_sess_kv(r);
-        pthread_mutex_unlock(&r->engine_lock);
+        ythread_create(&works[0], rank_pipe_work_thread, r);
+        nw = 1;
     } else {
-        int srv = sock_listen((uint16_t)port, 8);
-        if (srv < 0) { r->quit = 1; if (hb) ythread_join(&hb); return 1; }
-        ylog_info("rank: ready on port %u (model loaded, 常驻等待请求)", port);
-        while (!r->quit) {
-            int fd = sock_accept_with_timeout(srv, 500);
-            if (fd >= 0) {
-                ylog_info("rank: accept fd=%d", fd);
-                Frame f;
-                if (frame_recv(fd, &f) >= 0)
-                    handle_frame(fd, r, &f);
-                ylog_info("rank: closing conn fd=%d", fd);
-                sock_close(fd);
-            }
-        }
-        /* 退出兜底落盘(DRAIN/QUIT 路径已保存过则再写一次无害) */
-        pthread_mutex_lock(&r->engine_lock);
-        rank_save_sess_kv(r);
-        pthread_mutex_unlock(&r->engine_lock);
-        sock_close(srv);
+        nw = r->work_threads;
+        if (nw < 1) nw = 1;
+        if (nw > RANK_WORK_MAX) nw = RANK_WORK_MAX;
+        for (i = 0; i < nw; i++)
+            ythread_create(&works[i], rank_infer_work_thread, r);
     }
+
+    if (io) ythread_join(&io);
     r->quit = 1;
+    pthread_cond_broadcast(&r->q_cv);
+    for (i = 0; i < nw; i++)
+        if (works[i]) ythread_join(&works[i]);
     if (hb) ythread_join(&hb);
+
+    pthread_mutex_lock(&r->engine_lock);
+    rank_save_sess_kv(r);
+    pthread_mutex_unlock(&r->engine_lock);
+    pthread_cond_destroy(&r->q_cv);
+    pthread_mutex_destroy(&r->q_mu);
     return 0;
 }
 
@@ -811,6 +982,7 @@ int cmd_rank(ServeConfig* cfg)
     if (!cfg->model[0]) {
         fprintf(stderr, "usage: yllm rank --model <file.llf> [--vocab <file>] [--port N] "                        "[--supervisor <ip:port>] [--id <name>] "
                         "[--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] "
+                        "[--work-mode serial|parallel] [--work-threads N] "
                         "[--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] "
                         "[--gpu-layers N] [--gpu-stream 0|1] [--config <yaml>]\n");
         return 1;
@@ -907,10 +1079,15 @@ int cmd_rank(ServeConfig* cfg)
         }
         if (cfg->gpu_weights[0] &&
             cuda_weight_mode_parse(cfg->gpu_weights, &r.engine.cuda_wmode) != 0) {
-            ylog_error("rank: bad --gpu-weights %s (want auto|q4k|fp16)", cfg->gpu_weights);
-            engine_free(&r.engine);
-            vocab_free(&r.vocab);
-            return 1;
+            /* CPU 路径不依赖该字段; 避免错误配置/脏串直接把 rank 打死 */
+            if (dk != DEV_CPU) {
+                ylog_error("rank: bad --gpu-weights %s (want auto|q4k|fp16)", cfg->gpu_weights);
+                engine_free(&r.engine);
+                vocab_free(&r.vocab);
+                return 1;
+            }
+            ylog_warn("rank: ignore bad gpu-weights [%s], use auto (device=cpu)", cfg->gpu_weights);
+            r.engine.cuda_wmode = CUDA_W_AUTO;
         }
         if (cfg->gpu_layers >= 0)
             engine_set_gpu_layers(&r.engine, cfg->gpu_layers);
@@ -956,6 +1133,21 @@ int cmd_rank(ServeConfig* cfg)
     }
 
     pthread_mutex_init(&r.engine_lock, NULL);
+
+    /* work 消费模式: serial=1 线程; parallel=N 线程(引擎仍 engine_lock 互斥) */
+    r.work_mode = 0;
+    r.work_threads = 1;
+    if (cfg->work_mode[0] && strcmp(cfg->work_mode, "parallel") == 0) {
+        r.work_mode = 1;
+        r.work_threads = cfg->work_threads > 0 ? cfg->work_threads : 2;
+        if (r.work_threads > RANK_WORK_MAX) r.work_threads = RANK_WORK_MAX;
+    } else if (cfg->work_threads > 1) {
+        /* 未写 parallel 但给了 threads>1 → 视为 parallel */
+        r.work_mode = 1;
+        r.work_threads = cfg->work_threads > RANK_WORK_MAX ? RANK_WORK_MAX : cfg->work_threads;
+    }
+    ylog_info("rank: work-mode=%s work-threads=%d",
+              r.work_mode ? "parallel" : "serial", r.work_threads);
 
     int rc = run_rank(cfg->rank_port_base, &r);
 

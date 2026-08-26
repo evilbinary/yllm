@@ -77,6 +77,8 @@ typedef struct {
     int  rank_idx;                      /* --rank 段号(0..ranks-1) */
     char peers[CFG_STR_MAX];            /* 组内各段节点 IP(可选覆盖; 缺省自动发现) */
     int  dist_fp16;                     /* 段间激活 fp16 传输(带宽减半, 引入量化误差) */
+    char work_mode[16];                 /* serial | parallel(rank0 INFER 消费模式) */
+    int  work_threads;                  /* parallel 时 work 线程数; serial 强制 1 */
 
     /* 推理参数(rank 用) */
     float temp;
@@ -173,6 +175,8 @@ static inline void config_defaults(ServeConfig* c)
     c->gpu_layers = -1;
     c->gpu_stream = 0;
     c->api_log = 1;   /* 默认开启 */
+    snprintf(c->work_mode, sizeof(c->work_mode), "serial");
+    c->work_threads = 1;
 }
 
 /* 解析内存预算字符串 → MB 数。
@@ -259,6 +263,12 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->rank_idx = atoi(val);
     } else if (strcmp(key, "peers") == 0) {
         snprintf(c->peers, sizeof(c->peers), "%s", val);
+    } else if (strcmp(key, "work-mode") == 0 || strcmp(key, "work_mode") == 0) {
+        snprintf(c->work_mode, sizeof(c->work_mode), "%s", val);
+    } else if (strcmp(key, "work-threads") == 0 || strcmp(key, "work_threads") == 0) {
+        c->work_threads = atoi(val);
+        if (c->work_threads < 1) c->work_threads = 1;
+        if (c->work_threads > 8) c->work_threads = 8;
     } else if (strcmp(key, "dist-fp16") == 0) {
         c->dist_fp16 = atoi(val);
     } else if (strcmp(key, "temp") == 0) {
