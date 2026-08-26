@@ -57,6 +57,18 @@ void dist_close(Dist* d);
  *   master: key/pos = 会话续接点, 结束时 pos = 结束位置
  *   worker: my_pos = 本段已有 kv 位置(校验用), 结束时 my_pos = 本段 kv 已推进位置
  *   cache_dir = kv 落盘目录(空 = 纯内存) */
+/* 进行中作业进度(rank STAT: pos + prefill/decode tok/s) */
+typedef struct DistLive {
+    volatile uint32_t pos;
+    volatile uint32_t phase;     /* 0=idle 1=prefill 2=decode */
+    uint32_t start;              /* 本轮起始 pos */
+    uint32_t dec_start;          /* 进入 decode 时的 pos */
+    uint64_t t0;                 /* prefill 起点 ynow_ms */
+    uint64_t dec_t0;             /* decode 起点; 0=尚未 decode */
+    float pf_tps;                /* prefill 结束快照; 进行中由 STAT 现算 */
+    float dec_tps;               /* decode 结束快照; 进行中由 STAT 现算 */
+} DistLive;
+
 typedef struct {
     char key[64];
     uint32_t pos;
@@ -64,7 +76,7 @@ typedef struct {
     const char* cache_dir;
     char last_key[64];          /* worker: 上次处理的会话 key(变化时重置本段 kv 并恢复) */
     const volatile int* quit;   /* 非空时 worker 空闲等待周期检查(进程退出信号) */
-    uint32_t* live_pos;         /* 非空: 每批推进后写入, 供 STAT 读进行中 pos */
+    DistLive* live;             /* 非空: 每批推进后写入, 供 STAT 读 */
 } DistSess;
 
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,

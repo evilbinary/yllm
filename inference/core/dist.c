@@ -543,6 +543,24 @@ void dist_print_stats(Dist* d, const char* tag)
 /* 分布式层流水线推理: 各 rank 均执行, 按 rank 分 master / middle / last。
  * addrs: 每 rank 节点 IP(逗号分隔, 长度=ranks); NULL 退化为 loopback。
  * emit 为生成 token 的输出回调(跑在 rank0)。 */
+static void live_pos(DistSess* s, uint32_t pos)
+{
+    if (s && s->live) s->live->pos = pos;
+}
+
+static void live_enter_decode(DistSess* s, uint32_t pos, uint32_t pf_n, uint64_t t0)
+{
+    if (!s || !s->live) return;
+    uint64_t now = ynow_ms();
+    uint64_t ms = now > t0 && t0 ? now - t0 : 1;
+    if (pf_n)
+        s->live->pf_tps = (float)((double)pf_n * 1000.0 / (double)ms);
+    s->live->dec_t0 = now;
+    s->live->dec_start = pos;
+    s->live->phase = 2;
+    s->live->pos = pos;
+}
+
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
              int ntokens, float temp, float top_p, uint64_t seed,
              int rank, int ranks, int port_base, const char* addrs, int dist_fp16,
@@ -599,6 +617,8 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 rc = -1; snprintf(err, sizeof(err), "send sess failed");
             }
         }
+        float lse = 0.0f;
+        if (sess && sess->live) sess->live->phase = 1;
 #if YLLM_BATCH_PREFILL
         for (i = 0; i < nprompt && rc == 0; ) {
             int nb = nprompt - i;
@@ -618,7 +638,13 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             i += nb;
             if (sess) {
                 sess->pos = pos;
-                if (sess->live_pos) *sess->live_pos = pos;
+                live_pos(sess, pos);
+            }
+            /* 每批立刻收走 worker 的 logits, 避免 send_xb / send_logits 对向把 TCP 窗口堵死 */
+            if (i < nprompt) {
+                if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) {
+                    rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break;
+                }
             }
             if ((i & 63) == 0 || i == nprompt)
                 ylog_info("prefill: %d/%d pos=%u (%.1fs)", i, nprompt, pos,
@@ -633,22 +659,17 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             pos++;
             if (sess) {
                 sess->pos = pos;
-                if (sess->live_pos) *sess->live_pos = pos;
+                live_pos(sess, pos);
+            }
+            if (i + 1 < nprompt) {
+                if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) {
+                    rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break;
+                }
             }
         }
 #endif
-        float lse = 0.0f;
-        /* 丢弃 prompt 阶段多余的 logits(末 rank 每批回 1 个) */
-        {
-#if YLLM_BATCH_PREFILL
-            int nbatch = (nprompt + PP_XB - 1) / PP_XB;
-            for (i = 0; i < nbatch - 1; i++) {
-#else
-            for (i = 0; i < nprompt - 1; i++) {
-#endif
-                if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) { rc = -1; snprintf(err, sizeof(err), "recv logits prompt failed"); break; }
-            }
-        }
+        if (rc == 0)
+            live_enter_decode(sess, pos, (uint32_t)(nprompt > 0 ? nprompt : 0), t0);
         int dist_timing = getenv("YLLM_DISTTIMING") != NULL;
         uint64_t t_wait = 0, t_samp = 0, t_fwd = 0, t_snd = 0;
         for (i = 0; i < ntokens && rc == 0; i++) {
@@ -691,6 +712,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             pos++;
             ngen++;
             pend = 1;
+            live_pos(sess, pos);
             if (dist_stats && (ngen % STATS_EVERY) == 0) {
                 char tag[48];
                 snprintf(tag, sizeof(tag), "dist@tok%d", ngen);
@@ -785,6 +807,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             }
         }
         int w_timing = getenv("YLLM_DISTTIMING") != NULL;
+        int had_batch = 0, t1_n = 0;
         for (;;) {
             uint64_t w0 = ynow_ms();
             t = dist_recv_xb(&dist, &pos, tokbuf, xbuf, PP_XB, hidden, dist_fp16);
@@ -843,7 +866,24 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             }
             if (sess) {
                 sess->my_pos = pos + (uint32_t)t;   /* 本段 kv 已推进 */
-                if (sess->live_pos) *sess->live_pos = sess->my_pos;
+                live_pos(sess, sess->my_pos);
+                if (sess->live) {
+                    if (t > 1) {
+                        had_batch = 1;
+                        if (sess->live->phase != 2) sess->live->phase = 1;
+                    } else {
+                        t1_n++;
+                        if ((had_batch || t1_n > 1) && sess->live->phase != 2) {
+                            uint32_t pfn = sess->my_pos > sess->live->start
+                                ? sess->my_pos - sess->live->start - 1 : 0;
+                            uint64_t t0j = sess->live->t0 ? sess->live->t0 : t0;
+                            live_enter_decode(sess, pos, pfn, t0j);
+                            live_pos(sess, sess->my_pos);
+                        } else if (sess->live->phase != 2) {
+                            sess->live->phase = 1;
+                        }
+                    }
+                }
             }
             if (getenv("YLLM_DISTDBG"))
                 ylog_info("frame %d: %u tokens in %llu ms", nf, (uint32_t)t,

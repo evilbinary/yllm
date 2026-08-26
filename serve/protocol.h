@@ -41,8 +41,9 @@
 #define PROTO_PING "PING"
 
 /* STAT\n → OK inflight=<n> queued=<n> work=serial|parallel threads=<n> kv_mb=<f> prefix_hits=<n>
- *          uptime_s=<t> layers[<begin>,<end>) omp=<n> job_pos=<p> job_need=<n> job_ms=<ms>\n
- * 状态上报(供 server 路由决策: 忙闲 / KV 占用; job_* 为进行中 INFER 的 pos/prompt 数/已耗时) */
+ *          uptime_s=<t> layers[<begin>,<end>) omp=<n> job_pos=<p> job_need=<n> job_ms=<ms>
+ *          job_phase=prefill|decode|- job_pf_tps=<f> job_dec_tps=<f>\n
+ * 状态上报(供 server 路由决策: 忙闲 / KV 占用; job_* 为进行中 INFER 的 pos/prompt 数/已耗时/tok/s) */
 #define PROTO_STAT "STAT"
 
 /* INFER <max_tokens> <n_bytes> seg=<r> segs=<n> peers=<ip1,ip2,...>\n<prompt bytes>
