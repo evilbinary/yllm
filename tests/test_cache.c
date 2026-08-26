@@ -38,6 +38,11 @@ int main(void)
     CHECK(sess_prefix(v, p2, 7) == 5, "prefix full");
     static const uint32_t p3[] = {0, 2, 3};
     CHECK(sess_prefix(v, p3, 3) == 0, "prefix 0");
+    {
+        uint32_t plen = 0;
+        SessVal* hit = sess_find_prefix(&c, p1, 5, -1, &plen);
+        CHECK(hit == v && plen == 3, "find_prefix lcp 3 (partial stored)");
+    }
 
     /* 截断 */
     sess_truncate(v, 3);

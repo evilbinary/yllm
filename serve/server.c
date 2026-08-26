@@ -197,27 +197,7 @@ static int parse_sess_msgs(char* msg, size_t nbytes,
     return n;
 }
 
-static const char* last_user_content(char roles[][16], const char** contents, int n)
-{
-    int i;
-    for (i = n - 1; i >= 0; i--)
-        if (strcmp(roles[i], "user") == 0) return contents[i] ? contents[i] : "";
-    return (n > 0 && contents[n - 1]) ? contents[n - 1] : "";
-}
-
-static int sess_tokens_prefix_of(const SessVal* sv, const uint32_t* req, int nreq, int eos)
-{
-    if (!sv || !req || nreq <= 0 || sv->n == 0 || !sv->tokens) return 0;
-    uint32_t vn = sv->n;
-    if (eos >= 0 && vn > 0 && sv->tokens[vn - 1] == (uint32_t)eos) vn--;
-    if (vn == 0 || vn > (uint32_t)nreq) return 0;
-    uint32_t i;
-    for (i = 0; i < vn; i++)
-        if (sv->tokens[i] != req[i]) return 0;
-    return 1;
-}
-
-static void sess_try_disk(Server* s, SessVal* sv, const char* key, int* first, uint32_t* resume)
+static void sess_try_disk(Server* s, SessVal* sv, const char* key, uint32_t* resume)
 {
     if (!s->cache_dir[0] || !sv) return;
     char path[512];
@@ -225,7 +205,6 @@ static void sess_try_disk(Server* s, SessVal* sv, const char* key, int* first, u
     if (npre < 0 || npre >= (int)sizeof(path)) return;
     sess_file_name(path + npre, sizeof(path) - (size_t)npre, key, ".sess");
     if (sess_load(sv, path) == 0) {
-        *first = 0;
         *resume = sv->n;
         ylog_info("server: session %s restored from %s (%u tokens)", key, path, sv->n);
     }
@@ -279,46 +258,41 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     pthread_mutex_lock(&s->sess_lock);
     SessVal* sv = NULL;
     uint32_t resume = 0;
-    int first = 0;
     int eos = s->sess_vocab.eos;
+    uint32_t lcp = 0;
     if (has_key) {
         sv = sess_get(&s->sess, key);
         if (!sv) {
             sv = sess_put(&s->sess, key);
-            first = 1;
-            sess_try_disk(s, sv, key, &first, &resume);
-        } else {
-            resume = sv->n;
+            sess_try_disk(s, sv, key, &resume);
         }
-        if (sv && sv->n > 0 && nfull > 0 && !sess_tokens_prefix_of(sv, full_ids, nfull, eos)) {
-            ylog_info("server: sess %s history changed, reset", key);
-            sess_truncate(sv, 0);
-            first = 1;
-            resume = 0;
+        if (sv && nfull > 0) {
+            lcp = sess_lcp(sv, full_ids, (uint32_t)nfull, eos);
+            if (lcp < sv->n) sess_truncate(sv, lcp);
+            resume = lcp;
+            ylog_info("server: sess key=%s lcp=%u cached=%u req=%d", key, lcp, sv->n, nfull);
         }
     } else if (nfull > 0) {
-        sv = sess_find_prefix(&s->sess, full_ids, (uint32_t)nfull, eos);
-        if (sv) {
+        sv = sess_find_prefix(&s->sess, full_ids, (uint32_t)nfull, eos, &lcp);
+        if (sv && lcp > 0) {
             snprintf(key, sizeof(key), "%s", sv->key);
-            resume = sv->n;
-            first = 0;
-            ylog_info("server: sess prefix-hit key=%s n=%u req=%d", key, sv->n, nfull);
+            if (lcp < sv->n) sess_truncate(sv, lcp);
+            resume = lcp;
+            ylog_info("server: sess lcp-hit key=%s lcp=%u req=%d", key, lcp, nfull);
         } else {
             snprintf(key, sizeof(key), "a:%llx:%x",
                      (unsigned long long)ynow_ms(),
                      (unsigned)nfull ^ (nfull > 0 ? full_ids[0] : 0));
             sv = sess_put(&s->sess, key);
-            first = 1;
             resume = 0;
-            sess_try_disk(s, sv, key, &first, &resume);
+            sess_try_disk(s, sv, key, &resume);
         }
     } else {
         if (!key[0]) snprintf(key, sizeof(key), "a:%llx", (unsigned long long)ynow_ms());
         sv = sess_get(&s->sess, key);
         if (!sv) {
             sv = sess_put(&s->sess, key);
-            first = 1;
-            sess_try_disk(s, sv, key, &first, &resume);
+            sess_try_disk(s, sv, key, &resume);
         } else {
             resume = sv->n;
         }
@@ -330,28 +304,16 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         sock_send_line(client_fd, PROTO_ERROR " server: render failed");
         return;
     }
-    if (first || resume == 0) {
-        memcpy(tokens, full_ids, (size_t)nfull * 4);
-        n = nfull;
-        resume = 0;
-    } else if (is_msgs) {
-        n = vocab_chat_ids(&s->sess_vocab, last_user_content(roles, contents, n_msgs),
-                           tokens, 65536, 0);
-        if (n <= 0) {
-            memcpy(tokens, full_ids, (size_t)nfull * 4);
-            n = nfull;
-            resume = 0;
-            first = 1;
-        }
-    } else {
-        n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, 0);
-        if (n <= 0) {
-            free(full_ids); free(tokens); free(store); free(msg);
-            pthread_mutex_unlock(&s->sess_lock);
-            pthread_mutex_unlock(&s->infer_lock);
-            sock_send_line(client_fd, PROTO_ERROR " server: render failed");
-            return;
-        }
+    /* 增量 = 整段渲染去掉已命中前缀, 不再只发最后一句 user */
+    if (resume > (uint32_t)nfull) resume = 0;
+    memcpy(tokens, full_ids + resume, (size_t)(nfull - (int)resume) * 4);
+    n = nfull - (int)resume;
+    if (n <= 0 && resume == 0) {
+        free(full_ids); free(tokens); free(store); free(msg);
+        pthread_mutex_unlock(&s->sess_lock);
+        pthread_mutex_unlock(&s->infer_lock);
+        sock_send_line(client_fd, PROTO_ERROR " server: render failed");
+        return;
     }
     /* 成功 DONE 前不 commit: 超时重试不得把同一条用户消息反复追加进会话 */
     pthread_mutex_unlock(&s->sess_lock);

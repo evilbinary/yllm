@@ -803,6 +803,9 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                         /* 全量重发: 本段 kv 由 X 流从 0 覆盖 */
                         ylog_warn("dist worker: full resend (pos %u -> 0)", sess->my_pos);
                         sess->my_pos = 0;
+                    } else if (spos < sess->my_pos) {
+                        ylog_info("dist worker: truncate kv %u -> %u", sess->my_pos, spos);
+                        sess->my_pos = spos;
                     } else {
                         ylog_warn("dist worker: sess pos mismatch (%u vs %u), drop kv",
                                   spos, sess->my_pos);

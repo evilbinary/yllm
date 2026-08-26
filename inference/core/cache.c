@@ -72,28 +72,38 @@ uint32_t sess_prefix(const SessVal* v, const uint32_t* req, uint32_t n)
     return i;
 }
 
-/* 找「已缓存历史是本请求前缀」的最长会话(忽略尾部 eos)。无则 NULL。 */
-SessVal* sess_find_prefix(SessCache* c, const uint32_t* req, uint32_t n, int eos)
+uint32_t sess_lcp(const SessVal* v, const uint32_t* req, uint32_t n, int eos)
+{
+    if (!v || !req || !v->tokens) return 0;
+    uint32_t vn = v->n;
+    if (eos >= 0 && vn > 0 && v->tokens[vn - 1] == (uint32_t)eos) vn--;
+    uint32_t m = vn < n ? vn : n;
+    uint32_t i;
+    for (i = 0; i < m; i++)
+        if (v->tokens[i] != req[i]) break;
+    return i;
+}
+
+/* 找与本请求公共前缀最长的会话(忽略尾 eos)。无则 NULL。 */
+SessVal* sess_find_prefix(SessCache* c, const uint32_t* req, uint32_t n, int eos, uint32_t* plen)
 {
     SessVal* best = NULL;
     uint32_t best_p = 0;
     int i;
+    if (plen) *plen = 0;
     if (!c || !req || n == 0) return NULL;
     for (i = 0; i < c->n; i++) {
         SessVal* v = &c->v[i];
         if (!v->key[0] || v->n == 0 || !v->tokens) continue;
-        uint32_t vn = v->n;
-        if (eos >= 0 && vn > 0 && v->tokens[vn - 1] == (uint32_t)eos) vn--;
-        if (vn < 1 || vn > n) continue;
-        uint32_t p = 0;
-        while (p < vn && v->tokens[p] == req[p]) p++;
-        if (p == vn && p > best_p) {
+        uint32_t p = sess_lcp(v, req, n, eos);
+        if (p > best_p) {
             best = v;
             best_p = p;
         }
     }
     if (best) best->last_use = ynow_ms();
-    return best;
+    if (plen) *plen = best_p;
+    return best_p > 0 ? best : NULL;
 }
 
 void sess_truncate(SessVal* v, uint32_t n)

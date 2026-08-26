@@ -402,9 +402,10 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
             char path[512];
             cache_kv_path(path, sizeof(path), r->cache_dir, key, r->dist_rank);
             uint32_t loaded = 0;
-            if (sess_kv_load(&r->engine, path, &loaded) == 0 && loaded == resume) {
-                r->cache_pos = loaded;
-                ylog_info("rank: session %s kv restored (%u tokens) from %s", key, loaded, path);
+            if (sess_kv_load(&r->engine, path, &loaded) == 0 && loaded >= resume) {
+                r->cache_pos = resume;
+                ylog_info("rank: session %s kv restored (%u tokens, resume=%u) from %s",
+                          key, loaded, resume, path);
             } else {
                 /* 坏/过期 kv: 删掉, 让 server 走 resume=0 全量重建(同会话, 无需用户新开) */
                 ylog_warn("rank: session %s kv load failed/pos mismatch (%u vs %u), drop kv",
@@ -425,15 +426,17 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
             /* 全量重发: 以 0 为基, KV 由 X 流从 pos=0 覆盖 */
             ylog_warn("rank: full resend (pos %u -> 0)", r->cache_pos);
             r->cache_pos = 0;
+        } else if (resume < r->cache_pos) {
+            /* 最长前缀续写: 丢掉分叉后的 kv, 从公共前缀接着 prefill */
+            ylog_info("rank: sess %s truncate kv %u -> %u", key, r->cache_pos, resume);
+            r->cache_pos = resume;
         } else {
-            {
-                uint32_t have = r->cache_pos;
-                ylog_warn("rank: resume mismatch: rank has %u, got %u; drop kv", have, resume);
-                rank_unlink_sess_kv(r, key);
-                r->cache_pos = 0;
-                send_line(fd, PROTO_ERROR " resume mismatch: rank has %u, got %u", have, resume);
-                return 0;
-            }
+            uint32_t have = r->cache_pos;
+            ylog_warn("rank: resume mismatch: rank has %u, got %u; drop kv", have, resume);
+            rank_unlink_sess_kv(r, key);
+            r->cache_pos = 0;
+            send_line(fd, PROTO_ERROR " resume mismatch: rank has %u, got %u", have, resume);
+            return 0;
         }
     }
     if ((uint64_t)r->cache_pos + ndelta > r->engine.max_seq) {

@@ -29,8 +29,10 @@ SessVal* sess_get(SessCache* c, const char* key);
 SessVal* sess_put(SessCache* c, const char* key);
 /* 请求 token 与缓存序列的公共前缀长度(逐 token 比对) */
 uint32_t sess_prefix(const SessVal* v, const uint32_t* req, uint32_t n);
-/* 已缓存历史(去掉尾 eos)是 req 前缀的最长条目; 无则 NULL */
-SessVal* sess_find_prefix(SessCache* c, const uint32_t* req, uint32_t n, int eos);
+/* 忽略尾 eos 后的最长公共前缀 */
+uint32_t sess_lcp(const SessVal* v, const uint32_t* req, uint32_t n, int eos);
+/* 与 req 公共前缀最长的条目; plen 可空。无有效前缀则 NULL */
+SessVal* sess_find_prefix(SessCache* c, const uint32_t* req, uint32_t n, int eos, uint32_t* plen);
 /* 前缀缩短(历史被改时截断到公共前缀) */
 void sess_truncate(SessVal* v, uint32_t n);
 /* 追加一批 token 到条目末尾, 返回 0 成功 */
