@@ -760,8 +760,8 @@ rank: $(BIN) $(MODEL_LLF)
 ifneq ($(filter-out infer,$(MAKECMDGOALS)),)
 SERVE_PROMPT := $(filter-out infer,$(MAKECMDGOALS))
 endif
-status: $(BIN)
-	$(BIN) ctl --config $(SERVE_CONFIG) status
+status: $(BIN_AVX2)
+	$(BIN_AVX2) ctl --config $(SERVE_CONFIG) status
 
 # 管理命令: make ctl <target> <cmd> [need]  (目标用短别名, 避免与 make 目标名冲突)
 #   r0=rank-0  s0=server-0  sv=supervisor  rt=router
@@ -770,6 +770,7 @@ status: $(BIN)
 #       make ctl sv SCALE 2          # 扩一组 rank
 #       make ctl sv QUERY_SERVERS
 #       make ctl s0 DRAIN            # server 优雅下线
+#       make ctl stop / make ctl exit  # exit=先 stop(DRAIN 落盘)再强杀
 CTL_GOALS := $(filter-out ctl,$(MAKECMDGOALS))
 CTL_T0 := $(word 1,$(CTL_GOALS))
 CTL_TGT := $(if $(filter r0,$(CTL_T0)),rank-0,$(if $(filter s0,$(CTL_T0)),server-0,$(if $(filter sv,$(CTL_T0)),supervisor,$(if $(filter rt,$(CTL_T0)),router,$(CTL_T0)))))
@@ -780,8 +781,8 @@ CTL_ARGS := --target $(CTL_TGT) --cmd $(word 2,$(CTL_GOALS)) --need-groups $(wor
 else
 CTL_ARGS := --target $(CTL_TGT) --cmd $(word 2,$(CTL_GOALS))
 endif
-ctl: $(BIN)
-	$(BIN) ctl --config $(SERVE_CONFIG) $(CTL_ARGS)
+ctl: $(BIN_AVX2)
+	$(BIN_AVX2) ctl --config $(SERVE_CONFIG) $(CTL_ARGS)
 
 # 文件分发: 接收端 make sync-serve PORT=9600; 发送端 make sync-push FILE=... TO=host:9600 DEST=...
 sync-serve: $(BIN)
@@ -797,18 +798,10 @@ infer: $(BIN)
 %:
 	@:
 
-serve-stop:
-ifeq ($(UNAME_S),Windows)
-	@taskkill //F //IM yllm.exe 2>/dev/null; echo "serve processes stopped"
-else
-	@-pkill -f "yllm hub" 2>/dev/null; \
-	pkill -f "yllm rank" 2>/dev/null; \
-	pkill -f "yllm supervisor" 2>/dev/null; \
-	pkill -f "yllm router" 2>/dev/null; \
-	pkill -f "yllm server" 2>/dev/null; \
-	echo "serve processes stopped"
-endif
-
+# 停服务: 走 ctl exit(先 DRAIN/stop 落盘, 再强杀残留), 勿直接 taskkill
+serve-stop: $(BIN_AVX2)
+	$(BIN_AVX2) ctl --config $(SERVE_CONFIG) --cmd exit
+	@echo "serve processes stopped"
 # ---- 模型文件 dump (也可: yllm file <path>; 独立二进制仍可用 make dump) ----
 DUMP_BIN := $(OBJDIR)/llfdump
 

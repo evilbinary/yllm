@@ -55,11 +55,11 @@
 #define PROTO_INFER "INFER"
 #define PROTO_INFER_SESS "INFER_SESS"
 
-/* DRAIN\n → OK\n(等当前请求完成) 后关连接退出
- * 优雅下线(滚动更新 / 缩容) */
+/* DRAIN\n → 先落盘当前会话 KV, 再 OK\n, 等当前请求完成后退出
+ * 优雅下线(滚动更新 / 缩容 / ctl stop|exit) */
 #define PROTO_DRAIN "DRAIN"
 
-/* QUIT\n → OK\n 后退出(仅测试) */
+/* QUIT\n → 先落盘当前会话 KV, 再 OK\n 后退出 */
 #define PROTO_QUIT "QUIT"
 
 /* ---- server 帧(router / supervisor → server) ---- */

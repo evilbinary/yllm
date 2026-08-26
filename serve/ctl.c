@@ -140,49 +140,56 @@ static void kill_leftover_processes(const char* bin_hint)
     proclist_visit(kill_leftover_proc, (void*)bin_hint);
 }
 
-/* stop: 优雅停止服务(rank DRAIN + supervisor QUIT → hub 随之退出) */
-static int ctl_stop(ServeConfig* cfg)
+/* 向 host:port 发 DRAIN/QUIT, 打印一行结果。返回 0 成功联系上。 */
+static int ctl_send_cmd(const char* label, const char* host, uint16_t port, const char* cmd)
 {
-    int nm = cfg->n_models > 0 ? cfg->n_models : 1;
-    int stride = cfg_model_stride(cfg);
-    int mi, r;
-    for (mi = 0; mi < nm; mi++) {
-        int ranks = mi < cfg->n_models && cfg->models[mi].ranks > 0
-                    ? cfg->models[mi].ranks : (cfg->ranks > 0 ? cfg->ranks : 1);
-        for (r = 0; r < ranks; r++) {
-            int idx = mi * stride + r;
-            char label[32];
-            snprintf(label, sizeof(label), "rank-%d", idx);
-            int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->rank_port_base + idx), 1);
-            if (fd >= 0) {
-                frame_send(fd, PROTO_DRAIN, NULL);
-                Frame f;
-                if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
-                sock_close(fd);
-            } else {
-                printf("%s: 不可达(已停止?)\n", label);
-            }
-        }
+    int fd = sock_connect(host, port, 1);
+    if (fd < 0) {
+        printf("%s: 不可达(已停止?) %s:%u\n", label, host, (unsigned)port);
+        return -1;
     }
-    int sfd = sock_connect("127.0.0.1", (uint16_t)cfg->sv_port, 1);
-    if (sfd >= 0) {
-        frame_send(sfd, PROTO_QUIT, NULL);
-        Frame f;
-        if (frame_recv(sfd, &f) >= 0) printf("supervisor: %s %s\n", f.cmd, f.args);
-        sock_close(sfd);
-    } else {
-        printf("supervisor: 不可达(已停止?)\n");
-    }
+    frame_send(fd, cmd, NULL);
+    Frame f;
+    if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
+    else printf("%s: 无响应\n", label);
+    sock_close(fd);
     return 0;
 }
 
-/* exit: 全退 — DRAIN 所有 rank/server, QUIT router/supervisor, 再兜底强杀残留 */
-static int ctl_exit(ServeConfig* cfg)
+/* 优先按 supervisor 节点表 DRAIN 所有 rank(含跨机); 失败则回退本机端口扫描 */
+static void ctl_drain_ranks(ServeConfig* cfg)
 {
+    int drained = 0;
+    int fd = sock_connect(cfg->sv_host, (uint16_t)cfg->sv_port, 1);
+    if (fd >= 0) {
+        frame_send(fd, PROTO_QUERY_SERVERS, NULL);
+        Frame f;
+        while (frame_recv(fd, &f) >= 0) {
+            if (strcmp(f.cmd, PROTO_QUERY_DONE) == 0) break;
+            if (strcmp(f.cmd, PROTO_SERVER_INFO) != 0) continue;
+            char id[128] = "", type[16] = "", addr[128] = "";
+            char vb[256];
+            Frame ff;
+            snprintf(ff.cmd, sizeof(ff.cmd), "X");
+            snprintf(ff.args, sizeof(ff.args), "%s", f.args);
+            sscanf(f.args, "%127s", id);
+            if (frame_get(&ff, "type", vb, sizeof(vb)) == 0) snprintf(type, sizeof(type), "%s", vb);
+            if (frame_get(&ff, "addr", vb, sizeof(vb)) == 0) snprintf(addr, sizeof(addr), "%s", vb);
+            if (strcmp(type, "rank") != 0 || !addr[0]) continue;
+            char* colon = strrchr(addr, ':');
+            if (!colon) continue;
+            *colon = '\0';
+            uint16_t port = (uint16_t)atoi(colon + 1);
+            if (ctl_send_cmd(id, addr, port, PROTO_DRAIN) == 0) drained++;
+        }
+        sock_close(fd);
+    }
+    if (drained > 0) return;
+
+    /* supervisor 不可达或无 rank: 按 yaml 扫本机端口 */
     int nm = cfg->n_models > 0 ? cfg->n_models : 1;
     int stride = cfg_model_stride(cfg);
     int mi, r;
-    /* 1) DRAIN 所有 rank(动态步长, 多模型) */
     for (mi = 0; mi < nm; mi++) {
         int ranks = mi < cfg->n_models && cfg->models[mi].ranks > 0
                     ? cfg->models[mi].ranks : (cfg->ranks > 0 ? cfg->ranks : 1);
@@ -190,56 +197,53 @@ static int ctl_exit(ServeConfig* cfg)
             int idx = mi * stride + r;
             char label[32];
             snprintf(label, sizeof(label), "rank-%d", idx);
-            int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->rank_port_base + idx), 1);
-            if (fd >= 0) {
-                frame_send(fd, PROTO_DRAIN, NULL);
-                Frame f;
-                if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
-                sock_close(fd);
-            } else {
-                printf("%s: 不可达(已停止?)\n", label);
-            }
+            ctl_send_cmd(label, "127.0.0.1", (uint16_t)(cfg->rank_port_base + idx), PROTO_DRAIN);
         }
     }
-    /* 2) DRAIN 所有 server */
-    for (mi = 0; mi < nm; mi++) {
-        char label[32];
-        snprintf(label, sizeof(label), "server-%d", mi);
-        int fd = sock_connect("127.0.0.1", (uint16_t)(cfg->server_port + mi * stride), 1);
-        if (fd >= 0) {
-            frame_send(fd, PROTO_DRAIN, NULL);
-            Frame f;
-            if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", label, f.cmd, f.args);
-            sock_close(fd);
-        } else {
-            printf("%s: 不可达(已停止?)\n", label);
-        }
-    }
-    /* 3) QUIT router / supervisor */
+}
+
+/* stop: 优雅停止 — DRAIN 全部 rank(含远程) + supervisor QUIT → hub 随之退出 */
+static int ctl_stop(ServeConfig* cfg)
+{
+    printf("stop: DRAIN ranks...\n");
+    ctl_drain_ranks(cfg);
+    printf("stop: QUIT supervisor...\n");
+    ctl_send_cmd("supervisor", "127.0.0.1", (uint16_t)cfg->sv_port, PROTO_QUIT);
+    return 0;
+}
+
+/* exit: 先 stop(优雅落盘), 再 DRAIN server / QUIT router, 最后兜底强杀 */
+static int ctl_exit(ServeConfig* cfg)
+{
+    printf("exit: 1/3 graceful stop (DRAIN ranks → save kv)...\n");
+    ctl_stop(cfg);
+
+    printf("exit: 2/3 DRAIN servers + QUIT router...\n");
     {
-        struct { const char* name; int port; } tops[2] = {
-            { "router", cfg->router_port },
-            { "supervisor", cfg->sv_port },
-        };
-        int t;
-        for (t = 0; t < 2; t++) {
-            int fd = sock_connect("127.0.0.1", (uint16_t)tops[t].port, 1);
-            if (fd >= 0) {
-                frame_send(fd, PROTO_QUIT, NULL);
-                Frame f;
-                if (frame_recv(fd, &f) >= 0) printf("%s: %s %s\n", tops[t].name, f.cmd, f.args);
-                sock_close(fd);
-            } else {
-                printf("%s: 不可达(已停止?)\n", tops[t].name);
-            }
+        int nm = cfg->n_models > 0 ? cfg->n_models : 1;
+        int stride = cfg_model_stride(cfg);
+        int mi;
+        for (mi = 0; mi < nm; mi++) {
+            char label[32];
+            snprintf(label, sizeof(label), "server-%d", mi);
+            ctl_send_cmd(label, "127.0.0.1",
+                         (uint16_t)(cfg->server_port + mi * stride), PROTO_DRAIN);
         }
+        ctl_send_cmd("router", "127.0.0.1", (uint16_t)cfg->router_port, PROTO_QUIT);
     }
-    /* 4) 兜底强杀: 等 3s 让 DRAIN/QUIT 优雅退出(engine_free 释放模型需 1~2s),
-     *    残留的一并清理 */
+
+    /* 等 DRAIN 落盘 + engine_free; rank 已在回 OK 前写完 kv */
+    printf("exit: wait for graceful shutdown...\n");
     ysleep_ms(3000);
+
+    printf("exit: 3/3 force-kill leftovers...\n");
     char bin_hint[128] = "";
     if (cfg->bin[0]) {
         const char* base = strrchr(cfg->bin, '/');
+#ifdef _WIN32
+        const char* base2 = strrchr(cfg->bin, '\\');
+        if (!base || (base2 && base2 > base)) base = base2;
+#endif
         snprintf(bin_hint, sizeof(bin_hint), "%s", base ? base + 1 : cfg->bin);
     }
     kill_leftover_processes(bin_hint);

@@ -544,8 +544,17 @@ static int handle_frame(int fd, Rank* r, const Frame* f)
     if (strcmp(f->cmd, PROTO_PING) == 0) return handle_ping(fd, r);
     if (strcmp(f->cmd, PROTO_STAT) == 0) return handle_stat(fd, r);
     if (strcmp(f->cmd, PROTO_INFER) == 0) return handle_infer(fd, r, (char*)f->args);
-    if (strcmp(f->cmd, PROTO_DRAIN) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
-    if (strcmp(f->cmd, PROTO_QUIT) == 0) { send_line(fd, "OK"); r->quit = 1; return 2; }
+    if (strcmp(f->cmd, PROTO_DRAIN) == 0 || strcmp(f->cmd, PROTO_QUIT) == 0) {
+        /* 先打断可能在跑的 worker 轮次, 再持锁落盘, 最后回 OK。
+         * 否则 ctl exit 在 OK 后强杀时 KV 可能还没写完 → 重启 sess/kv 不一致。 */
+        r->quit = 1;
+        pthread_mutex_lock(&r->engine_lock);
+        rank_save_sess_kv(r);
+        pthread_mutex_unlock(&r->engine_lock);
+        send_line(fd, "OK");
+        ylog_info("rank: %s ok (kv saved, exiting)", f->cmd);
+        return 2;
+    }
     send_line(fd, PROTO_ERROR " unknown cmd");
     return 0;
 }
@@ -617,6 +626,7 @@ static int run_rank(int port, Rank* r)
             wsess.my_pos = r->cache_pos;
             wsess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
             wsess.quit = &r->quit;
+            pthread_mutex_lock(&r->engine_lock);
             int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
                               r->temp, r->top_p, r->seed,
                               r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
@@ -627,25 +637,18 @@ static int run_rank(int port, Rank* r)
             r->cache_pos = wsess.my_pos;
             /* 每会话结束即落盘(与 rank0 一致): 否则多会话时退出仅剩最后
              * 活跃会话, 其余会话的 .rN.kv 丢失, 重启后 worker 无法续接 */
-            if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
-                char path[512];
-                cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
-                if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
-                    ylog_info("rank: worker sess %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
-            }
+            rank_save_sess_kv(r);
+            pthread_mutex_unlock(&r->engine_lock);
             if (r->quit) break;
             if (rc != 0) {
                 ylog_warn("rank: pipeline round failed (rc=%d), retry", rc);
                 sock_sleep_ms(1000);
             }
         }
-        /* 退出: worker 段 KV 落盘(带段号, 与其它段互不覆盖) */
-        if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
-            char path[512];
-            cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
-            if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
-                ylog_info("rank: exit, session %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
-        }
+        /* 退出兜底落盘(DRAIN/QUIT 已保存过则再写一次无害) */
+        pthread_mutex_lock(&r->engine_lock);
+        rank_save_sess_kv(r);
+        pthread_mutex_unlock(&r->engine_lock);
     } else {
         int srv = sock_listen((uint16_t)port, 8);
         if (srv < 0) { r->quit = 1; if (hb) ythread_join(&hb); return 1; }
@@ -661,13 +664,10 @@ static int run_rank(int port, Rank* r)
                 sock_close(fd);
             }
         }
-        /* 退出: 当前会话 KV 落盘 */
-        if (r->cache_dir[0] && r->cache_key[0] && r->cache_pos > 0) {
-            char path[512];
-            cache_kv_path(path, sizeof(path), r->cache_dir, r->cache_key, r->dist_rank);
-            if (sess_kv_save(&r->engine, r->cache_pos, path) == 0)
-                ylog_info("rank: exit, session %s kv saved (%u tokens)", r->cache_key, r->cache_pos);
-        }
+        /* 退出兜底落盘(DRAIN/QUIT 路径已保存过则再写一次无害) */
+        pthread_mutex_lock(&r->engine_lock);
+        rank_save_sess_kv(r);
+        pthread_mutex_unlock(&r->engine_lock);
         sock_close(srv);
     }
     r->quit = 1;
