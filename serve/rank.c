@@ -113,17 +113,14 @@ static void rank_job_begin(Rank* r, uint32_t start, uint32_t need, uint64_t t0)
 static void rank_job_end(Rank* r)
 {
     DistLive* L = &r->job;
-    uint64_t now = ynow_ms();
-    if (L->phase == 1 && L->t0) {
-        uint32_t n = L->pos >= L->start ? L->pos - L->start : 0;
-        uint64_t ms = now > L->t0 ? now - L->t0 : 1;
-        if (n) L->pf_tps = (float)((double)n * 1000.0 / (double)ms);
-    } else if (L->phase == 2 && L->dec_t0) {
-        uint32_t n = L->pos >= L->dec_start ? L->pos - L->dec_start : 0;
-        uint64_t ms = now > L->dec_t0 ? now - L->dec_t0 : 1;
-        if (n) L->dec_tps = (float)((double)n * 1000.0 / (double)ms);
-    }
     L->phase = 0;
+    L->pos = 0;
+    L->start = 0;
+    L->dec_start = 0;
+    L->t0 = 0;
+    L->dec_t0 = 0;
+    L->pf_tps = 0;
+    L->dec_tps = 0;
     r->job_need = 0;
 }
 
@@ -253,24 +250,31 @@ static int handle_stat(int fd, Rank* r)
     uint32_t jneed = r->job_need;
     DistLive L = r->job;
     uint64_t now = ynow_ms();
-    uint64_t jms = (L.phase && L.t0) ? (now - L.t0) : 0;
-    float pf = L.pf_tps, dc = L.dec_tps;
+    uint64_t jms = 0;
+    uint32_t jpos = 0;
+    float pf = 0, dc = 0;
     const char* phase = "-";
     if (L.phase == 1) {
         phase = "prefill";
+        jpos = L.pos;
+        jms = L.t0 ? (now - L.t0) : 0;
         {
             uint32_t n = L.pos >= L.start ? L.pos - L.start : 0;
             uint64_t ms = now > L.t0 && L.t0 ? now - L.t0 : 1;
             if (n) pf = (float)((double)n * 1000.0 / (double)ms);
         }
-        dc = 0;
     } else if (L.phase == 2) {
         phase = "decode";
+        jpos = L.pos;
+        jms = L.t0 ? (now - L.t0) : 0;
+        pf = L.pf_tps;
         if (L.dec_t0) {
             uint32_t n = L.pos >= L.dec_start ? L.pos - L.dec_start : 0;
             uint64_t ms = now > L.dec_t0 ? now - L.dec_t0 : 1;
             if (n) dc = (float)((double)n * 1000.0 / (double)ms);
         }
+    } else {
+        jneed = 0;
     }
     send_line(fd,
               "OK inflight=%d queued=%d work=%s threads=%d kv_mb=%.1f prefix_hits=0 "
@@ -278,7 +282,7 @@ static int handle_stat(int fd, Rank* r)
               "job_phase=%s job_pf_tps=%.2f job_dec_tps=%.2f",
               inflight, queued, mode ? "parallel" : "serial", nwork, kv_mb,
               (unsigned long long)uptime, e->layer_begin, e->layer_end, omp_n,
-              L.pos, jneed, (unsigned long long)jms, phase, pf, dc);
+              jpos, jneed, (unsigned long long)jms, phase, pf, dc);
     return 0;
 }
 

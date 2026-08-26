@@ -183,10 +183,8 @@ static void query_one_rank(const char* label, const char* addr)
         if (p) dct = (float)atof(p + 12);
     }
     char pfs[16], dcs[16];
-    if (pft > 0.05f) snprintf(pfs, sizeof(pfs), "%.1f", pft);
-    else snprintf(pfs, sizeof(pfs), "-");
-    if (dct > 0.05f) snprintf(dcs, sizeof(dcs), "%.1f", dct);
-    else snprintf(dcs, sizeof(dcs), "-");
+    snprintf(pfs, sizeof(pfs), "%.1f", pft);
+    snprintf(dcs, sizeof(dcs), "%.1f", dct);
     double kv = 0.0;
     {
         const char* p = strstr(a, "kv_mb=");
