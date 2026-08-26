@@ -37,11 +37,14 @@ void dist_print_stats(Dist* d, const char* tag);
 
 int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* const* addrs,
               const volatile int* quit);
-int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16);
-int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16);
-int dist_send_xb(Dist* d, uint32_t pos, const float* x, uint32_t count,
-                 uint32_t hidden, int fp16);
-int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
+/* X: pos+token+x; XB: pos+count+tokens[count]+x — token 供 gemma4 下游重算 PLE */
+int dist_send_x(Dist* d, uint32_t pos, uint32_t token, const float* x, uint32_t hidden,
+                int fp16);
+int dist_recv_x(Dist* d, uint32_t* pos, uint32_t* token, float* x, uint32_t hidden,
+                int fp16);
+int dist_send_xb(Dist* d, uint32_t pos, const uint32_t* tokens, const float* x,
+                 uint32_t count, uint32_t hidden, int fp16);
+int dist_recv_xb(Dist* d, uint32_t* pos, uint32_t* tokens, float* x, uint32_t cap_count,
                  uint32_t hidden, int fp16);
 int dist_send_logits(Dist* d, const float* logits, uint32_t vocab, uint32_t topk);
 int dist_recv_logits(Dist* d, uint32_t* ids, float* logits, uint32_t topk, float* lse_out);

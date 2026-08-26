@@ -2,9 +2,10 @@
  *
  * 拓扑: rank i 把激活发给 rank i+1; 末 rank 把 top-k logits 发回 rank 0。
  * 帧格式: [4B type][4B len][payload]
- *   type 1 = X(激活: pos(4B) + hidden 个 fp16)
+ *   type 1 = X(激活: pos(4B) + token(4B) + hidden 个 fp16/fp32)
  *   type 2 = LOGITS_K(top-k: k(4B) + k × [id(4B) + logit fp16(2B)])
  *   type 3 = DONE(终止)
+ *   type 5 = XB(批量: pos + count + tokens[count] + x[count*hidden])
  */
 #include "dist.h"
 #include "cache.h"
@@ -236,16 +237,18 @@ int dist_init(Dist* d, int rank, int ranks, uint16_t port_base, const char* cons
     return 0;
 }
 
-/* 激活传输: fp16 减半带宽, 但引入量化误差(可能翻转 argmax); fp32 与单机逐位一致 */
-int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16)
+/* 激活传输: fp16 减半带宽; payload = pos(4) + token(4) + x[hidden] */
+int dist_send_x(Dist* d, uint32_t pos, uint32_t token, const float* x, uint32_t hidden,
+                int fp16)
 {
     uint8_t hdr[8];
-    uint32_t len = 4 + hidden * (fp16 ? 2 : 4);
+    uint32_t len = 4 + 4 + hidden * (fp16 ? 2 : 4);
     uint32_t type = DTYPE_X;
     memcpy(hdr, &type, 4);
     memcpy(hdr + 4, &len, 4);
     if (xio(d, d->down_fd, hdr, 8, 1) != 0) return -1;
     if (xio(d, d->down_fd, &pos, 4, 1) != 0) return -1;
+    if (xio(d, d->down_fd, &token, 4, 1) != 0) return -1;
     if (fp16) {
         if (d->x16 == NULL || d->cap_x < hidden) {
             free(d->x16);
@@ -262,12 +265,11 @@ int dist_send_x(Dist* d, uint32_t pos, const float* x, uint32_t hidden, int fp16
     return 0;
 }
 
-/* 返回帧类型: 1=X(pos/x 已填充), 3=DONE, -1=错误 */
-int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16)
+/* 返回帧类型: 1=X(pos/token/x 已填充), 3=DONE, -1=错误 */
+int dist_recv_x(Dist* d, uint32_t* pos, uint32_t* token, float* x, uint32_t hidden, int fp16)
 {
     int fd = d->rank == 0 ? d->log_fd : d->up_fd;
     if (d->quit) {
-        /* worker 空闲等激活: 周期超时检查退出信号(DRAIN 后及时退出落盘) */
         for (;;) {
             if (*d->quit) return -2;
             int sel = dist_wait_readable(fd, 500);
@@ -282,8 +284,9 @@ int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16)
     memcpy(&len, hdr + 4, 4);
     if (type == DTYPE_DONE) return DTYPE_DONE;
     if (type == DTYPE_X) {
-        if (len < 4) return -1;
+        if (len < 8) return -1;
         if (xrecv(d, fd, pos, 4) != 0) return -1;
+        if (xrecv(d, fd, token, 4) != 0) return -1;
         if (fp16) {
             if (d->x16 == NULL || d->cap_x < hidden) {
                 free(d->x16);
@@ -302,19 +305,20 @@ int dist_recv_x(Dist* d, uint32_t* pos, float* x, uint32_t hidden, int fp16)
     return -1;
 }
 
-/* 批量激活传输(prefill): [type=5][len][pos 4B][count 4B][x: count*hidden*(2|4)B] */
-int dist_send_xb(Dist* d, uint32_t pos, const float* x, uint32_t count,
-                 uint32_t hidden, int fp16)
+/* 批量激活: [pos][count][tokens×count][x…] */
+int dist_send_xb(Dist* d, uint32_t pos, const uint32_t* tokens, const float* x,
+                 uint32_t count, uint32_t hidden, int fp16)
 {
     uint8_t hdr[8];
     uint32_t esz = fp16 ? 2u : 4u;
-    uint32_t len = 4 + 4 + count * hidden * esz;
+    uint32_t len = 4 + 4 + count * 4 + count * hidden * esz;
     uint32_t type = DTYPE_XB;
     memcpy(hdr, &type, 4);
     memcpy(hdr + 4, &len, 4);
     if (xio(d, d->down_fd, hdr, 8, 1) != 0) return -1;
     if (xio(d, d->down_fd, &pos, 4, 1) != 0) return -1;
     if (xio(d, d->down_fd, &count, 4, 1) != 0) return -1;
+    if (xio(d, d->down_fd, tokens, (size_t)count * 4, 1) != 0) return -1;
     if (getenv("YLLM_DISTDBG"))
         ylog_info("send_xb: count=%u fp16=%d pos=%u len=%u", count, fp16, pos, len);
     if (fp16) {
@@ -331,8 +335,8 @@ int dist_send_xb(Dist* d, uint32_t pos, const float* x, uint32_t count,
     return 0;
 }
 
-/* 接收批量激活; 返回 count(>0), -1=错误 */
-int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
+/* 接收批量激活; 返回 count(>0)。tokens 可空(丢弃 token 字段)。 */
+int dist_recv_xb(Dist* d, uint32_t* pos, uint32_t* tokens, float* x, uint32_t cap_count,
                  uint32_t hidden, int fp16)
 {
     int fd = d->rank == 0 ? d->log_fd : d->up_fd;
@@ -346,7 +350,6 @@ int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
     }
     uint8_t hdr[8];
     if (d->has_peek) {
-        /* 会话握手探测暂存的帧头: 直接消费, 不重复 recv */
         memcpy(hdr, d->peek_hdr, 8);
         d->has_peek = 0;
     } else {
@@ -359,9 +362,11 @@ int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
         ylog_info("recv_xb: type=%u len=%u", type, len);
     if (type == DTYPE_DONE) return -3;
     if (type == DTYPE_X) {
-        /* decode 单 token 帧(与批量 prefill 混流): 按 count=1 处理 */
-        if (len < 4) return -1;
+        uint32_t tok = 0;
+        if (len < 8) return -1;
         if (xrecv(d, fd, pos, 4) != 0) return -1;
+        if (xrecv(d, fd, &tok, 4) != 0) return -1;
+        if (tokens) tokens[0] = tok;
         if (fp16) {
             if (d->x16 == NULL || d->cap_x < hidden) {
                 free(d->x16);
@@ -379,10 +384,21 @@ int dist_recv_xb(Dist* d, uint32_t* pos, float* x, uint32_t cap_count,
     }
     if (type != DTYPE_XB) return -1;
     uint32_t esz = fp16 ? 2u : 4u;
-    uint32_t count = (len - 8) / (hidden * esz);
+    if (len < 8 + 4) return -1;
+    uint32_t count = (len - 8) / (4 + hidden * esz);
     if (count < 1 || count > cap_count) return -1;
     if (xrecv(d, fd, pos, 4) != 0) return -1;
     if (xrecv(d, fd, &count, 4) != 0) return -1;
+    if (count < 1 || count > cap_count) return -1;
+    if (tokens) {
+        if (xrecv(d, fd, tokens, (size_t)count * 4) != 0) return -1;
+    } else {
+        uint32_t i;
+        for (i = 0; i < count; i++) {
+            uint32_t dump;
+            if (xrecv(d, fd, &dump, 4) != 0) return -1;
+        }
+    }
     if (fp16) {
         if (d->x16 == NULL || d->cap_x < count * hidden) {
             free(d->x16);
@@ -564,6 +580,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
     enum { TOPK = 1024 };
     float* xbuf = (float*)ymalloc((size_t)hidden * 4 * PP_XB);
     uint32_t* k_ids = (uint32_t*)ymalloc((size_t)TOPK * 4);
+    uint32_t* tokbuf = (uint32_t*)ymalloc((size_t)PP_XB * 4);
 
     uint64_t rng = ysrand(seed);
     int ngen = 0;
@@ -590,7 +607,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (engine_forward_batch_tokens(e, ids + i, nb, pos, xb) != 0) {
                 free(xb); rc = -1; snprintf(err, sizeof(err), "batch prefill failed"); break;
             }
-            if (dist_send_xb(&dist, pos, xb, (uint32_t)nb, hidden, dist_fp16) != 0) {
+            if (dist_send_xb(&dist, pos, ids + i, xb, (uint32_t)nb, hidden, dist_fp16) != 0) {
                 free(xb); rc = -1; snprintf(err, sizeof(err), "send_xb prompt failed"); break;
             }
             if (getenv("YLLM_DISTDBG"))
@@ -603,7 +620,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
 #else
         for (i = 0; i < nprompt && rc == 0; i++) {
             engine_forward_range(e, ids[i], 1, pos, xbuf, NULL);
-            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) {
+            if (dist_send_x(&dist, pos, ids[i], xbuf, hidden, dist_fp16) != 0) {
                 rc = -1; snprintf(err, sizeof(err), "send_x prompt failed"); break;
             }
             pos++;
@@ -641,7 +658,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (nxt == (uint32_t)v->eos) break;
             engine_forward_range(e, nxt, 1, pos, xbuf, NULL);
             uint64_t t3_tok = ynow_ms();
-            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
+            if (dist_send_x(&dist, pos, nxt, xbuf, hidden, dist_fp16) != 0) { rc = -1; break; }
             if (getenv("YLLM_DISTDBG"))
                 ylog_info("R0 send_x pos=%u xbuf[0..3]=%g %g %g %g", pos,
                           (double)xbuf[0], (double)xbuf[1], (double)xbuf[2], (double)xbuf[3]);
@@ -684,7 +701,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         /* 会话模式: 生成结束(eos/上限)后各段补写 eos 的 kv, 与单机一致 */
         if (sess && rc == 0 && pos < e->max_seq) {
             engine_forward_range(e, (uint32_t)v->eos, 1, pos, xbuf, NULL);
-            if (dist_send_x(&dist, pos, xbuf, hidden, dist_fp16) == 0) {
+            if (dist_send_x(&dist, pos, (uint32_t)v->eos, xbuf, hidden, dist_fp16) == 0) {
                 pos++;
                 float* flush = (float*)ymalloc((size_t)vocab_sz * 4);
                 (void)dist_recv_logits(&dist, NULL, flush, vocab_sz, NULL);
@@ -752,7 +769,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
         int w_timing = getenv("YLLM_DISTTIMING") != NULL;
         for (;;) {
             uint64_t w0 = ynow_ms();
-            t = dist_recv_xb(&dist, &pos, xbuf, PP_XB, hidden, dist_fp16);
+            t = dist_recv_xb(&dist, &pos, tokbuf, xbuf, PP_XB, hidden, dist_fp16);
             uint64_t w1 = ynow_ms();
             if (t == -3) { /* DONE: 向后转发并退出 */
                 dist_send_done(&dist);
@@ -771,7 +788,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 memcpy(e->x, xbuf, (size_t)hidden * 4);
                 cuda_mark_x_host(e);
                 if (rank == ranks - 1) {
-                    engine_forward_range(e, 0, 0, pos, NULL, e->logits);
+                    engine_forward_range(e, tokbuf[0], 0, pos, NULL, e->logits);
                     uint64_t f1 = ynow_ms();
                     if (getenv("YLLM_DISTDBG"))
                         ylog_info("wtok last x[0..3]=%g %g %g %g logits[0..3]=%g %g %g %g",
@@ -782,13 +799,13 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                                   (unsigned)(w1 - w0), (unsigned)(f1 - f0));
                     if (dist_send_logits(&dist, e->logits, vocab_sz, TOPK) != 0) { rc = -1; break; }
                 } else {
-                    engine_forward_range(e, 0, 0, pos, xbuf, NULL);
-                    if (dist_send_xb(&dist, pos, xbuf, 1, hidden, dist_fp16) != 0) { rc = -1; break; }
+                    engine_forward_range(e, tokbuf[0], 0, pos, xbuf, NULL);
+                    if (dist_send_xb(&dist, pos, tokbuf, xbuf, 1, hidden, dist_fp16) != 0) { rc = -1; break; }
                 }
             } else if (rank == ranks - 1) {
                 if (getenv("YLLM_DISTDBG"))
                     ylog_info("wbatch: t=%d pos=%u", t, pos);
-                if (engine_forward_batch_x(e, xbuf, t, pos, NULL, e->logits) != 0) {
+                if (engine_forward_batch_x(e, xbuf, t, pos, NULL, e->logits, tokbuf) != 0) {
                     ylog_info("worker batch-x failed: t=%d pos=%u rc=%d", t, pos, rc);
                     rc = -1; break;
                 }
@@ -797,11 +814,11 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                     rc = -1; break;
                 }
             } else {
-                if (engine_forward_batch_x(e, xbuf, t, pos, xbuf, NULL) != 0) {
+                if (engine_forward_batch_x(e, xbuf, t, pos, xbuf, NULL, tokbuf) != 0) {
                     ylog_info("worker batch-x failed: t=%d pos=%u rc=%d", t, pos, rc);
                     rc = -1; break;
                 }
-                if (dist_send_xb(&dist, pos, xbuf, (uint32_t)t, hidden, dist_fp16) != 0) {
+                if (dist_send_xb(&dist, pos, tokbuf, xbuf, (uint32_t)t, hidden, dist_fp16) != 0) {
                     ylog_info("worker send_xb failed: t=%d pos=%u", t, pos);
                     rc = -1; break;
                 }
@@ -821,6 +838,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
     }
     free(xbuf);
     free(k_ids);
+    free(tokbuf);
 
     dist.elapsed_ms = (double)(ynow_ms() - t0);
     if (dist_stats || getenv("YLLM_DISTDBG")) dist_print_stats(&dist, "dist");

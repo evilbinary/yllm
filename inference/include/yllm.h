@@ -217,9 +217,10 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
 /* 分布式批量前向: tokens → 本 rank 层段 → 每 token 激活(仅 PP 首段, 内部 embed) */
 int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32_t pos,
                                 float* x_out);
-/* 分布式批量前向: 输入激活 → 本 rank 层段 → 输出激活(中段)或最后 token logits(末段) */
+/* 分布式批量前向: 输入激活 → 本 rank 层段 → 输出激活(中段)或最后 token logits(末段)。
+ * tokens 非空且 gemma4 时先按 token 重算 PLE(中段/末段无 embed)。 */
 int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
-                           float* x_out, float* logits_out);
+                           float* x_out, float* logits_out, const uint32_t* tokens);
 
 int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
