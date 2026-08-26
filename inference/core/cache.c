@@ -2,6 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 void sess_init(SessCache* c, int cap)
 {
@@ -203,6 +209,110 @@ int sess_load(SessVal* v, const char* path)
     }
     fclose(f);
     return rc;
+}
+
+#define SESS_SCAN_MAX 1024
+
+typedef struct {
+    char path[512];
+    char key[128];
+    uint64_t mtime;
+} SessFile;
+
+static int sess_file_newer_first(const void* a, const void* b)
+{
+    const SessFile* x = (const SessFile*)a;
+    const SessFile* y = (const SessFile*)b;
+    if (x->mtime < y->mtime) return 1;
+    if (x->mtime > y->mtime) return -1;
+    return 0;
+}
+
+static int sess_key_from_name(const char* name, char* key, size_t keysz)
+{
+    size_t n = strlen(name);
+    if (n < 6 || strcmp(name + n - 5, ".sess") != 0) return -1;
+    n -= 5;
+    if (n == 0 || n >= keysz) return -1;
+    memcpy(key, name, n);
+    key[n] = '\0';
+    return 0;
+}
+
+int sess_load_dir(SessCache* c, const char* dir)
+{
+    SessFile* files;
+    int nf = 0, i, nloaded = 0;
+    if (!c || !dir || !dir[0]) return 0;
+    files = (SessFile*)calloc(SESS_SCAN_MAX, sizeof(SessFile));
+    if (!files) return 0;
+
+#ifdef _WIN32
+    {
+        char pat[512];
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+        snprintf(pat, sizeof(pat), "%s/*.sess", dir);
+        h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                if (sess_key_from_name(fd.cFileName, files[nf].key, sizeof(files[nf].key)) != 0)
+                    continue;
+                snprintf(files[nf].path, sizeof(files[nf].path), "%s/%s", dir, fd.cFileName);
+                {
+                    ULARGE_INTEGER u;
+                    u.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+                    u.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+                    files[nf].mtime = u.QuadPart;
+                }
+                nf++;
+            } while (nf < SESS_SCAN_MAX && FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+    }
+#else
+    {
+        DIR* d = opendir(dir);
+        if (d) {
+            struct dirent* de;
+            while (nf < SESS_SCAN_MAX && (de = readdir(d)) != NULL) {
+                struct stat st;
+                char path[512];
+                if (sess_key_from_name(de->d_name, files[nf].key, sizeof(files[nf].key)) != 0)
+                    continue;
+                snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+                if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                snprintf(files[nf].path, sizeof(files[nf].path), "%s", path);
+                files[nf].mtime = (uint64_t)st.st_mtime * 1000ull;
+                nf++;
+            }
+            closedir(d);
+        }
+    }
+#endif
+    if (nf > 1) qsort(files, (size_t)nf, sizeof(SessFile), sess_file_newer_first);
+    for (i = 0; i < nf; i++) {
+        SessVal tmp;
+        SessVal* v;
+        if (sess_get(c, files[i].key)) continue;
+        if (c->n >= c->cap && c->cap > 0) break;
+        memset(&tmp, 0, sizeof(tmp));
+        if (sess_load(&tmp, files[i].path) != 0 || tmp.n == 0) {
+            free(tmp.tokens);
+            continue;
+        }
+        v = sess_put(c, files[i].key);
+        if (!v) { free(tmp.tokens); continue; }
+        free(v->tokens);
+        v->tokens = tmp.tokens;
+        v->n = tmp.n;
+        v->cap = tmp.cap;
+        v->last_use = files[i].mtime ? files[i].mtime : ynow_ms();
+        nloaded++;
+    }
+    free(files);
+    return nloaded;
 }
 
 int sess_kv_save(Engine* e, uint32_t pos, const char* path)

@@ -308,6 +308,15 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     if (resume > (uint32_t)nfull) resume = 0;
     memcpy(tokens, full_ids + resume, (size_t)(nfull - (int)resume) * 4);
     n = nfull - (int)resume;
+    /* PP 不能 ndelta=0: worker 等 X 帧, master 等 logits, 会死锁。完全命中时回放最后 1 个 prompt token。 */
+    int replay_last = 0;
+    if (n <= 0 && resume > 0 && nfull > 0) {
+        resume--;
+        tokens[0] = full_ids[resume];
+        n = 1;
+        replay_last = 1;
+        ylog_info("server: sess exact-prefix, replay last token resume=%u", resume);
+    }
     if (n <= 0 && resume == 0) {
         free(full_ids); free(tokens); free(store); free(msg);
         pthread_mutex_unlock(&s->sess_lock);
@@ -449,7 +458,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
                 pthread_mutex_lock(&s->sess_lock);
                 SessVal* ev = sess_get(&s->sess, key);
                 if (ev) {
-                    if (n > 0) sess_commit(ev, tokens, (uint32_t)n);
+                    if (n > 0 && !replay_last) sess_commit(ev, tokens, (uint32_t)n);
                     {
                         uint32_t gi;
                         for (gi = 0; gi < ngen; gi++) sess_append(ev, gen[gi]);
@@ -647,10 +656,14 @@ static void server_sess_init(Server* s)
     if (s->vocab_path[0]) {
         if (vocab_load(s->vocab_path, &s->sess_vocab) == 0) {
             s->sess_vocab_ok = 1;
-            sess_init(&s->sess, 64);
+            sess_init(&s->sess, 256);
             pthread_mutex_init(&s->sess_lock, NULL);
             pthread_mutex_init(&s->infer_lock, NULL);
             ylog_info("server: session vocab=%s loaded (%d pieces)", s->vocab_path, s->sess_vocab.n);
+            if (s->cache_dir[0]) {
+                int n = sess_load_dir(&s->sess, s->cache_dir);
+                ylog_info("server: loaded %d sessions from %s", n, s->cache_dir);
+            }
         } else {
             ylog_warn("server: session vocab load failed: %s", s->vocab_path);
         }

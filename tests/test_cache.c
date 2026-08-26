@@ -150,6 +150,46 @@ int main(void)
         CHECK(strncmp(p, "sessions/", 9) == 0 && strstr(p, "../evil") == NULL, "cache_path no traversal");
     }
 
+    /* 启动扫描目录 *.sess */
+    {
+        char sdir[640], p1[700], p2[700];
+        snprintf(sdir, sizeof(sdir), "%s/sess_scan", tdir);
+#ifndef _WIN32
+        mkdir(sdir, 0755);
+#else
+        _mkdir(sdir);
+#endif
+        snprintf(p1, sizeof(p1), "%s/a_111.sess", sdir);
+        snprintf(p2, sizeof(p2), "%s/a_222.sess", sdir);
+        {
+            SessCache c2;
+            SessVal* a = NULL;
+            static const uint32_t ta[] = {9, 8, 7, 6};
+            static const uint32_t tb[] = {1, 1, 1};
+            sess_init(&c2, 8);
+            a = sess_put(&c2, "tmp");
+            sess_commit(a, ta, 4);
+            sess_save(a, p1);
+            sess_truncate(a, 0);
+            sess_commit(a, tb, 3);
+            sess_save(a, p2);
+            sess_free(&c2);
+        }
+        {
+            SessCache c3;
+            uint32_t plen = 0;
+            static const uint32_t req[] = {9, 8, 7, 6, 5};
+            sess_init(&c3, 8);
+            CHECK(sess_load_dir(&c3, sdir) == 2, "load_dir 2 sess");
+            CHECK(sess_get(&c3, "a_111") && sess_get(&c3, "a_111")->n == 4, "load_dir a_111");
+            CHECK(sess_get(&c3, "a_222") && sess_get(&c3, "a_222")->n == 3, "load_dir a_222");
+            CHECK(sess_find_prefix(&c3, req, 5, -1, &plen) != NULL && plen == 4, "load_dir prefix");
+            sess_free(&c3);
+        }
+        remove(p1);
+        remove(p2);
+    }
+
     sess_free(&c);
     if (fails == 0) {
         printf("cache tests: all passed\n");

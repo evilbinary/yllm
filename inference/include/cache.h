@@ -49,6 +49,8 @@ void sess_evict(SessCache* c);
  * 返回 0 成功; 载入时 v 自动扩容。 */
 int sess_save(const SessVal* v, const char* path);
 int sess_load(SessVal* v, const char* path);
+/* 扫描 dir 下 *.sess 载入内存(mtime 新→旧, 受 cap 限制)。返回载入条数 */
+int sess_load_dir(SessCache* c, const char* dir);
 
 /* 引擎 KV 缓存落盘/载入(rank 侧会话换出/恢复)。
  * 直接读引擎公开字段(e->kv/kv_dim/max_seq + ws.model.h.n_blocks), 引擎零改动。

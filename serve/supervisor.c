@@ -407,10 +407,9 @@ static void handle_lease(Supervisor* s, int fd, const char* args)
         /* request: 由 server 推理后 RELEASE, 这里照常租出 */
     }
 
-    /* 找该模型全部 ready + 未租的 rank; leader = 端口最小(段0 = rank0) */
+    /* 找该模型 ready + 未租的 rank。leader 必须是 rank-0; 只有 worker 时拒租。 */
     int i, n = 0;
     const char* leader = NULL;
-    int leader_port = 0;
     for (i = 0; i < s->n_nodes; i++) {
         SvNode* sv = &s->nodes[i];
         Node* nd = &sv->node;
@@ -419,10 +418,8 @@ static void handle_lease(Supervisor* s, int fd, const char* args)
         if (model[0] && nd->model[0] && strcmp(nd->model, model) != 0) continue;
         if (sv->leased_by[0] && strcmp(sv->leased_by, srv_id) != 0) continue; /* 别人租的跳过 */
         n++;
-        int p = 0;
-        const char* colon = strchr(nd->addr, ':');
-        if (colon) p = atoi(colon + 1);
-        if (!leader || p < leader_port) { leader = nd->addr; leader_port = p; }
+        if (strncmp(nd->node_id, "rank-", 5) == 0 && atoi(nd->node_id + 5) == 0)
+            leader = nd->addr;
     }
     if (n == 0 || !leader) { frame_send(fd, "ERR", "no-rank"); return; }
     /* 收集组内成员 IP(端口升序 = 段号序; 暂存 ip:port, 排序后去端口) */
