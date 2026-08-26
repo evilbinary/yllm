@@ -68,6 +68,26 @@ static inline int http_auth_key(const HttpRequest* req, char* out, size_t outsz)
     return -1;
 }
 
+/* 取请求头(不区分大小写)。找到写入 out 并返回 0。 */
+static inline int http_header_get(const HttpRequest* req, const char* name, char* out, size_t outsz)
+{
+    size_t nlen = strlen(name);
+    int i;
+    for (i = 0; i < req->n_headers; i++) {
+        const char* h = req->headers[i];
+        if (strncasecmp(h, name, nlen) == 0 && h[nlen] == ':') {
+            const char* p = h + nlen + 1;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t n = strlen(p);
+            if (n >= outsz) n = outsz - 1;
+            memcpy(out, p, n);
+            out[n] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* 解析请求(阻塞读请求行+头+body)。返回 0 成功, -1 失败 */
 static inline int http_parse_request(int fd, HttpRequest* req)
 {

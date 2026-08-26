@@ -133,26 +133,119 @@ static void server_unlink_rank0_kv(Server* s, const char* key)
         ylog_info("server: stale kv removed %s", path);
 }
 
-/* 会话 INFER: INFER_SESS <max_tokens> <nbytes> key=<key>\n<新消息文本>
- * server 侧: 词表渲染新消息 → 会话缓存累积 → 只发增量 token 给 rank(key/resume)。
- * rank 状态未知/kv 损坏时: 先全量重发; 仍失败则按新会话重渲染当前消息。 */
+#define SESS_MSG_MAX 32
+
+static void strip_tool_order_line(char* s)
+{
+    char* p = s;
+    while (p && *p) {
+        char* hit = strstr(p, "可用的工具:");
+        if (!hit) hit = strstr(p, "可用的工具：");
+        if (!hit) break;
+        char* e = strchr(hit, '\n');
+        if (!e) { *hit = '\0'; break; }
+        memmove(hit, e + 1, strlen(e + 1) + 1);
+        p = hit;
+    }
+}
+
+static void copy_named_arg(const char* args, const char* name, char* out, size_t outsz)
+{
+    out[0] = '\0';
+    const char* kv = strstr(args, name);
+    while (kv) {
+        if (kv == args || kv[-1] == ' ') break;
+        kv = strstr(kv + 1, name);
+    }
+    if (!kv) return;
+    kv += strlen(name);
+    size_t kl = strcspn(kv, " \t");
+    if (kl >= outsz) kl = outsz - 1;
+    memcpy(out, kv, kl);
+    out[kl] = '\0';
+    if (strcmp(out, "-") == 0) out[0] = '\0';
+}
+
+static int parse_sess_msgs(char* msg, size_t nbytes,
+                           char roles[][16], const char** contents,
+                           char* store, size_t storesz, int maxn)
+{
+    if (nbytes < 6 || strncmp(msg, "MSGS ", 5) != 0) return -1;
+    int n = atoi(msg + 5);
+    if (n < 1 || n > maxn) return -1;
+    char* p = strchr(msg, '\n');
+    if (!p) return -1;
+    p++;
+    size_t off = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        unsigned long clen = 0;
+        if (sscanf(p, "%15s %lu", roles[i], &clen) != 2) return -1;
+        char* nl = strchr(p, '\n');
+        if (!nl) return -1;
+        p = nl + 1;
+        if (p + (size_t)clen > msg + nbytes) return -1;
+        if (off + (size_t)clen + 1 > storesz) return -1;
+        memcpy(store + off, p, (size_t)clen);
+        store[off + (size_t)clen] = '\0';
+        if (strcmp(roles[i], "system") == 0)
+            strip_tool_order_line(store + off);
+        contents[i] = store + off;
+        off += strlen(store + off) + 1;
+        p += (size_t)clen;
+    }
+    return n;
+}
+
+static const char* last_user_content(char roles[][16], const char** contents, int n)
+{
+    int i;
+    for (i = n - 1; i >= 0; i--)
+        if (strcmp(roles[i], "user") == 0) return contents[i] ? contents[i] : "";
+    return (n > 0 && contents[n - 1]) ? contents[n - 1] : "";
+}
+
+static int sess_tokens_prefix_of(const SessVal* sv, const uint32_t* req, int nreq, int eos)
+{
+    if (!sv || !req || nreq <= 0 || sv->n == 0 || !sv->tokens) return 0;
+    uint32_t vn = sv->n;
+    if (eos >= 0 && vn > 0 && sv->tokens[vn - 1] == (uint32_t)eos) vn--;
+    if (vn == 0 || vn > (uint32_t)nreq) return 0;
+    uint32_t i;
+    for (i = 0; i < vn; i++)
+        if (sv->tokens[i] != req[i]) return 0;
+    return 1;
+}
+
+static void sess_try_disk(Server* s, SessVal* sv, const char* key, int* first, uint32_t* resume)
+{
+    if (!s->cache_dir[0] || !sv) return;
+    char path[512];
+    int npre = snprintf(path, sizeof(path), "%s/", s->cache_dir);
+    if (npre < 0 || npre >= (int)sizeof(path)) return;
+    sess_file_name(path + npre, sizeof(path) - (size_t)npre, key, ".sess");
+    if (sess_load(sv, path) == 0) {
+        *first = 0;
+        *resume = sv->n;
+        ylog_info("server: session %s restored from %s (%u tokens)", key, path, sv->n);
+    }
+}
+
+/* 会话 INFER: INFER_SESS <max_tokens> <nbytes> key=<id|->"\n<MSGS 或单条文本>
+ * key 即客户端会话 id; 无则 "-" , server 按 token 前缀续接或自动分配。
+ * rank kv 损坏: 先全量重发; 仍失败则按新会话重渲染。 */
 static void forward_infer_sess(int client_fd, Server* s, const char* args)
 {
     int max_tokens = 0;
     long nbytes = 0;
-    char key[64] = "";
+    char key[128] = "";
     if (sscanf(args, "%d %ld", &max_tokens, &nbytes) != 2 || max_tokens <= 0 || nbytes < 0) {
         sock_send_line(client_fd, PROTO_ERROR " bad INFER_SESS args");
         return;
     }
-    const char* kv = strstr(args, "key=");
-    if (kv) {
-        kv += 4;
-        size_t kl = strcspn(kv, " ");
-        if (kl >= sizeof(key)) kl = sizeof(key) - 1;
-        memcpy(key, kv, kl);
-        key[kl] = '\0';
-    }
+    copy_named_arg(args, "key=", key, sizeof(key));
+    int has_key = key[0] && strcmp(key, "-") != 0;
+    if (!has_key) key[0] = '\0';
     if (!s->sess_vocab_ok) { sock_send_line(client_fd, PROTO_ERROR " server: session vocab not loaded"); return; }
 
     char* msg = (char*)malloc((size_t)nbytes + 1);
@@ -160,35 +253,105 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     if (sock_recv_n(client_fd, msg, (size_t)nbytes) != 0) { free(msg); return; }
     msg[nbytes] = '\0';
 
+    char roles[SESS_MSG_MAX][16];
+    const char* contents[SESS_MSG_MAX];
+    char* store = (char*)malloc((size_t)nbytes + (size_t)SESS_MSG_MAX * 8 + 8);
+    int n_msgs = 0;
+    int is_msgs = 0;
+    if (store)
+        n_msgs = parse_sess_msgs(msg, (size_t)nbytes, roles, contents, store,
+                                 (size_t)nbytes + (size_t)SESS_MSG_MAX * 8, SESS_MSG_MAX);
+    if (n_msgs > 0) is_msgs = 1;
+
+    uint32_t* full_ids = (uint32_t*)ymalloc(65536 * 4);
+    uint32_t* tokens = (uint32_t*)ymalloc(65536 * 4);
+    int nfull = 0, n = 0;
+    if (is_msgs) {
+        const char* rp[SESS_MSG_MAX];
+        int mi;
+        for (mi = 0; mi < n_msgs; mi++) rp[mi] = roles[mi];
+        nfull = vocab_chat_ids_multi(&s->sess_vocab, rp, contents, n_msgs, full_ids, 65536, 1);
+    } else {
+        nfull = vocab_chat_ids(&s->sess_vocab, msg, full_ids, 65536, 1);
+    }
+
     pthread_mutex_lock(&s->infer_lock);
     pthread_mutex_lock(&s->sess_lock);
-    SessVal* sv = sess_get(&s->sess, key);
+    SessVal* sv = NULL;
     uint32_t resume = 0;
     int first = 0;
-    if (!sv) {
-        sv = sess_put(&s->sess, key);
-        first = 1;
-        /* 磁盘恢复: 有 <dir>/<key>.sess 则载入历史 */
-        if (s->cache_dir[0]) {
-            char path[512];
-            sess_file_name(path + snprintf(path, sizeof(path), "%s/", s->cache_dir), sizeof(path), key, ".sess");
-            if (sess_load(sv, path) == 0) {
-                first = 0;
-                resume = sv->n;
-                ylog_info("server: session %s restored from %s (%u tokens)", key, path, sv->n);
-            }
+    int eos = s->sess_vocab.eos;
+    if (has_key) {
+        sv = sess_get(&s->sess, key);
+        if (!sv) {
+            sv = sess_put(&s->sess, key);
+            first = 1;
+            sess_try_disk(s, sv, key, &first, &resume);
+        } else {
+            resume = sv->n;
+        }
+        if (sv && sv->n > 0 && nfull > 0 && !sess_tokens_prefix_of(sv, full_ids, nfull, eos)) {
+            ylog_info("server: sess %s history changed, reset", key);
+            sess_truncate(sv, 0);
+            first = 1;
+            resume = 0;
+        }
+    } else if (nfull > 0) {
+        sv = sess_find_prefix(&s->sess, full_ids, (uint32_t)nfull, eos);
+        if (sv) {
+            snprintf(key, sizeof(key), "%s", sv->key);
+            resume = sv->n;
+            first = 0;
+            ylog_info("server: sess prefix-hit key=%s n=%u req=%d", key, sv->n, nfull);
+        } else {
+            snprintf(key, sizeof(key), "a:%llx:%x",
+                     (unsigned long long)ynow_ms(),
+                     (unsigned)nfull ^ (nfull > 0 ? full_ids[0] : 0));
+            sv = sess_put(&s->sess, key);
+            first = 1;
+            resume = 0;
+            sess_try_disk(s, sv, key, &first, &resume);
+        }
+    } else {
+        if (!key[0]) snprintf(key, sizeof(key), "a:%llx", (unsigned long long)ynow_ms());
+        sv = sess_get(&s->sess, key);
+        if (!sv) {
+            sv = sess_put(&s->sess, key);
+            first = 1;
+            sess_try_disk(s, sv, key, &first, &resume);
+        } else {
+            resume = sv->n;
         }
     }
-    else resume = sv->n;   /* 缓存含尾部 eos, 与 rank kv 逐 token 对齐 */
-    uint32_t* tokens = (uint32_t*)ymalloc(65536 * 4);
-    int n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, first ? 1 : 0);
-    if (n <= 0) {
-        free(tokens);
-        free(msg);
+    if (nfull <= 0) {
+        free(full_ids); free(tokens); free(store); free(msg);
         pthread_mutex_unlock(&s->sess_lock);
         pthread_mutex_unlock(&s->infer_lock);
         sock_send_line(client_fd, PROTO_ERROR " server: render failed");
         return;
+    }
+    if (first || resume == 0) {
+        memcpy(tokens, full_ids, (size_t)nfull * 4);
+        n = nfull;
+        resume = 0;
+    } else if (is_msgs) {
+        n = vocab_chat_ids(&s->sess_vocab, last_user_content(roles, contents, n_msgs),
+                           tokens, 65536, 0);
+        if (n <= 0) {
+            memcpy(tokens, full_ids, (size_t)nfull * 4);
+            n = nfull;
+            resume = 0;
+            first = 1;
+        }
+    } else {
+        n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, 0);
+        if (n <= 0) {
+            free(full_ids); free(tokens); free(store); free(msg);
+            pthread_mutex_unlock(&s->sess_lock);
+            pthread_mutex_unlock(&s->infer_lock);
+            sock_send_line(client_fd, PROTO_ERROR " server: render failed");
+            return;
+        }
     }
     /* 成功 DONE 前不 commit: 超时重试不得把同一条用户消息反复追加进会话 */
     pthread_mutex_unlock(&s->sess_lock);
@@ -201,7 +364,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     for (;;) {
         int fd = sock_connect(s->leader_host, s->leader_port, 5);
         if (fd < 0) {
-            free(gen); free(tokens); free(msg);
+            free(gen); free(full_ids); free(tokens); free(store); free(msg);
             pthread_mutex_unlock(&s->infer_lock);
             sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader");
             return;
@@ -216,7 +379,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
             SessVal* rv = sess_get(&s->sess, key);
             if (!rv) {
                 pthread_mutex_unlock(&s->sess_lock);
-                sock_close(fd); free(gen); free(tokens); free(msg);
+                sock_close(fd); free(gen); free(full_ids); free(tokens); free(store); free(msg);
                 pthread_mutex_unlock(&s->infer_lock);
                 return;
             }
@@ -275,7 +438,14 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
                     SessVal* rv = sess_get(&s->sess, key);
                     if (rv) {
                         sess_truncate(rv, 0);
-                        n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, 1);
+                        if (is_msgs) {
+                            const char* rp[SESS_MSG_MAX];
+                            int mi;
+                            for (mi = 0; mi < n_msgs; mi++) rp[mi] = roles[mi];
+                            n = vocab_chat_ids_multi(&s->sess_vocab, rp, contents, n_msgs, tokens, 65536, 1);
+                        } else {
+                            n = vocab_chat_ids(&s->sess_vocab, msg, tokens, 65536, 1);
+                        }
                         if (s->cache_dir[0]) {
                             char path[512];
                             sess_file_name(path + snprintf(path, sizeof(path), "%s/", s->cache_dir),
@@ -287,7 +457,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
                     }
                     pthread_mutex_unlock(&s->sess_lock);
                     if (n <= 0) {
-                        free(full); free(gen); free(tokens); free(msg);
+                        free(full); free(gen); free(full_ids); free(tokens); free(store); free(msg);
                         pthread_mutex_unlock(&s->infer_lock);
                         sock_send_line(client_fd, PROTO_ERROR " server: sess reset render failed");
                         return;
@@ -363,7 +533,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         sock_close(fd);
         free(full);
         if (rc == -2) continue;
-        free(gen); free(tokens); free(msg);
+        free(gen); free(full_ids); free(tokens); free(store); free(msg);
         pthread_mutex_unlock(&s->infer_lock);
         return;
     }

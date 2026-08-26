@@ -316,9 +316,11 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
         router_set_err(err, errlen, NULL, "cannot connect server");
         return -1;
     }
-    char args[192];
+    char args[256];
     snprintf(args, sizeof(args), "%d %zu key=%s temp=%.6g top_p=%.6g",
-             max_tokens, msg_len, sess_key, temp, top_p);
+             max_tokens, msg_len,
+             (sess_key && sess_key[0]) ? sess_key : "-",
+             temp, top_p);
 #if YLLM_SESS_DEBUG
     ylog_info("ROUTER->SERVER: INFER_SESS args=[%s] msg=[%.60s]", args, new_msg);
 #endif

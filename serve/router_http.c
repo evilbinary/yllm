@@ -226,18 +226,49 @@ static void sse_on_done(SseCtx* sc, const char* reason)
     }
 }
 
-/* 会话 key: 客户端 IP + 首条用户消息哈希(同一对话稳定) */
-static void make_sess_key(int fd, const char* first, size_t flen, char* out, size_t outsz)
+/* 会话 key = 客户端显式 id(头或 JSON); 没有则空, 由 server 按对话 token 前缀续接 */
+static void pick_client_sess_id(const HttpRequest* req, const char* body, char* out, size_t outsz)
 {
-    char ip[64] = "0.0.0.0";
-    struct sockaddr_in sa;
-    socklen_t sl = sizeof(sa);
-    if (getpeername(fd, (struct sockaddr*)&sa, &sl) == 0)
-        inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
-    uint64_t h = 1469598103934665603ull;
-    size_t i;
-    for (i = 0; i < flen; i++) { h ^= (unsigned char)first[i]; h *= 1099511628211ull; }
-    snprintf(out, outsz, "%s:%llx", ip, (unsigned long long)h);
+    JsonVal v;
+    out[0] = '\0';
+    if (req) {
+        if (http_header_get(req, "X-Session-Id", out, outsz) == 0 && out[0]) return;
+        if (http_header_get(req, "X-Conversation-Id", out, outsz) == 0 && out[0]) return;
+    }
+    if (body) {
+        const char* keys[] = { "conversation_id", "session_id", "chat_id", NULL };
+        int k;
+        for (k = 0; keys[k]; k++) {
+            if (json_find(body, keys[k], &v) && v.type == JSON_STR && v.len > 0) {
+                size_t n = json_str_unescape(v.start, v.len, out);
+                if (n >= outsz) n = outsz - 1;
+                out[n] = '\0';
+                if (out[0]) return;
+            }
+        }
+    }
+}
+
+/* 打包全部 messages 给 server(长度前缀, 可含换行) */
+static int pack_chat_msgs(char* out, size_t cap, char** roles, char** contents, int n, size_t* olen)
+{
+    size_t o = 0;
+    int i, w;
+    w = snprintf(out, cap, "MSGS %d\n", n);
+    if (w < 0 || (size_t)w >= cap) return -1;
+    o = (size_t)w;
+    for (i = 0; i < n; i++) {
+        const char* role = roles[i] ? roles[i] : "user";
+        const char* c = contents[i] ? contents[i] : "";
+        size_t cl = strlen(c);
+        w = snprintf(out + o, cap - o, "%s %zu\n", role, cl);
+        if (w < 0 || o + (size_t)w + cl > cap) return -1;
+        o += (size_t)w;
+        memcpy(out + o, c, cl);
+        o += cl;
+    }
+    *olen = o;
+    return 0;
 }
 
 /* 提取 chat 请求的全部消息(role/content), 返回消息数 */
@@ -289,7 +320,7 @@ static size_t extract_chat_prompt(const char* body, char* out, size_t outsz)
 }
 
 /* ---- /v1/chat/completions ---- */
-static void handle_chat_completions(int fd, Router* r, const char* body, int stream)
+static void handle_chat_completions(int fd, Router* r, const char* body, int stream, const HttpRequest* httpreq)
 {
     JsonVal v;
     char model[128] = "default";
@@ -326,24 +357,33 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     }
     /* 会话模式: 提取全部消息 + 会话 key, 渲染后只发增量 token 给 rank */
     char* pool = (char*)malloc(HTTP_MAX_BODY);
-    char* roles[16];
-    char* contents[16];
+    char* roles[32];
+    char* contents[32];
     int n_msgs = 0;
     int sess_ok = 0;
     char sess_key[128] = "";
+    char* packed = NULL;
+    size_t packlen = 0;
     if (pool) {
-        n_msgs = extract_chat_messages(body, pool, HTTP_MAX_BODY, roles, contents, 16);
+        n_msgs = extract_chat_messages(body, pool, HTTP_MAX_BODY, roles, contents, 32);
         if (n_msgs > 0) {
-            make_sess_key(fd, contents[0], strlen(contents[0]), sess_key, sizeof(sess_key));
-            sess_ok = 1;
+            pick_client_sess_id(httpreq, body, sess_key, sizeof(sess_key));
+            packed = (char*)malloc(HTTP_MAX_BODY);
+            if (packed && pack_chat_msgs(packed, HTTP_MAX_BODY, roles, contents, n_msgs, &packlen) == 0)
+                sess_ok = 1;
+            else {
+                free(packed);
+                packed = NULL;
+            }
         }
 #if YLLM_SESS_DEBUG
-        ylog_info("router_http: sess_ok=%d n_msgs=%d key=%s", sess_ok, n_msgs, sess_key);
+        ylog_info("router_http: sess_ok=%d n_msgs=%d key=%s", sess_ok, n_msgs, sess_key[0] ? sess_key : "-");
 #endif
     }
 
     if (plen == 0 && n_msgs == 0) {
         if (pool) free(pool);
+        free(packed);
         free(prompt);
         free(collected);
         HttpResponse rr;
@@ -361,14 +401,15 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         sc.prompt_tokens = 0;
         sc.include_usage = include_usage;
         if (g_api_log)
-            ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu",
-                      model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen);
+            ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu key=%s",
+                      model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen,
+                      sess_key[0] ? sess_key : "-");
         http_sse_begin(&rr, fd);
         int rc;
         char errbuf[256] = "";
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
-                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), sse_on_token, &sc,
+                                   packed, packlen, sse_on_token, &sc,
                                    rtemp, rtop_p, &sc.prompt_tokens, errbuf, sizeof(errbuf));
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
@@ -398,7 +439,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         char errbuf[256] = "";
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
-                                   contents[n_msgs - 1], strlen(contents[n_msgs - 1]), collect_on_token, &cc,
+                                   packed, packlen, collect_on_token, &cc,
                                    rtemp, rtop_p, &ptoken, errbuf, sizeof(errbuf));
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
@@ -414,12 +455,14 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                 http_begin(&rr, fd, 502, NULL);
                 http_reply(&rr, ej);
             }
+            free(packed);
+            if (pool) free(pool);
             free(prompt);
             free(collected);
             return;
         }
         char* json = (char*)malloc(HTTP_MAX_BODY + 512);
-        if (!json) { free(prompt); free(collected); return; }
+        if (!json) { free(packed); if (pool) free(pool); free(prompt); free(collected); return; }
         snprintf(json, HTTP_MAX_BODY + 512,
                  "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\","
                  "\"created\":%lld,\"model\":\"%s\","
@@ -434,6 +477,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         free(json);
     }
     if (pool) free(pool);
+    free(packed);
     free(prompt);
     free(collected);
 }
@@ -604,7 +648,7 @@ static void handle_conn(int fd, Router* r)
                strcmp(req.path, "/v1/chat/completions") == 0) {
         if (g_api_log) ylog_body("HTTP CHAT", req.body);
         int stream = req.body && strstr(req.body, "\"stream\":true");
-        handle_chat_completions(fd, r, req.body ? req.body : "", stream);
+        handle_chat_completions(fd, r, req.body ? req.body : "", stream, &req);
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/completions") == 0) {
         if (g_api_log) ylog_body("HTTP COMPLETIONS", req.body);
         int stream = req.body && strstr(req.body, "\"stream\":true");

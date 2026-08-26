@@ -7,7 +7,7 @@
  * 纯逻辑层: 不依赖引擎, 由 server(router)做会话管理时使用;
  * CLI 会话功能同样可复用。 */
 typedef struct {
-    char key[64];        /* 会话 key */
+    char key[128];       /* 会话 key(客户端 id 或自动分配) */
     uint32_t* tokens;    /* 已缓存完整 token 序列 */
     uint32_t n;          /* 已缓存长度 */
     uint32_t cap;        /* 容量 */
@@ -29,6 +29,8 @@ SessVal* sess_get(SessCache* c, const char* key);
 SessVal* sess_put(SessCache* c, const char* key);
 /* 请求 token 与缓存序列的公共前缀长度(逐 token 比对) */
 uint32_t sess_prefix(const SessVal* v, const uint32_t* req, uint32_t n);
+/* 已缓存历史(去掉尾 eos)是 req 前缀的最长条目; 无则 NULL */
+SessVal* sess_find_prefix(SessCache* c, const uint32_t* req, uint32_t n, int eos);
 /* 前缀缩短(历史被改时截断到公共前缀) */
 void sess_truncate(SessVal* v, uint32_t n);
 /* 追加一批 token 到条目末尾, 返回 0 成功 */
