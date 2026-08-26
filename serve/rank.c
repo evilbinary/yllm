@@ -94,9 +94,38 @@ typedef struct {
     volatile int io_stop;  /* IO 线程退出(排空完成或 listen 失败) */
     double kv_mb_cache;    /* hb 刷新, STAT 免抢 engine */
     uint32_t job_need;     /* 本轮 prompt/delta token 数; 0=无进行中作业 */
-    volatile uint32_t job_pos; /* 已推进到的 pos(prefill/decode 共用) */
-    uint64_t job_t0;       /* 本轮开始 ynow_ms() */
+    DistLive job;          /* pos / prefill|decode / tok/s */
 } Rank;
+
+static void rank_job_begin(Rank* r, uint32_t start, uint32_t need, uint64_t t0)
+{
+    r->job_need = need;
+    r->job.start = start;
+    r->job.pos = start;
+    r->job.phase = 1;
+    r->job.t0 = t0;
+    r->job.dec_t0 = 0;
+    r->job.dec_start = start;
+    r->job.pf_tps = 0;
+    r->job.dec_tps = 0;
+}
+
+static void rank_job_end(Rank* r)
+{
+    DistLive* L = &r->job;
+    uint64_t now = ynow_ms();
+    if (L->phase == 1 && L->t0) {
+        uint32_t n = L->pos >= L->start ? L->pos - L->start : 0;
+        uint64_t ms = now > L->t0 ? now - L->t0 : 1;
+        if (n) L->pf_tps = (float)((double)n * 1000.0 / (double)ms);
+    } else if (L->phase == 2 && L->dec_t0) {
+        uint32_t n = L->pos >= L->dec_start ? L->pos - L->dec_start : 0;
+        uint64_t ms = now > L->dec_t0 ? now - L->dec_t0 : 1;
+        if (n) L->dec_tps = (float)((double)n * 1000.0 / (double)ms);
+    }
+    L->phase = 0;
+    r->job_need = 0;
+}
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
 
@@ -222,14 +251,34 @@ static int handle_stat(int fd, Rank* r)
     if (kv_mb <= 0.0)
         kv_mb = (double)engine_resident(e) / 1048576.0;
     uint32_t jneed = r->job_need;
-    uint32_t jpos = r->job_pos;
-    uint64_t jms = (jneed || inflight) && r->job_t0 ? (ynow_ms() - r->job_t0) : 0;
+    DistLive L = r->job;
+    uint64_t now = ynow_ms();
+    uint64_t jms = (L.phase && L.t0) ? (now - L.t0) : 0;
+    float pf = L.pf_tps, dc = L.dec_tps;
+    const char* phase = "-";
+    if (L.phase == 1) {
+        phase = "prefill";
+        {
+            uint32_t n = L.pos >= L.start ? L.pos - L.start : 0;
+            uint64_t ms = now > L.t0 && L.t0 ? now - L.t0 : 1;
+            if (n) pf = (float)((double)n * 1000.0 / (double)ms);
+        }
+        dc = 0;
+    } else if (L.phase == 2) {
+        phase = "decode";
+        if (L.dec_t0) {
+            uint32_t n = L.pos >= L.dec_start ? L.pos - L.dec_start : 0;
+            uint64_t ms = now > L.dec_t0 ? now - L.dec_t0 : 1;
+            if (n) dc = (float)((double)n * 1000.0 / (double)ms);
+        }
+    }
     send_line(fd,
               "OK inflight=%d queued=%d work=%s threads=%d kv_mb=%.1f prefix_hits=0 "
-              "uptime_s=%llu layers[%u,%u) omp=%d job_pos=%u job_need=%u job_ms=%llu",
+              "uptime_s=%llu layers[%u,%u) omp=%d job_pos=%u job_need=%u job_ms=%llu "
+              "job_phase=%s job_pf_tps=%.2f job_dec_tps=%.2f",
               inflight, queued, mode ? "parallel" : "serial", nwork, kv_mb,
               (unsigned long long)uptime, e->layer_begin, e->layer_end, omp_n,
-              jpos, jneed, (unsigned long long)jms);
+              L.pos, jneed, (unsigned long long)jms, phase, pf, dc);
     return 0;
 }
 
@@ -394,17 +443,15 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         sess.pos = resume;                 /* master 从续接点开始 */
         sess.my_pos = r->cache_pos;
         sess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
-        r->job_need = ndelta;
-        r->job_pos = resume;
-        r->job_t0 = t0;
-        sess.live_pos = (uint32_t*)&r->job_pos;
+        rank_job_begin(r, resume, ndelta, t0);
+        sess.live = &r->job;
         int rc2 = dist_gen(&r->engine, &r->vocab, delta, (int)ndelta, (int)max_tokens,
                            r->temp, r->top_p, r->seed,
                            r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
                            t0, on_token_rank, &tc, &sess);
         r->cache_pos = sess.pos;
-        r->job_need = 0;
-        r->job_t0 = 0;
+        r->job.pos = sess.pos;
+        rank_job_end(r);
         tim.n_decode = (uint32_t)tc.n_tokens;
         tim.decode_ms = ynow_ms() - t0;
         ylog_info("rank: sess %s pp done rc=%d (resume=%u end=%u, %d tokens, %llu ms)",
@@ -423,13 +470,24 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
 
     /* 增量 prefill: 旧 token 的 KV 已在本引擎缓存, 只算新 token */
     uint64_t t_prefill = ynow_ms();
+    rank_job_begin(r, r->cache_pos, ndelta, t0);
     if (ndelta > 0)
         engine_forward_prefill(&r->engine, delta, (int)ndelta, r->cache_pos);
     r->cache_pos += ndelta;
+    r->job.pos = r->cache_pos;
     if (ndelta > 0)
         ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", ndelta,
                (double)(ynow_ms() - t_prefill) / 1000.0,
                (double)ndelta * 1000.0 / (double)(ynow_ms() - t_prefill > 0 ? ynow_ms() - t_prefill : 1));
+    {
+        uint64_t now = ynow_ms();
+        uint64_t pms = now > t_prefill ? now - t_prefill : 1;
+        if (ndelta)
+            r->job.pf_tps = (float)((double)ndelta * 1000.0 / (double)pms);
+        r->job.dec_t0 = now;
+        r->job.dec_start = r->cache_pos;
+        r->job.phase = 2;
+    }
 
     /* decode 循环: 采样 → 流式回 → 前向推进(与 engine_generate 同构) */
     uint64_t t_dec0 = ynow_ms();
@@ -444,6 +502,7 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         engine_forward(&r->engine, nxt, pos);
         pos++;
         ngen++;
+        r->job.pos = pos;
     }
     /* 结束(命中 eos 或达上限)后补 eos 到 kv, 使 rank pos 与 router 缓存(回复+eos)一致 */
     if (pos < r->engine.max_seq) {
@@ -451,6 +510,8 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         pos++;
     }
     r->cache_pos = pos;
+    r->job.pos = pos;
+    rank_job_end(r);
     tim.n_decode = ngen;
     tim.decode_ms = ynow_ms() - t_dec0;
 
@@ -780,10 +841,12 @@ static void rank_pipe_work_thread(void* arg)
         wsess.my_pos = r->cache_pos;
         wsess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
         wsess.quit = &r->quit;
-        r->job_need = 0;
-        r->job_pos = r->cache_pos;
-        r->job_t0 = ynow_ms();
-        wsess.live_pos = (uint32_t*)&r->job_pos;
+        r->job.start = r->cache_pos;
+        r->job.pos = r->cache_pos;
+        r->job.t0 = ynow_ms();
+        r->job.phase = 0;
+        r->job.dec_t0 = 0;
+        wsess.live = &r->job;
         pthread_mutex_lock(&r->engine_lock);
         int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
                           r->temp, r->top_p, r->seed,
@@ -792,6 +855,8 @@ static void rank_pipe_work_thread(void* arg)
         if (wsess.key[0])
             snprintf(r->cache_key, sizeof(r->cache_key), "%s", wsess.key);
         r->cache_pos = wsess.my_pos;
+        r->job.pos = wsess.my_pos;
+        rank_job_end(r);
         rank_save_sess_kv(r);
         pthread_mutex_unlock(&r->engine_lock);
         if (r->quit) break;

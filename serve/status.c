@@ -141,8 +141,8 @@ static unsigned long long stat_ull(const char* args, const char* key)
 
 static void print_rank_header(void)
 {
-    printf("  %-8s %-4s %3s %3s %6s %-9s %3s %6s %6s %8s %6s\n",
-           "id", "st", "in", "q", "kv", "layers", "omp", "pos", "need", "ms", "up");
+    printf("  %-8s %-4s %3s %3s %6s %-9s %3s %6s %6s %8s %6s %6s %6s\n",
+           "id", "st", "in", "q", "kv", "layers", "omp", "pos", "need", "ms", "pf/s", "dc/s", "up");
 }
 
 static void query_one_rank(const char* label, const char* addr)
@@ -175,6 +175,18 @@ static void query_one_rank(const char* label, const char* addr)
     int jneed = stat_int(a, "job_need", 0);
     unsigned long long jms = stat_ull(a, "job_ms");
     unsigned long long up = stat_ull(a, "uptime_s");
+    float pft = 0, dct = 0;
+    {
+        const char* p = strstr(a, "job_pf_tps=");
+        if (p) pft = (float)atof(p + 11);
+        p = strstr(a, "job_dec_tps=");
+        if (p) dct = (float)atof(p + 12);
+    }
+    char pfs[16], dcs[16];
+    if (pft > 0.05f) snprintf(pfs, sizeof(pfs), "%.1f", pft);
+    else snprintf(pfs, sizeof(pfs), "-");
+    if (dct > 0.05f) snprintf(dcs, sizeof(dcs), "%.1f", dct);
+    else snprintf(dcs, sizeof(dcs), "-");
     double kv = 0.0;
     {
         const char* p = strstr(a, "kv_mb=");
@@ -187,9 +199,9 @@ static void query_one_rank(const char* label, const char* addr)
         if (p && sscanf(p, "layers[%u,%u)", &b, &e) == 2)
             snprintf(layers, sizeof(layers), "[%u,%u)", b, e);
     }
-    printf("  %-8s %-4s %3d %3d %6.1f %-9s %3d %6d %6d %8llu %6llu\n",
+    printf("  %-8s %-4s %3d %3d %6.1f %-9s %3d %6d %6d %8llu %6s %6s %6llu\n",
            label, f.cmd, inflight, queued, kv, layers, omp_n,
-           jpos, jneed, (unsigned long long)jms, (unsigned long long)up);
+           jpos, jneed, (unsigned long long)jms, pfs, dcs, (unsigned long long)up);
 }
 
 static void query_ranks(ServeConfig* cfg, const NodeInfo* infos, int n)

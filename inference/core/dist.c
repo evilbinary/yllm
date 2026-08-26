@@ -806,6 +806,13 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 }
             }
         }
+        if (sess && sess->live && rc == 0) {
+            sess->live->start = sess->my_pos;
+            sess->live->pos = sess->my_pos;
+            sess->live->t0 = ynow_ms();
+            sess->live->phase = 1;
+            sess->live->dec_t0 = 0;
+        }
         int w_timing = getenv("YLLM_DISTTIMING") != NULL;
         int had_batch = 0, t1_n = 0;
         for (;;) {
