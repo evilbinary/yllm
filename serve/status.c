@@ -10,6 +10,7 @@
 #include "proclist.h"
 #include "../inference/include/log.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int print_proc_one(int pid, const char* cmdline, void* ctx)
@@ -98,9 +99,81 @@ static void query_role(const char* label, const char* addr)
     sock_close(fd);
 }
 
+static int stat_int(const char* args, const char* key, int def)
+{
+    const char* p = strstr(args, key);
+    if (!p) return def;
+    p += strlen(key);
+    if (*p == '=') p++;
+    return atoi(p);
+}
+
+static unsigned long long stat_ull(const char* args, const char* key)
+{
+    const char* p = strstr(args, key);
+    if (!p) return 0;
+    p += strlen(key);
+    if (*p == '=') p++;
+    return strtoull(p, NULL, 10);
+}
+
+static void print_rank_header(void)
+{
+    printf("  %-8s %-4s %3s %3s %6s %-9s %3s %6s %6s %8s %6s\n",
+           "id", "st", "in", "q", "kv", "layers", "omp", "pos", "need", "ms", "up");
+}
+
+static void query_one_rank(const char* label, const char* addr)
+{
+    const char* colon = strchr(addr, ':');
+    if (!colon) {
+        printf("  %-8s %-4s\n", label, "?");
+        return;
+    }
+    size_t hlen = (size_t)(colon - addr);
+    int fd = sock_connect_host(addr, hlen, (uint16_t)atoi(colon + 1), 2);
+    if (fd < 0) {
+        printf("  %-8s %-4s  (%s)\n", label, "--", addr);
+        return;
+    }
+    sock_set_timeout(fd, 3);
+    frame_send(fd, PROTO_STAT, NULL);
+    Frame f;
+    if (frame_recv(fd, &f) < 0) {
+        printf("  %-8s %-4s  timeout (%s)\n", label, "--", addr);
+        sock_close(fd);
+        return;
+    }
+    sock_close(fd);
+    const char* a = f.args;
+    int inflight = stat_int(a, "inflight", 0);
+    int queued = stat_int(a, "queued", 0);
+    int omp_n = stat_int(a, "omp", 0);
+    int jpos = stat_int(a, "job_pos", 0);
+    int jneed = stat_int(a, "job_need", 0);
+    unsigned long long jms = stat_ull(a, "job_ms");
+    unsigned long long up = stat_ull(a, "uptime_s");
+    double kv = 0.0;
+    {
+        const char* p = strstr(a, "kv_mb=");
+        if (p) kv = atof(p + 6);
+    }
+    char layers[16] = "-";
+    {
+        const char* p = strstr(a, "layers[");
+        unsigned b = 0, e = 0;
+        if (p && sscanf(p, "layers[%u,%u)", &b, &e) == 2)
+            snprintf(layers, sizeof(layers), "[%u,%u)", b, e);
+    }
+    printf("  %-8s %-4s %3d %3d %6.1f %-9s %3d %6d %6d %8llu %6llu\n",
+           label, f.cmd, inflight, queued, kv, layers, omp_n,
+           jpos, jneed, (unsigned long long)jms, (unsigned long long)up);
+}
+
 static void query_ranks(ServeConfig* cfg, const NodeInfo* infos, int n)
 {
     int r;
+    print_rank_header();
     for (r = 0; r < n; r++) {
         char label[32];
         snprintf(label, sizeof(label), "rank-%d", infos[r].idx);
@@ -110,7 +183,7 @@ static void query_ranks(ServeConfig* cfg, const NodeInfo* infos, int n)
         } else {
             snprintf(addr, sizeof(addr), "127.0.0.1:%d", cfg->rank_port_base + infos[r].idx);
         }
-        query_role(label, addr);
+        query_one_rank(label, addr);
     }
 }
 
@@ -139,7 +212,7 @@ int cmd_status(ServeConfig* cfg)
     printf("\n");
     query_supervisor(cfg, ranks, &n_rank, srvs, &n_srv);
     printf("\n");
-    printf("== rank 状态 (端口基址 %d) ==\n", cfg->rank_port_base);
+    printf("== rank 状态 ==\n");
     if (n_rank > 0) {
         query_ranks(cfg, ranks, n_rank);
     } else {
