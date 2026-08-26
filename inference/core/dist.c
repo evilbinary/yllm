@@ -616,6 +616,13 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             free(xb);
             pos += (uint32_t)nb;
             i += nb;
+            if (sess) {
+                sess->pos = pos;
+                if (sess->live_pos) *sess->live_pos = pos;
+            }
+            if ((i & 63) == 0 || i == nprompt)
+                ylog_info("prefill: %d/%d pos=%u (%.1fs)", i, nprompt, pos,
+                          (double)(ynow_ms() - t0) / 1000.0);
         }
 #else
         for (i = 0; i < nprompt && rc == 0; i++) {
@@ -624,6 +631,10 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 rc = -1; snprintf(err, sizeof(err), "send_x prompt failed"); break;
             }
             pos++;
+            if (sess) {
+                sess->pos = pos;
+                if (sess->live_pos) *sess->live_pos = pos;
+            }
         }
 #endif
         float lse = 0.0f;
@@ -830,7 +841,10 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                     rc = -1; break;
                 }
             }
-            if (sess) sess->my_pos = pos + (uint32_t)t;   /* 本段 kv 已推进 */
+            if (sess) {
+                sess->my_pos = pos + (uint32_t)t;   /* 本段 kv 已推进 */
+                if (sess->live_pos) *sess->live_pos = sess->my_pos;
+            }
             if (getenv("YLLM_DISTDBG"))
                 ylog_info("frame %d: %u tokens in %llu ms", nf, (uint32_t)t,
                           (unsigned long long)(ynow_ms() - f0));

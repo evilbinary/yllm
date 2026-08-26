@@ -64,6 +64,7 @@ typedef struct {
     const char* cache_dir;
     char last_key[64];          /* worker: 上次处理的会话 key(变化时重置本段 kv 并恢复) */
     const volatile int* quit;   /* 非空时 worker 空闲等待周期检查(进程退出信号) */
+    uint32_t* live_pos;         /* 非空: 每批推进后写入, 供 STAT 读进行中 pos */
 } DistSess;
 
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,

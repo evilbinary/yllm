@@ -40,8 +40,9 @@
  * 存活/就绪探测(server 心跳、supervisor 自愈检测用) */
 #define PROTO_PING "PING"
 
-/* STAT\n → OK inflight=<n> kv_mb=<f> prefix_hits=<n> uptime_s=<t> layers[<begin>,<end>) omp=<n>\n
- * 状态上报(供 server 路由决策: 忙闲 / KV 占用; layers 为本段 PP 层区间; omp 为 OpenMP 线程数) */
+/* STAT\n → OK inflight=<n> queued=<n> work=serial|parallel threads=<n> kv_mb=<f> prefix_hits=<n>
+ *          uptime_s=<t> layers[<begin>,<end>) omp=<n> job_pos=<p> job_need=<n> job_ms=<ms>\n
+ * 状态上报(供 server 路由决策: 忙闲 / KV 占用; job_* 为进行中 INFER 的 pos/prompt 数/已耗时) */
 #define PROTO_STAT "STAT"
 
 /* INFER <max_tokens> <n_bytes> seg=<r> segs=<n> peers=<ip1,ip2,...>\n<prompt bytes>

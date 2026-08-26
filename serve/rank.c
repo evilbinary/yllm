@@ -93,6 +93,9 @@ typedef struct {
     int drain_fd;          /* DRAIN 连接: 排空后再回 OK; -1=无 */
     volatile int io_stop;  /* IO 线程退出(排空完成或 listen 失败) */
     double kv_mb_cache;    /* hb 刷新, STAT 免抢 engine */
+    uint32_t job_need;     /* 本轮 prompt/delta token 数; 0=无进行中作业 */
+    volatile uint32_t job_pos; /* 已推进到的 pos(prefill/decode 共用) */
+    uint64_t job_t0;       /* 本轮开始 ynow_ms() */
 } Rank;
 
 #define RANK_PIPE_OFFSET 100 /* 协作口基址偏移(避开 serve/server 端口区段) */
@@ -218,11 +221,15 @@ static int handle_stat(int fd, Rank* r)
     double kv_mb = r->kv_mb_cache;
     if (kv_mb <= 0.0)
         kv_mb = (double)engine_resident(e) / 1048576.0;
+    uint32_t jneed = r->job_need;
+    uint32_t jpos = r->job_pos;
+    uint64_t jms = (jneed || inflight) && r->job_t0 ? (ynow_ms() - r->job_t0) : 0;
     send_line(fd,
               "OK inflight=%d queued=%d work=%s threads=%d kv_mb=%.1f prefix_hits=0 "
-              "uptime_s=%llu layers[%u,%u) omp=%d",
+              "uptime_s=%llu layers[%u,%u) omp=%d job_pos=%u job_need=%u job_ms=%llu",
               inflight, queued, mode ? "parallel" : "serial", nwork, kv_mb,
-              (unsigned long long)uptime, e->layer_begin, e->layer_end, omp_n);
+              (unsigned long long)uptime, e->layer_begin, e->layer_end, omp_n,
+              jpos, jneed, (unsigned long long)jms);
     return 0;
 }
 
@@ -387,14 +394,22 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         sess.pos = resume;                 /* master 从续接点开始 */
         sess.my_pos = r->cache_pos;
         sess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
+        r->job_need = ndelta;
+        r->job_pos = resume;
+        r->job_t0 = t0;
+        sess.live_pos = (uint32_t*)&r->job_pos;
         int rc2 = dist_gen(&r->engine, &r->vocab, delta, (int)ndelta, (int)max_tokens,
                            r->temp, r->top_p, r->seed,
                            r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,
                            t0, on_token_rank, &tc, &sess);
         r->cache_pos = sess.pos;
+        r->job_need = 0;
+        r->job_t0 = 0;
         tim.n_decode = (uint32_t)tc.n_tokens;
         tim.decode_ms = ynow_ms() - t0;
-        ylog_info("rank: sess %s pp done rc=%d (resume=%u end=%u, %d tokens)", key, rc2, resume, sess.pos, tc.n_tokens);
+        ylog_info("rank: sess %s pp done rc=%d (resume=%u end=%u, %d tokens, %llu ms)",
+                  key, rc2, resume, sess.pos, tc.n_tokens,
+                  (unsigned long long)(ynow_ms() - t0));
         pthread_mutex_unlock(&r->engine_lock);
         if (rc2 != 0) {
             /* 失败不得伪装成功: server 收到 ERR 后走全量重发/退避重试 */
@@ -765,6 +780,10 @@ static void rank_pipe_work_thread(void* arg)
         wsess.my_pos = r->cache_pos;
         wsess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
         wsess.quit = &r->quit;
+        r->job_need = 0;
+        r->job_pos = r->cache_pos;
+        r->job_t0 = ynow_ms();
+        wsess.live_pos = (uint32_t*)&r->job_pos;
         pthread_mutex_lock(&r->engine_lock);
         int rc = dist_gen(&r->engine, &r->vocab, NULL, 0, 0,
                           r->temp, r->top_p, r->seed,
