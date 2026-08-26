@@ -31,9 +31,17 @@ static void print_procs(void)
 
 #define NODE_MAX 32
 typedef struct { int idx; char addr[128]; } NodeInfo;
+
+static void dash_if_q(char* s)
+{
+    if (s[0] == '?' && s[1] == '\0') { s[0] = '-'; s[1] = 0; }
+}
+
 static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, NodeInfo* srvs, int* n_srv)
 {
     printf("== supervisor 节点表 (%s:%d) ==\n", cfg->sv_host, cfg->sv_port);
+    printf("  %-10s %-7s %-12s %-7s %-22s %4s %6s\n",
+           "id", "type", "model", "state", "addr", "in", "kv");
     int fd = sock_connect(cfg->sv_host, cfg->sv_port, 3);
     if (fd < 0) { printf("  (supervisor 不可达)\n"); return; }
     frame_send(fd, PROTO_QUERY_SERVERS, NULL);
@@ -42,8 +50,8 @@ static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, Nod
     while (frame_recv(fd, &f) >= 0) {
         if (strcmp(f.cmd, PROTO_QUERY_DONE) == 0) break;
         if (strcmp(f.cmd, PROTO_SERVER_INFO) == 0) {
-            char id[128], type[16] = "?", model[128] = "?", state[64] = "?", addr[128] = "?";
-            char s_inflight[64] = "?", s_kv[64] = "?";
+            char id[128], type[16] = "-", model[128] = "-", state[64] = "-", addr[128] = "-";
+            char s_inflight[64] = "-", s_kv[64] = "-";
             sscanf(f.args, "%127s", id);
             Frame ff;
             snprintf(ff.cmd, sizeof(ff.cmd), "X");
@@ -56,7 +64,10 @@ static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, Nod
             if (frame_get(&ff, "addr", vb, sizeof(vb)) == 0) snprintf(addr, sizeof(addr), "%s", vb);
             if (frame_get(&ff, "inflight", vb, sizeof(vb)) == 0) snprintf(s_inflight, sizeof(s_inflight), "%s", vb);
             if (frame_get(&ff, "kv_mb", vb, sizeof(vb)) == 0) snprintf(s_kv, sizeof(s_kv), "%s", vb);
-            printf("  %-10s %-6s model=%-12s state=%-7s addr=%-22s inflight=%s kv_mb=%s\n",
+            dash_if_q(model);
+            dash_if_q(s_inflight);
+            dash_if_q(s_kv);
+            printf("  %-10s %-7s %-12s %-7s %-22s %4s %6s\n",
                    id, type, model, state, addr, s_inflight, s_kv);
             /* 收集 rank/server 编号+地址(数量不写死, 地址来自节点表) */
             if (strcmp(type, "rank") == 0 && *n_rank < NODE_MAX) {
@@ -78,25 +89,36 @@ static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, Nod
         }
     }
     sock_close(fd);
-    if (!found) printf("  (无 server 节点)\n");
+    if (!found) printf("  (无节点)\n");
 }
 
-static void query_role(const char* label, const char* addr)
+static int stat_fetch(const char* addr, Frame* f)
 {
     const char* colon = strchr(addr, ':');
-    if (!colon) { printf("  %s: 地址无效 %s\n", label, addr); return; }
+    if (!colon) return -1;
     size_t hlen = (size_t)(colon - addr);
     int fd = sock_connect_host(addr, hlen, (uint16_t)atoi(colon + 1), 2);
-    if (fd < 0) { printf("  %s: 不可达 (%s)\n", label, addr); return; }
-    /* 节点僵死(如 rank 被 STOP)时 3s 超时, 不阻塞整个 status */
+    if (fd < 0) return -2;
     sock_set_timeout(fd, 3);
     frame_send(fd, PROTO_STAT, NULL);
-    Frame f;
-    if (frame_recv(fd, &f) >= 0)
-        printf("  %s: %s %s\n", label, f.cmd, f.args);
-    else
-        printf("  %s: 无响应(超时) (%s)\n", label, addr);
+    int rc = frame_recv(fd, f);
     sock_close(fd);
+    return rc >= 0 ? 0 : -3;
+}
+
+static void stat_cpy(const char* args, const char* key, char* out, size_t n, const char* def)
+{
+    const char* p = strstr(args, key);
+    if (!p) { snprintf(out, n, "%s", def); return; }
+    p += strlen(key);
+    if (*p == '=') p++;
+    size_t i = 0;
+    while (p[i] && p[i] != ' ' && i + 1 < n) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = 0;
+    if (out[0] == '?' || !out[0]) snprintf(out, n, "%s", def);
 }
 
 static int stat_int(const char* args, const char* key, int def)
@@ -190,17 +212,56 @@ static void query_ranks(ServeConfig* cfg, const NodeInfo* infos, int n)
 static void query_servers(ServeConfig* cfg, const NodeInfo* infos, int n)
 {
     int r;
+    printf("  %-10s %-4s %3s %6s %6s %5s %-28s %-16s\n",
+           "id", "st", "in", "kv", "up", "ranks", "peers", "ids");
     for (r = 0; r < n; r++) {
-        char label[32];
+        char label[32], addr[128];
         snprintf(label, sizeof(label), "server-%d", infos[r].idx);
-        char addr[128];
-        if (infos[r].addr[0]) {
+        if (infos[r].addr[0])
             snprintf(addr, sizeof(addr), "%s", infos[r].addr);
-        } else {
+        else
             snprintf(addr, sizeof(addr), "127.0.0.1:%d", cfg->server_port + infos[r].idx);
+        Frame f;
+        int rc = stat_fetch(addr, &f);
+        if (rc != 0) {
+            printf("  %-10s %-4s  (%s)\n", label, "--", addr);
+            continue;
         }
-        query_role(label, addr);
+        char peers[128], ids[64];
+        stat_cpy(f.args, "lease_peers", peers, sizeof(peers), "-");
+        stat_cpy(f.args, "lease_rank_ids", ids, sizeof(ids), "-");
+        double kv = 0.0;
+        const char* kp = strstr(f.args, "kv_mb=");
+        if (kp) kv = atof(kp + 6);
+        printf("  %-10s %-4s %3d %6.1f %6llu %5d %-28s %-16s\n",
+               label, f.cmd,
+               stat_int(f.args, "inflight", 0), kv,
+               stat_ull(f.args, "uptime_s"),
+               stat_int(f.args, "lease_ranks", 0),
+               peers, ids);
     }
+}
+
+static void query_router(ServeConfig* cfg)
+{
+    char addr[128];
+    snprintf(addr, sizeof(addr), "127.0.0.1:%d", cfg->router_port);
+    printf("  %-10s %-4s %7s %3s %6s %6s\n",
+           "id", "st", "servers", "in", "kv", "up");
+    Frame f;
+    int rc = stat_fetch(addr, &f);
+    if (rc != 0) {
+        printf("  %-10s %-4s  (%s)\n", "router-0", "--", addr);
+        return;
+    }
+    double kv = 0.0;
+    const char* kp = strstr(f.args, "kv_mb=");
+    if (kp) kv = atof(kp + 6);
+    printf("  %-10s %-4s %7d %3d %6.1f %6llu\n",
+           "router-0", f.cmd,
+           stat_int(f.args, "servers", 0),
+           stat_int(f.args, "inflight", 0), kv,
+           stat_ull(f.args, "uptime_s"));
 }
 
 int cmd_status(ServeConfig* cfg)
@@ -235,10 +296,6 @@ int cmd_status(ServeConfig* cfg)
         }
     }
     printf("\n== router 状态 ==\n");
-    {
-        char addr[128];
-        snprintf(addr, sizeof(addr), "127.0.0.1:%d", cfg->router_port);
-        query_role("router-0", addr);
-    }
+    query_router(cfg);
     return 0;
 }
