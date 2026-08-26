@@ -52,10 +52,12 @@
  *   seg 段号(rank0=0), segs 总段数, peers 各段节点 IP(逗号分隔, 段号顺序)。
  * rank0 收到后按该数据组织组内协作; worker 段不接收 INFER。
  * 响应: 逐 token 流式回 T <len>\n<token utf8 bytes>...,
+ *       prefill 保活 PROG <done> <total> <pos>\n,
  *       结束回 DONE <gen_tokens> <eos=0|1> <ms>\n
  * 错误回 ERR <msg>(PROTO_ERROR; 流式路径遇 ERR 即结束) */
 #define PROTO_INFER "INFER"
 #define PROTO_INFER_SESS "INFER_SESS"
+#define PROTO_PROG "PROG"
 
 /* DRAIN\n → 先落盘当前会话 KV, 再 OK\n, 等当前请求完成后退出
  * 优雅下线(滚动更新 / 缩容 / ctl stop|exit) */

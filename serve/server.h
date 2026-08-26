@@ -27,6 +27,7 @@ typedef struct {
     int sess_vocab_ok;
     SessCache sess;
     pthread_mutex_t sess_lock;
+    pthread_mutex_t infer_lock; /* 同一 server 上会话推理串行, 避免超时重试把 token 账打乱 */
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */

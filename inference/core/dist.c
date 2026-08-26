@@ -561,6 +561,12 @@ static void live_enter_decode(DistSess* s, uint32_t pos, uint32_t pf_n, uint64_t
     s->live->pos = pos;
 }
 
+static int live_prog(DistSess* s, uint32_t done, uint32_t total, uint32_t pos)
+{
+    if (!s || !s->on_prog) return 0;
+    return s->on_prog(done, total, pos, s->prog_ctx);
+}
+
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
              int ntokens, float temp, float top_p, uint64_t seed,
              int rank, int ranks, int port_base, const char* addrs, int dist_fp16,
@@ -640,6 +646,9 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 sess->pos = pos;
                 live_pos(sess, pos);
             }
+            if (live_prog(sess, (uint32_t)i, (uint32_t)nprompt, pos) != 0) {
+                rc = -1; snprintf(err, sizeof(err), "prog send failed"); break;
+            }
             /* 每批立刻收走 worker 的 logits, 避免 send_xb / send_logits 对向把 TCP 窗口堵死 */
             if (i < nprompt) {
                 if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) {
@@ -660,6 +669,9 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             if (sess) {
                 sess->pos = pos;
                 live_pos(sess, pos);
+            }
+            if (live_prog(sess, (uint32_t)(i + 1), (uint32_t)nprompt, pos) != 0) {
+                rc = -1; snprintf(err, sizeof(err), "prog send failed"); break;
             }
             if (i + 1 < nprompt) {
                 if (dist_recv_logits(&dist, k_ids, e->logits, vocab_sz, &lse) <= 0) {
@@ -697,7 +709,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
             uint64_t t4_tok = ynow_ms();
             /* emit 放到 send_x 之后: 先让 worker 开工, 再输出 token。
              * 避免 emit 的同步 send/日志阻塞推迟 worker 启动(stream/慢客户端下反压)。 */
-            if (emit) emit(nxt, ctx);
+            if (emit && emit(nxt, ctx) != 0) { rc = -1; snprintf(err, sizeof(err), "emit failed"); break; }
             if (dist_timing) {
                 t_wait += t1_tok - t0_tok;
                 t_samp += t2_tok - t1_tok;

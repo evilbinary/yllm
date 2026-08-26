@@ -316,6 +316,12 @@ static int on_token_rank(uint32_t id, void* ctx)
     return 0;
 }
 
+static int on_prog_rank(uint32_t done, uint32_t total, uint32_t pos, void* ctx)
+{
+    TokenCtx* tc = (TokenCtx*)ctx;
+    return send_line(tc->fd, "PROG %u %u %u", done, total, pos);
+}
+
 /* 会话模式推理: payload = 增量 token 二进制(server 已渲染并算好续接点)。
  * rank 只做最小记账: cache_key/cache_pos; token 列表/历史在 server 侧管理。 */
 /* 缓存文件名安全化(与 server 一致): 替换 ':' 等文件系统非法字符 */
@@ -449,6 +455,8 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
         sess.cache_dir = r->cache_dir[0] ? r->cache_dir : NULL;
         rank_job_begin(r, resume, ndelta, t0);
         sess.live = &r->job;
+        sess.on_prog = on_prog_rank;
+        sess.prog_ctx = &tc;
         int rc2 = dist_gen(&r->engine, &r->vocab, delta, (int)ndelta, (int)max_tokens,
                            r->temp, r->top_p, r->seed,
                            r->dist_rank, r->dist_ranks, r->pipe_base, r->addrs_csv, r->dist_fp16,

@@ -77,6 +77,8 @@ typedef struct {
     char last_key[64];          /* worker: 上次处理的会话 key(变化时重置本段 kv 并恢复) */
     const volatile int* quit;   /* 非空时 worker 空闲等待周期检查(进程退出信号) */
     DistLive* live;             /* 非空: 每批推进后写入, 供 STAT 读 */
+    int (*on_prog)(uint32_t done, uint32_t total, uint32_t pos, void* ctx);
+    void* prog_ctx;             /* prefill 保活(server 刷新 leader 超时) */
 } DistSess;
 
 int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,

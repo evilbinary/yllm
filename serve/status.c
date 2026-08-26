@@ -40,8 +40,8 @@ static void dash_if_q(char* s)
 static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, NodeInfo* srvs, int* n_srv)
 {
     printf("== supervisor 节点表 (%s:%d) ==\n", cfg->sv_host, cfg->sv_port);
-    printf("  %-10s %-7s %-12s %-7s %-22s %4s %6s\n",
-           "id", "type", "model", "state", "addr", "in", "kv");
+    printf("  %-10s %-7s %-12s %-7s %-22s\n",
+           "id", "type", "model", "state", "addr");
     int fd = sock_connect(cfg->sv_host, cfg->sv_port, 3);
     if (fd < 0) { printf("  (supervisor 不可达)\n"); return; }
     frame_send(fd, PROTO_QUERY_SERVERS, NULL);
@@ -51,7 +51,6 @@ static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, Nod
         if (strcmp(f.cmd, PROTO_QUERY_DONE) == 0) break;
         if (strcmp(f.cmd, PROTO_SERVER_INFO) == 0) {
             char id[128], type[16] = "-", model[128] = "-", state[64] = "-", addr[128] = "-";
-            char s_inflight[64] = "-", s_kv[64] = "-";
             sscanf(f.args, "%127s", id);
             Frame ff;
             snprintf(ff.cmd, sizeof(ff.cmd), "X");
@@ -62,13 +61,9 @@ static void query_supervisor(ServeConfig* cfg, NodeInfo* ranks, int* n_rank, Nod
             if (frame_get(&ff, "state", vb, sizeof(vb)) == 0) snprintf(state, sizeof(state), "%s", vb);
             if (frame_get(&ff, "leader", vb, sizeof(vb)) == 0) snprintf(addr, sizeof(addr), "%s", vb);
             if (frame_get(&ff, "addr", vb, sizeof(vb)) == 0) snprintf(addr, sizeof(addr), "%s", vb);
-            if (frame_get(&ff, "inflight", vb, sizeof(vb)) == 0) snprintf(s_inflight, sizeof(s_inflight), "%s", vb);
-            if (frame_get(&ff, "kv_mb", vb, sizeof(vb)) == 0) snprintf(s_kv, sizeof(s_kv), "%s", vb);
             dash_if_q(model);
-            dash_if_q(s_inflight);
-            dash_if_q(s_kv);
-            printf("  %-10s %-7s %-12s %-7s %-22s %4s %6s\n",
-                   id, type, model, state, addr, s_inflight, s_kv);
+            printf("  %-10s %-7s %-12s %-7s %-22s\n",
+                   id, type, model, state, addr);
             /* 收集 rank/server 编号+地址(数量不写死, 地址来自节点表) */
             if (strcmp(type, "rank") == 0 && *n_rank < NODE_MAX) {
                 int idx = atoi(id + 5);
