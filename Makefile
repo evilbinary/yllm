@@ -770,7 +770,8 @@ status: $(BIN_AVX2)
 #       make ctl sv SCALE 2          # 扩一组 rank
 #       make ctl sv QUERY_SERVERS
 #       make ctl s0 DRAIN            # server 优雅下线
-#       make ctl stop / make ctl exit  # exit=先 stop(DRAIN 落盘)再强杀
+#       make ctl stop                 # 只发 DRAIN/QUIT(落盘), 不强杀
+#       make ctl exit                 # 先 stop, 再强杀残留
 CTL_GOALS := $(filter-out ctl,$(MAKECMDGOALS))
 CTL_T0 := $(word 1,$(CTL_GOALS))
 CTL_TGT := $(if $(filter r0,$(CTL_T0)),rank-0,$(if $(filter s0,$(CTL_T0)),server-0,$(if $(filter sv,$(CTL_T0)),supervisor,$(if $(filter rt,$(CTL_T0)),router,$(CTL_T0)))))
@@ -798,10 +799,10 @@ infer: $(BIN)
 %:
 	@:
 
-# 停服务: 走 ctl exit(先 DRAIN/stop 落盘, 再强杀残留), 勿直接 taskkill
+# 优雅停: 等同 make ctl stop(只发消息). 要强杀用 make ctl exit
 serve-stop: $(BIN_AVX2)
-	$(BIN_AVX2) ctl --config $(SERVE_CONFIG) --cmd exit
-	@echo "serve processes stopped"
+	$(BIN_AVX2) ctl --config $(SERVE_CONFIG) --cmd stop
+	@echo "serve stop signals sent (no force-kill; use make ctl exit if needed)"
 # ---- 模型文件 dump (也可: yllm file <path>; 独立二进制仍可用 make dump) ----
 DUMP_BIN := $(OBJDIR)/llfdump
 

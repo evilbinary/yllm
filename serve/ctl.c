@@ -202,23 +202,14 @@ static void ctl_drain_ranks(ServeConfig* cfg)
     }
 }
 
-/* stop: 优雅停止 — DRAIN 全部 rank(含远程) + supervisor QUIT → hub 随之退出 */
+/* stop: 只发优雅停机消息(DRAIN/QUIT), 绝不强杀。
+ *   DRAIN 全部 rank(含远程, 先落盘) → DRAIN server → QUIT router → QUIT supervisor */
 static int ctl_stop(ServeConfig* cfg)
 {
     printf("stop: DRAIN ranks...\n");
     ctl_drain_ranks(cfg);
-    printf("stop: QUIT supervisor...\n");
-    ctl_send_cmd("supervisor", "127.0.0.1", (uint16_t)cfg->sv_port, PROTO_QUIT);
-    return 0;
-}
 
-/* exit: 先 stop(优雅落盘), 再 DRAIN server / QUIT router, 最后兜底强杀 */
-static int ctl_exit(ServeConfig* cfg)
-{
-    printf("exit: 1/3 graceful stop (DRAIN ranks → save kv)...\n");
-    ctl_stop(cfg);
-
-    printf("exit: 2/3 DRAIN servers + QUIT router...\n");
+    printf("stop: DRAIN servers + QUIT router/supervisor...\n");
     {
         int nm = cfg->n_models > 0 ? cfg->n_models : 1;
         int stride = cfg_model_stride(cfg);
@@ -229,14 +220,22 @@ static int ctl_exit(ServeConfig* cfg)
             ctl_send_cmd(label, "127.0.0.1",
                          (uint16_t)(cfg->server_port + mi * stride), PROTO_DRAIN);
         }
-        ctl_send_cmd("router", "127.0.0.1", (uint16_t)cfg->router_port, PROTO_QUIT);
     }
+    ctl_send_cmd("router", "127.0.0.1", (uint16_t)cfg->router_port, PROTO_QUIT);
+    ctl_send_cmd("supervisor", "127.0.0.1", (uint16_t)cfg->sv_port, PROTO_QUIT);
+    return 0;
+}
 
-    /* 等 DRAIN 落盘 + engine_free; rank 已在回 OK 前写完 kv */
+/* exit: 先 stop(只发消息落盘), 再兜底强杀残留 */
+static int ctl_exit(ServeConfig* cfg)
+{
+    printf("exit: graceful stop (messages only)...\n");
+    ctl_stop(cfg);
+
     printf("exit: wait for graceful shutdown...\n");
     ysleep_ms(3000);
 
-    printf("exit: 3/3 force-kill leftovers...\n");
+    printf("exit: force-kill leftovers...\n");
     char bin_hint[128] = "";
     if (cfg->bin[0]) {
         const char* base = strrchr(cfg->bin, '/');
@@ -355,7 +354,7 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
         return 0;
     }
 
-    /* stop: 优雅停止(rank DRAIN + supervisor QUIT); exit: 全退(所有节点 + 强杀残留) */
+    /* stop: 只发 DRAIN/QUIT(落盘), 不强杀; exit: stop 后再强杀残留 */
     if (strcmp(cmd, "stop") == 0) return ctl_stop(cfg);
     if (strcmp(cmd, "exit") == 0) return ctl_exit(cfg);
 
