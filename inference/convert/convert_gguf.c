@@ -309,7 +309,8 @@ static void gg_add(GGList* l, GGTensor* v)
 /* probe per-type byte layout from actual tensor sizes; map[gtype] -> llf dtype,
    or 255 for unsupported.  Some quantizers emit non-standard ggml type ids,
    so the fixed enum cannot be trusted. */
-static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start, uint64_t fsize, uint8_t map[256])
+static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start, uint64_t fsize,
+                            uint32_t alignment, uint8_t map[256])
 {
     static const struct { uint64_t nb; uint32_t dt; } cand[] = {
         { 210, DT_Q6K },
@@ -354,7 +355,10 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
                 uint64_t nelem = 1;
                 uint32_t d;
                 for (d = 0; d < t->ndims; d++) nelem *= t->dims[d];
-                if (nelem == 0 || nelem % 256 != 0 || t->nbytes != nelem / 256 * cand[c].nb) { ok = 0; break; }
+                uint64_t exp = nelem / 256 * cand[c].nb;
+                uint64_t pad = (t->nbytes >= exp) ? t->nbytes - exp : ~0ull;
+                /* GGUF 按 alignment 填到下一张量, nbytes 可能略大于真实块大小 */
+                if (nelem == 0 || nelem % 256 != 0 || pad >= (uint64_t)alignment) { ok = 0; break; }
             }
             if (ok && seen) {
                 map[a] = (uint8_t)cand[c].dt;
@@ -703,7 +707,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
            b.be ? " (big-endian)" : "", alignment, (unsigned long long)data_start);
 
     uint8_t type_map[256];
-    gg_probe_layout(&list, data, data_start, fsize, type_map);
+    gg_probe_layout(&list, data, data_start, fsize, alignment, type_map);
     {
         static const char* dn[8] = { "f16", "f32", "bf16", "q4_k", "q6_k", "iq4_xs", "q5_k" };
         int a;
@@ -868,8 +872,8 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             n++;
         }
     }
-    /* tied embedding: 无独立 output.weight 时用 token_embd 兼 lm_head(gemma4 / qwen3vl 等) */
-    if (is_gemma4 || is_qwen) {
+    /* tied embedding: 无独立 output.weight 时用 token_embd 兼 lm_head(gemma4 / qwen3vl / qwen35) */
+    if (is_gemma4 || is_qwen || is_qwen35) {
         int have_out = 0, emb = -1;
         int p2;
         for (p2 = 0; p2 < n; p2++) {
