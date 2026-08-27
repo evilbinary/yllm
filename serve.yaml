@@ -70,7 +70,7 @@ models:
     local: 1           # 本机 hub 只拉 rank0; rank1 远程手工起
   - name: gemma4-e4b
     model: models/gemma-4-E4B-it-Q4_K_M.llf
-    vocab: models/gemma4-e4b.vocab.txt
+    vocab: models/gemma4.vocab.txt
     ranks: 1
   - name: qwen2.5-1.5b
     model: models/qwen2.5-1.5b.llf

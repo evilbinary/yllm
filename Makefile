@@ -516,7 +516,7 @@ G4_E2B_LLF   ?= models/gemma-4-E2B-it-Q4_K_M.llf
 G4_E2B_VOCAB ?= models/gemma4.vocab.txt
 G4_E4B_GGUF  ?= models/gemma-4-E4B-it-Q4_K_M.gguf
 G4_E4B_LLF   ?= models/gemma-4-E4B-it-Q4_K_M.llf
-G4_E4B_VOCAB ?= models/gemma4-e4b.vocab.txt
+G4_E4B_VOCAB ?= models/gemma4.vocab.txt
 
 $(G4_E2B_LLF): $(G4_E2B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(G4_E2B_GGUF) --out $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --seq 8192
