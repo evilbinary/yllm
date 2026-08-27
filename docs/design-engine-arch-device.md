@@ -1,6 +1,6 @@
 # Engine / Arch / Device
 
-版本：v1.1 ｜ 状态：Arch `alloc` / PLE / `prefill_batch_min` 已迁出 engine_init；CPU 块图仍大部分在 `engine.c`  
+版本：v1.2 ｜ 状态：Gemma4 / Qwen3.5 CPU 图已在 `arch/*.c`；llama/qwen 块仍在 `engine.c`  
 关联：[design-gpu-inference.md](design-gpu-inference.md) · [design-mobile.md](design-mobile.md) · [qwen35-arch.md](qwen35-arch.md)
 
 推理拆成两轴，避免 `engine.c` 里铺 `if (ARCH_*)` × `if (DEV_MODE_*)`，也避免按「模型 × 后端」复制 shader / kernel。
@@ -89,14 +89,14 @@ typedef struct ArchOps {
 |------|--------|---------------------|---------------------|
 | `llama.c` | 默认块 + batch | 0 | Vulkan/CUDA fused → `dev->fwd_block` |
 | `qwen.c` | 同块；RoPE 在 `engine_fwd_block_at` / CUDA 按 header 分支 | 0 | 同 llama |
-| `gemma4.c` | `alloc`+PLE+after_embed；decode 仍走 `engine_fwd_block_at` 的 Gemma 路径；batch 单独 | 1 | **不挂** GPU 块（fused 是 LLaMA 形） |
-| `qwen35.c` | `alloc` SSM；GDN + gated attn 仍在 `engine.c` | 1 | **不挂** GPU 块 |
+| `gemma4.c` | `alloc`+PLE+decode/batch 块 | 1 | **不挂** GPU 块（fused 是 LLaMA 形） |
+| `qwen35.c` | `alloc` SSM + GDN/gated attn 块 | 1 | **不挂** GPU 块 |
 
 `after_embed`：Gemma 做 `×√hidden` + PLE；llama/qwen 为 NULL。  
 `post_logits`：Gemma final tanh cap。  
 `LlfGemma4Ext` / SWA / rope theta：`llf.h`（convert 与推理共用）。
 
-CPU 块实现第一期仍在 `engine.c`（`arch_llama_fwd_block` 等），表只引用符号。目标是把图迁进对应 `arch/*.c`。
+CPU 块：llama/qwen decode+batch 仍在 `engine.c`（`arch_llama_fwd_block` / `engine_fwd_block_at`）。Gemma4 与 Qwen3.5 图在 `inference/arch/{gemma4,qwen35}.c`。
 
 ### 1.3 Device（一个后端一份）
 
@@ -402,8 +402,8 @@ Vulkan Llama fused 填了 `fwd_block` 就能前 GPU 后 CPU。Gemma 现在 `fwd_
 | `inference/include/arch.h` | `ArchOps` |
 | `inference/include/device.h` | `Device` |
 | `inference/include/yllm.h` | `Engine` + `engine_call_fwd_block` / `layer_on_device` |
-| `inference/arch/*.c` | 四份 const 表 + lookup |
-| `inference/core/engine.c` | 编排；CPU 图实现（待迁） |
+| `inference/arch/*.c` | 四份 const 表 + lookup；gemma4/qwen35 CPU 图 |
+| `inference/core/engine.c` | 编排；llama/qwen CPU 块 |
 | `inference/device/device_*.c` | 填 vtable；`load_weights` |
 | `inference/cuda/cuda_fwd.c` | `cuda_attach_fwd` → `dev->fwd_block` |
 | `inference/vulkan/vulkan_fwd.c` | `vulkan_attach_fwd`；Gemma skip GPU 块 |
@@ -412,8 +412,8 @@ Vulkan Llama fused 填了 `fwd_block` 就能前 GPU 后 CPU。Gemma 现在 `fwd_
 
 ## 6. 后续（未做）
 
-1. 把 `engine_fwd_block_at` 的 Gemma 分支 / Gemma batch / Qwen3.5 GDN 从 `engine.c` 迁进对应 `arch/*.c`。
+1. 把 llama/qwen 的 `engine_fwd_block_at` / `arch_llama_fwd_block_batch` 迁进 `llama.c` / `qwen.c`（RoPE 差可留在块内或拆 qwen 自己的 fwd）。
 2. PLE/SSM/rope 缓冲收入 `arch_ctx`（alloc 已迁，字段仍在 Engine）。
 3. Gemma GPU：对齐 CPU greedy 后再在 `gemma4` 路径填 `Device.fwd_block`（不要改 llama fused 去迁就 Gemma）。
 4. `load_weights` 可只 pack `gpu_layer_end` 之前的层以省显存。
-5. Engine 热路径彻底去掉剩余的 `e->arch == ARCH_*`（块内核内部仍可按 header 分支，直到图迁完）。
+5. llama/qwen 热路径去掉 `h->arch == ARCH_QWEN`（迁完 qwen 自己的块即可）。
