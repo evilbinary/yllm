@@ -680,6 +680,11 @@ void vulkan_attach_fwd(Engine* e)
     {
         VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
         if (ctx->host_shim) return;
+        /* fused block 按 llama: Q=hidden, SWIGLU, 1/sqrt(hd) RoPE。gemma4 的 q_dim=n_heads*hd、GEGLU、SWA、PLE 对不上 */
+        if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) {
+            ylog_info("vulkan: arch=%u uses CPU transformer (llama fused block incompatible)", e->arch);
+            return;
+        }
         /* gemv/block 都关时必须走 CPU, 否则 stream 失败会被 engine 忽略, 整层跳过 */
         if (!ctx->gemv_ready && !ctx->block_ready && !ctx->fuse_ready)
             return;
@@ -693,6 +698,7 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     if (!e || e->device_mode != DEV_MODE_VULKAN || !tokens || n <= 0) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || ctx->host_shim || !ctx->wq_resident) return -1;
+    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
     if (!e->pb || e->pb_cap == 0) return -1;
 
     Ws* ws = &e->ws;
@@ -792,6 +798,7 @@ int vulkan_embed(Engine* e, uint32_t token)
     if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (ctx->host_shim || !ctx->embed_ready) return -1;
+    if (e->arch == ARCH_GEMMA4) return -1; /* 还需 √hidden 与 PLE, 不能只解一行 Q4 */
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
@@ -812,6 +819,7 @@ void vulkan_sync_x(Engine* e)
 int vulkan_final_norm(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->compute_ready) return -1;
     if (ctx->lm_fused) return 0;
@@ -841,6 +849,7 @@ int vulkan_final_norm(Engine* e)
 int vulkan_lm_head(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
     if (getenv("YLLM_VK_LM_CPU")) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->lm_ready || !ctx->wq_resident) return -1;
@@ -920,6 +929,7 @@ int vulkan_lm_head(Engine* e)
 int vulkan_lm_fused_active(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return 0;
+    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return 0;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     return ctx->lm_fused;
 }
@@ -927,6 +937,7 @@ int vulkan_lm_fused_active(Engine* e)
 int vulkan_lm_fused(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
+    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
     if (getenv("YLLM_VK_LM_CPU")) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->lm_fused || !ctx->lm_ready) return -1;

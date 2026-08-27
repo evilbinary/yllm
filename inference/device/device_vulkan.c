@@ -385,6 +385,14 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     ctx->n_blocks = e->ws.model.h.n_blocks;
     memcpy(&ctx->norm_eps, &e->ws.model.h.norm_eps_bits, 4);
 
+    if (!ctx->host_shim &&
+        (e->ws.model.h.arch == ARCH_GEMMA4 || e->ws.model.h.arch == ARCH_QWEN35)) {
+        ylog_info("vulkan: skip GPU kernels for arch=%u (llama fused block != gemma4/qwen35)",
+                  e->ws.model.h.arch);
+        vulkan_attach_fwd(e);
+        return 0;
+    }
+
     if (!ctx->host_shim) {
         uint32_t max_in = ctx->hidden, max_out = ctx->hidden;
         size_t total_wq = 0;

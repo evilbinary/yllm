@@ -973,16 +973,18 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
         }
         return 0;
     }
-    /* Vulkan: 层外批 prefill(摊销 stream); 失败回退逐 token */
+    /* Vulkan: 层外批 prefill(摊销 stream); gemma4/qwen35 走 CPU 批量(含 PLE/GEGLU) */
     if (e->device_mode == DEV_MODE_VULKAN) {
         if (vulkan_prefill(e, tokens, n, start_pos) == 0)
             return 0;
-        int i;
-        for (i = 0; i < n; i++) {
-            if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
-                return -1;
+        if (e->arch != ARCH_GEMMA4 && e->arch != ARCH_QWEN35) {
+            int i;
+            for (i = 0; i < n; i++) {
+                if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
+                    return -1;
+            }
+            return 0;
         }
-        return 0;
     }
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -1879,15 +1881,15 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
             default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
             }
         }
-        /* gemma4 final logit soft-capping */
+        }
+        /* gemma4 final logit soft-capping(CPU 与 Vulkan/CUDA lm_head 之后都要做) */
         if (h->arch == ARCH_GEMMA4) {
             float cap = llf_gemma4_final_cap(h);
             if (cap > 0.0f) {
-            uint32_t vi;
-            for (vi = 0; vi < h->vocab; vi++)
-                e->logits[vi] = cap * tanhf(e->logits[vi] / cap);
+                uint32_t vi;
+                for (vi = 0; vi < h->vocab; vi++)
+                    e->logits[vi] = cap * tanhf(e->logits[vi] / cap);
             }
-        }
         }
     }
 }
