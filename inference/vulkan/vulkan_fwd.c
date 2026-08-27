@@ -343,7 +343,7 @@ static void vk_or_cpu_matmul(VulkanCtx* ctx, float* y, const float* x,
                              const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype,
                              uint32_t layer, uint32_t slot)
 {
-    if (ctx && ctx->gemv_ready && dtype == DT_Q4K) {
+    if (ctx && ctx->gemv_ready && dtype == DT_Q4K && !getenv("YLLM_VK_HOSTW")) {
         if (ctx->wq_resident && ctx->wq_off && !getenv("YLLM_VK_HOSTW")) {
             uint64_t off = wq_off(ctx, layer, slot);
             if (off != (uint64_t)~0ull &&
@@ -371,7 +371,7 @@ static int try_fused_qkv(VulkanCtx* ctx, const float* x, float* q, float* k, flo
     if (oq == (uint64_t)~0ull || ok == (uint64_t)~0ull || ov == (uint64_t)~0ull)
         return -1;
     return vulkan_fused_norm_qkv(ctx, x, ctx->host_w, hidden, eps,
-                                 q, k, v, kv_dim, oq, ok, ov);
+                                 q, k, v, hidden, kv_dim, oq, ok, ov);
 }
 
 static int try_fused_ffn(VulkanCtx* ctx, const float* x, float* out,
@@ -470,7 +470,7 @@ static int try_fused_attn_block(VulkanCtx* ctx, const float* x, float* out,
     const uint8_t* qn = mt[SLOT_QNORM].size > 0 ? base + mt[SLOT_QNORM].offset : NULL;
     const uint8_t* kn = mt[SLOT_KNORM].size > 0 ? base + mt[SLOT_KNORM].offset : NULL;
 
-    return vulkan_fused_qkv_rope_attn(ctx, x, ctx->host_w, hidden, eps,
+        return vulkan_fused_qkv_rope_attn(ctx, x, ctx->host_w, hidden, eps,
                                       out, kv_dim, oq, ok, ov, oo,
                                       layer, pos, rope_mode, theta,
                                       bq, bk, bv,
@@ -680,7 +680,7 @@ void vulkan_attach_fwd(Engine* e)
     {
         VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
         if (ctx->host_shim) return;
-        /* fused block 按 llama: Q=hidden, SWIGLU, 1/sqrt(hd) RoPE。gemma4 的 q_dim=n_heads*hd、GEGLU、SWA、PLE 对不上 */
+        /* fused llama 假定 Q=hidden、SWIGLU、1/sqrt(hd)。gemma4 走 CPU 直到 gemv 与 CPU greedy 对齐 */
         if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) {
             ylog_info("vulkan: arch=%u uses CPU transformer (llama fused block incompatible)", e->arch);
             return;

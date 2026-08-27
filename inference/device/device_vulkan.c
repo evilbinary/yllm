@@ -40,6 +40,33 @@ static int tensor_out_in(const LlfTensorMeta* mt, uint32_t* out, uint32_t* in)
     return 0;
 }
 
+/* Q4_K 行列可对调且字节相同(gemma O/down: 1536×4096 与 4096×1536 同体积).
+ * 较大维=out 对 lm_head 对, 对 O/down 会把 in 收成 hidden, GPU gemv 与 CPU 不一致. */
+static int tensor_out_in_slot(const LlfTensorMeta* mt, uint32_t slot, uint32_t hidden,
+                              uint32_t* out, uint32_t* in)
+{
+    uint32_t a, b;
+    if (tensor_out_in(mt, out, in) != 0) return -1;
+    if (hidden == 0 || mt->ndim < 2) return 0;
+    if (mt->dtype != DT_Q4K && mt->dtype != DT_Q6K) return 0;
+    a = mt->shape[0];
+    b = mt->shape[1];
+    {
+        size_t rowb = (mt->dtype == DT_Q4K) ? 144u : 210u;
+        size_t e0 = (size_t)a * ((size_t)(b / 256) * rowb);
+        size_t e1 = (size_t)b * ((size_t)(a / 256) * rowb);
+        if (e0 != mt->size || e1 != mt->size) return 0;
+    }
+    if (slot == SLOT_O || slot == SLOT_DOWN || slot == SLOT_PLE_PROJ) {
+        if (a == hidden) { *out = a; *in = b; }
+        else if (b == hidden) { *out = b; *in = a; }
+    } else {
+        if (b == hidden) { *out = a; *in = b; }
+        else if (a == hidden) { *out = b; *in = a; }
+    }
+    return 0;
+}
+
 /* bank=0 不填充. 张量不跨 SSBO 边界 */
 static size_t wq_bank_align(size_t cursor, size_t nbytes, size_t bank)
 {
@@ -62,7 +89,7 @@ static size_t block_q4k_bytes(const LlModel* m, uint32_t layer)
         const LlfTensorMeta* mt = &m->metas[hidx + s];
         uint32_t o, i;
         if (mt->dtype != DT_Q4K || mt->size == 0) continue;
-        if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+        if (tensor_out_in_slot(mt, s, m->h.hidden, &o, &i) != 0 || (i % 256) != 0) continue;
         sum += (size_t)o * ((size_t)(i / 256) * 144);
     }
     return sum;
@@ -84,7 +111,7 @@ static size_t q4k_packed_bytes(const LlModel* m, size_t bank)
             uint32_t o, i;
             size_t nbytes;
             if (mt->dtype != DT_Q4K || mt->size == 0) continue;
-            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            if (tensor_out_in_slot(mt, s, m->h.hidden, &o, &i) != 0 || (i % 256) != 0) continue;
             nbytes = (size_t)o * ((size_t)(i / 256) * 144);
             cursor = wq_bank_align(cursor, nbytes, bank);
             cursor += nbytes;
@@ -131,7 +158,7 @@ static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out
             const LlfTensorMeta* mt = &m->metas[hidx + s];
             if (mt->dtype != DT_Q4K || mt->size == 0) continue;
             uint32_t o, i;
-            if (tensor_out_in(mt, &o, &i) != 0) continue;
+            if (tensor_out_in_slot(mt, s, hidden, &o, &i) != 0) continue;
             if ((i % 256) != 0) continue;
             if (o > *max_out) *max_out = o;
             if (i > *max_in) *max_in = i;
@@ -171,7 +198,7 @@ static size_t max_block_q4k_bytes(const LlModel* m)
             const LlfTensorMeta* mt = &m->metas[hidx + s];
             if (mt->dtype != DT_Q4K || mt->size == 0) continue;
             uint32_t o, i;
-            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            if (tensor_out_in_slot(mt, s, m->h.hidden, &o, &i) != 0 || (i % 256) != 0) continue;
             layer_sz += (size_t)o * ((size_t)(i / 256) * 144);
         }
         if (layer_sz > mx) mx = layer_sz;
@@ -270,7 +297,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
             const LlfTensorMeta* mt = &m->metas[hidx + s];
             if (mt->dtype != DT_Q4K || mt->size == 0) continue;
             uint32_t o, i;
-            if (tensor_out_in(mt, &o, &i) != 0 || (i % 256) != 0) continue;
+            if (tensor_out_in_slot(mt, s, m->h.hidden, &o, &i) != 0 || (i % 256) != 0) continue;
             size_t nbytes = (size_t)o * ((size_t)(i / 256) * 144);
             if (mt->size != 0 && mt->size != nbytes) {
                 ylog_warn("vulkan: Q4_K size mismatch slot=%u layer=%u calc=%zu meta=%llu; use calc",
@@ -387,7 +414,7 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
 
     if (!ctx->host_shim &&
         (e->ws.model.h.arch == ARCH_GEMMA4 || e->ws.model.h.arch == ARCH_QWEN35)) {
-        ylog_info("vulkan: skip GPU kernels for arch=%u (llama fused block != gemma4/qwen35)",
+        ylog_info("vulkan: skip GPU kernels for arch=%u (need arch-specific fused block)",
                   e->ws.model.h.arch);
         vulkan_attach_fwd(e);
         return 0;

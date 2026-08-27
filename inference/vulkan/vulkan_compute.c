@@ -2122,12 +2122,12 @@ int vulkan_k_embed_q4k(VulkanCtx* ctx, float* host_y, const uint8_t* table,
 
 int vulkan_fused_norm_qkv(VulkanCtx* ctx,
                           const float* x, const float* wn, uint32_t hidden, float eps,
-                          float* q, float* k, float* v, uint32_t kv_dim,
+                          float* q, float* k, float* v, uint32_t q_dim, uint32_t kv_dim,
                           uint64_t off_q, uint64_t off_k, uint64_t off_v)
 {
     if (!ctx || !ctx->fuse_ready || !ctx->wq_resident || !x || !wn || !q || !k || !v)
         return -1;
-    if (hidden > ctx->max_in || hidden > ctx->max_out || kv_dim > ctx->max_out)
+    if (hidden > ctx->max_in || q_dim > ctx->max_out || kv_dim > ctx->max_out)
         return -1;
     if (off_q > 0xffffffffull || off_k > 0xffffffffull || off_v > 0xffffffffull)
         return -1;
@@ -2153,13 +2153,13 @@ int vulkan_fused_norm_qkv(VulkanCtx* ctx,
     cmd_rmsnorm(ctx, cmd, hidden, eps, 0);
     cmd_barrier_compute(cmd);
     /* Q/K/V 只读 buf_y, 写不同 o* — 可并行 dispatch */
-    cmd_gemv(ctx, cmd, ctx->gemv_ds0, hidden, hidden, (uint32_t)off_q);
+    cmd_gemv(ctx, cmd, ctx->gemv_ds0, q_dim, hidden, (uint32_t)off_q);
     cmd_gemv(ctx, cmd, ctx->gemv_ds1, kv_dim, hidden, (uint32_t)off_k);
     cmd_gemv(ctx, cmd, ctx->gemv_ds2, kv_dim, hidden, (uint32_t)off_v);
     a->EndCommandBuffer(cmd);
     if (submit_and_wait(ctx, cmd) != 0) return -1;
 
-    if (map_read(ctx, ctx->mem_o0, q, xb) != 0) return -1;
+    if (map_read(ctx, ctx->mem_o0, q, (size_t)q_dim * 4) != 0) return -1;
     if (map_read(ctx, ctx->mem_o1, k, kb) != 0) return -1;
     if (map_read(ctx, ctx->mem_o2, v, kb) != 0) return -1;
     return 0;
