@@ -133,7 +133,7 @@ static int cuda_fwd_block_gpu(Engine* e, uint32_t layer, uint32_t pos)
     const float* kn = cuda_tensor_f32(e, layer, SLOT_KNORM, &n);
     qk_norm_batch(ctx, q, k, qn, kn, 1);
 
-    if (ctx->arch == ARCH_QWEN) {
+    if (e->ops && e->ops->qwen_rope) {
         cuda_k_rope_qwen_heads(q, ctx->n_heads, ctx->head_dim, pos, ctx->theta);
         cuda_k_rope_qwen_heads(k, ctx->n_kv_heads, ctx->head_dim, pos, ctx->theta);
     } else {
@@ -204,7 +204,7 @@ static int cuda_fwd_block_batch_gpu(Engine* e, uint32_t layer, uint32_t pos_star
     const float* kn = cuda_tensor_f32(e, layer, SLOT_KNORM, &n);
     qk_norm_batch(ctx, q, k, qn, kn, B);
 
-    if (ctx->arch == ARCH_QWEN) {
+    if (e->ops && e->ops->qwen_rope) {
         cuda_k_rope_qwen_heads_batch(q, ctx->n_heads, ctx->head_dim, pos_start, B, ctx->theta);
         cuda_k_rope_qwen_heads_batch(k, ctx->n_kv_heads, ctx->head_dim, pos_start, B, ctx->theta);
     } else {
@@ -478,6 +478,11 @@ int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
 void cuda_attach_fwd(Engine* e)
 {
     if (!e || !e->dev) return;
+    if (e->ops && !e->ops->gpu_fused) {
+        e->dev->fwd_block = NULL;
+        e->dev->fwd_block_batch = NULL;
+        return;
+    }
     e->dev->fwd_block = cuda_fwd_block;
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode == DEV_MODE_CUDA)

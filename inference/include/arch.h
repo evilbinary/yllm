@@ -13,6 +13,10 @@ typedef struct ArchOps {
     /* 1 = GPU prefill 失败时走 CPU 批(gemma4/qwen35); 0 = 退回逐 token */
     int cpu_batch_prefill;
     uint32_t prefill_batch_min; /* 0 视为 16 */
+    /* 1 = llama 形 fused 块/GPU prefill/fused lm 可用; 0 = Device 勿挂 fwd_block */
+    int gpu_fused;
+    /* 1 = Qwen interleaved RoPE(与 llama pairwise 相对) */
+    int qwen_rope;
 
     int  (*alloc)(Engine* e);
     void (*free)(Engine* e);

@@ -488,10 +488,17 @@ static int cuda_load_weights(Engine* e, char* err, size_t errlen)
         if (err && errlen) snprintf(err, errlen, "null cuda ctx");
         return -1;
     }
-    if (e->arch == ARCH_QWEN35) {
-        if (err && errlen)
-            snprintf(err, errlen, "CUDA path does not support ARCH_QWEN35 yet; use --device cpu");
-        return -1;
+    if (e->ops && !e->ops->gpu_fused) {
+        ylog_info("cuda: skip GPU transformer for %s", e->ops->name);
+        e->w_dev = ctx;
+        e->d_kv = e->kv;
+        e->weights_ready = 1;
+        e->device_mode = DEV_MODE_CPU;
+        if (e->dev) {
+            e->dev->fwd_block = NULL;
+            e->dev->fwd_block_batch = NULL;
+        }
+        return 0;
     }
     int device_id = ctx->device_id;
     int host_shim = ctx->host_shim;

@@ -610,7 +610,7 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
 int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
                         const uint8_t* base, uint16_t* kv)
 {
-    int qwen = e->ops && e->ops->id == ARCH_QWEN;
+    int qwen = e->ops && e->ops->qwen_rope;
     return arch_llama_fwd_block_at(e, layer, pos, base, kv, qwen);
 }
 

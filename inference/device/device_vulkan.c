@@ -412,10 +412,9 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     ctx->n_blocks = e->ws.model.h.n_blocks;
     memcpy(&ctx->norm_eps, &e->ws.model.h.norm_eps_bits, 4);
 
-    if (!ctx->host_shim &&
-        (e->ws.model.h.arch == ARCH_GEMMA4 || e->ws.model.h.arch == ARCH_QWEN35)) {
-        ylog_info("vulkan: skip GPU kernels for arch=%u (need arch-specific fused block)",
-                  e->ws.model.h.arch);
+    if (!ctx->host_shim && e->ops && !e->ops->gpu_fused) {
+        ylog_info("vulkan: skip GPU kernels for %s (need arch-specific fused block)",
+                  e->ops->name);
         vulkan_attach_fwd(e);
         return 0;
     }

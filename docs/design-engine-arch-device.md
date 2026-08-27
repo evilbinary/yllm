@@ -1,6 +1,6 @@
 # Engine / Arch / Device
 
-版本：v1.4 ｜ 状态：四份 Arch CPU 图在 `arch/`；PLE/SSM 在 `arch_ctx`  
+版本：v1.5 ｜ 状态：Arch CPU 图 + `arch_ctx` + Device 用 `gpu_fused`/`qwen_rope`  
 关联：[design-gpu-inference.md](design-gpu-inference.md) · [design-mobile.md](design-mobile.md) · [qwen35-arch.md](qwen35-arch.md)
 
 推理拆成两轴，避免 `engine.c` 里铺 `if (ARCH_*)` × `if (DEV_MODE_*)`，也避免按「模型 × 后端」复制 shader / kernel。
@@ -76,11 +76,12 @@ typedef struct Engine {
 typedef struct ArchOps {
     const char* name;
     uint32_t id;
-    int cpu_batch_prefill;   /* 1=GPU prefill 失败走 CPU 批(gemma4/qwen35) */
-    uint32_t prefill_batch_min; /* 0 视为 16 */
+    int cpu_batch_prefill;   /* 1=GPU prefill 失败走 CPU 批 */
+    uint32_t prefill_batch_min;
+    int gpu_fused;           /* 1=llama 形 Device.fwd_block 可用 */
+    int qwen_rope;           /* 1=Qwen interleaved RoPE */
 
     int  (*alloc)(Engine* e);          /* gemma4 PLE/rope、qwen35 SSM → arch_ctx */
-    void (*free)(Engine* e);
     void (*free)(Engine* e);
     void (*after_embed)(Engine* e, uint32_t token);
     void (*after_embed_batch)(Engine* e, const uint32_t* tokens, uint32_t B);
@@ -105,7 +106,7 @@ typedef struct ArchOps {
 `post_logits`：Gemma final tanh cap。  
 `LlfGemma4Ext` / SWA / rope theta：`llf.h`（convert 与推理共用）。
 
-CPU 块都在 `inference/arch/*.c`。CUDA host-shim 仍调 `engine_fwd_block_at`，内部按 `ops->id` 选 llama/qwen RoPE。
+CPU 块都在 `inference/arch/*.c`。CUDA host-shim 调 `engine_fwd_block_at`，按 `ops->qwen_rope` 选 RoPE。Device 是否挂 fused 看 `ops->gpu_fused`，不再扫 `ARCH_GEMMA4`。
 
 ### 1.3 Device（一个后端一份）
 
@@ -459,7 +460,9 @@ Vulkan Llama fused 填了 `fwd_block` 就能前 GPU 后 CPU。Gemma 现在 `fwd_
 
 ## 6. 后续（未做）
 
-1. Gemma GPU：对齐 CPU greedy 后再在 `gemma4` 路径填 `Device.fwd_block`（不要改 llama fused 去迁就 Gemma）。
-2. `load_weights` 可只 pack `gpu_layer_end` 之前的层以省显存。
-3. CUDA/Vulkan 真 GPU 核里剩余的 `header.arch` RoPE 分支，与 CPU `qwen_rope` 对齐即可。
+1. **Gemma / Qwen3.5 GPU 块**：CPU greedy 对齐后，各写自己的 `Device.fwd_block`（不要改 llama fused）。`gpu_fused=0` 现在只表示「现有 llama 形核不能用」。
+2. **混合切层省显存**：`load_weights` 只 pack `gpu_layer_end` 之前的层。
+3. **PP Gemma shared-KV**：`dist_split_layers` 仍读 header.reserved 钉扎末 rank（格式语义，可留）。
+
+已不在 Engine/Device 热路径：`ARCH_*` 切图、PLE/SSM 字段、Vulkan/CUDA 的 `ARCH_GEMMA4||QWEN35` 跳过。
 

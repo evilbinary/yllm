@@ -18,6 +18,8 @@ const ArchOps arch_qwen_ops = {
     .id = ARCH_QWEN,
     .cpu_batch_prefill = 0,
     .prefill_batch_min = 16,
+    .gpu_fused = 1,
+    .qwen_rope = 1,
     .fwd_block = arch_qwen_fwd_block,
     .fwd_block_batch = arch_qwen_fwd_block_batch,
 };

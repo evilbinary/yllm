@@ -506,7 +506,7 @@ static int vulkan_fwd_block_ex(Engine* e, uint32_t layer, uint32_t pos, int sync
     uint16_t* vcache = kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
     uint64_t kvp = (uint64_t)pos * kv_dim;
     uint32_t hh, j;
-    uint32_t rope_mode = (h->arch == ARCH_QWEN) ? 1u : 0u;
+    uint32_t rope_mode = (e->ops && e->ops->qwen_rope) ? 1u : 0u;
     int upload_x = ctx ? !ctx->x_on_dev : 1;
 
     if (ctx && ctx->wq_stream && ctx->gemv_ready && vulkan_stream_layer(ctx, layer) != 0)
@@ -683,8 +683,9 @@ void vulkan_attach_fwd(Engine* e)
         VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
         if (ctx->host_shim) return;
         /* fused llama 假定 Q=hidden、SWIGLU、1/sqrt(hd)。gemma4 走 CPU 直到 gemv 与 CPU greedy 对齐 */
-        if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) {
-            ylog_info("vulkan: arch=%u uses CPU transformer (llama fused block incompatible)", e->arch);
+        if (e->ops && !e->ops->gpu_fused) {
+            ylog_info("vulkan: %s uses CPU transformer (llama fused block incompatible)",
+                      e->ops->name);
             return;
         }
         /* gemv/block 都关时必须走 CPU, 否则 stream 失败会被 engine 忽略, 整层跳过 */
@@ -701,7 +702,7 @@ int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
     if (e->gpu_layer_end) return -1; /* 混合切层: 走逐层 engine_call_fwd_block */
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || ctx->host_shim || !ctx->wq_resident) return -1;
-    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
+    if (e->ops && !e->ops->gpu_fused) return -1;
     if (!e->pb || e->pb_cap == 0) return -1;
 
     Ws* ws = &e->ws;
@@ -801,7 +802,7 @@ int vulkan_embed(Engine* e, uint32_t token)
     if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (ctx->host_shim || !ctx->embed_ready) return -1;
-    if (e->arch == ARCH_GEMMA4) return -1; /* 还需 √hidden 与 PLE, 不能只解一行 Q4 */
+    if (e->ops && e->ops->after_embed) return -1; /* √hidden + PLE 等在 Arch.after_embed */
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
@@ -822,7 +823,7 @@ void vulkan_sync_x(Engine* e)
 int vulkan_final_norm(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
-    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
+    if (e->ops && !e->ops->gpu_fused) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->compute_ready) return -1;
     if (ctx->lm_fused) return 0;
@@ -852,7 +853,7 @@ int vulkan_final_norm(Engine* e)
 int vulkan_lm_head(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
-    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
+    if (e->ops && !e->ops->gpu_fused) return -1;
     if (getenv("YLLM_VK_LM_CPU")) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->lm_ready || !ctx->wq_resident) return -1;
@@ -932,7 +933,7 @@ int vulkan_lm_head(Engine* e)
 int vulkan_lm_fused_active(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return 0;
-    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return 0;
+    if (e->ops && !e->ops->gpu_fused) return 0;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     return ctx->lm_fused;
 }
@@ -940,7 +941,7 @@ int vulkan_lm_fused_active(Engine* e)
 int vulkan_lm_fused(Engine* e)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN) return -1;
-    if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
+    if (e->ops && !e->ops->gpu_fused) return -1;
     if (getenv("YLLM_VK_LM_CPU")) return -1;
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || !ctx->lm_fused || !ctx->lm_ready) return -1;
