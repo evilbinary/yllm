@@ -43,6 +43,9 @@ void matvec_q8k_quant(const float* x, float* xq, uint32_t n);
  * 不支持行分块的 dtype 退化为整算(n_rows 全量)。 */
 void matmul_rows(float* y, const float* x, const uint8_t* w,
                  uint32_t row_begin, uint32_t n_rows, uint32_t in, uint32_t out, uint32_t dtype);
+/* x 已 q8k_quant; 避免 lm_head 每个行块重复量化 */
+void matmul_rows_preq(float* y, const float* xq, const uint8_t* w,
+                      uint32_t row_begin, uint32_t n_rows, uint32_t in, uint32_t out, uint32_t dtype);
 /* 单行字节(行分块释放用); 不支持行分块的 dtype 返回 0 */
 size_t matmul_row_bytes(uint32_t dtype, uint32_t in);
 

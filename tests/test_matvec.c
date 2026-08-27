@@ -196,6 +196,33 @@ static void test_matmul_q6k(void)
     CHECK_NEAR(y[0], -31.0 * 512, 1e-3, "matmul_q6k synthetic");
 }
 
+static void test_q8k_quant(void)
+{
+    float x[512], y[512], ref[512];
+    uint32_t i, b;
+    for (i = 0; i < 512; i++) x[i] = (float)((int)i - 256) * 0.07f;
+    matvec_q8k_quant(x, y, 512);
+    for (b = 0; b < 2; b++) {
+        const float* xb = x + b * 256;
+        float* rb = ref + b * 256;
+        float amax = 0.0f;
+        for (i = 0; i < 256; i++) {
+            float a = fabsf(xb[i]);
+            if (a > amax) amax = a;
+        }
+        float d = amax / 127.0f;
+        float inv = 1.0f / d;
+        for (i = 0; i < 256; i++) {
+            float q = roundf(xb[i] * inv);
+            if (q > 127.0f) q = 127.0f;
+            else if (q < -128.0f) q = -128.0f;
+            rb[i] = q * d;
+        }
+    }
+    for (i = 0; i < 512; i++)
+        CHECK_NEAR(y[i], ref[i], 1e-5, "q8k_quant vs scalar");
+}
+
 /* ---- rmsnorm ---- */
 static void test_rmsnorm(void)
 {
@@ -265,6 +292,8 @@ int main(void)
     test_matmul_q5k();
     printf("running test_matmul_q6k...\n"); fflush(stdout);
     test_matmul_q6k();
+    printf("running test_q8k_quant...\n"); fflush(stdout);
+    test_q8k_quant();
     printf("running test_rmsnorm...\n"); fflush(stdout);
     test_rmsnorm();
     printf("running test_rope...\n"); fflush(stdout);

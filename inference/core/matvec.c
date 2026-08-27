@@ -22,6 +22,15 @@ static inline float hsum_avx2(__m256 v)
     sum = _mm_add_ss(sum, shuf);
     return _mm_cvtss_f32(sum);
 }
+static inline float hmax_avx2(__m256 v)
+{
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_max_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+    return _mm_cvtss_f32(lo);
+}
 #endif
 
 #if defined(__aarch64__)
@@ -290,7 +299,33 @@ static void q5k_block(float* y, const uint8_t* blk)
 static void q8k_quant(const float* x, float* xq, uint32_t n)
 {
     uint32_t nb = n / 256;
-    uint32_t b, i;
+    uint32_t b;
+#if defined(__AVX2__)
+    const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 vlo = _mm256_set1_ps(-128.0f);
+    const __m256 vhi = _mm256_set1_ps(127.0f);
+    const int rnd = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+    #pragma omp parallel for schedule(static) if (nb >= 16)
+    for (b = 0; b < nb; b++) {
+        const float* xb = x + (size_t)b * 256;
+        float* xqb = xq + (size_t)b * 256;
+        __m256 am = _mm256_setzero_ps();
+        uint32_t i;
+        for (i = 0; i < 256; i += 8)
+            am = _mm256_max_ps(am, _mm256_and_ps(_mm256_loadu_ps(xb + i), absm));
+        float amax = hmax_avx2(am);
+        float d = amax / 127.0f;
+        if (d <= 0.0f) { memset(xqb, 0, 256 * 4); continue; }
+        __m256 vinv = _mm256_set1_ps(1.0f / d);
+        __m256 vd = _mm256_set1_ps(d);
+        for (i = 0; i < 256; i += 8) {
+            __m256 q = _mm256_round_ps(_mm256_mul_ps(_mm256_loadu_ps(xb + i), vinv), rnd);
+            q = _mm256_min_ps(_mm256_max_ps(q, vlo), vhi);
+            _mm256_storeu_ps(xqb + i, _mm256_mul_ps(q, vd));
+        }
+    }
+#else
+    uint32_t i;
     for (b = 0; b < nb; b++) {
         const float* xb = x + (size_t)b * 256;
         float* xqb = xq + (size_t)b * 256;
@@ -306,6 +341,7 @@ static void q8k_quant(const float* x, float* xq, uint32_t n)
             xqb[i] = q * d;
         }
     }
+#endif
 }
 
 void matvec_q8k_quant(const float* x, float* xq, uint32_t n)
@@ -333,6 +369,14 @@ static void q8k_quant_i8(const float* x, int8_t* xq, float* xs, uint32_t n)
             }
             amax = vmaxvq_f32(am);
         }
+#elif defined(__AVX2__)
+        {
+            __m256 am = _mm256_setzero_ps();
+            const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+            for (i = 0; i < 256; i += 8)
+                am = _mm256_max_ps(am, _mm256_and_ps(_mm256_loadu_ps(xb + i), absm));
+            amax = hmax_avx2(am);
+        }
 #else
         for (i = 0; i < 256; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
 #endif
@@ -357,6 +401,24 @@ static void q8k_quant_i8(const float* x, int8_t* xq, float* xs, uint32_t n)
                 int16x8_t p0 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
                 int16x8_t p1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
                 vst1q_s8(xqb + i, vcombine_s8(vqmovn_s16(p0), vqmovn_s16(p1)));
+            }
+        }
+#elif defined(__AVX2__)
+        {
+            __m256 vinv = _mm256_set1_ps(inv);
+            __m256 vlo = _mm256_set1_ps(-128.0f);
+            __m256 vhi = _mm256_set1_ps(127.0f);
+            const int rnd = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+            for (i = 0; i < 256; i += 8) {
+                __m256 q = _mm256_round_ps(_mm256_mul_ps(_mm256_loadu_ps(xb + i), vinv), rnd);
+                q = _mm256_min_ps(_mm256_max_ps(q, vlo), vhi);
+                __m256i qi = _mm256_cvtps_epi32(q);
+                int32_t tmp[8];
+                _mm256_storeu_si256((__m256i*)tmp, qi);
+                xqb[i + 0] = (int8_t)tmp[0]; xqb[i + 1] = (int8_t)tmp[1];
+                xqb[i + 2] = (int8_t)tmp[2]; xqb[i + 3] = (int8_t)tmp[3];
+                xqb[i + 4] = (int8_t)tmp[4]; xqb[i + 5] = (int8_t)tmp[5];
+                xqb[i + 6] = (int8_t)tmp[6]; xqb[i + 7] = (int8_t)tmp[7];
             }
         }
 #else
@@ -998,13 +1060,11 @@ void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 #endif
 }
 
-void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+static void matmul_q6k_preq(float* y, const float* xq, const uint8_t* w, uint32_t out, uint32_t in)
 {
     uint32_t nb = in / 256;
     uint32_t rowb = nb * 210;
     uint32_t oo;
-    float* xq = (float*)alloca((size_t)in * 4);
-    q8k_quant(x, xq, in);
 #ifdef __AVX2__
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
@@ -1077,7 +1137,6 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
             const uint8_t* blk = row + (size_t)b * 210;
             const float* xb = xq + (size_t)b * 256;
             float d = f16_to_f32(((const uint16_t*)blk)[104]);
-            /* 每次 3 个 load 解出 4 个 6-bit 权重(无 per-element 索引运算) */
             const uint8_t* ql = blk;
             const uint8_t* qh = blk + 128;
             const int8_t* sc = (const int8_t*)(blk + 192);
@@ -1117,6 +1176,13 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
         y[oo] = acc;
     }
 #endif
+}
+
+void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    float* xq = (float*)alloca((size_t)in * 4);
+    q8k_quant(x, xq, in);
+    matmul_q6k_preq(y, xq, w, out, in);
 }
 
 size_t w4b64_bytes(uint32_t out, uint32_t in)
@@ -1781,6 +1847,7 @@ void matmul_rows(float* y, const float* x, const uint8_t* w,
     switch (dtype) {
     case DT_Q4K:   matmul_q4k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
     case DT_Q6K:   matmul_q6k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 210), n_rows, in); break;
+    case DT_Q5K:   matmul_q5k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 176), n_rows, in); break;
     case DT_IQ4XS: matmul_iq4xs(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
     case DT_W4B64:
         /* Arm82 按 OC×8 tile; 要求 row_begin%8==0 */
@@ -1796,6 +1863,21 @@ void matmul_rows(float* y, const float* x, const uint8_t* w,
         }
         break;
     default:       matmul(y, x, w, n_rows, in, dtype); break;
+    }
+}
+
+/* xq 已是 q8k_quant 结果; lm_head 行分块时只量化一次 */
+void matmul_rows_preq(float* y, const float* xq, const uint8_t* w,
+                      uint32_t row_begin, uint32_t n_rows, uint32_t in, uint32_t out, uint32_t dtype)
+{
+    (void)out;
+    switch (dtype) {
+    case DT_Q6K:
+        matmul_q6k_preq(y, xq, w + (size_t)row_begin * ((size_t)(in / 256) * 210), n_rows, in);
+        break;
+    default:
+        matmul_rows(y, xq, w, row_begin, n_rows, in, out, dtype);
+        break;
     }
 }
 

@@ -398,6 +398,44 @@ static uint32_t head_chunk_rows(size_t rbytes, uint32_t max_rows)
     uint64_t c = (uint64_t)max_rows / per * per;
     return c >= per ? (uint32_t)c : 0;
 }
+
+static void lm_head_chunked(Engine* e, const uint8_t* w, uint64_t w_file_off,
+                            uint32_t hidden, uint32_t vocab, uint32_t dtype)
+{
+    Ws* ws = &e->ws;
+    size_t rbytes = matmul_row_bytes(dtype, hidden);
+    uint32_t chunk = head_chunk_rows(rbytes,
+        ws->budget < 32u * 1024 * 1024 ? 2048u : 4096u);
+    if (chunk == 0) {
+        matmul(e->logits, e->x, w, vocab, hidden, dtype);
+        return;
+    }
+    const float* xa = e->x;
+    int pre = (dtype == DT_Q6K);
+    if (pre) {
+        matvec_q8k_quant(e->x, e->hb, hidden);
+        xa = e->hb;
+    }
+    {
+        uint32_t rows = 0;
+        while (rows + chunk <= vocab) {
+            if (pre)
+                matmul_rows_preq(e->logits + rows, xa, w, rows, chunk, hidden, vocab, dtype);
+            else
+                matmul_rows(e->logits + rows, e->x, w, rows, chunk, hidden, vocab, dtype);
+            ws_release_aligned(ws, w_file_off + (uint64_t)rows * rbytes,
+                               (uint64_t)chunk * rbytes);
+            rows += chunk;
+        }
+        if (rows < vocab) {
+            uint32_t n = vocab - rows;
+            if (pre)
+                matmul_rows_preq(e->logits + rows, xa, w, rows, n, hidden, vocab, dtype);
+            else
+                matmul_rows(e->logits + rows, e->x, w, rows, n, hidden, vocab, dtype);
+        }
+    }
+}
 #endif
 
 int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, char* err, size_t errlen)
@@ -1033,27 +1071,13 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
                 if (ws->budget > 0) {
                     size_t rbytes = matmul_row_bytes(out->dtype, h->hidden);
                     uint32_t dl = h->n_blocks + 2;
-                    uint32_t chunk = head_chunk_rows(rbytes,
-                        ws->budget < 32u * 1024 * 1024 ? 2048u : 4096u);
-                    if (chunk > 0) {
-                        uint32_t rows = 0;
-                        while (rows + chunk <= h->vocab) {
-                            matmul_rows(e->logits + rows, e->x,
-                                        base + m->dir[dl].offset + out->offset,
-                                        rows, chunk, h->hidden, h->vocab, out->dtype);
-                            ws_release_aligned(ws, m->dir[dl].offset + out->offset +
-                                                   (uint64_t)rows * rbytes,
-                                               (uint64_t)chunk * rbytes);
-                            rows += chunk;
-                        }
-                        if (rows < h->vocab)
-                            matmul_rows(e->logits + rows, e->x,
-                                        base + m->dir[dl].offset + out->offset,
-                                        rows, h->vocab - rows, h->hidden, h->vocab, out->dtype);
-                    } else {
+                    if (rbytes > 0)
+                        lm_head_chunked(e, base + m->dir[dl].offset + out->offset,
+                                        m->dir[dl].offset + out->offset,
+                                        h->hidden, h->vocab, out->dtype);
+                    else
                         matmul(e->logits, e->x, base + m->dir[dl].offset + out->offset,
                                h->vocab, hidden, out->dtype);
-                    }
                 } else {
                     matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
                            h->vocab, hidden, out->dtype);
@@ -1898,24 +1922,9 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
              * (页缓存保留, 下个 token 重读是 minor fault); 尾块保留驻留。 */
             size_t rbytes = matmul_row_bytes(tm->dtype, h->hidden);
             if (ws->budget > 0 && rbytes > 0) {
-                uint32_t chunk = head_chunk_rows(rbytes,
-                    ws->budget < 32u * 1024 * 1024 ? 2048u : 4096u);
-                if (chunk > 0) {
-                    uint32_t rows = 0;
-                    while (rows + chunk <= h->vocab) {
-                        matmul_rows(e->logits + rows, e->x, base + tm->offset,
-                                    rows, chunk, h->hidden, h->vocab, tm->dtype);
-                        ws_release_aligned(ws, m->dir[i].offset + tm->offset +
-                                                (uint64_t)rows * rbytes,
-                                            (uint64_t)chunk * rbytes);
-                        rows += chunk;
-                    }
-                    if (rows < h->vocab)
-                        matmul_rows(e->logits + rows, e->x, base + tm->offset,
-                                    rows, h->vocab - rows, h->hidden, h->vocab, tm->dtype);
-                } else {
-                    matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
-                }
+                lm_head_chunked(e, base + tm->offset,
+                                m->dir[i].offset + tm->offset,
+                                h->hidden, h->vocab, tm->dtype);
                 return;
             }
             matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
