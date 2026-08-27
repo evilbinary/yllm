@@ -1845,17 +1845,12 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
             gemma4_prepare_ple(e, token);
         }
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
-        if (on_cuda) {
-            e->fwd_block(e, i, pos);
-        } else if (e->device_mode == DEV_MODE_VULKAN) {
-            e->fwd_block(e, i, pos);
-        } else {
-            if (e->device_mode == DEV_MODE_CUDA) {
-                cuda_sync_x_to_host(e);
-                cuda_mark_x_host(e);
-            }
-            engine_fwd_block_at(e, i, pos, base, e->kv);
+        /* 必须走 e->fwd_block。勿写死 engine_fwd_block_at, 否则 Qwen3.5 CPU 会走错内核。 */
+        if (e->device_mode == DEV_MODE_CUDA && !on_cuda) {
+            cuda_sync_x_to_host(e);
+            cuda_mark_x_host(e);
         }
+        e->fwd_block(e, i, pos);
         if (e->mtp_h && i == (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
             cuda_sync_x_to_host(e);
             memcpy(e->mtp_h, e->x, (size_t)h->hidden * 4);
