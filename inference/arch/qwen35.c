@@ -7,6 +7,16 @@
 #include <stdio.h>
 #include <math.h>
 
+
+typedef struct {
+    float *ssm_state, *ssm_conv, *scratch;
+} Qwen35Ctx;
+
+static Qwen35Ctx* q35c(Engine* e)
+{
+    return (e && e->arch_ctx) ? (Qwen35Ctx*)e->arch_ctx : NULL;
+}
+
 int arch_qwen35_alloc(Engine* e)
 {
     LlModel* m = &e->ws.model;
@@ -26,12 +36,26 @@ int arch_qwen35_alloc(Engine* e)
             }
         }
     }
+    Qwen35Ctx* c = (Qwen35Ctx*)ycalloc(1, sizeof(*c));
+    if (!c) return -1;
+    e->arch_ctx = c;
+    c->scratch = (float*)ymalloc(65536 * 4);
     if (n_gdn > 0 && conv_chan > 0 && n_vheads > 0 && hvd > 0) {
-        e->ssm_state = (float*)ycalloc((size_t)n_gdn * n_vheads * hvd * hvd, 4);
-        e->ssm_conv = (float*)ycalloc((size_t)n_gdn * (kwidth > 0 ? kwidth : 1) * conv_chan, 4);
-        e->scratch = (float*)ymalloc(65536 * 4);
+        c->ssm_state = (float*)ycalloc((size_t)n_gdn * n_vheads * hvd * hvd, 4);
+        c->ssm_conv = (float*)ycalloc((size_t)n_gdn * (kwidth > 0 ? kwidth : 1) * conv_chan, 4);
     }
     return 0;
+}
+
+void arch_qwen35_free(Engine* e)
+{
+    Qwen35Ctx* c = q35c(e);
+    if (!c) return;
+    free(c->ssm_state);
+    free(c->ssm_conv);
+    free(c->scratch);
+    free(c);
+    e->arch_ctx = NULL;
 }
 
 const ArchOps arch_qwen35_ops = {
@@ -40,6 +64,7 @@ const ArchOps arch_qwen35_ops = {
     .cpu_batch_prefill = 1,
     .prefill_batch_min = 16,
     .alloc = arch_qwen35_alloc,
+    .free = arch_qwen35_free,
     .fwd_block = arch_qwen35_fwd_block,
     .fwd_block_batch = arch_qwen35_fwd_block_batch,
 };
@@ -72,6 +97,8 @@ int arch_qwen35_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
 /* qwen35 混合架构单层前向: Gated Attention 层 + GDN 层 */
 int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
+    Qwen35Ctx* c = q35c(e);
+    if (!c || !c->scratch) return -1;
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -103,7 +130,7 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         uint32_t key_dim = (conv_chan - value_dim) / 2;      /* 2048 */
         uint32_t num_k_heads = key_dim / hvd;                /* 16 */
 
-        float* scratch = e->scratch;
+        float* scratch = c->scratch;
         float* qkv = scratch;              /* [conv_chan] conv 输入/输出 */
         float* z = scratch + 16384;        /* [value_dim] */
         float* alpha = scratch + 32768;    /* [n_vheads] */
@@ -135,7 +162,7 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 
         /* conv1d: 延迟线滑入当前输入, 卷积+silu 就地到 qkv */
         uint32_t gdn_idx = gdn_index_of(m, layer);
-        float* conv_state = e->ssm_conv + (size_t)gdn_idx * kwidth * conv_chan;
+        float* conv_state = c->ssm_conv + (size_t)gdn_idx * kwidth * conv_chan;
         const uint8_t* conv_w = base + mt[SLOT_SSM_CONV1D].offset;
         if (getenv("YLLM_QDBG") && layer == 1) {
             fprintf(stderr, "[qdbg] layer=1 conv_pre[0..2]=%g %g %g wf3=%g\n",
@@ -163,7 +190,7 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         for (i = 0; i < num_k_heads; i++) l2norm_inplace(k + (size_t)i * hvd, hvd, eps);
 
         /* 递归状态更新 + 注意力输出 */
-        float* state_base = e->ssm_state + (size_t)gdn_idx * n_vheads * hvd * hvd;
+        float* state_base = c->ssm_state + (size_t)gdn_idx * n_vheads * hvd * hvd;
         gdn_state_update(state_base, attn_out, q, k, v, gate, beta, num_k_heads, hvd, n_vheads, hvd);
         if (getenv("YLLM_QDBG") && layer == 1) {
             fprintf(stderr, "[qdbg] layer=1 state_out[0..2]=%g %g %g z[0..2]=%g %g %g q0=%g k0=%g v0=%g\n",
@@ -227,7 +254,7 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         uint32_t kv_dim = n_kv * hd;          /* 1024 */
         uint32_t n_rot = 64;                  /* rope.dimension_count */
 
-        float* scratch = e->scratch;
+        float* scratch = c->scratch;
         float* q = scratch;                   /* [6144] q 部分(转换期已拆出) */
         float* gate = scratch + qdim;         /* [6144] gate 部分 */
         float* k = scratch + 2 * qdim;        /* [1024] */

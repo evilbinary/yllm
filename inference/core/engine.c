@@ -331,14 +331,6 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->ffn = (float*)ycalloc((size_t)2 * inter, 4);
     e->att = (float*)ymalloc((size_t)e->max_seq * m->h.n_heads * 4);
     e->logits = (float*)ymalloc((size_t)vocab * 4);
-    e->n_ple = 0;
-    e->ple = NULL;
-    e->ple_work = NULL;
-    e->ple_batch = NULL;
-    e->rope_ff = NULL;
-    e->n_rope_ff = 0;
-    e->rope_if_swa = NULL;
-    e->n_rope_if_swa = 0;
     /* 批量 prefill 工作区 */
     {
         uint32_t PB_MAX = 64;
@@ -384,6 +376,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
             e->mtp_layer = m->h.n_blocks;   /* blk.64 = MTP 块, 不进主干 */
             e->mtp_h = (float*)ycalloc(m->h.hidden, 4);
             e->mtp_logits = (float*)ymalloc((size_t)m->h.vocab * 4);
+            e->scratch = (float*)ymalloc(65536 * 4);
             ylog_info("engine: MTP weights detected (eh_proj=%s size=%llu, trunk=%u layers)",
                       tm->name, (unsigned long long)tm->size, m->h.n_blocks - 1);
         } else {
@@ -505,6 +498,7 @@ void engine_free(Engine* e)
         ymutex_destroy(w->mtx);
     }
     wmap_close(&e->ws.map);
+    if (e->ops && e->ops->free) e->ops->free(e);
     free(e->kv);
     free(e->x);
     free(e->hb);
@@ -514,17 +508,10 @@ void engine_free(Engine* e)
     free(e->logits);
     if (e->mtp_h) free(e->mtp_h);
     if (e->mtp_logits) free(e->mtp_logits);
+    if (e->scratch) free(e->scratch);
     free(e->pb); free(e->pb2); free(e->pbq);
     free(e->pbk); free(e->pbv); free(e->pbg); free(e->pbu);
     free(e->pba);
-    if (e->ssm_state) free(e->ssm_state);
-    if (e->ssm_conv) free(e->ssm_conv);
-    if (e->scratch) free(e->scratch);
-    if (e->ple) free(e->ple);
-    if (e->ple_work) free(e->ple_work);
-    if (e->ple_batch) free(e->ple_batch);
-    if (e->rope_ff) free(e->rope_ff);
-    if (e->rope_if_swa) free(e->rope_if_swa);
     if (e->ws.model.base_idx) free(e->ws.model.base_idx);
     if (e->ws.pstate) free(e->ws.pstate);
     if (e->ws.res) free(e->ws.res);
@@ -946,7 +933,7 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
     uint32_t B = e->pb_cap ? e->pb_cap : 16;
     if (n < 1 || (uint32_t)n > B) return -1;
     /* gemma4 PP: 先用 token embed 填 pb 算 PLE, 再覆盖为上游激活 */
-    if (tokens && e->n_ple && e->ops && e->ops->after_embed_batch && e->ple_batch) {
+    if (tokens && e->ops && e->ops->after_embed_batch) {
         uint32_t b;
         for (b = 0; b < (uint32_t)n; b++)
             engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[b]);

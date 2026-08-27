@@ -1,15 +1,17 @@
 # Engine / Arch / Device
 
-版本：v1.3 ｜ 状态：四份 Arch CPU 图均在 `inference/arch/*.c`；Engine 只编排  
+版本：v1.4 ｜ 状态：四份 Arch CPU 图在 `arch/`；PLE/SSM 在 `arch_ctx`  
 关联：[design-gpu-inference.md](design-gpu-inference.md) · [design-mobile.md](design-mobile.md) · [qwen35-arch.md](qwen35-arch.md)
 
 推理拆成两轴，避免 `engine.c` 里铺 `if (ARCH_*)` × `if (DEV_MODE_*)`，也避免按「模型 × 后端」复制 shader / kernel。
 
-| 轴 | 管什么 | 不管什么 |
-|----|--------|----------|
-| **Arch** | 图：RoPE、q_dim、GEGLU/SwiGLU、SWA、PLE、GDN、logit cap | SSBO、cublas、权上卡 |
-| **Device** | 权/KV 在哪、embed/norm/lm/prefill/GEMV | GEGLU、PLE、SWA 语义 |
-| **Engine** | 编排：init/bind、prefill/decode、sample、mmap 调度、混合切层 | 具体图或具体 GPU API |
+
+| 轴          | 管什么                                             | 不管什么                 |
+| ---------- | ----------------------------------------------- | -------------------- |
+| **Arch**   | 图：RoPE、q_dim、GEGLU/SwiGLU、SWA、PLE、GDN、logit cap | SSBO、cublas、Weight上卡 |
+| **Device** | Weight/KV 在哪、embed/norm/lm/prefill/GEMV         | GEGLU、PLE、SWA 语义     |
+| **Engine** | 编排：init/bind、prefill/decode、sample、mmap 调度、混合切层 | 具体图或具体 GPU API       |
+
 
 ```text
 serve / dist / sample
@@ -32,11 +34,15 @@ engine_call_fwd_block(e, layer, pos):
 
 ---
 
+
+
 ## 1. 结构体
+
+
 
 ### 1.1 Engine（状态 + 编排）
 
-共用缓冲仍挂 Engine。Gemma PLE / Qwen3.5 SSM 第一期也仍在 Engine 上，之后可收进 `arch_ctx`。
+共用缓冲仍挂 Engine。Gemma PLE / Qwen3.5 SSM / rope 在 `e->arch_ctx`（`ArchOps.alloc` / `free`）。
 
 ```c
 typedef struct Engine {
@@ -50,7 +56,7 @@ typedef struct Engine {
     void* w_dev;
     float *x, *hb, *hb2, *ffn, *att, *logits;
     float *pb, *pb2, *pbq, *pbk, *pbv, *pbg, *pbu, *pba;
-    /* gemma/qwen35 专用: ple*, ssm_*, rope_if_* */
+    void* arch_ctx;         /* gemma4 / qwen35 私有缓冲 */
 
     uint32_t layer_begin, layer_end;  /* PP：本 rank 层段 */
     uint32_t gpu_layer_end;           /* 单进程混合，见 §4 */
@@ -73,7 +79,8 @@ typedef struct ArchOps {
     int cpu_batch_prefill;   /* 1=GPU prefill 失败走 CPU 批(gemma4/qwen35) */
     uint32_t prefill_batch_min; /* 0 视为 16 */
 
-    int  (*alloc)(Engine* e);          /* gemma4 PLE/rope、qwen35 SSM */
+    int  (*alloc)(Engine* e);          /* gemma4 PLE/rope、qwen35 SSM → arch_ctx */
+    void (*free)(Engine* e);
     void (*free)(Engine* e);
     void (*after_embed)(Engine* e, uint32_t token);
     void (*after_embed_batch)(Engine* e, const uint32_t* tokens, uint32_t B);
@@ -85,12 +92,14 @@ typedef struct ArchOps {
 } ArchOps;
 ```
 
-| 文件 | CPU 图 | `cpu_batch_prefill` | Device 覆盖（现在） |
-|------|--------|---------------------|---------------------|
-| `llama.c` | decode + batch（`qwen_rope=0`） | 0 | Vulkan/CUDA fused → `dev->fwd_block` |
-| `qwen.c` | 同块，`qwen_rope=1` | 0 | 同 llama |
-| `gemma4.c` | `alloc`+PLE+decode/batch 块 | 1 | **不挂** GPU 块（fused 是 LLaMA 形） |
-| `qwen35.c` | `alloc` SSM + GDN/gated attn 块 | 1 | **不挂** GPU 块 |
+
+| 文件         | CPU 图                          | `cpu_batch_prefill` | Device 覆盖（现在）                        |
+| ---------- | ------------------------------ | ------------------- | ------------------------------------ |
+| `llama.c`  | decode + batch（`qwen_rope=0`）  | 0                   | Vulkan/CUDA fused → `dev->fwd_block` |
+| `qwen.c`   | 同块，`qwen_rope=1`               | 0                   | 同 llama                              |
+| `gemma4.c` | `alloc`+PLE+decode/batch 块     | 1                   | **不挂** GPU 块（fused 是 LLaMA 形）        |
+| `qwen35.c` | `alloc` SSM + GDN/gated attn 块 | 1                   | **不挂** GPU 块                         |
+
 
 `after_embed`：Gemma 做 `×√hidden` + PLE；llama/qwen 为 NULL。  
 `post_logits`：Gemma final tanh cap。  
@@ -127,15 +136,19 @@ typedef struct Device {
 } Device;
 ```
 
-| 后端 | embed / prefill / lm | `fwd_block` |
-|------|----------------------|-------------|
-| CPU | 全 NULL | NULL → 全走 Arch |
-| CUDA | `cuda_*` | `cuda_attach_fwd` 挂上 |
+
+| 后端     | embed / prefill / lm                        | `fwd_block`                               |
+| ------ | ------------------------------------------- | ----------------------------------------- |
+| CPU    | 全 NULL                                      | NULL → 全走 Arch                            |
+| CUDA   | `cuda_*`                                    | `cuda_attach_fwd` 挂上                      |
 | Vulkan | `vulkan_*`；`lm_head` = `vulkan_lm_or_fused` | Llama 且 kernel 就绪才挂；Gemma/Qwen3.5 保持 NULL |
 
-`device.h` 里的 `cuda_embed` / `vulkan_prefill` 等仍是实现函数，创建 Device 时赋给指针。Engine **只走 `e->dev->*`**。
+
+`device.h` 里的 `cuda_embed` / `vulkan_prefill` 等仍是实现函数，创建 Device 时赋给指针。Engine **只走** `e->dev->`*。
 
 ---
+
+
 
 ## 2. 绑定顺序
 
@@ -155,6 +168,8 @@ serve:
 
 ---
 
+
+
 ## 3. 推理时序图
 
 整次推理分两段：**启动绑一次**，然后 **generate = prefill + decode 循环**。Engine 只编排；Arch 定图；Device 能跑就跑，不能就回落到 Arch 的 CPU。
@@ -171,6 +186,10 @@ flowchart LR
   dev --> cuda["device_cuda"]
   dev --> vk["device_vulkan"]
 ```
+
+
+
+
 
 ### 3.1 启动（一次）
 
@@ -193,6 +212,10 @@ sequenceDiagram
     Device-->>Engine: weights_ready，可选填 dev->fwd_block
     Note over Device: Llama Vulkan/CUDA: fwd_block 非空<br/>Gemma Vulkan: fwd_block 仍 NULL
 ```
+
+
+
+
 
 ### 3.2 一次 `engine_generate`
 
@@ -218,6 +241,10 @@ sequenceDiagram
         Engine->>Engine: pos++
     end
 ```
+
+
+
+
 
 ### 3.3 Prefill 一条（批）
 
@@ -256,6 +283,8 @@ sequenceDiagram
         end
     end
 ```
+
+
 
 小批（低于 `PREFILL_BATCH_MIN` / Gemma 的 `PREFILL_BATCH_MIN_GEMMA4`）退化成逐 token `engine_forward`，时序与 decode 相同。
 
@@ -313,6 +342,8 @@ sequenceDiagram
     end
 ```
 
+
+
 `fwd_block` 内部（Arch 图，Device 只换实现）：
 
 ```text
@@ -344,18 +375,24 @@ engine_forward (decode)
   └─ arch->post_logits
 ```
 
+
+
 ### 3.6 三方职责
 
-| 时刻 | Engine | Arch | Device |
-|------|--------|------|--------|
-| init | 缓冲、层区间 | 选表 | — |
-| bind | 换 `e->dev` | — | `load_weights`，可选 `fwd_block` |
-| prefill 入口 | 试 Device，失败按 `cpu_batch_prefill` | — | 整段 GPU 或 -1 |
-| 每层 | mmap 调度；`layer_on_device` | 图 | GEMV / fused / KV 位置 |
-| 头尾 | 指针失败回落 | `after_embed` / `post_logits` | embed / norm / lm |
-| sample | softmax / top_p | — | — |
+
+| 时刻         | Engine                           | Arch                          | Device                        |
+| ---------- | -------------------------------- | ----------------------------- | ----------------------------- |
+| init       | 缓冲、层区间                           | 选表                            | —                             |
+| bind       | 换 `e->dev`                       | —                             | `load_weights`，可选 `fwd_block` |
+| prefill 入口 | 试 Device，失败按 `cpu_batch_prefill` | —                             | 整段 GPU 或 -1                   |
+| 每层         | mmap 调度；`layer_on_device`        | 图                             | GEMV / fused / KV 位置          |
+| 头尾         | 指针失败回落                           | `after_embed` / `post_logits` | embed / norm / lm             |
+| sample     | softmax / top_p                  | —                             | —                             |
+
 
 ---
+
+
 
 ## 4. 混合推理（部分 GPU + 部分 CPU）
 
@@ -377,42 +414,52 @@ GPU blk … → 最后一层 GPU
 CPU blk … → CPU rmsnorm + lm_head
 ```
 
-| 段 | 权 | 算 |
-|----|----|----|
+
+| 段     | 权                          | 算                  |
+| ----- | -------------------------- | ------------------ |
 | GPU 层 | `load_weights` 上卡 / 流式 H2D | `Device.fwd_block` |
-| CPU 层 | 已有 mmap | `Arch.fwd_block` |
+| CPU 层 | 已有 mmap                    | `Arch.fwd_block`   |
+
 
 PP 的 `layer_begin/end` 是进程间切层，与 `gpu_layer_end` 正交：各 rank 仍可再混合。
 
-| 模式 | 怎么配 |
-|------|--------|
-| 全 CPU | `Device.fwd_block == NULL` |
-| 全 GPU | 有 `fwd_block` 且 `gpu_layer_end == 0` |
+
+| 模式    | 怎么配                                     |
+| ----- | --------------------------------------- |
+| 全 CPU | `Device.fwd_block == NULL`              |
+| 全 GPU | 有 `fwd_block` 且 `gpu_layer_end == 0`    |
 | 单进程混合 | 一个 CUDA/Vulkan Device + `gpu_layer_end` |
-| 多卡 PP | 各 rank 自己的 `layer_begin/end` |
+| 多卡 PP | 各 rank 自己的 `layer_begin/end`            |
+
 
 Vulkan Llama fused 填了 `fwd_block` 就能前 GPU 后 CPU。Gemma 现在 `fwd_block == NULL`，切分无意义。
 
 ---
 
+
+
 ## 5. 代码地图
 
-| 路径 | 内容 |
-|------|------|
-| `inference/include/arch.h` | `ArchOps` |
-| `inference/include/device.h` | `Device` |
-| `inference/include/yllm.h` | `Engine` + `engine_call_fwd_block` / `layer_on_device` |
-| `inference/arch/*.c` | 四份 const 表 + lookup + CPU 图 |
-| `inference/core/engine.c` | 编排（prefill/decode/sample/mmap/混合切层） |
-| `inference/device/device_*.c` | 填 vtable；`load_weights` |
-| `inference/cuda/cuda_fwd.c` | `cuda_attach_fwd` → `dev->fwd_block` |
-| `inference/vulkan/vulkan_fwd.c` | `vulkan_attach_fwd`；Gemma skip GPU 块 |
+
+| 路径                              | 内容                                                     |
+| ------------------------------- | ------------------------------------------------------ |
+| `inference/include/arch.h`      | `ArchOps`                                              |
+| `inference/include/device.h`    | `Device`                                               |
+| `inference/include/yllm.h`      | `Engine` + `engine_call_fwd_block` / `layer_on_device` |
+| `inference/arch/*.c`            | 四份 const 表 + lookup + CPU 图                            |
+| `inference/core/engine.c`       | 编排（prefill/decode/sample/mmap/混合切层）                    |
+| `inference/device/device_*.c`   | 填 vtable；`load_weights`                                |
+| `inference/cuda/cuda_fwd.c`     | `cuda_attach_fwd` → `dev->fwd_block`                   |
+| `inference/vulkan/vulkan_fwd.c` | `vulkan_attach_fwd`；Gemma skip GPU 块                   |
+
 
 ---
 
+
+
 ## 6. 后续（未做）
 
-1. PLE/SSM/rope 缓冲收入 `arch_ctx`（alloc 已迁，字段仍在 Engine）。
-2. Gemma GPU：对齐 CPU greedy 后再在 `gemma4` 路径填 `Device.fwd_block`（不要改 llama fused 去迁就 Gemma）。
-3. `load_weights` 可只 pack `gpu_layer_end` 之前的层以省显存。
-4. CUDA/Vulkan 真 GPU 核里剩余的 `header.arch` RoPE 分支，与 CPU `qwen_rope` 对齐即可。
+1. Gemma GPU：对齐 CPU greedy 后再在 `gemma4` 路径填 `Device.fwd_block`（不要改 llama fused 去迁就 Gemma）。
+2. `load_weights` 可只 pack `gpu_layer_end` 之前的层以省显存。
+3. CUDA/Vulkan 真 GPU 核里剩余的 `header.arch` RoPE 分支，与 CPU `qwen_rope` 对齐即可。
+

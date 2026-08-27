@@ -16,12 +16,26 @@
 #include <alloca.h>
 #endif
 
+
+typedef struct {
+    float *ple, *ple_work, *ple_batch;
+    uint32_t n_ple;
+    float *rope_ff, *rope_if_swa;
+    uint32_t n_rope_ff, n_rope_if_swa;
+} Gemma4Ctx;
+
+static Gemma4Ctx* g4c(Engine* e)
+{
+    return (e && e->arch_ctx) ? (Gemma4Ctx*)e->arch_ctx : NULL;
+}
+
 const ArchOps arch_gemma4_ops = {
     .name = "gemma4",
     .id = ARCH_GEMMA4,
     .cpu_batch_prefill = 1,
     .prefill_batch_min = 2,
     .alloc = arch_gemma4_alloc,
+    .free = arch_gemma4_free,
     .after_embed = arch_gemma4_after_embed,
     .after_embed_batch = arch_gemma4_after_embed_batch,
     .refresh_ple_pp = arch_gemma4_refresh_ple_pp,
@@ -49,12 +63,15 @@ int arch_gemma4_alloc(Engine* e)
     LlModel* m = &ws->model;
     uint32_t hidden = m->h.hidden;
     LlfGemma4Ext g4;
+    Gemma4Ctx* c = (Gemma4Ctx*)ycalloc(1, sizeof(*c));
+    if (!c) return -1;
+    e->arch_ctx = c;
     llf_gemma4_ext(&m->h, &g4);
-    e->n_ple = g4.n_embd_per_layer;
-    if (e->n_ple > 0) {
-        uint32_t psz = e->n_ple * m->h.n_blocks;
-        e->ple = (float*)ycalloc(psz, 4);
-        e->ple_work = (float*)ycalloc(psz, 4);
+    c->n_ple = g4.n_embd_per_layer;
+    if (c->n_ple > 0) {
+        uint32_t psz = c->n_ple * m->h.n_blocks;
+        c->ple = (float*)ycalloc(psz, 4);
+        c->ple_work = (float*)ycalloc(psz, 4);
     }
     {
         const LlfTensorMeta* tm = &m->metas[m->base_idx[0] + SLOT_ROPE_FREQS];
@@ -65,18 +82,18 @@ int arch_gemma4_alloc(Engine* e)
             }
             if (n > 0 && n <= 8192) {
                 const uint8_t* p = (const uint8_t*)ws->map.base + m->dir[0].offset + tm->offset;
-                e->rope_ff = (float*)ymalloc((size_t)n * 4);
-                e->n_rope_ff = n;
+                c->rope_ff = (float*)ymalloc((size_t)n * 4);
+                c->n_rope_ff = n;
                 if (tm->dtype == DT_F32) {
-                    memcpy(e->rope_ff, p, (size_t)n * 4);
+                    memcpy(c->rope_ff, p, (size_t)n * 4);
                 } else if (tm->dtype == DT_F16) {
                     const uint16_t* hp = (const uint16_t*)p;
                     uint32_t j;
-                    for (j = 0; j < n; j++) e->rope_ff[j] = f16_to_f32(hp[j]);
+                    for (j = 0; j < n; j++) c->rope_ff[j] = f16_to_f32(hp[j]);
                 } else {
-                    free(e->rope_ff);
-                    e->rope_ff = NULL;
-                    e->n_rope_ff = 0;
+                    free(c->rope_ff);
+                    c->rope_ff = NULL;
+                    c->n_rope_ff = 0;
                 }
             }
         }
@@ -86,13 +103,13 @@ int arch_gemma4_alloc(Engine* e)
         uint32_t hd_g = m->h.head_dim ? m->h.head_dim : 1;
         uint32_t hd_s = 0, li, swa_il = 0;
         memcpy(&theta_g, &m->h.rope_theta_bits, 4);
-        if (e->rope_ff && e->n_rope_ff > 0) {
-            uint32_t d = e->n_rope_ff * 2u;
-            gemma4_fill_inv_freq(e->rope_ff, e->n_rope_ff, d, theta_g, 1);
+        if (c->rope_ff && c->n_rope_ff > 0) {
+            uint32_t d = c->n_rope_ff * 2u;
+            gemma4_fill_inv_freq(c->rope_ff, c->n_rope_ff, d, theta_g, 1);
         } else if (hd_g >= 2) {
-            e->n_rope_ff = hd_g / 2;
-            e->rope_ff = (float*)ymalloc((size_t)e->n_rope_ff * 4);
-            gemma4_fill_inv_freq(e->rope_ff, e->n_rope_ff, hd_g, theta_g, 0);
+            c->n_rope_ff = hd_g / 2;
+            c->rope_ff = (float*)ymalloc((size_t)c->n_rope_ff * 4);
+            gemma4_fill_inv_freq(c->rope_ff, c->n_rope_ff, hd_g, theta_g, 0);
         }
         for (li = 1; li <= m->h.n_blocks; li++) {
             const LlfTensorMeta* mt = &m->metas[m->base_idx[li]];
@@ -106,9 +123,9 @@ int arch_gemma4_alloc(Engine* e)
         }
         if (hd_s >= 2) {
             float ths = llf_gemma4_rope_theta(&m->h, &g4, swa_il);
-            e->n_rope_if_swa = hd_s / 2;
-            e->rope_if_swa = (float*)ymalloc((size_t)e->n_rope_if_swa * 4);
-            gemma4_fill_inv_freq(e->rope_if_swa, e->n_rope_if_swa, hd_s, ths, 0);
+            c->n_rope_if_swa = hd_s / 2;
+            c->rope_if_swa = (float*)ymalloc((size_t)c->n_rope_if_swa * 4);
+            gemma4_fill_inv_freq(c->rope_if_swa, c->n_rope_if_swa, hd_s, ths, 0);
         }
     }
     if (hidden > 0 && e->pb_cap > 0) {
@@ -126,21 +143,36 @@ int arch_gemma4_alloc(Engine* e)
             e->pbq_dim = q_dim_max;
         }
     }
-    if (e->n_ple > 0 && e->pb_cap > 0) {
-        size_t psz = (size_t)e->n_ple * m->h.n_blocks;
-        e->ple_batch = (float*)ycalloc((size_t)e->pb_cap * psz, 4);
-        free(e->ple_work);
-        e->ple_work = (float*)ycalloc((size_t)e->pb_cap * psz, 4);
+    if (c->n_ple > 0 && e->pb_cap > 0) {
+        size_t psz = (size_t)c->n_ple * m->h.n_blocks;
+        c->ple_batch = (float*)ycalloc((size_t)e->pb_cap * psz, 4);
+        free(c->ple_work);
+        c->ple_work = (float*)ycalloc((size_t)e->pb_cap * psz, 4);
     }
     ylog_info("gemma4: n_ple=%u shared_kv=%u swa_win=%u swa_pat=%u rope_freqs=%u",
-              e->n_ple, g4.n_kv_shared_layers, g4.swa_window, g4.swa_pattern,
-              e->n_rope_ff);
+              c->n_ple, g4.n_kv_shared_layers, g4.swa_window, g4.swa_pattern,
+              c->n_rope_ff);
     return 0;
+}
+
+void arch_gemma4_free(Engine* e)
+{
+    Gemma4Ctx* c = g4c(e);
+    if (!c) return;
+    free(c->ple);
+    free(c->ple_work);
+    free(c->ple_batch);
+    free(c->rope_ff);
+    free(c->rope_if_swa);
+    free(c);
+    e->arch_ctx = NULL;
 }
 
 static void gemma4_prepare_ple_resid(Engine* e, uint32_t token, const float* resid)
 {
-    if (!e->n_ple || !e->ple || !e->ple_work || !resid) return;
+    Gemma4Ctx* c = g4c(e);
+
+    if (!c || !c->n_ple || !c->ple || !c->ple_work || !resid) return;
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -149,7 +181,7 @@ static void gemma4_prepare_ple_resid(Engine* e, uint32_t token, const float* res
     const LlfTensorMeta* tok = &em[SLOT_PLE_TOK];
     const LlfTensorMeta* mproj = &em[SLOT_PLE_MPROJ];
     const LlfTensorMeta* pnorm = &em[SLOT_PLE_PNORM];
-    uint32_t n_ple = e->n_ple;
+    uint32_t n_ple = c->n_ple;
     uint32_t nblk = h->n_blocks;
     uint32_t width = n_ple * nblk;
     uint32_t j, il;
@@ -158,21 +190,21 @@ static void gemma4_prepare_ple_resid(Engine* e, uint32_t token, const float* res
     if (tok->size == 0 || mproj->size == 0) return;
     memcpy(&eps, &h->norm_eps_bits, 4);
     switch (tok->dtype) {
-    case DT_F32: embed_f32(e->ple, ebase + tok->offset, token, width); break;
-    case DT_Q4K: embed_q4k(e->ple, ebase + tok->offset, token, width); break;
-    case DT_Q6K: embed_q6k(e->ple, ebase + tok->offset, token, width); break;
-    case DT_Q5K: embed_q5k(e->ple, ebase + tok->offset, token, width); break;
-    default: embed_f16(e->ple, ebase + tok->offset, token, width); break;
+    case DT_F32: embed_f32(c->ple, ebase + tok->offset, token, width); break;
+    case DT_Q4K: embed_q4k(c->ple, ebase + tok->offset, token, width); break;
+    case DT_Q6K: embed_q6k(c->ple, ebase + tok->offset, token, width); break;
+    case DT_Q5K: embed_q5k(c->ple, ebase + tok->offset, token, width); break;
+    default: embed_f16(c->ple, ebase + tok->offset, token, width); break;
     }
     ts = sqrtf((float)n_ple);
-    for (j = 0; j < width; j++) e->ple[j] *= ts;
-    matmul(e->ple_work, resid, ebase + mproj->offset, width, h->hidden, mproj->dtype);
+    for (j = 0; j < width; j++) c->ple[j] *= ts;
+    matmul(c->ple_work, resid, ebase + mproj->offset, width, h->hidden, mproj->dtype);
     ps = 1.0f / sqrtf((float)h->hidden);
-    for (j = 0; j < width; j++) e->ple_work[j] *= ps;
+    for (j = 0; j < width; j++) c->ple_work[j] *= ps;
     isc = 1.0f / sqrtf(2.0f);
     for (il = 0; il < nblk; il++) {
-        float* sl = e->ple_work + (size_t)il * n_ple;
-        float* pe = e->ple + (size_t)il * n_ple;
+        float* sl = c->ple_work + (size_t)il * n_ple;
+        float* pe = c->ple + (size_t)il * n_ple;
         if (pnorm->size > 0)
             rmsnorm(sl, sl, ebase + pnorm->offset, n_ple, eps, pnorm->dtype);
         else
@@ -193,7 +225,9 @@ void arch_gemma4_after_embed(Engine* e, uint32_t token)
 
 void arch_gemma4_refresh_ple_pp(Engine* e, uint32_t token)
 {
-    if (!e->n_ple || !e->hb) return;
+    Gemma4Ctx* c = g4c(e);
+
+    if (!c || !c->n_ple || !e->hb) return;
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -218,7 +252,9 @@ void arch_gemma4_refresh_ple_pp(Engine* e, uint32_t token)
 
 static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t B)
 {
-    if (!e->n_ple || !e->ple_batch || !e->ple_work || B == 0) return;
+    Gemma4Ctx* c = g4c(e);
+
+    if (!c || !c->n_ple || !c->ple_batch || !c->ple_work || B == 0) return;
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -227,7 +263,7 @@ static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t
     const LlfTensorMeta* tok = &em[SLOT_PLE_TOK];
     const LlfTensorMeta* mproj = &em[SLOT_PLE_MPROJ];
     const LlfTensorMeta* pnorm = &em[SLOT_PLE_PNORM];
-    uint32_t n_ple = e->n_ple;
+    uint32_t n_ple = c->n_ple;
     uint32_t nblk = h->n_blocks;
     uint32_t width = n_ple * nblk;
     uint32_t b, j, il;
@@ -238,7 +274,7 @@ static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t
     ps = 1.0f / sqrtf((float)h->hidden);
     isc = 1.0f / sqrtf(2.0f);
     for (b = 0; b < B; b++) {
-        float* pe = e->ple_batch + (size_t)b * width;
+        float* pe = c->ple_batch + (size_t)b * width;
         switch (tok->dtype) {
         case DT_F32: embed_f32(pe, ebase + tok->offset, tokens[b], width); break;
         case DT_Q4K: embed_q4k(pe, ebase + tok->offset, tokens[b], width); break;
@@ -248,10 +284,10 @@ static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t
         }
         for (j = 0; j < width; j++) pe[j] *= ts;
     }
-    matmul_batch(e->ple_work, e->pb, ebase + mproj->offset, width, h->hidden, mproj->dtype, B);
+    matmul_batch(c->ple_work, e->pb, ebase + mproj->offset, width, h->hidden, mproj->dtype, B);
     for (b = 0; b < B; b++) {
-        float* sl0 = e->ple_work + (size_t)b * width;
-        float* pe = e->ple_batch + (size_t)b * width;
+        float* sl0 = c->ple_work + (size_t)b * width;
+        float* pe = c->ple_batch + (size_t)b * width;
         for (j = 0; j < width; j++) sl0[j] *= ps;
         for (il = 0; il < nblk; il++) {
             float* sl = sl0 + (size_t)il * n_ple;
@@ -268,13 +304,15 @@ static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t
 
 void arch_gemma4_after_embed_batch(Engine* e, const uint32_t* tokens, uint32_t B)
 {
+    Gemma4Ctx* c = g4c(e);
+
     uint32_t hidden = e->ws.model.h.hidden;
     float scale = sqrtf((float)hidden);
     uint32_t b2, j;
     for (b2 = 0; b2 < B; b2++)
         for (j = 0; j < hidden; j++)
             e->pb[(size_t)b2 * hidden + j] *= scale;
-    if (e->ple_batch && e->n_ple)
+    if (c && c->ple_batch && c->n_ple)
         gemma4_prepare_ple_batch(e, tokens, B);
 }
 
@@ -291,6 +329,9 @@ void arch_gemma4_post_logits(Engine* e)
 /* gemma4 批量前向: QKV/O/FFN 走 matmul_batch; attn/PLE 按 token */
 int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
+    Gemma4Ctx* c = g4c(e);
+    if (!c) return -1;
+
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -308,7 +349,7 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
     int has_kv = 1;
     uint32_t kv_layer = layer;
     uint32_t b, hh;
-    size_t ple_stride = (e->n_ple > 0) ? (size_t)e->n_ple * h->n_blocks : 0;
+    size_t ple_stride = (c->n_ple > 0) ? (size_t)c->n_ple * h->n_blocks : 0;
     float* att_batch = e->pba; /* [B x q_dim] 暂存 attn 输出 */
     const float* rope_if = NULL;
     float inv_d = 1.0f;
@@ -337,18 +378,18 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
     if (q_dim > e->pbq_dim || inter > e->inter || B > e->pb_cap) {
         for (b = 0; b < B; b++) {
             memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
-            if (e->ple && e->ple_batch && ple_stride)
-                memcpy(e->ple, e->ple_batch + (size_t)b * ple_stride, ple_stride * 4);
+            if (c->ple && c->ple_batch && ple_stride)
+                memcpy(c->ple, c->ple_batch + (size_t)b * ple_stride, ple_stride * 4);
             if (e->ops->fwd_block(e, layer, pos_start + b) != 0) return -1;
             memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
         }
         return 0;
     }
 
-    if (swa && e->rope_if_swa && e->n_rope_if_swa == hd / 2)
-        rope_if = e->rope_if_swa;
-    else if (!swa && e->rope_ff && e->n_rope_ff == hd / 2)
-        rope_if = e->rope_ff;
+    if (swa && c->rope_if_swa && c->n_rope_if_swa == hd / 2)
+        rope_if = c->rope_if_swa;
+    else if (!swa && c->rope_ff && c->n_rope_ff == hd / 2)
+        rope_if = c->rope_ff;
 
     for (b = 0; b < B; b++)
         rmsnorm(e->pb2 + (size_t)b * hidden, e->pb + (size_t)b * hidden,
@@ -441,13 +482,13 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
         rmsnorm(x2, ao, base + mt[SLOT_NORM4].offset, hidden, eps, mt[SLOT_NORM4].dtype);
         add_inplace(x, x2, hidden);
     }
-    if (e->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0 && e->ple_batch && ple_stride) {
-        uint32_t n_ple = e->n_ple;
+    if (c->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0 && c->ple_batch && ple_stride) {
+        uint32_t n_ple = c->n_ple;
         uint32_t j;
         matmul_batch(e->pbg, e->pb, base + mt[SLOT_PLE_GATE].offset, n_ple, hidden, mt[SLOT_PLE_GATE].dtype, B);
         for (b = 0; b < B; b++) {
             float* gate = e->pbg + (size_t)b * n_ple;
-            const float* pe = e->ple_batch + (size_t)b * ple_stride + (size_t)il * n_ple;
+            const float* pe = c->ple_batch + (size_t)b * ple_stride + (size_t)il * n_ple;
             gelu_inplace(gate, n_ple);
             for (j = 0; j < n_ple; j++) gate[j] *= pe[j];
         }
@@ -476,6 +517,9 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
 
 int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
+    Gemma4Ctx* c = g4c(e);
+    if (!c) return -1;
+
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
@@ -583,10 +627,10 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         uint16_t* vcache = kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * kv_dim;
         uint64_t kvp = (uint64_t)pos * kv_dim;
         int swa = llf_gemma4_is_swa(&g4, il);
-        if (swa && e->rope_if_swa && e->n_rope_if_swa == hd / 2)
-            rope_if = e->rope_if_swa;
-        else if (!swa && e->rope_ff && e->n_rope_ff == hd / 2)
-            rope_if = e->rope_ff;
+        if (swa && c->rope_if_swa && c->n_rope_if_swa == hd / 2)
+            rope_if = c->rope_if_swa;
+        else if (!swa && c->rope_ff && c->n_rope_ff == hd / 2)
+            rope_if = c->rope_ff;
         for (hh = 0; hh < h->n_heads; hh++) {
             if (rope_if)
                 rope_inplace_neox_if(q + (size_t)hh * hd, hd, pos, rope_if);
@@ -636,13 +680,13 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
         rmsnorm(x2, att_out, base + mt[SLOT_NORM4].offset, hidden, eps, mt[SLOT_NORM4].dtype);
         add_inplace(x, x2, hidden);
-        if (e->ple && e->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0) {
-            uint32_t n_ple = e->n_ple;
-            float* gate = e->ple_work;
+        if (c->ple && c->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0) {
+            uint32_t n_ple = c->n_ple;
+            float* gate = c->ple_work;
             matmul(gate, x, base + mt[SLOT_PLE_GATE].offset, n_ple, hidden, mt[SLOT_PLE_GATE].dtype);
             gelu_inplace(gate, n_ple);
             for (j = 0; j < n_ple; j++)
-                gate[j] *= e->ple[(size_t)il * n_ple + j];
+                gate[j] *= c->ple[(size_t)il * n_ple + j];
             matmul(att_out, gate, base + mt[SLOT_PLE_PROJ].offset, hidden, n_ple, mt[SLOT_PLE_PROJ].dtype);
             if (mt[SLOT_PLE_POST].size > 0)
                 rmsnorm(att_out, att_out, base + mt[SLOT_PLE_POST].offset, hidden, eps, mt[SLOT_PLE_POST].dtype);

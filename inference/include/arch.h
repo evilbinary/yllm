@@ -45,7 +45,9 @@ int  arch_qwen35_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint3
 int  arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
 int  arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
 int  arch_gemma4_alloc(Engine* e);
+void arch_gemma4_free(Engine* e);
 int  arch_qwen35_alloc(Engine* e);
+void arch_qwen35_free(Engine* e);
 void arch_gemma4_after_embed(Engine* e, uint32_t token);
 void arch_gemma4_after_embed_batch(Engine* e, const uint32_t* tokens, uint32_t B);
 void arch_gemma4_refresh_ple_pp(Engine* e, uint32_t token);
