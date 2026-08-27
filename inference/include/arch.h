@@ -32,9 +32,14 @@ extern const ArchOps arch_gemma4_ops;
 
 const ArchOps* arch_lookup(uint32_t arch_id);
 
-/* CPU graph: llama/qwen 块在 engine.c; gemma4/qwen35 在 inference/arch. */
+/* CPU 图在 inference/arch；engine_fwd_block_at 转给 llama/qwen 共用实现。 */
 int  arch_llama_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
 int  arch_llama_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
+int  arch_llama_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
+                            const uint8_t* layer_base, uint16_t* kv, int qwen_rope);
+int  arch_llama_fwd_block_batch_rope(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B, int qwen_rope);
+int  arch_qwen_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
+int  arch_qwen_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
 int  arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
 int  arch_qwen35_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
 int  arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos);

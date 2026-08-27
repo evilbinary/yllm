@@ -10,7 +10,9 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#if !defined(_WIN32)
+#ifdef _WIN32
+#include <malloc.h>
+#else
 #include <alloca.h>
 #endif
 
