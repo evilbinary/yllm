@@ -168,16 +168,14 @@ void embed_q4k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
     }
 }
 
+static void q6k_block(float* y, const uint8_t* blk);
+
 void embed_q6k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
 {
     uint32_t nb = hidden / 256;
     const uint8_t* r = w + (size_t)row * nb * 210;
     uint32_t b;
-    for (b = 0; b < nb; b++) {
-        const uint8_t* blk = r + (size_t)b * 210;
-        uint32_t e;
-        for (e = 0; e < 256; e++) y[b * 256 + e] = q6k_val(blk, e);
-    }
+    for (b = 0; b < nb; b++) q6k_block(y + (size_t)b * 256, r + (size_t)b * 210);
 }
 
 void embed_f32(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
@@ -241,10 +239,59 @@ void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps, 
     }
 }
 
+#ifdef __AVX2__
+static inline __m256 q6_group_dot(const __m128i qvals, const float* x)
+{
+    __m256i e16 = _mm256_cvtepu8_epi16(qvals);
+    __m256 fl = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(e16))),
+                              _mm256_set1_ps(32.0f));
+    __m256 fh = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(e16, 1))),
+                              _mm256_set1_ps(32.0f));
+    return _mm256_fmadd_ps(fl, _mm256_loadu_ps(x),
+                           _mm256_fmadd_ps(fh, _mm256_loadu_ps(x + 8), _mm256_setzero_ps()));
+}
+#endif
+
 /* Q6_K 块反量化到 tmp[256](批量路径用, 无逐元素函数调用) */
 static void q6k_block(float* y, const uint8_t* blk)
 {
+#ifdef __F16C__
+    float d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)*(const uint16_t*)(blk + 208))));
+#else
     float d = f16_to_f32(((const uint16_t*)blk)[104]);
+#endif
+#if defined(__AVX2__)
+    {
+        const __m128i nibble = _mm_set1_epi8(0x0F);
+        const __m128i m3 = _mm_set1_epi8(3);
+        const __m256 v32 = _mm256_set1_ps(32.0f);
+        uint32_t half, quad, part;
+        for (half = 0; half < 2; half++) {
+            const uint8_t* ql = blk + half * 64;
+            const uint8_t* qh = blk + 128 + half * 32;
+            const int8_t* sc = (const int8_t*)(blk + 192) + half * 8;
+            for (quad = 0; quad < 4; quad++) {
+                const uint8_t* qb = ql + (quad & 1u) * 32;
+                int qshift = (quad & 2u) ? 4 : 0;
+                int hshift = (int)quad * 2;
+                float* yp = y + half * 128 + quad * 32;
+                for (part = 0; part < 2; part++) {
+                    __m128i qbl = _mm_loadu_si128((const __m128i*)(qb + part * 16));
+                    __m128i qhv = _mm_loadu_si128((const __m128i*)(qh + part * 16));
+                    __m128i lo = _mm_and_si128(qshift ? _mm_srli_epi16(qbl, 4) : qbl, nibble);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(qhv, hshift), m3);
+                    __m128i bits = _mm_or_si128(lo, _mm_slli_epi16(hi, 4));
+                    __m256i e16 = _mm256_cvtepu8_epi16(bits);
+                    __m256 vs = _mm256_set1_ps(d * (float)sc[quad * 2 + part]);
+                    __m256 f0 = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(e16))), v32);
+                    __m256 f1 = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(e16, 1))), v32);
+                    _mm256_storeu_ps(yp + part * 16, _mm256_mul_ps(f0, vs));
+                    _mm256_storeu_ps(yp + part * 16 + 8, _mm256_mul_ps(f1, vs));
+                }
+            }
+        }
+    }
+#else
     uint32_t half, e;
     for (half = 0; half < 2; half++) {
         const uint8_t* ql = blk + half * 64;
@@ -260,6 +307,7 @@ static void q6k_block(float* y, const uint8_t* blk)
             y[half * 128 + e] = d * (float)s * (float)q;
         }
     }
+#endif
 }
 
 /* Q5_K 块反量化到 y[256] (176 B/256). 布局: d(f16,0) dmin(f16,2) scales(4,12B)
@@ -1069,18 +1117,22 @@ static void matmul_q6k_preq(float* y, const float* xq, const uint8_t* w, uint32_
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * rowb;
-        float acc = 0.0f;
+        __m256 acc_v = _mm256_setzero_ps();
         uint32_t b;
         for (b = 0; b < nb; b++) {
             const uint8_t* blk = row + (size_t)b * 210;
             const float* xb = xq + (size_t)b * 256;
+#ifdef __F16C__
+            float d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)*(const uint16_t*)(blk + 208))));
+#else
             float d = f16_to_f32(((const uint16_t*)blk)[104]);
+#endif
             const uint8_t* ql = blk;
             const uint8_t* qh = blk + 128;
             const int8_t* sc = (const int8_t*)(blk + 192);
-            float sums[16];
-            memset(sums, 0, sizeof(sums));
-            for (int chunk = 0; chunk < 2; chunk++) {
+            if (b + 1 < nb) _mm_prefetch((const char*)(blk + 210), _MM_HINT_T0);
+            int chunk;
+            for (chunk = 0; chunk < 2; chunk++) {
                 const uint8_t* ql_c = ql + chunk * 64;
                 const uint8_t* qh_c = qh + chunk * 32;
                 const float* xp_c = xb + chunk * 128;
@@ -1093,39 +1145,25 @@ static void matmul_q6k_preq(float* y, const float* xq, const uint8_t* w, uint32_
                 __m128i qh1 = _mm_loadu_si128((const __m128i*)(qh_c + 16));
                 __m128i mF = _mm_set1_epi8(0x0F);
                 __m128i m3 = _mm_set1_epi8(3);
-                /* even groups */
                 __m128i e_q1 = _mm_or_si128(_mm_and_si128(ql0, mF), _mm_slli_epi16(_mm_and_si128(qh0, m3), 4));
                 __m128i e_q2 = _mm_or_si128(_mm_and_si128(ql2, mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 2), m3), 4));
                 __m128i e_q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql0, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 4), m3), 4));
                 __m128i e_q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql2, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 6), m3), 4));
-                /* odd groups */
                 __m128i o_q1 = _mm_or_si128(_mm_and_si128(ql1, mF), _mm_slli_epi16(_mm_and_si128(qh1, m3), 4));
                 __m128i o_q2 = _mm_or_si128(_mm_and_si128(ql3, mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 2), m3), 4));
                 __m128i o_q3 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql1, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 4), m3), 4));
                 __m128i o_q4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql3, 4), mF), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 6), m3), 4));
-#define Q6_GROUP_SUM(qvals, xpos) ({ \
-    __m256i _e16 = _mm256_cvtepu8_epi16(qvals); \
-    __m128i _l = _mm256_castsi256_si128(_e16); \
-    __m128i _h = _mm256_extracti128_si256(_e16, 1); \
-    __m256 _fl = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_l)), _mm256_set1_ps(32.0f)); \
-    __m256 _fh = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_h)), _mm256_set1_ps(32.0f)); \
-    __m256 _p = _mm256_fmadd_ps(_fl, _mm256_loadu_ps(xp_c + (xpos)), \
-               _mm256_mul_ps(_fh, _mm256_loadu_ps(xp_c + (xpos) + 8))); \
-    hsum_avx2(_p); \
-})
-                sums[is+0] = Q6_GROUP_SUM(e_q1, 0);
-                sums[is+2] = Q6_GROUP_SUM(e_q2, 32);
-                sums[is+4] = Q6_GROUP_SUM(e_q3, 64);
-                sums[is+6] = Q6_GROUP_SUM(e_q4, 96);
-                sums[is+1] = Q6_GROUP_SUM(o_q1, 16);
-                sums[is+3] = Q6_GROUP_SUM(o_q2, 48);
-                sums[is+5] = Q6_GROUP_SUM(o_q3, 80);
-                sums[is+7] = Q6_GROUP_SUM(o_q4, 112);
-#undef Q6_GROUP_SUM
+                acc_v = _mm256_fmadd_ps(q6_group_dot(e_q1, xp_c + 0),   _mm256_set1_ps(d * (float)sc[is + 0]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(o_q1, xp_c + 16),  _mm256_set1_ps(d * (float)sc[is + 1]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(e_q2, xp_c + 32),  _mm256_set1_ps(d * (float)sc[is + 2]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(o_q2, xp_c + 48),  _mm256_set1_ps(d * (float)sc[is + 3]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(e_q3, xp_c + 64),  _mm256_set1_ps(d * (float)sc[is + 4]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(o_q3, xp_c + 80),  _mm256_set1_ps(d * (float)sc[is + 5]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(e_q4, xp_c + 96),  _mm256_set1_ps(d * (float)sc[is + 6]), acc_v);
+                acc_v = _mm256_fmadd_ps(q6_group_dot(o_q4, xp_c + 112), _mm256_set1_ps(d * (float)sc[is + 7]), acc_v);
             }
-            for (int j = 0; j < 16; j++) acc += d * (float)sc[j] * sums[j];
         }
-        y[oo] = acc;
+        y[oo] = hsum_avx2(acc_v);
     }
 #else
     #pragma omp parallel for schedule(static)

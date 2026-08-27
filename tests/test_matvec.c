@@ -71,13 +71,17 @@ static void test_q4k_decode(void)
 /* ---- Q6_K decode regression (block5 has negative d) ---- */
 static void test_q6k_decode(void)
 {
-    float out[256];
+    float out[256], blk[256];
     uint32_t e;
     for (e = 0; e < 256; e++) {
         out[e] = q6k_val(V6_RAW, e);
     }
     for (e = 0; e < 256; e++) {
         CHECK_NEAR(out[e], V6_REF[e], 1e-6, "q6k decode value");
+    }
+    CHECK(dequant_mat_f32(blk, V6_RAW, 1, 256, DT_Q6K) == 0, "dequant_mat_f32 q6k");
+    for (e = 0; e < 256; e++) {
+        CHECK_NEAR(blk[e], V6_REF[e], 1e-5, "q6k_block vs golden");
     }
 }
 
@@ -194,6 +198,24 @@ static void test_matmul_q6k(void)
     float y[1];
     matmul_q6k(y, x, w, 1, 512);
     CHECK_NEAR(y[0], -31.0 * 512, 1e-3, "matmul_q6k synthetic");
+    {
+        float wr[512], xq[512], ref = 0.0f;
+        uint32_t i;
+        CHECK(dequant_mat_f32(wr, w, 1, 512, DT_Q6K) == 0, "dequant q6k row");
+        matvec_q8k_quant(x, xq, 512);
+        for (i = 0; i < 512; i++) ref += wr[i] * xq[i];
+        CHECK_NEAR(y[0], ref, 1e-2, "matmul_q6k vs dequant dot");
+    }
+    {
+        float xv[256], xq[256], wr[256], yg[1], ref = 0.0f;
+        uint32_t i;
+        for (i = 0; i < 256; i++) xv[i] = (float)((int)i - 128) * 0.03125f;
+        CHECK(dequant_mat_f32(wr, V6_RAW, 1, 256, DT_Q6K) == 0, "dequant V6_RAW");
+        matvec_q8k_quant(xv, xq, 256);
+        for (i = 0; i < 256; i++) ref += wr[i] * xq[i];
+        matmul_q6k(yg, xv, V6_RAW, 1, 256);
+        CHECK_NEAR(yg[0], ref, 2e-2, "matmul_q6k golden vs dequant");
+    }
 }
 
 static void test_q8k_quant(void)
