@@ -56,5 +56,10 @@ void arch_gemma4_after_embed(Engine* e, uint32_t token);
 void arch_gemma4_after_embed_batch(Engine* e, const uint32_t* tokens, uint32_t B);
 void arch_gemma4_refresh_ple_pp(Engine* e, uint32_t token);
 void arch_gemma4_post_logits(Engine* e);
+/* Device 用: rope 表与当前 token 的 PLE 向量(host)。 */
+void arch_gemma4_cuda_tables(Engine* e,
+                             const float** rope_ff, uint32_t* n_ff,
+                             const float** rope_swa, uint32_t* n_swa,
+                             const float** ple, uint32_t* n_ple);
 
 #endif /* YLLM_ARCH_H */

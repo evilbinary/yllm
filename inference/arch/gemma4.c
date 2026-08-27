@@ -318,6 +318,20 @@ void arch_gemma4_after_embed_batch(Engine* e, const uint32_t* tokens, uint32_t B
         gemma4_prepare_ple_batch(e, tokens, B);
 }
 
+void arch_gemma4_cuda_tables(Engine* e,
+                             const float** rope_ff, uint32_t* n_ff,
+                             const float** rope_swa, uint32_t* n_swa,
+                             const float** ple, uint32_t* n_ple)
+{
+    Gemma4Ctx* c = g4c(e);
+    if (rope_ff) *rope_ff = c ? c->rope_ff : NULL;
+    if (n_ff) *n_ff = c ? c->n_rope_ff : 0;
+    if (rope_swa) *rope_swa = c ? c->rope_if_swa : NULL;
+    if (n_swa) *n_swa = c ? c->n_rope_if_swa : 0;
+    if (ple) *ple = c ? c->ple : NULL;
+    if (n_ple) *n_ple = c ? c->n_ple : 0;
+}
+
 void arch_gemma4_post_logits(Engine* e)
 {
     float cap = llf_gemma4_final_cap(&e->ws.model.h);

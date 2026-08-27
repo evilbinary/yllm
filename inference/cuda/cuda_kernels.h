@@ -38,6 +38,13 @@ void cuda_k_add_bias(float* y, const float* bias, uint32_t n);
 void cuda_k_add_bias_batch(float* y, const float* bias, uint32_t n, uint32_t B);
 void cuda_k_swiglu(float* y, const float* gate, const float* up, uint32_t n);
 void cuda_k_swiglu_batch(float* y, const float* gate, const float* up, uint32_t n, uint32_t B);
+void cuda_k_geglu(float* y, const float* gate, const float* up, uint32_t n);
+void cuda_k_gelu(float* y, uint32_t n);
+void cuda_k_mul(float* y, const float* a, const float* b, uint32_t n);
+void cuda_k_scale(float* y, float s, uint32_t n);
+void cuda_k_rmsnorm_unit(float* y, const float* x, uint32_t n, float eps);
+void cuda_k_rope_neox_if_heads(float* v, uint32_t n_heads, uint32_t head_dim,
+                               uint32_t pos, const float* inv_freq);
 void cuda_k_rope_llama(float* v, uint32_t d, uint32_t pos, float theta);
 void cuda_k_rope_qwen(float* v, uint32_t d, uint32_t pos, float theta);
 void cuda_k_rope_llama_heads(float* v, uint32_t n_heads, uint32_t head_dim, uint32_t pos, float theta);
@@ -56,6 +63,11 @@ void cuda_k_attn_decode(float* att_out,
                         const float* q, const uint16_t* kcache, const uint16_t* vcache,
                         uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                         uint32_t kv_dim);
+/* s0=窗口起点; scale 为点积系数(gemma decode 用 1, llama 用 1/sqrt(hd)) */
+void cuda_k_attn_decode_win(float* att_out,
+                            const float* q, const uint16_t* kcache, const uint16_t* vcache,
+                            uint32_t s0, uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads,
+                            uint32_t head_dim, uint32_t kv_dim, float scale);
 /* Flash 风格 online-softmax; 不写 att_scores */
 void cuda_k_attn_prefill(float* att_out,
                          const float* q, const uint16_t* kcache, const uint16_t* vcache,

@@ -80,10 +80,49 @@ static int slot_out_in(uint32_t layer, uint32_t slot, const Engine* e,
         *in = hidden;
     } else if (layer >= 1 && layer <= h->n_blocks) {
         switch (slot) {
-        case SLOT_Q: case SLOT_O: *out = hidden; *in = hidden; break;
-        case SLOT_K: case SLOT_V: *out = kv_dim; *in = hidden; break;
-        case SLOT_GATE: case SLOT_UP: *out = inter; *in = hidden; break;
-        case SLOT_DOWN: *out = hidden; *in = inter; break;
+        case SLOT_Q: {
+            *in = hidden;
+            *out = hidden;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                *out = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            break;
+        }
+        case SLOT_O: {
+            *out = hidden;
+            *in = hidden;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                *in = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            break;
+        }
+        case SLOT_K: case SLOT_V: {
+            *in = hidden;
+            *out = kv_dim;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                *out = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            break;
+        }
+        case SLOT_GATE: case SLOT_UP: {
+            *in = hidden;
+            *out = inter;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                *out = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            break;
+        }
+        case SLOT_DOWN: {
+            *out = hidden;
+            *in = inter;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                *in = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            break;
+        }
+        case SLOT_PLE_GATE:
+        case SLOT_PLE_PROJ:
+            return tensor_out_in(mt, out, in);
         default:
             return tensor_out_in(mt, out, in);
         }
@@ -112,7 +151,8 @@ static int is_linear_slot(uint32_t layer, uint32_t slot, const LlfHeader* h)
     if (layer == 0) return slot == SLOT_EMBED;
     if (layer >= 1 && layer <= h->n_blocks)
         return slot == SLOT_Q || slot == SLOT_K || slot == SLOT_V || slot == SLOT_O ||
-               slot == SLOT_GATE || slot == SLOT_UP || slot == SLOT_DOWN;
+               slot == SLOT_GATE || slot == SLOT_UP || slot == SLOT_DOWN ||
+               slot == SLOT_PLE_GATE || slot == SLOT_PLE_PROJ;
     if (layer == h->n_blocks + 2) return 1; /* lm_head (+ MTP linears) */
     return 0;
 }
@@ -122,8 +162,10 @@ static int is_f32vec_slot(uint32_t layer, uint32_t slot, const LlfHeader* h, con
     if (mt->size == 0) return 0;
     if (layer >= 1 && layer <= h->n_blocks) {
         if (slot == SLOT_NORM1 || slot == SLOT_NORM2 ||
+            slot == SLOT_NORM3 || slot == SLOT_NORM4 ||
             slot == SLOT_QBIAS || slot == SLOT_KBIAS || slot == SLOT_VBIAS ||
-            slot == SLOT_QNORM || slot == SLOT_KNORM)
+            slot == SLOT_QNORM || slot == SLOT_KNORM ||
+            slot == SLOT_PLE_POST || slot == SLOT_LAYER_SCALE)
             return 1;
     }
     if (layer == h->n_blocks + 1) return 1; /* final norm */
@@ -154,6 +196,8 @@ static void cuda_ctx_clear(CudaCtx* ctx)
         if (ctx->d_pbg) cudaFree(ctx->d_pbg);
         if (ctx->d_pbu) cudaFree(ctx->d_pbu);
         if (ctx->d_tokens) cudaFree(ctx->d_tokens);
+        if (ctx->d_rope_ff) cudaFree(ctx->d_rope_ff);
+        if (ctx->d_rope_swa) cudaFree(ctx->d_rope_swa);
         if (ctx->cublas) cuda_k_cublas_destroy(ctx->cublas);
     } else
 #endif
@@ -399,7 +443,12 @@ static int load_weights_gpu(Engine* e, CudaCtx* ctx, char* err, size_t errlen)
 
     CUDA_OK(cudaMalloc((void**)&ctx->d_x, (size_t)ctx->hidden * 4), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_hb, (size_t)ctx->hidden * 4 * 9), err, errlen);
-    CUDA_OK(cudaMalloc((void**)&ctx->d_hb2, (size_t)ctx->hidden * 4 * 9), err, errlen);
+    {
+        uint32_t hb2 = ctx->hidden * 9;
+        uint32_t need = e->pbq_dim + 2 * ctx->kv_dim + (e->pbq_dim > ctx->hidden ? e->pbq_dim : ctx->hidden);
+        if (need > hb2) hb2 = need;
+        CUDA_OK(cudaMalloc((void**)&ctx->d_hb2, (size_t)hb2 * 4), err, errlen);
+    }
     CUDA_OK(cudaMalloc((void**)&ctx->d_ffn, (size_t)2 * ctx->inter * 4), err, errlen);
     CUDA_OK(cudaMalloc((void**)&ctx->d_logits, (size_t)h->vocab * 4), err, errlen);
     {

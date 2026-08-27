@@ -65,6 +65,7 @@ typedef struct {
     uint32_t pb_cap;
     void* cublas;               /* cublasHandle_t */
     int x_on_dev;               /* 1 = d_x 为权威激活, 跳过层间 H2D/D2H */
+    int kv_on_dev;              /* 1 = kv_blob 已含 cache; CPU prefill 后需 H2D */
     uint32_t hidden;
     uint32_t kv_dim;
     uint32_t max_seq;
@@ -77,6 +78,11 @@ typedef struct {
     uint32_t arch;
     float eps;
     float theta;
+    /* gemma4: host 拷上来的 RoPE inv_freq */
+    float* d_rope_ff;
+    float* d_rope_swa;
+    uint32_t n_rope_ff;
+    uint32_t n_rope_swa;
 } CudaCtx;
 
 #endif /* YLLM_CUDA_CTX_H */

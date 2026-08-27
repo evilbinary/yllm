@@ -7,12 +7,14 @@
 #include "yllm.h"
 #include "matvec.h"
 #include "cuda_ctx.h"
+#include "log.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
 #include "cuda_kernels.h"
+#include <cuda_runtime.h>
 #endif
 
 const uint8_t* cuda_layer_base(const Engine* e, uint32_t layer);
@@ -234,13 +236,244 @@ static int cuda_fwd_block_batch_gpu(Engine* e, uint32_t layer, uint32_t pos_star
     cuda_k_add_batch(x, x, q, hidden, B);
     return 0;
 }
+
+static int gemma_ensure_rope(Engine* e, CudaCtx* ctx)
+{
+    const float *ff = NULL, *swa = NULL;
+    uint32_t nff = 0, nsw = 0, nple = 0;
+    arch_gemma4_cuda_tables(e, &ff, &nff, &swa, &nsw, NULL, &nple);
+    (void)nple;
+    if (nff && !ctx->d_rope_ff) {
+        if (cudaMalloc((void**)&ctx->d_rope_ff, (size_t)nff * 4) != cudaSuccess) return -1;
+        if (cuda_k_memcpy_h2d(ctx->d_rope_ff, ff, (size_t)nff * 4) != 0) return -1;
+        ctx->n_rope_ff = nff;
+    }
+    if (nsw && !ctx->d_rope_swa) {
+        if (cudaMalloc((void**)&ctx->d_rope_swa, (size_t)nsw * 4) != cudaSuccess) return -1;
+        if (cuda_k_memcpy_h2d(ctx->d_rope_swa, swa, (size_t)nsw * 4) != 0) return -1;
+        ctx->n_rope_swa = nsw;
+    }
+    return 0;
+}
+
+static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
+{
+    CudaCtx* ctx = cuda_get_ctx(e);
+    if (!ctx || e->device_mode != DEV_MODE_CUDA) return -1;
+    if (ensure_stream_layer(e, layer) != 0) return -1;
+    if (gemma_ensure_rope(e, ctx) != 0) return -1;
+
+    LlModel* m = &e->ws.model;
+    const LlfHeader* h = &m->h;
+    const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+    if (mt[SLOT_Q].dtype == DT_W4B64) return -1;
+
+    char err[256];
+    uint32_t hidden = ctx->hidden;
+    uint32_t kv_dim = ctx->kv_dim;
+    uint32_t q_dim = h->n_heads * h->head_dim;
+    uint32_t hd = h->head_dim;
+    uint32_t kvd = kv_dim;
+    uint32_t n = 0, qo = 0, qi = 0;
+    uint32_t il = layer > 0 ? layer - 1 : 0;
+    int has_kv = 1;
+    uint32_t kv_layer = layer;
+    uint32_t s0 = 0, hh, inter = ctx->inter;
+    LlfGemma4Ext g4;
+    int swa;
+    const float* rope_dev = NULL;
+    const float* ple = NULL;
+    uint32_t n_ple = 0;
+    float* x = ctx->d_x;
+    float* x2 = ctx->d_hb;
+    float *q, *k, *v, *att, *fg, *fu;
+
+    llf_gemma4_ext(h, &g4);
+    if (g4.n_kv_shared_layers > 0 && g4.n_kv_shared_layers < h->n_blocks) {
+        uint32_t kv_from = h->n_blocks - g4.n_kv_shared_layers;
+        if (il >= kv_from) {
+            has_kv = 0;
+            kv_layer = kv_from - (llf_gemma4_is_swa(&g4, il) ? 2u : 1u) + 1u;
+        }
+    }
+    if (mt[SLOT_K].size == 0) has_kv = 0;
+    if (cuda_tensor_q4k(e, layer, SLOT_Q, &qo, &qi) || cuda_tensor_f16w(e, layer, SLOT_Q, &qo, &qi))
+        q_dim = qo;
+    else if (mt[SLOT_Q].ndim >= 2 && hidden)
+        q_dim = mt[SLOT_Q].shape[0] * mt[SLOT_Q].shape[1] / hidden;
+    hd = h->n_heads ? q_dim / h->n_heads : hd;
+    if (has_kv) {
+        uint32_t ko = 0, ki = 0;
+        if (cuda_tensor_q4k(e, layer, SLOT_K, &ko, &ki) || cuda_tensor_f16w(e, layer, SLOT_K, &ko, &ki))
+            kvd = ko;
+        else if (mt[SLOT_K].ndim >= 2 && hidden)
+            kvd = mt[SLOT_K].shape[0] * mt[SLOT_K].shape[1] / hidden;
+    }
+    {
+        uint32_t go = 0, gi = 0;
+        if (cuda_tensor_q4k(e, layer, SLOT_GATE, &go, &gi) || cuda_tensor_f16w(e, layer, SLOT_GATE, &go, &gi))
+            inter = go;
+        else if (mt[SLOT_GATE].ndim >= 2 && hidden)
+            inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
+    }
+    if (inter > ctx->inter) return -1;
+
+    q = ctx->d_hb2;
+    k = ctx->d_hb2 + q_dim;
+    v = ctx->d_hb2 + q_dim + kv_dim;
+    att = ctx->d_hb2 + q_dim + 2 * kv_dim;
+    fg = ctx->d_ffn;
+    fu = ctx->d_ffn + inter;
+
+    if (!ctx->x_on_dev) {
+        if (cuda_k_memcpy_h2d(x, e->x, (size_t)hidden * 4) != 0) return -1;
+        ctx->x_on_dev = 1;
+    }
+    /* CPU 批 prefill 写的是 e->kv; decode 走 GPU 前把 cache 上卡 */
+    if (!ctx->kv_on_dev && pos > 0 && e->kv && ctx->kv_blob && ctx->kv_bytes) {
+        if (cuda_k_memcpy_h2d(ctx->kv_blob, e->kv, ctx->kv_bytes) != 0) return -1;
+        ctx->kv_on_dev = 1;
+    }
+
+    {
+        const float* wn1 = cuda_tensor_f32(e, layer, SLOT_NORM1, &n);
+        if (!wn1) return -1;
+        cuda_k_rmsnorm(x2, x, wn1, hidden, ctx->eps);
+    }
+
+    if (gemv(e, ctx, q, layer, SLOT_Q, x2, err, sizeof(err)) != 0) return -1;
+    if (has_kv) {
+        cuda_k_memset_zero(k, (size_t)kv_dim * 4);
+        cuda_k_memset_zero(v, (size_t)kv_dim * 4);
+        if (gemv(e, ctx, k, layer, SLOT_K, x2, err, sizeof(err)) != 0) return -1;
+        if (mt[SLOT_V].size > 0) {
+            if (gemv(e, ctx, v, layer, SLOT_V, x2, err, sizeof(err)) != 0) return -1;
+        } else if (cuda_k_memcpy_d2d(v, k, (size_t)kvd * 4) != 0) {
+            return -1;
+        }
+    }
+
+    {
+        const float* bq = cuda_tensor_f32(e, layer, SLOT_QBIAS, &n);
+        if (bq) cuda_k_add_bias(q, bq, q_dim);
+        if (has_kv) {
+            const float* bk = cuda_tensor_f32(e, layer, SLOT_KBIAS, &n);
+            if (bk) cuda_k_add_bias(k, bk, kvd);
+            const float* bv = cuda_tensor_f32(e, layer, SLOT_VBIAS, &n);
+            if (bv) cuda_k_add_bias(v, bv, kvd);
+        }
+    }
+    {
+        const float* qn = cuda_tensor_f32(e, layer, SLOT_QNORM, &n);
+        const float* kn = cuda_tensor_f32(e, layer, SLOT_KNORM, &n);
+        if (qn) {
+            for (hh = 0; hh < h->n_heads; hh++)
+                cuda_k_rmsnorm(q + (size_t)hh * hd, q + (size_t)hh * hd, qn, hd, ctx->eps);
+        }
+        if (has_kv && kn) {
+            uint32_t nkvh = (kvd / hd) ? (kvd / hd) : 1u;
+            for (hh = 0; hh < nkvh; hh++)
+                cuda_k_rmsnorm(k + (size_t)hh * hd, k + (size_t)hh * hd, kn, hd, ctx->eps);
+        }
+        if (has_kv) {
+            uint32_t nkvh = (kvd / hd) ? (kvd / hd) : 1u;
+            for (hh = 0; hh < nkvh; hh++)
+                cuda_k_rmsnorm_unit(v + (size_t)hh * hd, v + (size_t)hh * hd, hd, ctx->eps);
+        }
+    }
+
+    swa = llf_gemma4_is_swa(&g4, il);
+    arch_gemma4_cuda_tables(e, NULL, NULL, NULL, NULL, &ple, &n_ple);
+    if (swa && ctx->d_rope_swa && ctx->n_rope_swa == hd / 2)
+        rope_dev = ctx->d_rope_swa;
+    else if (!swa && ctx->d_rope_ff && ctx->n_rope_ff == hd / 2)
+        rope_dev = ctx->d_rope_ff;
+
+    if (rope_dev) {
+        cuda_k_rope_neox_if_heads(q, h->n_heads, hd, pos, rope_dev);
+        if (has_kv)
+            cuda_k_rope_neox_if_heads(k, (kvd / hd) ? (kvd / hd) : 1u, hd, pos, rope_dev);
+    } else {
+        float theta = llf_gemma4_rope_theta(h, &g4, il);
+        cuda_k_rope_qwen_heads(q, h->n_heads, hd, pos, theta);
+        if (has_kv)
+            cuda_k_rope_qwen_heads(k, (kvd / hd) ? (kvd / hd) : 1u, hd, pos, theta);
+    }
+
+    {
+        uint16_t* kv = ctx->kv_blob;
+        uint16_t* kcache = kv + (size_t)kv_layer * e->max_seq * kv_dim;
+        uint16_t* vcache = kv + (size_t)(ctx->n_blocks + kv_layer) * e->max_seq * kv_dim;
+        if (has_kv) {
+            cuda_k_store_kv(kcache, vcache, k, v, pos, kv_dim);
+            ctx->kv_on_dev = 1;
+        }
+        if (swa && g4.swa_window > 0 && pos + 1 > g4.swa_window)
+            s0 = pos + 1 - g4.swa_window;
+        cuda_k_attn_decode_win(att, q, kcache, vcache, s0, pos,
+                               h->n_heads, (kvd / hd) ? (kvd / hd) : 1u, hd, kv_dim, 1.0f);
+    }
+
+    if (gemv(e, ctx, x2, layer, SLOT_O, att, err, sizeof(err)) != 0) return -1;
+    {
+        const float* wn3 = cuda_tensor_f32(e, layer, SLOT_NORM3, &n);
+        if (!wn3) return -1;
+        cuda_k_rmsnorm(att, x2, wn3, hidden, ctx->eps);
+        cuda_k_add(x, x, att, hidden);
+    }
+    {
+        const float* wn2 = cuda_tensor_f32(e, layer, SLOT_NORM2, &n);
+        if (!wn2) return -1;
+        cuda_k_rmsnorm(x2, x, wn2, hidden, ctx->eps);
+    }
+    if (gemv(e, ctx, fg, layer, SLOT_GATE, x2, err, sizeof(err)) != 0) return -1;
+    if (gemv(e, ctx, fu, layer, SLOT_UP, x2, err, sizeof(err)) != 0) return -1;
+    cuda_k_geglu(x2, fg, fu, inter);
+    if (gemv(e, ctx, att, layer, SLOT_DOWN, x2, err, sizeof(err)) != 0) return -1;
+    {
+        const float* wn4 = cuda_tensor_f32(e, layer, SLOT_NORM4, &n);
+        if (!wn4) return -1;
+        cuda_k_rmsnorm(x2, att, wn4, hidden, ctx->eps);
+        cuda_k_add(x, x, x2, hidden);
+    }
+
+    if (n_ple > 0 && mt[SLOT_PLE_GATE].size > 0 && ple) {
+        float* pg = ctx->d_ffn;
+        float* pe = ctx->d_ffn + n_ple;
+        if (n_ple * 2u > 2u * ctx->inter) return -1;
+        if (cuda_k_memcpy_h2d(pe, ple + (size_t)il * n_ple, (size_t)n_ple * 4) != 0)
+            return -1;
+        if (gemv(e, ctx, pg, layer, SLOT_PLE_GATE, x, err, sizeof(err)) != 0) return -1;
+        cuda_k_gelu(pg, n_ple);
+        cuda_k_mul(pg, pg, pe, n_ple);
+        if (gemv(e, ctx, att, layer, SLOT_PLE_PROJ, pg, err, sizeof(err)) != 0) return -1;
+        {
+            const float* pn = cuda_tensor_f32(e, layer, SLOT_PLE_POST, &n);
+            if (pn) cuda_k_rmsnorm(att, att, pn, hidden, ctx->eps);
+        }
+        cuda_k_add(x, x, att, hidden);
+    }
+    {
+        const float* ls = cuda_tensor_f32(e, layer, SLOT_LAYER_SCALE, &n);
+        if (ls && n >= 1) {
+            float s = 0.0f;
+            if (cuda_k_memcpy_d2h(&s, (const void*)ls, 4) != 0) return -1;
+            cuda_k_scale(x, s, hidden);
+        }
+    }
+    ctx->x_on_dev = 1;
+    return 0;
+}
 #endif
 
 static int cuda_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
-    if (e->device_mode == DEV_MODE_CUDA)
+    if (e->device_mode == DEV_MODE_CUDA) {
+        if (e->ops && e->ops->id == ARCH_GEMMA4)
+            return cuda_fwd_block_gemma4(e, layer, pos);
         return cuda_fwd_block_gpu(e, layer, pos);
+    }
 #endif
     return cuda_fwd_block_shim(e, layer, pos);
 }
@@ -284,6 +517,8 @@ int cuda_embed(Engine* e, uint32_t token)
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode != DEV_MODE_CUDA) return -1;
+    /* PLE / ×√hidden 在 host after_embed; GPU embed 会让它们改到过期的 e->x */
+    if (e->ops && e->ops->after_embed) return -1;
     if (ensure_stream_layer(e, 0) != 0) return -1;
     CudaCtx* ctx = cuda_get_ctx(e);
     uint32_t out = 0, in = 0;
@@ -364,6 +599,7 @@ int cuda_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode != DEV_MODE_CUDA || !tokens || n <= 0) return -1;
+    if (e->ops && !e->ops->gpu_fused) return -1;
     /* 单进程层切混合: 全 GPU 批路径不适用, 交回逐 token */
     if (e->gpu_layer_end) return -1;
     CudaCtx* ctx = cuda_get_ctx(e);
@@ -430,6 +666,7 @@ int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
 {
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode != DEV_MODE_CUDA || !xin || n < 1) return -1;
+    if (e->ops && !e->ops->gpu_fused) return -1;
     if (e->gpu_layer_end) return -1; /* 混合层切: 走逐 token 回退 */
     CudaCtx* ctx = cuda_get_ctx(e);
     if (!ctx || !ctx->d_pb || (uint32_t)n > ctx->pb_cap) return -1;
