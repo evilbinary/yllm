@@ -325,6 +325,8 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
     fg = ctx->d_ffn;
     fu = ctx->d_ffn + inter;
 
+    if (hd > 1024u) return -1;
+
     if (!ctx->x_on_dev) {
         if (cuda_k_memcpy_h2d(x, e->x, (size_t)hidden * 4) != 0) return -1;
         ctx->x_on_dev = 1;
@@ -371,13 +373,11 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
                 cuda_k_rmsnorm(q + (size_t)hh * hd, q + (size_t)hh * hd, qn, hd, ctx->eps);
         }
         if (has_kv && kn) {
-            uint32_t nkvh = (kvd / hd) ? (kvd / hd) : 1u;
-            for (hh = 0; hh < nkvh; hh++)
+            for (hh = 0; hh < h->n_kv_heads; hh++)
                 cuda_k_rmsnorm(k + (size_t)hh * hd, k + (size_t)hh * hd, kn, hd, ctx->eps);
         }
         if (has_kv) {
-            uint32_t nkvh = (kvd / hd) ? (kvd / hd) : 1u;
-            for (hh = 0; hh < nkvh; hh++)
+            for (hh = 0; hh < h->n_kv_heads; hh++)
                 cuda_k_rmsnorm_unit(v + (size_t)hh * hd, v + (size_t)hh * hd, hd, ctx->eps);
         }
     }
@@ -392,12 +392,12 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
     if (rope_dev) {
         cuda_k_rope_neox_if_heads(q, h->n_heads, hd, pos, rope_dev);
         if (has_kv)
-            cuda_k_rope_neox_if_heads(k, (kvd / hd) ? (kvd / hd) : 1u, hd, pos, rope_dev);
+            cuda_k_rope_neox_if_heads(k, h->n_kv_heads ? h->n_kv_heads : 1u, hd, pos, rope_dev);
     } else {
         float theta = llf_gemma4_rope_theta(h, &g4, il);
         cuda_k_rope_qwen_heads(q, h->n_heads, hd, pos, theta);
         if (has_kv)
-            cuda_k_rope_qwen_heads(k, (kvd / hd) ? (kvd / hd) : 1u, hd, pos, theta);
+            cuda_k_rope_qwen_heads(k, h->n_kv_heads ? h->n_kv_heads : 1u, hd, pos, theta);
     }
 
     {
@@ -411,7 +411,7 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
         if (swa && g4.swa_window > 0 && pos + 1 > g4.swa_window)
             s0 = pos + 1 - g4.swa_window;
         cuda_k_attn_decode_win(att, q, kcache, vcache, s0, pos,
-                               h->n_heads, (kvd / hd) ? (kvd / hd) : 1u, hd, kv_dim, 1.0f);
+                               h->n_heads, h->n_kv_heads ? h->n_kv_heads : 1u, hd, kv_dim, 1.0f);
     }
 
     if (gemv(e, ctx, x2, layer, SLOT_O, att, err, sizeof(err)) != 0) return -1;
@@ -716,6 +716,17 @@ void cuda_attach_fwd(Engine* e)
 {
     if (!e || !e->dev) return;
     if (e->ops && !e->ops->gpu_fused) {
+        /* gemma: decode 挂 GPU 块; prefill 仍 CPU 批(gpu_fused=0) */
+        if (e->ops->id == ARCH_GEMMA4) {
+            if (e->device_mode == DEV_MODE_CUDA) {
+                e->dev->fwd_block = cuda_fwd_block;
+                e->dev->fwd_block_batch = NULL;
+            } else {
+                e->dev->fwd_block = NULL;
+                e->dev->fwd_block_batch = NULL;
+            }
+            return;
+        }
         e->dev->fwd_block = NULL;
         e->dev->fwd_block_batch = NULL;
         return;

@@ -638,8 +638,10 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
             engine_embed_into(e, e->x, token);
             engine_dev_mark_x_host(e);
         }
-        if (e->ops && e->ops->after_embed)
+        if (e->ops && e->ops->after_embed) {
             e->ops->after_embed(e, token);
+            engine_dev_mark_x_host(e);
+        }
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
         if (!layer_on_device(e, i) && e->dev && e->dev->fwd_block) {
             /* 混合切点: GPU 激活 → host, 后续 Arch CPU */

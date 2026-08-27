@@ -70,8 +70,8 @@
 #define SLOT_NORM4 25       /* gemma4 post_feedforward_norm [hidden] */
 #define SLOT_LAYER_SCALE 26 /* gemma4 layer_output_scale scalar [1] F32 */
 /* gemma4 per-layer embedding: 复用 GDN 空槽(与 qwen35 不共存) */
-#define SLOT_PLE_GATE SLOT_QKV       /* blk.N.inp_gate [hidden, n_ple] */
-#define SLOT_PLE_PROJ SLOT_GATE_ATTN /* blk.N.proj [n_ple, hidden] */
+#define SLOT_PLE_GATE SLOT_QKV       /* blk.N.inp_gate matmul: [n_ple, hidden] */
+#define SLOT_PLE_PROJ SLOT_GATE_ATTN /* blk.N.proj matmul: [hidden, n_ple] */
 #define SLOT_PLE_POST SLOT_QGATE     /* blk.N.post_norm [hidden] */
 #define SLOT_PLE_TOK  1              /* embed 层 per_layer_token_embd */
 #define SLOT_PLE_MPROJ 2             /* embed 层 per_layer_model_proj */

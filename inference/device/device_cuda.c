@@ -28,7 +28,11 @@ void cuda_attach_fwd(Engine* e);
 
 static uint32_t slot_count(const LlModel* m, uint32_t layer)
 {
-    uint32_t nt = m->dir[layer].n_tensors;
+    /* metas 按 SLOT_* 稀疏下标; n_tensors 是占用个数不是扫描上界.
+     * gemma4 的 NORM3/NORM4 在 slot 24/25, 只扫 0..n_tensors-1 会漏装. */
+    uint32_t nt = BLOCK_TENSORS_MTP;
+    if (m && layer < m->n_layers && m->dir && m->dir[layer].n_tensors > nt)
+        nt = m->dir[layer].n_tensors;
     if (nt > BLOCK_TENSORS_MTP) nt = BLOCK_TENSORS_MTP;
     return nt;
 }
@@ -120,9 +124,26 @@ static int slot_out_in(uint32_t layer, uint32_t slot, const Engine* e,
                 *in = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
             break;
         }
-        case SLOT_PLE_GATE:
-        case SLOT_PLE_PROJ:
-            return tensor_out_in(mt, out, in);
+        case SLOT_PLE_GATE: {
+            /* CPU: matmul(gate, x, n_ple, hidden). 文件 shape 可能是 (hidden,n_ple). */
+            uint32_t n_ple = hidden;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                n_ple = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            *out = n_ple;
+            *in = hidden;
+            break;
+        }
+        case SLOT_PLE_PROJ: {
+            /* CPU: matmul(y, gate, hidden, n_ple) */
+            uint32_t n_ple = hidden;
+            if (mt->ndim >= 2 && hidden && mt->shape[0] && mt->shape[1] &&
+                ((uint64_t)mt->shape[0] * mt->shape[1]) % hidden == 0)
+                n_ple = (uint32_t)((uint64_t)mt->shape[0] * mt->shape[1] / hidden);
+            *out = hidden;
+            *in = n_ple;
+            break;
+        }
         default:
             return tensor_out_in(mt, out, in);
         }
@@ -538,16 +559,23 @@ static int cuda_load_weights(Engine* e, char* err, size_t errlen)
         return -1;
     }
     if (e->ops && !e->ops->gpu_fused) {
-        ylog_info("cuda: skip GPU transformer for %s", e->ops->name);
-        e->w_dev = ctx;
-        e->d_kv = e->kv;
-        e->weights_ready = 1;
-        e->device_mode = DEV_MODE_CPU;
-        if (e->dev) {
-            e->dev->fwd_block = NULL;
-            e->dev->fwd_block_batch = NULL;
+        int gemma_gpu = 0;
+#if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
+        gemma_gpu = (e->ops->id == ARCH_GEMMA4 && !ctx->host_shim);
+#endif
+        if (!gemma_gpu) {
+            ylog_info("cuda: skip GPU transformer for %s", e->ops->name);
+            e->w_dev = ctx;
+            e->d_kv = e->kv;
+            e->weights_ready = 1;
+            e->device_mode = DEV_MODE_CPU;
+            if (e->dev) {
+                e->dev->fwd_block = NULL;
+                e->dev->fwd_block_batch = NULL;
+            }
+            return 0;
         }
-        return 0;
+        ylog_info("cuda: gemma4 decode on GPU (prefill stays CPU batch)");
     }
     int device_id = ctx->device_id;
     int host_shim = ctx->host_shim;

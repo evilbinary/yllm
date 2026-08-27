@@ -628,7 +628,7 @@ extern "C" void cuda_k_store_kv_batch(uint16_t* kcache, uint16_t* vcache, const 
 
 __device__ __forceinline__ float attn_block_sum(float v)
 {
-    __shared__ float sh[256];
+    __shared__ float sh[1024];
     sh[threadIdx.x] = v;
     __syncthreads();
     for (int s = (int)blockDim.x / 2; s > 0; s >>= 1) {
@@ -687,7 +687,7 @@ __global__ void k_attn_flash_decode(float* att_out, const float* q,
 static uint32_t attn_threads(uint32_t head_dim)
 {
     uint32_t t = 32;
-    while (t < head_dim && t < 256u) t <<= 1;
+    while (t < head_dim && t < 1024u) t <<= 1;
     return t;
 }
 
@@ -705,7 +705,7 @@ extern "C" void cuda_k_attn_decode_win(float* att_out,
                                        uint32_t s0, uint32_t pos, uint32_t n_heads, uint32_t n_kv_heads,
                                        uint32_t head_dim, uint32_t kv_dim, float scale)
 {
-    if (head_dim == 0 || head_dim > 256 || n_heads == 0) return;
+    if (head_dim == 0 || head_dim > 1024 || n_heads == 0) return;
     uint32_t t = attn_threads(head_dim);
     k_attn_flash_decode<<<n_heads, t, head_dim * sizeof(float)>>>(
         att_out, q, kcache, vcache, s0, pos, n_heads, n_kv_heads, head_dim, kv_dim, scale);
@@ -759,7 +759,7 @@ extern "C" void cuda_k_attn_prefill(float* att_out,
                                     uint32_t pos_start, uint32_t B, uint32_t n_heads, uint32_t n_kv_heads,
                                     uint32_t head_dim, uint32_t kv_dim, uint32_t q_stride)
 {
-    if (head_dim == 0 || head_dim > 256 || n_heads == 0 || B == 0) return;
+    if (head_dim == 0 || head_dim > 1024 || n_heads == 0 || B == 0) return;
     uint32_t t = attn_threads(head_dim);
     dim3 grid(n_heads, B);
     k_attn_flash_prefill<<<grid, t, head_dim * sizeof(float)>>>(
