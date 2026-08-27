@@ -83,6 +83,8 @@ typedef struct {
     float* d_rope_swa;
     uint32_t n_rope_ff;
     uint32_t n_rope_swa;
+    float* d_ple;               /* gemma4 PLE 表 [n_blocks * n_ple] */
+    uint32_t n_ple;
 } CudaCtx;
 
 #endif /* YLLM_CUDA_CTX_H */

@@ -416,6 +416,19 @@ extern "C" void cuda_k_scale(float* y, float s, uint32_t n)
     k_scale<<<(n + 255) / 256, 256>>>(y, s, n);
 }
 
+__global__ void k_scale_dev(float* y, const float* s, uint32_t n)
+{
+    float sc = s[0];
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] *= sc;
+}
+
+extern "C" void cuda_k_scale_dev(float* y, const float* s, uint32_t n)
+{
+    if (n == 0 || !s) return;
+    k_scale_dev<<<(n + 255) / 256, 256>>>(y, s, n);
+}
+
 __global__ void k_rmsnorm_unit(float* y, const float* x, uint32_t n, float eps)
 {
     float s = 0.0f;
@@ -435,6 +448,31 @@ __global__ void k_rmsnorm_unit(float* y, const float* x, uint32_t n, float eps)
 extern "C" void cuda_k_rmsnorm_unit(float* y, const float* x, uint32_t n, float eps)
 {
     k_rmsnorm_unit<<<1, 256>>>(y, x, n, eps);
+}
+
+__global__ void k_rmsnorm_unit_batch(float* y, const float* x, uint32_t n, float eps)
+{
+    uint32_t b = blockIdx.x;
+    const float* xb = x + (size_t)b * n;
+    float* yb = y + (size_t)b * n;
+    float s = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) s += xb[i] * xb[i];
+    __shared__ float sh[256];
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) sh[threadIdx.x] += sh[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+        yb[i] = xb[i] * inv;
+}
+
+extern "C" void cuda_k_rmsnorm_unit_batch(float* y, const float* x, uint32_t n, float eps, uint32_t B)
+{
+    if (B == 0 || n == 0) return;
+    k_rmsnorm_unit_batch<<<B, 256>>>(y, x, n, eps);
 }
 
 __global__ void k_rope_neox_if_heads(float* v, uint32_t n_heads, uint32_t head_dim,

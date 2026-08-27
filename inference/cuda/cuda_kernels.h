@@ -42,7 +42,9 @@ void cuda_k_geglu(float* y, const float* gate, const float* up, uint32_t n);
 void cuda_k_gelu(float* y, uint32_t n);
 void cuda_k_mul(float* y, const float* a, const float* b, uint32_t n);
 void cuda_k_scale(float* y, float s, uint32_t n);
+void cuda_k_scale_dev(float* y, const float* s, uint32_t n);
 void cuda_k_rmsnorm_unit(float* y, const float* x, uint32_t n, float eps);
+void cuda_k_rmsnorm_unit_batch(float* y, const float* x, uint32_t n, float eps, uint32_t B);
 void cuda_k_rope_neox_if_heads(float* v, uint32_t n_heads, uint32_t head_dim,
                                uint32_t pos, const float* inv_freq);
 void cuda_k_rope_llama(float* v, uint32_t d, uint32_t pos, float theta);

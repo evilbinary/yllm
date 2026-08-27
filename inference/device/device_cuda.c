@@ -219,6 +219,7 @@ static void cuda_ctx_clear(CudaCtx* ctx)
         if (ctx->d_tokens) cudaFree(ctx->d_tokens);
         if (ctx->d_rope_ff) cudaFree(ctx->d_rope_ff);
         if (ctx->d_rope_swa) cudaFree(ctx->d_rope_swa);
+        if (ctx->d_ple) cudaFree(ctx->d_ple);
         if (ctx->cublas) cuda_k_cublas_destroy(ctx->cublas);
     } else
 #endif

@@ -76,21 +76,12 @@ static int gemm(Engine* e, CudaCtx* ctx, float* y, uint32_t layer, uint32_t slot
 static void qk_norm_batch(CudaCtx* ctx, float* q, float* k, const float* qn, const float* kn,
                           uint32_t B)
 {
-    uint32_t b, hh;
-    if (qn) {
-        for (b = 0; b < B; b++)
-            for (hh = 0; hh < ctx->n_heads; hh++)
-                cuda_k_rmsnorm(q + (size_t)b * ctx->hidden + (size_t)hh * ctx->head_dim,
-                               q + (size_t)b * ctx->hidden + (size_t)hh * ctx->head_dim,
-                               qn, ctx->head_dim, ctx->eps);
-    }
-    if (kn) {
-        for (b = 0; b < B; b++)
-            for (hh = 0; hh < ctx->n_kv_heads; hh++)
-                cuda_k_rmsnorm(k + (size_t)b * ctx->kv_dim + (size_t)hh * ctx->head_dim,
-                               k + (size_t)b * ctx->kv_dim + (size_t)hh * ctx->head_dim,
-                               kn, ctx->head_dim, ctx->eps);
-    }
+    uint32_t hd = ctx->head_dim;
+    if (!hd) return;
+    if (qn)
+        cuda_k_rmsnorm_batch(q, q, qn, hd, ctx->eps, B * ctx->n_heads);
+    if (kn)
+        cuda_k_rmsnorm_batch(k, k, kn, hd, ctx->eps, B * ctx->n_kv_heads);
 }
 
 static int cuda_fwd_block_gpu(Engine* e, uint32_t layer, uint32_t pos)
@@ -239,10 +230,9 @@ static int cuda_fwd_block_batch_gpu(Engine* e, uint32_t layer, uint32_t pos_star
 
 static int gemma_ensure_rope(Engine* e, CudaCtx* ctx)
 {
-    const float *ff = NULL, *swa = NULL;
+    const float *ff = NULL, *swa = NULL, *ple = NULL;
     uint32_t nff = 0, nsw = 0, nple = 0;
-    arch_gemma4_cuda_tables(e, &ff, &nff, &swa, &nsw, NULL, &nple);
-    (void)nple;
+    arch_gemma4_cuda_tables(e, &ff, &nff, &swa, &nsw, &ple, &nple);
     if (nff && !ctx->d_rope_ff) {
         if (cudaMalloc((void**)&ctx->d_rope_ff, (size_t)nff * 4) != cudaSuccess) return -1;
         if (cuda_k_memcpy_h2d(ctx->d_rope_ff, ff, (size_t)nff * 4) != 0) return -1;
@@ -252,6 +242,13 @@ static int gemma_ensure_rope(Engine* e, CudaCtx* ctx)
         if (cudaMalloc((void**)&ctx->d_rope_swa, (size_t)nsw * 4) != cudaSuccess) return -1;
         if (cuda_k_memcpy_h2d(ctx->d_rope_swa, swa, (size_t)nsw * 4) != 0) return -1;
         ctx->n_rope_swa = nsw;
+    }
+    if (nple && ple && !ctx->d_ple) {
+        size_t n = (size_t)nple * ctx->n_blocks;
+        if (n == 0) n = nple;
+        if (cudaMalloc((void**)&ctx->d_ple, n * 4) != cudaSuccess) return -1;
+        if (cuda_k_memcpy_h2d(ctx->d_ple, ple, n * 4) != 0) return -1;
+        ctx->n_ple = nple;
     }
     return 0;
 }
@@ -278,12 +275,11 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
     uint32_t il = layer > 0 ? layer - 1 : 0;
     int has_kv = 1;
     uint32_t kv_layer = layer;
-    uint32_t s0 = 0, hh, inter = ctx->inter;
+    uint32_t s0 = 0, inter = ctx->inter;
     LlfGemma4Ext g4;
     int swa;
     const float* rope_dev = NULL;
-    const float* ple = NULL;
-    uint32_t n_ple = 0;
+    uint32_t n_ple = ctx->n_ple;
     float* x = ctx->d_x;
     float* x2 = ctx->d_hb;
     float *q, *k, *v, *att, *fg, *fu;
@@ -368,22 +364,15 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
     {
         const float* qn = cuda_tensor_f32(e, layer, SLOT_QNORM, &n);
         const float* kn = cuda_tensor_f32(e, layer, SLOT_KNORM, &n);
-        if (qn) {
-            for (hh = 0; hh < h->n_heads; hh++)
-                cuda_k_rmsnorm(q + (size_t)hh * hd, q + (size_t)hh * hd, qn, hd, ctx->eps);
-        }
-        if (has_kv && kn) {
-            for (hh = 0; hh < h->n_kv_heads; hh++)
-                cuda_k_rmsnorm(k + (size_t)hh * hd, k + (size_t)hh * hd, kn, hd, ctx->eps);
-        }
-        if (has_kv) {
-            for (hh = 0; hh < h->n_kv_heads; hh++)
-                cuda_k_rmsnorm_unit(v + (size_t)hh * hd, v + (size_t)hh * hd, hd, ctx->eps);
-        }
+        if (qn)
+            cuda_k_rmsnorm_batch(q, q, qn, hd, ctx->eps, h->n_heads);
+        if (has_kv && kn)
+            cuda_k_rmsnorm_batch(k, k, kn, hd, ctx->eps, h->n_kv_heads ? h->n_kv_heads : 1u);
+        if (has_kv)
+            cuda_k_rmsnorm_unit_batch(v, v, hd, ctx->eps, h->n_kv_heads ? h->n_kv_heads : 1u);
     }
 
     swa = llf_gemma4_is_swa(&g4, il);
-    arch_gemma4_cuda_tables(e, NULL, NULL, NULL, NULL, &ple, &n_ple);
     if (swa && ctx->d_rope_swa && ctx->n_rope_swa == hd / 2)
         rope_dev = ctx->d_rope_swa;
     else if (!swa && ctx->d_rope_ff && ctx->n_rope_ff == hd / 2)
@@ -437,12 +426,10 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
         cuda_k_add(x, x, x2, hidden);
     }
 
-    if (n_ple > 0 && mt[SLOT_PLE_GATE].size > 0 && ple) {
+    if (n_ple > 0 && mt[SLOT_PLE_GATE].size > 0 && ctx->d_ple) {
         float* pg = ctx->d_ffn;
-        float* pe = ctx->d_ffn + n_ple;
+        const float* pe = ctx->d_ple + (size_t)il * n_ple;
         if (n_ple * 2u > 2u * ctx->inter) return -1;
-        if (cuda_k_memcpy_h2d(pe, ple + (size_t)il * n_ple, (size_t)n_ple * 4) != 0)
-            return -1;
         if (gemv(e, ctx, pg, layer, SLOT_PLE_GATE, x, err, sizeof(err)) != 0) return -1;
         cuda_k_gelu(pg, n_ple);
         cuda_k_mul(pg, pg, pe, n_ple);
@@ -455,11 +442,8 @@ static int cuda_fwd_block_gemma4(Engine* e, uint32_t layer, uint32_t pos)
     }
     {
         const float* ls = cuda_tensor_f32(e, layer, SLOT_LAYER_SCALE, &n);
-        if (ls && n >= 1) {
-            float s = 0.0f;
-            if (cuda_k_memcpy_d2h(&s, (const void*)ls, 4) != 0) return -1;
-            cuda_k_scale(x, s, hidden);
-        }
+        if (ls && n >= 1)
+            cuda_k_scale_dev(x, ls, hidden);
     }
     ctx->x_on_dev = 1;
     return 0;
