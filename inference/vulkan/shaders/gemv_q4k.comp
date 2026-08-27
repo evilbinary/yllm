@@ -1,16 +1,17 @@
 #version 450
-/* Q4_K gemv: y[o] = row_o · x ; 每 workgroup 一行, local 归约 */
-layout(local_size_x = 64) in;
+/* Q4_K gemv: 每 workgroup 一行. 32 线程各吃一组 32 元, 再 shared 归约.
+ * qs 按 uint 取字节, 避免逐 byte 的 w[] 下标. */
+layout(local_size_x = 32) in;
 
 layout(set = 0, binding = 0) readonly buffer InX { float x[]; };
 layout(set = 0, binding = 1) writeonly buffer OutY { float y[]; };
-layout(set = 0, binding = 2) readonly buffer InW { uint w[]; }; /* 按字节访问 */
+layout(set = 0, binding = 2) readonly buffer InW { uint w[]; };
 
 layout(push_constant) uniform Push {
     uint out_n;
     uint in_n;
-    uint w_off; /* 权在 SSBO 中的字节偏移 */
-    uint serial; /* 1: 单线程累加(iGPU barrier/reduction 不可靠) */
+    uint w_off;
+    uint serial;
 } pc;
 
 uint load_u8(uint off)
@@ -21,9 +22,9 @@ uint load_u8(uint off)
 
 float load_f16(uint off)
 {
-    uint lo = load_u8(off);
-    uint hi = load_u8(off + 1u);
-    return unpackHalf2x16(lo | (hi << 8u)).x;
+    uint u = w[off >> 2u];
+    if ((off & 2u) != 0u) u >>= 16u;
+    return unpackHalf2x16(u).x;
 }
 
 void scale_min(uint g, uint scp, out uint sc, out uint mn)
@@ -51,16 +52,45 @@ float q4k_dot256(uint blk, uint xoff)
         float m1 = dmin * float(mn);
         uint q = qs + (g >> 1u) * 32u;
         uint xbase = xoff + g * 32u;
-        for (uint e = 0u; e < 32u; e++) {
-            uint nib = load_u8(q + e);
-            nib = ((g & 1u) != 0u) ? (nib >> 4u) : (nib & 15u);
-            acc += x[xbase + e] * (d1 * float(nib) - m1);
+        for (uint e = 0u; e < 32u; e += 4u) {
+            uint packed = w[(q + e) >> 2u];
+            uint shift = ((g & 1u) != 0u) ? 4u : 0u;
+            acc += x[xbase + e] * (d1 * float((packed >> shift) & 15u) - m1);
+            acc += x[xbase + e + 1u] * (d1 * float((packed >> (8u + shift)) & 15u) - m1);
+            acc += x[xbase + e + 2u] * (d1 * float((packed >> (16u + shift)) & 15u) - m1);
+            acc += x[xbase + e + 3u] * (d1 * float((packed >> (24u + shift)) & 15u) - m1);
         }
     }
     return acc;
 }
 
-shared float sh[64];
+/* 线程 lid 对每个 256 块处理 8 个 group 里下标 lid 的那一列 */
+float q4k_lane(uint row, uint nb, uint lid)
+{
+    float acc = 0.0;
+    for (uint b = 0u; b < nb; b++) {
+        uint blk = row + b * 144u;
+        uint xoff = b * 256u;
+        float d = load_f16(blk);
+        float dmin = load_f16(blk + 2u);
+        uint scp = blk + 4u;
+        uint qs = blk + 16u;
+        for (uint g = 0u; g < 8u; g++) {
+            uint sc, mn;
+            scale_min(g, scp, sc, mn);
+            float d1 = d * float(sc);
+            float m1 = dmin * float(mn);
+            uint byte_off = qs + (g >> 1u) * 32u + lid;
+            uint packed = w[byte_off >> 2u];
+            uint nib = (packed >> ((byte_off & 3u) * 8u)) & 0xFFu;
+            nib = ((g & 1u) != 0u) ? (nib >> 4u) : (nib & 15u);
+            acc += x[xoff + g * 32u + lid] * (d1 * float(nib) - m1);
+        }
+    }
+    return acc;
+}
+
+shared float sh[32];
 
 void main()
 {
@@ -72,7 +102,6 @@ void main()
     uint row = pc.w_off + o * rowb;
     uint lid = gl_LocalInvocationID.x;
 
-    /* iGPU: 跳过 shared 归约(Intel UHD 上多 block 行会得到垃圾) */
     if (pc.serial != 0u) {
         if (lid == 0u) {
             float acc = 0.0;
@@ -83,17 +112,12 @@ void main()
         return;
     }
 
-    float acc = 0.0;
-    for (uint b = lid; b < nb; b += 64u)
-        acc += q4k_dot256(row + b * 144u, b * 256u);
-
-    sh[lid] = acc;
+    sh[lid] = q4k_lane(row, nb, lid);
     memoryBarrierShared();
     barrier();
-    /* 单线程求和, 少一次易错的树形归约 */
     if (lid == 0u) {
         float s = 0.0;
-        for (uint i = 0u; i < 64u; i++)
+        for (uint i = 0u; i < 32u; i++)
             s += sh[i];
         y[o] = s;
     }

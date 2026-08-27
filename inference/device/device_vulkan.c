@@ -404,8 +404,16 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
             const char* env = getenv("YLLM_VK_STREAM");
             int force_stream = (env && env[0] == '1') ? 1 : 0;
             int force_resident = (env && env[0] == '0') ? 1 : 0;
+            /* 用设备 maxStorageBufferRange. 旧硬砍 256MB 会把 TinyLlama
+             * 拆成 3 bank, 从而关掉 token-batch(每层一次 fence). */
             size_t ssbo = (size_t)ctx->max_ssbo_range;
-            if (ssbo > (size_t)256 * 1024 * 1024) ssbo = (size_t)256 * 1024 * 1024;
+            {
+                const char* smb = getenv("YLLM_VK_SSBO_MB");
+                unsigned long mb;
+                if (smb && smb[0] && (mb = strtoul(smb, NULL, 10)) >= 16ul && mb <= 4096ul)
+                    ssbo = (size_t)mb * 1024ull * 1024ull;
+            }
+            if (ssbo > 0xfffff000ull) ssbo = 0xfffff000ull;
             ssbo &= ~(size_t)4095u;
             if (ssbo < 16u * 1024u * 1024u) ssbo = 16u * 1024u * 1024u;
             if (force_stream) {

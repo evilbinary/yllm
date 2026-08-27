@@ -1076,6 +1076,33 @@ int vulkan_compute_setup(VulkanCtx* ctx, uint32_t hidden,
                 ctx->buf_wq_bank[bi] = (void*)bwb;
                 ctx->mem_wq_bank[bi] = (void*)mwb;
             }
+            if (!wq_ok && nbank == 1 && ctx->wq_bytes > (size_t)256 * 1024 * 1024) {
+                size_t small = (size_t)256 * 1024 * 1024;
+                int n2 = (int)((ctx->wq_bytes + small - 1) / small);
+                ylog_warn("vulkan: single SSBO %zuMB failed; retry %d x 256MB banks",
+                          ctx->wq_bytes / (1024 * 1024), n2);
+                if (n2 >= 1 && n2 <= YLLM_VK_MAX_WQ_BANKS) {
+                    nbank = n2;
+                    ctx->wq_nbank = nbank;
+                    ctx->wq_bank_size = small;
+                    wq_ok = 1;
+                    for (bi = 0; wq_ok && bi < nbank; bi++) {
+                        VkBuffer bwb = VK_NULL_HANDLE;
+                        VkDeviceMemory mwb = VK_NULL_HANDLE;
+                        size_t this_sz = small;
+                        if ((size_t)(bi + 1) * small > ctx->wq_bytes)
+                            this_sz = ctx->wq_bytes - (size_t)bi * small;
+                        if (this_sz < 16) this_sz = 16;
+                        ctx->wq_bank_bytes[bi] = this_sz;
+                        if (create_host_buffer(ctx, this_sz, &bwb, &mwb, &ctx->map_wq_bank[bi]) != 0) {
+                            wq_ok = 0;
+                            break;
+                        }
+                        ctx->buf_wq_bank[bi] = (void*)bwb;
+                        ctx->mem_wq_bank[bi] = (void*)mwb;
+                    }
+                }
+            }
             if (wq_ok) {
                 bw = (VkBuffer)ctx->buf_wq_bank[0];
                 mw = (VkDeviceMemory)ctx->mem_wq_bank[0];
