@@ -2696,6 +2696,10 @@ static inline void vec_scale_f32(float* y, float a, uint32_t n)
     uint32_t i = 0;
 #if defined(__AVX2__)
     __m256 va = _mm256_set1_ps(a);
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), va));
+        _mm256_storeu_ps(y + i + 8, _mm256_mul_ps(_mm256_loadu_ps(y + i + 8), va));
+    }
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), va));
 #endif
@@ -2707,23 +2711,66 @@ static inline void vec_axpy_f32(float* y, const float* x, float a, uint32_t n)
     uint32_t i = 0;
 #if defined(__AVX2__)
     __m256 va = _mm256_set1_ps(a);
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+        _mm256_storeu_ps(y + i + 8, _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i + 8), _mm256_loadu_ps(y + i + 8)));
+    }
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
 #endif
     for (; i < n; i++) y[i] += a * x[i];
 }
 
+static inline float vec_dot_f32(const float* a, const float* b, uint32_t n)
+{
+    uint32_t i = 0;
+    float s = 0.0f;
+#if defined(__AVX2__)
+    {
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 16 <= n; i += 16) {
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc);
+        }
+        for (; i + 8 <= n; i += 8)
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+        s = hsum_avx2(acc);
+    }
+#elif defined(__aarch64__)
+    {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (; i + 8 <= n; i += 8) {
+            acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+            acc = vfmaq_f32(acc, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+        }
+        s = neon_hsum_f32(acc);
+    }
+#endif
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
 static void f16_to_f32_n(float* d, const uint16_t* s, uint32_t n)
 {
     uint32_t i = 0;
 #if defined(__AVX2__) && defined(__F16C__)
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(d + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(s + i))));
+        _mm256_storeu_ps(d + i + 8, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(s + i + 8))));
+    }
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(d + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(s + i))));
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16*)(s + i));
+        vst1q_f32(d + i, vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(d + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
 #endif
     for (; i < n; i++) d[i] = f16_to_f32(s[i]);
 }
 
-/* 一个 KV head 对应的 GQA 组: 每步只加载一次 K/V, online softmax。 */
+/* 一个 KV head 对应的 GQA 组: 每步 K/V 各转一次 f32, 组内 8 头共用。 */
 static void attn_gqa_kv_f16(float* out, const float* q,
                             const uint16_t* kcache, const uint16_t* vcache,
                             uint32_t s0, uint32_t pos,
@@ -2734,11 +2781,13 @@ static void attn_gqa_kv_f16(float* out, const float* q,
     uint32_t hh0, g, s;
     float* m;
     float* l;
+    float* ktmp;
     float* vtmp;
     if (gqa == 0) gqa = 1;
     hh0 = kv_head * gqa;
     m = (float*)alloca((size_t)gqa * 4);
     l = (float*)alloca((size_t)gqa * 4);
+    ktmp = (float*)alloca((size_t)hd * 4);
     vtmp = (float*)alloca((size_t)hd * 4);
     for (g = 0; g < gqa; g++) {
         m[g] = -INFINITY;
@@ -2749,17 +2798,25 @@ static void attn_gqa_kv_f16(float* out, const float* q,
         const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
         const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
         if (s + 1 <= pos) {
+            const char* nk = (const char*)(kcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd);
+            const char* nv = (const char*)(vcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd);
+            uint32_t nbytes = hd * 2u;
+            uint32_t off;
+            if (nbytes > 1024u) nbytes = 1024u;
+            for (off = 0; off < nbytes; off += 64u) {
 #if defined(__AVX2__)
-            _mm_prefetch((const char*)(kcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd), _MM_HINT_T0);
-            _mm_prefetch((const char*)(vcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd), _MM_HINT_T0);
+                _mm_prefetch(nk + off, _MM_HINT_T0);
+                _mm_prefetch(nv + off, _MM_HINT_T0);
 #elif defined(__GNUC__)
-            __builtin_prefetch(kcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd, 0, 3);
-            __builtin_prefetch(vcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd, 0, 3);
+                __builtin_prefetch(nk + off, 0, 3);
+                __builtin_prefetch(nv + off, 0, 3);
 #endif
+            }
         }
+        f16_to_f32_n(ktmp, kh, hd);
         f16_to_f32_n(vtmp, vh, hd);
         for (g = 0; g < gqa; g++) {
-            float sc = vec_dot_f32_f16(q + (size_t)(hh0 + g) * hd, kh, hd) * inv_d;
+            float sc = vec_dot_f32(q + (size_t)(hh0 + g) * hd, ktmp, hd) * inv_d;
             float mnew, alpha, p;
             float* og;
             if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
@@ -2778,7 +2835,6 @@ static void attn_gqa_kv_f16(float* out, const float* q,
     }
 }
 
-/* 单 query 头 online softmax(GQA 比大、KV 头少时按 Q 头并行) */
 static void attn_qh_kv_f16(float* og, const float* qh,
                            const uint16_t* kcache, const uint16_t* vcache,
                            uint32_t s0, uint32_t pos,
@@ -2787,14 +2843,16 @@ static void attn_qh_kv_f16(float* og, const float* qh,
 {
     uint32_t s;
     float m = -INFINITY, l = 0.0f;
+    float* ktmp = (float*)alloca((size_t)hd * 4);
     float* vtmp = (float*)alloca((size_t)hd * 4);
     memset(og, 0, (size_t)hd * 4);
     for (s = s0; s <= pos; s++) {
         const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
         const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
         float sc, mnew, alpha, p;
+        f16_to_f32_n(ktmp, kh, hd);
         f16_to_f32_n(vtmp, vh, hd);
-        sc = vec_dot_f32_f16(qh, kh, hd) * inv_d;
+        sc = vec_dot_f32(qh, ktmp, hd) * inv_d;
         if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
         mnew = (sc > m) ? sc : m;
         alpha = (m == -INFINITY) ? 0.0f : expf(m - mnew);
@@ -2819,8 +2877,8 @@ void attn_kv_f16(float* out, const float* q,
     int nseq = (int)(pos + 1 - s0);
     if (n_heads == 0 || hd == 0 || s0 > pos) return;
     if (gqa == 0) gqa = 1;
-    /* KV 头够多时按 KV 并行(GQA 组内共用一次 K/V); 否则按 Q 头并行, 避免 8:1 时整层单线程 */
-    if (nkv >= 4 || gqa <= 2) {
+    /* nkv>=2: 按 KV 头并行并共用 K/V; nkv=1(如 gemma4-e2b 8:1): 按 Q 头并行, 否则 8 路 axpy/exp 全串行 */
+    if (nkv >= 2) {
         #pragma omp parallel for schedule(static) if (nseq >= 64)
         for (kvh = 0; kvh < nkv; kvh++)
             attn_gqa_kv_f16(out, q, kcache, vcache, s0, pos, n_heads, nkv, hd, kv_dim,
@@ -2829,7 +2887,6 @@ void attn_kv_f16(float* out, const float* q,
         #pragma omp parallel for schedule(static) if (nseq >= 64)
         for (hh = 0; hh < n_heads; hh++)
             attn_qh_kv_f16(out + (size_t)hh * hd, q + (size_t)hh * hd,
-                           kcache, vcache, s0, pos, hh * nkv / n_heads, hd, kv_dim,
-                           inv_d, attn_cap);
+                           kcache, vcache, s0, pos, 0, hd, kv_dim, inv_d, attn_cap);
     }
 }
