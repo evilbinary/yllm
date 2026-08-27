@@ -3,7 +3,8 @@
 #   make            标量版本
 #   make avx2       x86_64 上的 AVX2 版本(其他架构退化为标量)
 #   make cuda       AVX2 + CUDA 后端(产物在 build/avx2-cuda/, 与 avx2 隔离)
-#   make vulkan     AVX2 + Vulkan 后端(产物在 build/avx2-vulkan/)
+#   make vulkan     标量 + Vulkan 后端(产物在 build/vulkan/, 无 AVX2)
+#   make vulkan-avx2  AVX2 + Vulkan(产物在 build/avx2-vulkan/)
 #   make android    NDK arm64 + Vulkan (platform/android → build/android)
 #   make android-cpu  同上但不编 Vulkan
 #   make gen-cuda / chat-cuda   用 --device cuda 冒烟
@@ -176,8 +177,10 @@ endif
 # CUDA 独立产物(与 build/avx2 隔离, 避免 CPU/CUDA 目标混用同一 .o)
 OBJDIR_CUDA := build/avx2-cuda
 BIN_CUDA    := $(OBJDIR_CUDA)/yllm$(EXE)
-OBJDIR_VULKAN := build/avx2-vulkan
+OBJDIR_VULKAN := build/vulkan
 BIN_VULKAN    := $(OBJDIR_VULKAN)/yllm$(EXE)
+OBJDIR_VULKAN_AVX2 := build/avx2-vulkan
+BIN_VULKAN_AVX2    := $(OBJDIR_VULKAN_AVX2)/yllm$(EXE)
 
 all: $(BIN)
 
@@ -397,10 +400,15 @@ chat-cuda: cuda $(MODEL_LLF)
 		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
 
 # ---- Vulkan: 独立目录; 默认尝试原生 VkDevice, YLLM_VULKAN_HOST=1 强制 shim ----
+# make vulkan = 标量 CPU fallback + Vulkan(无 -mavx2)
 vulkan:
-	$(MAKE) avx2 YLLM_VULKAN=1 OBJDIR_AVX2=$(OBJDIR_VULKAN) BIN_AVX2=$(BIN_VULKAN)
+	$(MAKE) all YLLM_VULKAN=1 OBJDIR=$(OBJDIR_VULKAN) BIN=$(BIN_VULKAN)
+
+vulkan-avx2:
+	$(MAKE) avx2 YLLM_VULKAN=1 OBJDIR_AVX2=$(OBJDIR_VULKAN_AVX2) BIN_AVX2=$(BIN_VULKAN_AVX2)
 
 RUN_VULKAN = OMP_NUM_THREADS=$(NTHREADS) $(BIN_VULKAN)
+RUN_VULKAN_AVX2 = OMP_NUM_THREADS=$(NTHREADS) $(BIN_VULKAN_AVX2)
 
 gen-vulkan: vulkan $(MODEL_LLF)
 	$(RUN_VULKAN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
@@ -410,9 +418,13 @@ chat-vulkan: vulkan $(MODEL_LLF)
 	$(RUN_VULKAN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU)
 
-# 与 chat-avx2 / gen-avx2 对称的命名(产物仍为 build/avx2-vulkan)
-chat-avx2-vulkan: chat-vulkan
-gen-avx2-vulkan: gen-vulkan
+# AVX2 CPU fallback + Vulkan(产物 build/avx2-vulkan)
+chat-avx2-vulkan: vulkan-avx2 $(MODEL_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU)
+gen-avx2-vulkan: vulkan-avx2 $(MODEL_LLF)
+	$(RUN_VULKAN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- Android: platform/android CMake + NDK (arm64-v8a) ----
 #   make android          Vulkan ON  → build/android/yllm + libyllm.so
@@ -519,8 +531,8 @@ test-long-chat: $(OBJDIR_AVX2)/test_long_chat.exe $(G4_E2B_LLF)
 	OMP_NUM_THREADS=$(NTHREADS) ./$(OBJDIR_AVX2)/test_long_chat.exe --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --n $(LONG_N) --tokens $(LONG_DECODE)
 test-long-chat-avx2: test-long-chat
 
-chat-gemma4-e2b-avx2-vulkan: vulkan $(G4_E2B_LLF)
-	$(RUN_VULKAN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-gemma4-e2b-avx2-vulkan: vulkan-avx2 $(G4_E2B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 chat-gemma4-e4b: $(BIN) $(G4_E4B_LLF)
@@ -529,8 +541,8 @@ chat-gemma4-e4b: $(BIN) $(G4_E4B_LLF)
 chat-gemma4-e4b-avx2: $(BIN_AVX2) $(G4_E4B_LLF)
 	$(RUN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-gemma4-e4b-avx2-vulkan: vulkan $(G4_E4B_LLF)
-	$(RUN_VULKAN) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-gemma4-e4b-avx2-vulkan: vulkan-avx2 $(G4_E4B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
@@ -562,8 +574,8 @@ chat-qwen2.5-1.5b: $(BIN) $(Q25_LLF)
 chat-qwen2.5-1.5b-avx2: $(BIN_AVX2) $(Q25_LLF)
 	$(RUN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen2.5-1.5b-avx2-vulkan: vulkan $(Q25_LLF)
-	$(RUN_VULKAN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-qwen2.5-1.5b-avx2-vulkan: vulkan-avx2 $(Q25_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 chat-qwen2.5-7b: $(BIN) $(Q25_7B_LLF)
@@ -572,8 +584,8 @@ chat-qwen2.5-7b: $(BIN) $(Q25_7B_LLF)
 chat-qwen2.5-7b-avx2: $(BIN_AVX2) $(Q25_7B_LLF)
 	$(RUN_AVX2) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen2.5-7b-avx2-vulkan: vulkan $(Q25_7B_LLF)
-	$(RUN_VULKAN) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-qwen2.5-7b-avx2-vulkan: vulkan-avx2 $(Q25_7B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 chat-qwen3-8b: $(BIN) $(Q3_8B_LLF)
@@ -582,8 +594,8 @@ chat-qwen3-8b: $(BIN) $(Q3_8B_LLF)
 chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_8B_LLF)
 	$(RUN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3-8b-avx2-vulkan: vulkan $(Q3_8B_LLF)
-	$(RUN_VULKAN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-qwen3-8b-avx2-vulkan: vulkan-avx2 $(Q3_8B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- qwen3-vl-2b(文本侧; GGUF arch=qwen3vl, 常无独立 lm_head / 无 vision 权) ----
@@ -601,8 +613,8 @@ chat-qwen3-vl-2b: $(BIN) $(Q3VL_2B_LLF)
 chat-qwen3-vl-2b-avx2: $(BIN_AVX2) $(Q3VL_2B_LLF)
 	$(RUN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3-vl-2b-avx2-vulkan: vulkan $(Q3VL_2B_LLF)
-	$(RUN_VULKAN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-qwen3-vl-2b-avx2-vulkan: vulkan-avx2 $(Q3VL_2B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
@@ -620,8 +632,8 @@ gen-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
 gen-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
 	$(RUN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-gen-qwen3.8-27b-avx2-vulkan: vulkan $(Q3_27B_LLF)
-	$(RUN_VULKAN) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
+gen-qwen3.8-27b-avx2-vulkan: vulkan-avx2 $(Q3_27B_LLF)
+	$(RUN_VULKAN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 chat-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
@@ -630,8 +642,8 @@ chat-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
 chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
 	$(RUN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
-chat-qwen3.8-27b-avx2-vulkan: vulkan $(Q3_27B_LLF)
-	$(RUN_VULKAN) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
+chat-qwen3.8-27b-avx2-vulkan: vulkan-avx2 $(Q3_27B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
@@ -908,4 +920,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess test-long-chat test-long-chat-avx2 chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-avx2-vulkan chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b
+.PHONY: all avx2 cuda vulkan vulkan-avx2 android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess test-long-chat test-long-chat-avx2 chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-avx2-vulkan chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b

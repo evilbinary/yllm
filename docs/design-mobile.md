@@ -44,7 +44,8 @@
 set VULKAN_SDK=...   # Windows
 # 改 .comp 后: glslc -fshader-stage=compute inference/vulkan/shaders/rmsnorm.comp -o inference/vulkan/shaders/rmsnorm.spv
 make vulkan
-./build/avx2-vulkan/yllm gen --device vulkan ... --temp 0
+./build/vulkan/yllm gen --device vulkan ... --temp 0
+# AVX2 CPU fallback: make vulkan-avx2 → ./build/avx2-vulkan/yllm
 ```
 
 ### Android（本机已验证 Ninja + NDK r27）
