@@ -2637,7 +2637,21 @@ float vec_dot_f32_f16(const float* a, const uint16_t* b, uint32_t n)
 {
     uint32_t i = 0;
     float s = 0.0f;
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#if defined(__AVX2__) && defined(__F16C__)
+    {
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 16 <= n; i += 16) {
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b + i))), acc);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b + i + 8))), acc);
+        }
+        for (; i + 8 <= n; i += 8)
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b + i))), acc);
+        s = hsum_avx2(acc);
+    }
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     float32x4_t acc = vdupq_n_f32(0.0f);
     for (; i + 8 <= n; i += 8) {
         float16x8_t h = vld1q_f16((const __fp16*)(b + i));
@@ -2653,7 +2667,20 @@ float vec_dot_f32_f16(const float* a, const uint16_t* b, uint32_t n)
 void vec_axpy_f16(float* y, const uint16_t* x, float a, uint32_t n)
 {
     uint32_t i = 0;
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#if defined(__AVX2__) && defined(__F16C__)
+    {
+        __m256 va = _mm256_set1_ps(a);
+        for (; i + 16 <= n; i += 16) {
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va,
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i))), _mm256_loadu_ps(y + i)));
+            _mm256_storeu_ps(y + i + 8, _mm256_fmadd_ps(va,
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i + 8))), _mm256_loadu_ps(y + i + 8)));
+        }
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va,
+                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i))), _mm256_loadu_ps(y + i)));
+    }
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     float32x4_t va = vdupq_n_f32(a);
     for (; i + 8 <= n; i += 8) {
         float16x8_t h = vld1q_f16((const __fp16*)(x + i));
@@ -2662,4 +2689,107 @@ void vec_axpy_f16(float* y, const uint16_t* x, float a, uint32_t n)
     }
 #endif
     for (; i < n; i++) y[i] += a * f16_to_f32(x[i]);
+}
+
+static inline void vec_scale_f32(float* y, float a, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    __m256 va = _mm256_set1_ps(a);
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), va));
+#endif
+    for (; i < n; i++) y[i] *= a;
+}
+
+static inline void vec_axpy_f32(float* y, const float* x, float a, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    __m256 va = _mm256_set1_ps(a);
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+#endif
+    for (; i < n; i++) y[i] += a * x[i];
+}
+
+static void f16_to_f32_n(float* d, const uint16_t* s, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__AVX2__) && defined(__F16C__)
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(d + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(s + i))));
+#endif
+    for (; i < n; i++) d[i] = f16_to_f32(s[i]);
+}
+
+/* 一个 KV head 对应的 GQA 组: 每步只加载一次 K/V, online softmax。 */
+static void attn_gqa_kv_f16(float* out, const float* q,
+                            const uint16_t* kcache, const uint16_t* vcache,
+                            uint32_t s0, uint32_t pos,
+                            uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                            uint32_t kv_head, float inv_d, float attn_cap)
+{
+    uint32_t gqa = n_kv_heads ? (n_heads / n_kv_heads) : n_heads;
+    uint32_t hh0, g, s;
+    float* m;
+    float* l;
+    float* vtmp;
+    if (gqa == 0) gqa = 1;
+    hh0 = kv_head * gqa;
+    m = (float*)alloca((size_t)gqa * 4);
+    l = (float*)alloca((size_t)gqa * 4);
+    vtmp = (float*)alloca((size_t)hd * 4);
+    for (g = 0; g < gqa; g++) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        memset(out + (size_t)(hh0 + g) * hd, 0, (size_t)hd * 4);
+    }
+    for (s = s0; s <= pos; s++) {
+        const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+        const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+        if (s + 1 <= pos) {
+#if defined(__AVX2__)
+            _mm_prefetch((const char*)(kcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd), _MM_HINT_T0);
+            _mm_prefetch((const char*)(vcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd), _MM_HINT_T0);
+#elif defined(__GNUC__)
+            __builtin_prefetch(kcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd, 0, 3);
+            __builtin_prefetch(vcache + (size_t)(s + 1) * kv_dim + (size_t)kv_head * hd, 0, 3);
+#endif
+        }
+        f16_to_f32_n(vtmp, vh, hd);
+        for (g = 0; g < gqa; g++) {
+            float sc = vec_dot_f32_f16(q + (size_t)(hh0 + g) * hd, kh, hd) * inv_d;
+            float mnew, alpha, p;
+            float* og;
+            if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
+            mnew = (sc > m[g]) ? sc : m[g];
+            alpha = (m[g] == -INFINITY) ? 0.0f : expf(m[g] - mnew);
+            p = expf(sc - mnew);
+            l[g] = l[g] * alpha + p;
+            og = out + (size_t)(hh0 + g) * hd;
+            if (alpha != 1.0f) vec_scale_f32(og, alpha, hd);
+            vec_axpy_f32(og, vtmp, p, hd);
+            m[g] = mnew;
+        }
+    }
+    for (g = 0; g < gqa; g++) {
+        if (l[g] > 0.0f) vec_scale_f32(out + (size_t)(hh0 + g) * hd, 1.0f / l[g], hd);
+    }
+}
+
+void attn_kv_f16(float* out, const float* q,
+                 const uint16_t* kcache, const uint16_t* vcache,
+                 uint32_t s0, uint32_t pos,
+                 uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                 float inv_d, float attn_cap)
+{
+    uint32_t nkv = n_kv_heads ? n_kv_heads : 1;
+    uint32_t kvh;
+    int nseq = (int)(pos + 1 - s0);
+    if (n_heads == 0 || hd == 0 || s0 > pos) return;
+    #pragma omp parallel for schedule(static) if (nseq >= 64)
+    for (kvh = 0; kvh < nkv; kvh++)
+        attn_gqa_kv_f16(out, q, kcache, vcache, s0, pos, n_heads, nkv, hd, kv_dim,
+                        kvh, inv_d, attn_cap);
 }
