@@ -1,6 +1,6 @@
 # Engine / Arch / Device
 
-版本：v1.5 ｜ 状态：Arch CPU 图 + `arch_ctx` + Device 用 `gpu_fused`/`qwen_rope`  
+版本：v1.6 ｜ 状态：Arch CPU 图 + `arch_ctx` + Device 用 `gpu_fused`/`qwen_rope`；混合 pack 已 clip  
 关联：[design-gpu-inference.md](design-gpu-inference.md) · [design-mobile.md](design-mobile.md) · [qwen35-arch.md](qwen35-arch.md)
 
 推理拆成两轴，避免 `engine.c` 里铺 `if (ARCH_*)` × `if (DEV_MODE_*)`，也避免按「模型 × 后端」复制 shader / kernel。
@@ -461,7 +461,7 @@ Vulkan Llama fused 填了 `fwd_block` 就能前 GPU 后 CPU。Gemma 现在 `fwd_
 ## 6. 后续（未做）
 
 1. **Gemma / Qwen3.5 GPU 块**：CPU greedy 对齐后，各写自己的 `Device.fwd_block`（不要改 llama fused）。`gpu_fused=0` 现在只表示「现有 llama 形核不能用」。
-2. **混合切层省显存**：`load_weights` 只 pack `gpu_layer_end` 之前的层。
+2. **混合切层省显存**（CUDA / Vulkan 已做）：`load_weights` 只 pack `[layer_begin, min(layer_end, gpu_layer_end||n_layers))`。Vulkan GPU KV 仍按全 `n_blocks` 开槽（fused `v_slot`）。
 3. **PP Gemma shared-KV**：`dist_split_layers` 仍读 header.reserved 钉扎末 rank（格式语义，可留）。
 
 已不在 Engine/Device 热路径：`ARCH_*` 切图、PLE/SSM 字段、Vulkan/CUDA 的 `ARCH_GEMMA4||QWEN35` 跳过。

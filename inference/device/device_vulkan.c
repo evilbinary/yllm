@@ -95,14 +95,33 @@ static size_t block_q4k_bytes(const LlModel* m, uint32_t layer)
     return sum;
 }
 
-static size_t q4k_packed_bytes(const LlModel* m, size_t bank)
+/* CUDA load_weights 同语义: 上卡 [layer_begin, min(layer_end, gpu_layer_end||n_layers)) */
+static void vk_gpu_pack_range(const Engine* e, uint32_t* begin, uint32_t* end)
 {
+    const LlModel* m = &e->ws.model;
+    uint32_t b = e->layer_begin;
+    uint32_t en = e->layer_end;
+    if (e->gpu_layer_end && e->gpu_layer_end < en) en = e->gpu_layer_end;
+    if (en > m->n_layers) en = m->n_layers;
+    if (b > en) b = en;
+    *begin = b;
+    *end = en;
+}
+
+static int vk_in_pack(uint32_t layer, uint32_t begin, uint32_t end)
+{
+    return layer >= begin && layer < end;
+}
+
+static size_t q4k_packed_bytes(const Engine* e, size_t bank)
+{
+    const LlModel* m = &e->ws.model;
+    uint32_t begin, end, layer, s;
     size_t cursor = 0;
-    uint32_t li, s;
-    for (li = 0; li < m->h.n_blocks; li++) {
-        uint32_t layer = li + 1;
+    vk_gpu_pack_range(e, &begin, &end);
+    for (layer = 1; layer <= m->h.n_blocks; layer++) {
         uint32_t hidx, nt;
-        if (layer >= m->n_layers) continue;
+        if (!vk_in_pack(layer, begin, end) || layer >= m->n_layers) continue;
         cursor = wq_bank_align(cursor, block_q4k_bytes(m, layer), bank);
         hidx = m->base_idx[layer];
         nt = m->dir[layer].n_tensors;
@@ -118,9 +137,9 @@ static size_t q4k_packed_bytes(const LlModel* m, size_t bank)
         }
     }
     {
-        uint32_t layer = m->h.n_blocks + 2;
-        if (layer < m->n_layers) {
-            const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+        uint32_t lm = m->h.n_blocks + 2;
+        if (vk_in_pack(lm, begin, end) && lm < m->n_layers) {
+            const LlfTensorMeta* mt = &m->metas[m->base_idx[lm]];
             uint32_t o, i;
             if (mt->size > 0 && tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
                 size_t nbytes = 0;
@@ -139,21 +158,22 @@ static size_t q4k_packed_bytes(const LlModel* m, size_t bank)
     return cursor;
 }
 
-static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out,
+static void scan_block_q4k(const Engine* e, uint32_t* max_in, uint32_t* max_out,
                            size_t* total_wq)
 {
+    const LlModel* m = &e->ws.model;
     uint32_t hidden = m->h.hidden;
+    uint32_t begin, end, layer;
     *max_in = hidden;
     *max_out = hidden;
     *total_wq = 0;
-    uint32_t li;
-    for (li = 0; li < m->h.n_blocks; li++) {
-        uint32_t layer = li + 1;
-        if (layer >= m->n_layers) continue;
-        uint32_t hidx = m->base_idx[layer];
-        uint32_t nt = m->dir[layer].n_tensors;
+    vk_gpu_pack_range(e, &begin, &end);
+    for (layer = 1; layer <= m->h.n_blocks; layer++) {
+        uint32_t hidx, nt, s;
+        if (!vk_in_pack(layer, begin, end) || layer >= m->n_layers) continue;
+        hidx = m->base_idx[layer];
+        nt = m->dir[layer].n_tensors;
         if (nt > BLOCK_TENSORS) nt = BLOCK_TENSORS;
-        uint32_t s;
         for (s = 0; s < nt; s++) {
             const LlfTensorMeta* mt = &m->metas[hidx + s];
             if (mt->dtype != DT_Q4K || mt->size == 0) continue;
@@ -167,9 +187,9 @@ static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out
     }
     /* lm_head 权体积计入 wq; 不抬 max_out(vocab 过大), gemv 分块写 logits */
     {
-        uint32_t layer = m->h.n_blocks + 2;
-        if (layer < m->n_layers) {
-            const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
+        uint32_t lm = m->h.n_blocks + 2;
+        if (vk_in_pack(lm, begin, end) && lm < m->n_layers) {
+            const LlfTensorMeta* mt = &m->metas[m->base_idx[lm]];
             if (mt->size > 0) {
                 uint32_t o, i;
                 if (tensor_out_in(mt, &o, &i) == 0 && (i % 256) == 0) {
@@ -183,16 +203,18 @@ static void scan_block_q4k(const LlModel* m, uint32_t* max_in, uint32_t* max_out
     }
 }
 
-static size_t max_block_q4k_bytes(const LlModel* m)
+static size_t max_block_q4k_bytes(const Engine* e)
 {
+    const LlModel* m = &e->ws.model;
+    uint32_t begin, end, layer, s;
     size_t mx = 0;
-    uint32_t li, s;
-    for (li = 0; li < m->h.n_blocks; li++) {
-        uint32_t layer = li + 1;
-        if (layer >= m->n_layers) continue;
+    vk_gpu_pack_range(e, &begin, &end);
+    for (layer = 1; layer <= m->h.n_blocks; layer++) {
         size_t layer_sz = 0;
-        uint32_t hidx = m->base_idx[layer];
-        uint32_t nt = m->dir[layer].n_tensors;
+        uint32_t hidx, nt;
+        if (!vk_in_pack(layer, begin, end) || layer >= m->n_layers) continue;
+        hidx = m->base_idx[layer];
+        nt = m->dir[layer].n_tensors;
         if (nt > BLOCK_TENSORS) nt = BLOCK_TENSORS;
         for (s = 0; s < nt; s++) {
             const LlfTensorMeta* mt = &m->metas[hidx + s];
@@ -231,9 +253,11 @@ static int vk_pack_norms(Engine* e, VulkanCtx* ctx)
     if (!ctx->map_wn || need > ctx->wn_bytes) return -1;
 
     float* dst = (float*)ctx->map_wn;
-    uint32_t li;
+    uint32_t begin, end, li;
+    vk_gpu_pack_range(e, &begin, &end);
     for (li = 0; li < n_blocks; li++) {
         uint32_t layer = li + 1;
+        if (!vk_in_pack(layer, begin, end)) continue;
         if (layer >= m->n_layers) return -1;
         const uint8_t* base =
             (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
@@ -252,13 +276,15 @@ static int vk_pack_norms(Engine* e, VulkanCtx* ctx)
     }
     {
         uint32_t layer = n_blocks + 1;
-        if (layer >= m->n_layers) return -1;
-        const uint8_t* base =
-            (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
-        const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
-        if (pack_norm_slice(dst + (size_t)n_blocks * 2u * hidden,
-                            base + tm->offset, hidden, tm->dtype) != 0)
-            return -1;
+        if (vk_in_pack(layer, begin, end)) {
+            if (layer >= m->n_layers) return -1;
+            const uint8_t* base =
+                (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
+            const LlfTensorMeta* tm = &m->metas[m->base_idx[layer]];
+            if (pack_norm_slice(dst + (size_t)n_blocks * 2u * hidden,
+                                base + tm->offset, hidden, tm->dtype) != 0)
+                return -1;
+        }
     }
     ctx->norm_ready = 1;
     return 0;
@@ -270,8 +296,9 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
     LlModel* m = &e->ws.model;
     uint32_t nslot = ctx->wq_nslot;
     size_t bank = (!ctx->wq_stream && ctx->wq_nbank > 1) ? ctx->wq_bank_size : 0;
-    size_t total = q4k_packed_bytes(m, bank);
-    uint32_t li, s;
+    uint32_t begin, end, layer, s;
+    size_t total = q4k_packed_bytes(e, bank);
+    vk_gpu_pack_range(e, &begin, &end);
     if (total == 0) return -1;
     if (!ctx->wq_stream && total > ctx->wq_bytes) {
         ylog_warn("vulkan: Q4_K pack size %zu vs buf %zu", total, ctx->wq_bytes);
@@ -284,9 +311,8 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
     ctx->lm_ready = 0;
     ctx->lm_off = (uint64_t)~0ull;
     ctx->lm_dtype = 0;
-    for (li = 0; li < m->h.n_blocks; li++) {
-        uint32_t layer = li + 1;
-        if (layer >= m->n_layers) continue;
+    for (layer = 1; layer <= m->h.n_blocks; layer++) {
+        if (!vk_in_pack(layer, begin, end) || layer >= m->n_layers) continue;
         const uint8_t* base =
             (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
         uint32_t hidx = m->base_idx[layer];
@@ -315,7 +341,7 @@ static int pack_upload_q4k(Engine* e, VulkanCtx* ctx)
     }
     {
         uint32_t layer = m->h.n_blocks + 2;
-        if (layer < m->n_layers) {
+        if (vk_in_pack(layer, begin, end) && layer < m->n_layers) {
             const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
             const uint8_t* base =
                 (const uint8_t*)e->ws.map.base + m->dir[layer].offset;
@@ -422,10 +448,10 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
     if (!ctx->host_shim) {
         uint32_t max_in = ctx->hidden, max_out = ctx->hidden;
         size_t total_wq = 0;
-        scan_block_q4k(&e->ws.model, &max_in, &max_out, &total_wq);
+        scan_block_q4k(e, &max_in, &max_out, &total_wq);
         ctx->layer_wq_max = 0;
         ctx->stream_base = 0;
-        size_t layer_max = max_block_q4k_bytes(&e->ws.model);
+        size_t layer_max = max_block_q4k_bytes(e);
         if (layer_max == 0) layer_max = total_wq;
         layer_max = (layer_max + 4095u) & ~(size_t)4095u;
         if (layer_max < 144 * 8) layer_max = 144 * 8;
@@ -456,7 +482,7 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                 ylog_info("vulkan: weight stream on (YLLM_VK_STREAM=1 total=%zuMB layer_gpu=%zuMB)",
                           total_wq / (1024 * 1024), layer_max / (1024 * 1024));
             } else {
-                size_t padded = (total_wq > ssbo) ? q4k_packed_bytes(&e->ws.model, ssbo) : total_wq;
+                size_t padded = (total_wq > ssbo) ? q4k_packed_bytes(e, ssbo) : total_wq;
                 size_t nbank = ssbo ? (padded + ssbo - 1) / ssbo : 1;
                 if (!force_resident && (nbank > YLLM_VK_MAX_WQ_BANKS || layer_max > ssbo)) {
                     ctx->wq_stream = 1;
@@ -478,8 +504,10 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
         uint32_t lm_vocab = 0;
         {
             LlModel* m = &e->ws.model;
-            uint32_t layer = m->h.n_blocks + 2;
-            if (layer < m->n_layers) {
+            uint32_t begin, end, layer;
+            vk_gpu_pack_range(e, &begin, &end);
+            layer = m->h.n_blocks + 2;
+            if (vk_in_pack(layer, begin, end) && layer < m->n_layers) {
                 const LlfTensorMeta* mt = &m->metas[m->base_idx[layer]];
                 if ((mt->dtype == DT_Q4K || mt->dtype == DT_Q6K) && mt->size > 0) {
                     uint32_t o, i;
@@ -487,6 +515,9 @@ static int vk_load_weights(Engine* e, char* err, size_t errlen)
                         lm_vocab = o;
                 }
             }
+            if (begin > 0 || end < m->n_layers)
+                ylog_info("vulkan: pack layers [%u,%u) (gpu_layer_end=%u)",
+                          begin, end, e->gpu_layer_end);
         }
         if (vulkan_compute_setup(ctx, ctx->hidden, max_in, max_out, gpu_wq,
                                  e->ws.model.n_layers, BLOCK_TENSORS, lm_vocab,
