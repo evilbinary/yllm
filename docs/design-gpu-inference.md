@@ -1,6 +1,6 @@
 # yllm GPU 推理设计方案
 
-版本：v0.5 ｜ 状态：P3 + 混合路径已落地 ｜ 关联：`design-mmap-layer-streaming.md`
+版本：v0.5 ｜ 状态：P3 + 混合路径已落地 ｜ 关联：`design-mmap-layer-streaming.md` · **[design-engine-arch-device.md](design-engine-arch-device.md)**（Engine / Arch / Device 分派）
 
 ## 1. 目标与边界
 
@@ -13,7 +13,7 @@
 | GPU↔CPU 混合（PP / 单进程层切 / 权流式） | 双缓冲异步 prefetch |
 | 跨端 Vulkan（见 `design-mobile.md`） | Web/WASM（`platform/web` 预留） |
 
-**原则：** serve / dist / sample 仍只调 `engine_forward*`；设备细节关在 `Device` + `fwd_block(_batch)` 里。
+**原则：** serve / dist / sample 仍只调 `engine_forward*`。图在 **Arch**（const 表），跑在哪在 **Device**（可选 `fwd_block` 覆盖）。Engine 不持有 `fwd_block`。详见 [design-engine-arch-device.md](design-engine-arch-device.md)。
 
 ## 2. 总体架构
 
