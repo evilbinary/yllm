@@ -83,6 +83,34 @@ static void test_escaping(void)
     remove(path);
 }
 
+/* SentencePiece 缩进: 一个 piece 里多个 ▁ 都应变成空格, 否则屏幕上会露出 ▁▁▁ */
+static void test_decode_multi_underline(void)
+{
+    const char* path = "build/test_vocab_sp.txt";
+    FILE* f = fopen(path, "wb");
+    const char u[] = { (char)0xE2, (char)0x96, (char)0x81, 0 };
+    if (!f) { printf("SKIP: cannot write %s\n", path); return; }
+    fprintf(f, "2\n");
+    fprintf(f, "0\t<unk>\n");
+    fprintf(f, "1\t%s%s%s%s\n", u, u, u, u); /* ▁▁▁▁ */
+    fclose(f);
+    {
+        Vocab v;
+        uint32_t id = 1;
+        char out[16];
+        if (vocab_load(path, &v) != 0) {
+            printf("FAIL: cannot load %s\n", path);
+            g_fail++;
+            remove(path);
+            return;
+        }
+        vocab_decode(&v, &id, 1, out, sizeof(out));
+        CHECK(strcmp(out, "    ") == 0, "decode ▁▁▁▁ -> 4 spaces");
+        vocab_free(&v);
+    }
+    remove(path);
+}
+
 /* ---- encoding must be deterministic and not crash on empty/space ---- */
 static void test_encode_edge(const char* vocab_path)
 {
@@ -466,6 +494,7 @@ int main(int argc, char** argv)
     test_encode_edge(vocab_path);
     test_decode(vocab_path);
     test_escaping();
+    test_decode_multi_underline();
     test_chat_template(vocab_path);
     test_chat_template_qwen_style();
     test_chat_template_qwen_real();

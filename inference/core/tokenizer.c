@@ -766,14 +766,21 @@ int vocab_decode(Vocab* v, const uint32_t* ids, int n, char* out, int max)
             }
             continue;
         }
-        if (pc[0] == (char)0xe2 && pc[1] == (char)0x96 && pc[2] == (char)0x81) {
-            if (o < max) out[o++] = ' ';
-            pc += 3;
-            l -= 3;
+        /* SentencePiece: 每个 ▁ (U+2581) → 空格。只剥 piece 开头会把 ▁▁▁▁ 解成 " ▁▁▁" */
+        {
+            size_t k = 0;
+            while (k < l && o < max - 1) {
+                if (k + 2 < l &&
+                    (unsigned char)pc[k] == 0xe2 &&
+                    (unsigned char)pc[k + 1] == 0x96 &&
+                    (unsigned char)pc[k + 2] == 0x81) {
+                    out[o++] = ' ';
+                    k += 3;
+                    continue;
+                }
+                out[o++] = pc[k++];
+            }
         }
-        if (o + (int)l >= max) l = (size_t)(max - o);
-        memcpy(out + o, pc, l);
-        o += (int)l;
     }
     out[o] = 0;
     return o;
