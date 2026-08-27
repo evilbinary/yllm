@@ -1,6 +1,7 @@
 #include "yllm.h"
 #include "matvec.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -296,6 +297,83 @@ static void test_softmax(void)
     CHECK_NEAR(v[0] + v[1] + v[2], 1.0, 1e-6, "softmax sum");
 }
 
+/* 对照旧路径: 每 head 独立 softmax + axpy */
+static void attn_ref(float* out, const float* q,
+                     const uint16_t* kcache, const uint16_t* vcache,
+                     uint32_t s0, uint32_t pos,
+                     uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                     float inv_d, float attn_cap)
+{
+    uint32_t n = pos + 1 - s0;
+    float* att = (float*)malloc((size_t)n * 4);
+    uint32_t hh, s;
+    for (hh = 0; hh < n_heads; hh++) {
+        uint32_t kv_head = hh * n_kv_heads / n_heads;
+        const float* qh = q + (size_t)hh * hd;
+        float* og = out + (size_t)hh * hd;
+        for (s = s0; s <= pos; s++) {
+            const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+            float sc = vec_dot_f32_f16(qh, kh, hd) * inv_d;
+            if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
+            att[s - s0] = sc;
+        }
+        softmax(att, n);
+        memset(og, 0, (size_t)hd * 4);
+        for (s = s0; s <= pos; s++) {
+            const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+            vec_axpy_f16(og, vh, att[s - s0], hd);
+        }
+    }
+    free(att);
+}
+
+static void test_attn_kv_f16(void)
+{
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, kv_dim = n_kv * hd;
+    const uint32_t pos = 11, s0 = 3;
+    float q[4 * 8];
+    float out[4 * 8], ref[4 * 8];
+    uint16_t kcache[12 * 16], vcache[12 * 16];
+    uint32_t i, t;
+    float inv_d = 1.0f / sqrtf((float)hd);
+    float cap = 20.0f;
+    for (i = 0; i < n_heads * hd; i++)
+        q[i] = sinf((float)i * 0.17f) * 0.5f;
+    for (t = 0; t <= pos; t++) {
+        for (i = 0; i < kv_dim; i++) {
+            float kf = cosf((float)(t * 17 + i) * 0.03f);
+            float vf = sinf((float)(t * 13 + i) * 0.05f);
+            kcache[t * kv_dim + i] = f32_to_f16(kf);
+            vcache[t * kv_dim + i] = f32_to_f16(vf);
+        }
+    }
+    attn_kv_f16(out, q, kcache, vcache, s0, pos, n_heads, n_kv, hd, kv_dim, inv_d, 0.0f);
+    attn_ref(ref, q, kcache, vcache, s0, pos, n_heads, n_kv, hd, kv_dim, inv_d, 0.0f);
+    for (i = 0; i < n_heads * hd; i++)
+        CHECK_NEAR(out[i], ref[i], 2e-3, "attn_kv_f16 vs two-pass (swa)");
+    attn_kv_f16(out, q, kcache, vcache, 0, pos, n_heads, n_kv, hd, kv_dim, 1.0f, cap);
+    attn_ref(ref, q, kcache, vcache, 0, pos, n_heads, n_kv, hd, kv_dim, 1.0f, cap);
+    for (i = 0; i < n_heads * hd; i++)
+        CHECK_NEAR(out[i], ref[i], 2e-3, "attn_kv_f16 vs two-pass (cap)");
+    {
+        const uint32_t nh = 8, nkv1 = 1, hd2 = 8, kvd = nkv1 * hd2;
+        float q2[8 * 8], o2[8 * 8], r2[8 * 8];
+        uint16_t k2[12 * 8], v2[12 * 8];
+        uint32_t j;
+        for (j = 0; j < nh * hd2; j++) q2[j] = sinf((float)j * 0.11f);
+        for (t = 0; t <= pos; t++) {
+            for (j = 0; j < kvd; j++) {
+                k2[t * kvd + j] = f32_to_f16(cosf((float)(t + j) * 0.07f));
+                v2[t * kvd + j] = f32_to_f16(sinf((float)(t + j) * 0.09f));
+            }
+        }
+        attn_kv_f16(o2, q2, k2, v2, 0, pos, nh, nkv1, hd2, kvd, inv_d, 0.0f);
+        attn_ref(r2, q2, k2, v2, 0, pos, nh, nkv1, hd2, kvd, inv_d, 0.0f);
+        for (j = 0; j < nh * hd2; j++)
+            CHECK_NEAR(o2[j], r2[j], 2e-3, "attn_kv_f16 GQA 8:1");
+    }
+}
+
 /* ---- swiglu ---- */
 static void test_swiglu(void)
 {
@@ -331,6 +409,8 @@ int main(void)
     test_rope();
     printf("running test_softmax...\n"); fflush(stdout);
     test_softmax();
+    printf("running test_attn_kv_f16...\n"); fflush(stdout);
+    test_attn_kv_f16();
     printf("running test_swiglu...\n"); fflush(stdout);
     test_swiglu();
     printf("matvec tests: %d passed, %d failed\n", g_pass, g_fail);

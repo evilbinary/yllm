@@ -79,6 +79,12 @@ void rmsnorm_unit(float* y, const float* x, uint32_t n, float eps);
 void add_inplace(float* y, const float* x, uint32_t n);
 float vec_dot_f32_f16(const float* a, const uint16_t* b, uint32_t n);
 void vec_axpy_f16(float* y, const uint16_t* x, float a, uint32_t n);
+/* 因果注意力 Q[n_heads*hd] × K/V f16[seq,kv_dim]; GQA + 长序列 online softmax */
+void attn_kv_f16(float* out, const float* q,
+                 const uint16_t* kcache, const uint16_t* vcache,
+                 uint32_t s0, uint32_t pos,
+                 uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                 float inv_d, float attn_cap);
 
 /* 单块解量化(导出供测试/embed 使用) */
 void q4k_block(float* y, const uint8_t* blk, uint32_t stride);

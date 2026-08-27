@@ -921,33 +921,18 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
         }
     }
 
-    /* 4) 注意力: 每 token 因果关注 0..pos_b; 并行于 head */
+    /* 4) 注意力: 每 token 因果关注 0..pos_b; GQA 共用 K/V */
     {
-        uint32_t hh;
+        uint32_t bb;
+        float inv_d = 1.0f / sqrtf((float)h->head_dim);
+        uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
+        uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
         #pragma omp parallel for schedule(static)
-        for (hh = 0; hh < h->n_heads; hh++) {
-            uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
-            uint32_t bb;
-            for (bb = 0; bb < B; bb++) {
-                uint32_t pos = pos_start + bb;
-                const float* qh = e->pbq + (size_t)bb * hidden + (size_t)hh * h->head_dim;
-                float* att_h = e->pba + ((size_t)bb * h->n_heads + hh) * e->max_seq;
-                float inv_d = 1.0f / sqrtf((float)h->head_dim);
-                uint32_t s;
-                for (s = 0; s <= pos; s++) {
-                    const uint16_t* kh = e->kv + (size_t)layer * e->max_seq * kv_dim
-                                         + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-                    att_h[s] = vec_dot_f32_f16(qh, kh, h->head_dim) * inv_d;
-                }
-                softmax(att_h, pos + 1);
-                float* out = e->pb2 + (size_t)bb * hidden + (size_t)hh * h->head_dim;
-                memset(out, 0, (size_t)h->head_dim * 4);
-                for (s = 0; s <= pos; s++) {
-                    const uint16_t* vh = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim
-                                         + (size_t)s * kv_dim + (size_t)kv_head * h->head_dim;
-                    vec_axpy_f16(out, vh, att_h[s], h->head_dim);
-                }
-            }
+        for (bb = 0; bb < B; bb++) {
+            uint32_t pos = pos_start + bb;
+            attn_kv_f16(e->pb2 + (size_t)bb * hidden, e->pbq + (size_t)bb * hidden,
+                        kcache, vcache, 0, pos,
+                        h->n_heads, h->n_kv_heads, h->head_dim, kv_dim, inv_d, 0.0f);
         }
     }
 
@@ -1195,8 +1180,6 @@ static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start,
             float* q = e->pbq + (size_t)b * q_dim;
             float* k = e->pbk + (size_t)b * kvd;
             float* v = e->pbv + (size_t)b * kvd;
-            float* att_out = att_batch + (size_t)b * q_dim;
-            uint32_t s0 = 0;
             if (mt[SLOT_QBIAS].size > 0) {
                 const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
                 uint32_t j; for (j = 0; j < q_dim; j++) q[j] += bq[j];
@@ -1232,25 +1215,17 @@ static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start,
                 f32_to_f16_buf(k, kcache + (uint64_t)pos * kv_dim, kvd);
                 f32_to_f16_buf(v, vcache + (uint64_t)pos * kv_dim, kvd);
             }
+        }
+        #pragma omp parallel for schedule(static)
+        for (b = 0; b < B; b++) {
+            uint32_t pos = pos_start + b;
+            float* q = e->pbq + (size_t)b * q_dim;
+            float* att_out = att_batch + (size_t)b * q_dim;
+            uint32_t s0 = 0;
             if (swa && g4.swa_window > 0 && pos + 1 > g4.swa_window)
                 s0 = pos + 1 - g4.swa_window;
-            for (hh = 0; hh < h->n_heads; hh++) {
-                float* att_h = e->att + (size_t)hh * e->max_seq;
-                uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
-                const float* qh = q + (size_t)hh * hd;
-                float* out = att_out + (size_t)hh * hd;
-                uint32_t s;
-                for (s = s0; s <= pos; s++) {
-                    const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-                    att_h[s] = vec_dot_f32_f16(qh, kh, hd) * inv_d;
-                }
-                softmax(att_h + s0, pos + 1 - s0);
-                memset(out, 0, (size_t)hd * 4);
-                for (s = s0; s <= pos; s++) {
-                    const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-                    vec_axpy_f16(out, vh, att_h[s], hd);
-                }
-            }
+            attn_kv_f16(att_out, q, kcache, vcache, s0, pos,
+                        h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
         }
     }
 
@@ -1520,26 +1495,9 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
         uint64_t kvp = (uint64_t)pos * kv_dim;
         f32_to_f16_buf(k, kcache + kvp, kv_dim);
         f32_to_f16_buf(v, vcache + kvp, kv_dim);
-        float* att = e->att;
         float inv_d = 1.0f / sqrtf((float)hd);
-        #pragma omp parallel for schedule(static)
-        for (hh = 0; hh < n_heads; hh++) {
-            float* att_h = att + (size_t)hh * e->max_seq;
-            uint32_t kv_head = hh * n_kv / n_heads;
-            const float* qh = q + (size_t)hh * hd;
-            uint32_t s;
-            for (s = 0; s <= pos; s++) {
-                const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-                att_h[s] = vec_dot_f32_f16(qh, kh, hd) * inv_d;
-            }
-            softmax(att_h, pos + 1);
-            float* out = att_out + (size_t)hh * hd;
-            memset(out, 0, (size_t)hd * 4);
-            for (s = 0; s <= pos; s++) {
-                const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-                vec_axpy_f16(out, vh, att_h[s], hd);
-            }
-        }
+        attn_kv_f16(att_out, q, kcache, vcache, 0, pos,
+                    n_heads, n_kv, hd, kv_dim, inv_d, 0.0f);
         /* gate 门控: att_out *= sigmoid(gate) */
         for (ii = 0; ii < qdim; ii++)
             att_out[ii] *= 1.0f / (1.0f + expf(-gate[ii]));
@@ -1720,7 +1678,6 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
         f32_to_f16_buf(v, vcache + kvp, kvd);
     }
 
-    float* att = e->att;
     float inv_d = (h->arch == ARCH_GEMMA4) ? 1.0f : 1.0f / sqrtf((float)hd);
     float attn_cap = 0.0f;
     uint32_t s0 = 0;
@@ -1730,27 +1687,8 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
         if (gemma4_is_swa(&g4, il) && g4.swa_window > 0 && pos + 1 > g4.swa_window)
             s0 = pos + 1 - g4.swa_window;
     }
-    /* 短序列 8 头 fork/join 比计算还贵 */
-    #pragma omp parallel for schedule(static) if((int)(pos + 1) >= 64)
-    for (hh = 0; hh < h->n_heads; hh++) {
-        float* att_h = att + (size_t)hh * e->max_seq;
-        uint32_t kv_head = hh * h->n_kv_heads / h->n_heads;
-        const float* qh = q + (size_t)hh * hd;
-        uint32_t s;
-        for (s = s0; s <= pos; s++) {
-            const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-            float sc = vec_dot_f32_f16(qh, kh, hd) * inv_d;
-            if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
-            att_h[s] = sc;
-        }
-        softmax(att_h + s0, pos + 1 - s0);
-        float* out = att_out + (size_t)hh * hd;
-        memset(out, 0, (size_t)hd * 4);
-        for (s = s0; s <= pos; s++) {
-            const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
-            vec_axpy_f16(out, vh, att_h[s], hd);
-        }
-    }
+    attn_kv_f16(att_out, q, kcache, vcache, s0, pos,
+                h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, attn_cap);
     memcpy(x2, att_out, (size_t)q_dim * 4);
     matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, q_dim, mt[SLOT_O].dtype);
     if (h->arch == ARCH_GEMMA4) {

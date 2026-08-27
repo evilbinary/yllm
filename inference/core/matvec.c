@@ -2778,6 +2778,35 @@ static void attn_gqa_kv_f16(float* out, const float* q,
     }
 }
 
+/* 单 query 头 online softmax(GQA 比大、KV 头少时按 Q 头并行) */
+static void attn_qh_kv_f16(float* og, const float* qh,
+                           const uint16_t* kcache, const uint16_t* vcache,
+                           uint32_t s0, uint32_t pos,
+                           uint32_t kv_head, uint32_t hd, uint32_t kv_dim,
+                           float inv_d, float attn_cap)
+{
+    uint32_t s;
+    float m = -INFINITY, l = 0.0f;
+    float* vtmp = (float*)alloca((size_t)hd * 4);
+    memset(og, 0, (size_t)hd * 4);
+    for (s = s0; s <= pos; s++) {
+        const uint16_t* kh = kcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+        const uint16_t* vh = vcache + (size_t)s * kv_dim + (size_t)kv_head * hd;
+        float sc, mnew, alpha, p;
+        f16_to_f32_n(vtmp, vh, hd);
+        sc = vec_dot_f32_f16(qh, kh, hd) * inv_d;
+        if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
+        mnew = (sc > m) ? sc : m;
+        alpha = (m == -INFINITY) ? 0.0f : expf(m - mnew);
+        p = expf(sc - mnew);
+        l = l * alpha + p;
+        if (alpha != 1.0f) vec_scale_f32(og, alpha, hd);
+        vec_axpy_f32(og, vtmp, p, hd);
+        m = mnew;
+    }
+    if (l > 0.0f) vec_scale_f32(og, 1.0f / l, hd);
+}
+
 void attn_kv_f16(float* out, const float* q,
                  const uint16_t* kcache, const uint16_t* vcache,
                  uint32_t s0, uint32_t pos,
@@ -2785,11 +2814,22 @@ void attn_kv_f16(float* out, const float* q,
                  float inv_d, float attn_cap)
 {
     uint32_t nkv = n_kv_heads ? n_kv_heads : 1;
-    uint32_t kvh;
+    uint32_t gqa = n_heads / nkv;
+    uint32_t kvh, hh;
     int nseq = (int)(pos + 1 - s0);
     if (n_heads == 0 || hd == 0 || s0 > pos) return;
-    #pragma omp parallel for schedule(static) if (nseq >= 64)
-    for (kvh = 0; kvh < nkv; kvh++)
-        attn_gqa_kv_f16(out, q, kcache, vcache, s0, pos, n_heads, nkv, hd, kv_dim,
-                        kvh, inv_d, attn_cap);
+    if (gqa == 0) gqa = 1;
+    /* KV 头够多时按 KV 并行(GQA 组内共用一次 K/V); 否则按 Q 头并行, 避免 8:1 时整层单线程 */
+    if (nkv >= 4 || gqa <= 2) {
+        #pragma omp parallel for schedule(static) if (nseq >= 64)
+        for (kvh = 0; kvh < nkv; kvh++)
+            attn_gqa_kv_f16(out, q, kcache, vcache, s0, pos, n_heads, nkv, hd, kv_dim,
+                            kvh, inv_d, attn_cap);
+    } else {
+        #pragma omp parallel for schedule(static) if (nseq >= 64)
+        for (hh = 0; hh < n_heads; hh++)
+            attn_qh_kv_f16(out + (size_t)hh * hd, q + (size_t)hh * hd,
+                           kcache, vcache, s0, pos, hh * nkv / n_heads, hd, kv_dim,
+                           inv_d, attn_cap);
+    }
 }
