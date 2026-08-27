@@ -477,11 +477,13 @@ int cuda_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
 
 void cuda_attach_fwd(Engine* e)
 {
-    e->fwd_block = cuda_fwd_block;
+    if (!e || !e->dev) return;
+    e->dev->fwd_block = cuda_fwd_block;
 #if defined(YLLM_CUDA) && !defined(YLLM_CUDA_HOST)
     if (e->device_mode == DEV_MODE_CUDA)
-        e->fwd_block_batch = cuda_fwd_block_batch;
+        e->dev->fwd_block_batch = cuda_fwd_block_batch;
 #else
+    e->dev->fwd_block_batch = NULL;
     (void)cuda_fwd_block_batch;
 #endif
 }

@@ -24,19 +24,23 @@ LIBS       :=
 INFER_INC := -Iinference/include -Iinference/cuda -Iinference/vulkan
 HDR_PUBLIC := inference/include/yllm.h inference/include/llf.h inference/include/convert.h \
 	inference/include/matvec.h inference/include/dist.h inference/include/device.h \
-	inference/include/log.h inference/include/cache.h
+	inference/include/arch.h inference/include/log.h inference/include/cache.h
 
 SRC := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
 	inference/convert/convert.c inference/convert/convert_safetensors.c inference/convert/convert_gguf.c \
 	inference/convert/dump.c \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
+	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
+	inference/arch/gemma4.c inference/arch/qwen35.c \
 	inference/core/cache.c inference/core/dist.c inference/device/device_cpu.c
 TEST_ENGINE_CORE := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
 	inference/convert/convert.c inference/convert/convert_safetensors.c inference/convert/convert_gguf.c \
 	inference/convert/dump.c \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
+	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
+	inference/arch/gemma4.c inference/arch/qwen35.c \
 	inference/device/device_cpu.c
 
 # ---- CUDA 后端(可选) ----

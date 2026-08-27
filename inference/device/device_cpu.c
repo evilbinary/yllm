@@ -14,7 +14,6 @@ static int cpu_load_weights(Engine* e, char* err, size_t errlen)
     e->d_kv = e->kv;
     e->weights_ready = 1;
     e->device_mode = DEV_MODE_CPU;
-    engine_attach_cpu_fwd(e);
     return 0;
 }
 
@@ -189,6 +188,11 @@ int vulkan_lm_fused_active(Engine* e)
     return 0;
 }
 int vulkan_lm_fused(Engine* e)
+{
+    (void)e;
+    return -1;
+}
+int vulkan_lm_or_fused(Engine* e)
 {
     (void)e;
     return -1;

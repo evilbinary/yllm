@@ -22,6 +22,11 @@ set(YLLM_SRCS
   ${INFER}/core/tokenizer.c
   ${INFER}/core/matvec.c
   ${INFER}/core/engine.c
+  ${INFER}/arch/arch.c
+  ${INFER}/arch/llama.c
+  ${INFER}/arch/qwen.c
+  ${INFER}/arch/gemma4.c
+  ${INFER}/arch/qwen35.c
   ${INFER}/core/cache.c
   ${INFER}/core/dist.c
   ${INFER}/device/device_cpu.c

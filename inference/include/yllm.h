@@ -3,6 +3,7 @@
 
 #include "llf.h"
 #include "device.h"
+#include "arch.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -118,10 +119,8 @@ typedef struct Engine {
     uint32_t kv_dim;
     uint32_t max_seq;
     uint32_t inter;   /* FFN 中间维度(gate/up 输出宽) */
-    uint32_t arch;    /* 架构(ARCH_LLAMA/ARCH_QWEN/ARCH_QWEN35), engine_init 从 header 读入 */
-    /* 层前向分派(engine_init 填一次): 不同架构挂不同实现 */
-    int (*fwd_block)(struct Engine* e, uint32_t layer, uint32_t pos);
-    int (*fwd_block_batch)(struct Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
+    uint32_t arch;    /* ARCH_* id(与 ops->id 相同, 日志/旧路径) */
+    const ArchOps* ops; /* const 图: CPU fwd_block; Device 可覆盖 */
     uint32_t layer_begin; /* 分布式分片: 本进程层区间 [begin, end) */
     uint32_t layer_end;
     float* x; /* 单 token 路径的主激活缓冲 */
@@ -174,12 +173,53 @@ typedef struct Engine {
     int weights_ready;       /* load_weights 成功 */
     DeviceMode device_mode;  /* 实际前向路径; load_weights / bind 时置位 */
     CudaWeightMode cuda_wmode; /* CUDA 线性权: auto|q4k|fp16; bind 前设置 */
-    /* 单进程混合: 0 = 本段全在 device_mode 上; >0 = 层 [layer_begin, gpu_layer_end) 用 CUDA,
-     * [gpu_layer_end, layer_end) 用 CPU(须先 bind CUDA)。PP 多 rank 时一般保持 0。 */
+    /* 单进程混合: 0 = 本段能 GPU 的层全走 Device.fwd_block; >0 = 层 i < gpu_layer_end
+     * 走 Device, 其余走 Arch CPU(前 GPU 后 CPU)。PP 多 rank 时一般保持 0。 */
     uint32_t gpu_layer_end;
     /* 1 = 权常驻 host 打包缓冲, 按层 H2D(prefetch_layer); 0 = load 时整段上卡 */
     int cuda_stream_w;
 } Engine;
+
+/* 混合切分: gpu_layer_end==0 表示本段全部算「设备范围」(能否真 GPU 看 Device 指针)。 */
+static inline int layer_in_gpu_range(const Engine* e, uint32_t i)
+{
+    if (!e) return 0;
+    if (!e->gpu_layer_end) return 1;
+    return i < e->gpu_layer_end;
+}
+
+/* transformer 块是否走 Device.fwd_block(混合时切点之后为 0 → Arch CPU) */
+static inline int layer_on_device(const Engine* e, uint32_t i)
+{
+    if (!e || !e->dev || !e->dev->fwd_block) return 0;
+    return layer_in_gpu_range(e, i);
+}
+
+static inline int engine_call_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
+{
+    if (layer_on_device(e, layer))
+        return e->dev->fwd_block(e, layer, pos);
+    if (!e->ops || !e->ops->fwd_block) return -1;
+    return e->ops->fwd_block(e, layer, pos);
+}
+
+static inline int engine_call_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B)
+{
+    if (layer_on_device(e, layer) && e->dev->fwd_block_batch)
+        return e->dev->fwd_block_batch(e, layer, pos0, B);
+    if (!e->ops || !e->ops->fwd_block_batch) return -1;
+    return e->ops->fwd_block_batch(e, layer, pos0, B);
+}
+
+static inline void engine_dev_sync_x(Engine* e)
+{
+    if (e && e->dev && e->dev->sync_x) e->dev->sync_x(e);
+}
+
+static inline void engine_dev_mark_x_host(Engine* e)
+{
+    if (e && e->dev && e->dev->mark_x_host) e->dev->mark_x_host(e);
+}
 
 typedef struct {
     uint32_t n_prefill;
@@ -199,7 +239,7 @@ int engine_load_weights(Engine* e, char* err, size_t errlen);
  * CUDA host-shim 的 load_weights 把权拷到 w_dev 后复用此函数校验/过渡。 */
 int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
                         const uint8_t* layer_base, uint16_t* kv);
-/* 恢复 CPU fwd_block 指针(按 arch) */
+/* 清掉 Device 上的层内核覆盖(回到 Arch CPU)。load_weights / host-shim 会再挂 GPU。 */
 void engine_attach_cpu_fwd(Engine* e);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,

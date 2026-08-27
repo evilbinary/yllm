@@ -675,7 +675,9 @@ static int vulkan_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 
 void vulkan_attach_fwd(Engine* e)
 {
-    engine_attach_cpu_fwd(e);
+    if (!e || !e->dev) return;
+    e->dev->fwd_block = NULL;
+    e->dev->fwd_block_batch = NULL;
     if (e->device_mode != DEV_MODE_VULKAN || !e->w_dev) return;
     {
         VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
@@ -688,7 +690,7 @@ void vulkan_attach_fwd(Engine* e)
         /* gemv/block 都关时必须走 CPU, 否则 stream 失败会被 engine 忽略, 整层跳过 */
         if (!ctx->gemv_ready && !ctx->block_ready && !ctx->fuse_ready)
             return;
-        e->fwd_block = vulkan_fwd_block;
+        e->dev->fwd_block = vulkan_fwd_block;
     }
 }
 
@@ -696,6 +698,7 @@ void vulkan_attach_fwd(Engine* e)
 int vulkan_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
     if (!e || e->device_mode != DEV_MODE_VULKAN || !tokens || n <= 0) return -1;
+    if (e->gpu_layer_end) return -1; /* 混合切层: 走逐层 engine_call_fwd_block */
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     if (!ctx || ctx->host_shim || !ctx->wq_resident) return -1;
     if (e->arch == ARCH_GEMMA4 || e->arch == ARCH_QWEN35) return -1;
@@ -958,4 +961,10 @@ int vulkan_lm_fused(Engine* e)
                               upload, upload ? e->x : NULL);
     if (r != 0) vulkan_gpu_discard(ctx);
     return r;
+}
+
+int vulkan_lm_or_fused(Engine* e)
+{
+    if (vulkan_lm_fused(e) == 0) return 0;
+    return vulkan_lm_head(e);
 }

@@ -47,6 +47,20 @@ typedef struct Device {
     /* 大模型流式可选; CPU/小模型可为 NULL */
     int (*prefetch_layer)(Engine* e, uint32_t layer);
     void (*release_layer)(Engine* e, uint32_t layer);
+
+    /* 下面 0=成功, -1=调用方走 CPU。NULL 视为 -1。
+     * fwd_block: 可选覆盖 Arch CPU 图; 混合切分见 Engine.gpu_layer_end。 */
+    int  (*embed)(Engine* e, uint32_t token);
+    void (*after_cpu_embed)(Engine* e);
+    int  (*final_norm)(Engine* e);
+    int  (*lm_head)(Engine* e);
+    int  (*prefill)(Engine* e, const uint32_t* tokens, int n, int start_pos);
+    void (*sync_x)(Engine* e);
+    void (*mark_x_host)(Engine* e);
+    int  (*forward_batch_x)(Engine* e, const float* xin, int n, uint32_t pos,
+                            float* x_out, float* logits_out);
+    int  (*fwd_block)(Engine* e, uint32_t layer, uint32_t pos);
+    int  (*fwd_block_batch)(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
 } Device;
 
 /* 解析 "cpu" / "cuda" / "vulkan"(大小写不敏感); 未知返回 -1 */
@@ -73,6 +87,7 @@ int vulkan_final_norm(Engine* e);
 int vulkan_lm_head(Engine* e);
 int vulkan_lm_fused_active(Engine* e);
 int vulkan_lm_fused(Engine* e);
+int vulkan_lm_or_fused(Engine* e);
 int vulkan_embed(Engine* e, uint32_t token);
 void vulkan_after_embed(Engine* e);
 void vulkan_sync_x(Engine* e);

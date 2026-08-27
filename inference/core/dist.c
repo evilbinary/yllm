@@ -849,7 +849,7 @@ int dist_gen(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
                 /* 单 token(decode): 走单发路径 —— 批量路径在 B=1 时反量化开销
                  * 无 batch 分摊, 比单发优化版 matmul 慢 ~7 倍 */
                 memcpy(e->x, xbuf, (size_t)hidden * 4);
-                cuda_mark_x_host(e);
+                engine_dev_mark_x_host(e);
                 if (rank == ranks - 1) {
                     engine_forward_range(e, tokbuf[0], 0, pos, NULL, e->logits);
                     uint64_t f1 = ynow_ms();

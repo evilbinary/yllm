@@ -707,6 +707,14 @@ Device* device_create_cuda(int device_id, char* err, size_t errlen)
     d->free_dev = cuda_free_dev;
     d->prefetch_layer = cuda_prefetch_layer;
     d->release_layer = cuda_release_layer;
+    d->embed = cuda_embed;
+    d->after_cpu_embed = cuda_mark_x_host;
+    d->final_norm = cuda_final_norm;
+    d->lm_head = cuda_lm_head;
+    d->prefill = cuda_prefill;
+    d->sync_x = cuda_sync_x_to_host;
+    d->mark_x_host = cuda_mark_x_host;
+    d->forward_batch_x = cuda_forward_batch_x;
     if (host_shim)
         ylog_info("cuda: host-shim device (weights mirrored in RAM; CPU compute)");
     else

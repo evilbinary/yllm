@@ -229,6 +229,59 @@ static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t
     }
 }
 
+void arch_gemma4_after_embed(Engine* e, uint32_t token)
+{
+    uint32_t hidden = e->ws.model.h.hidden;
+    float scale = sqrtf((float)hidden);
+    uint32_t j;
+    for (j = 0; j < hidden; j++) e->x[j] *= scale;
+    gemma4_prepare_ple(e, token);
+}
+
+void arch_gemma4_after_embed_batch(Engine* e, const uint32_t* tokens, uint32_t B)
+{
+    uint32_t hidden = e->ws.model.h.hidden;
+    float scale = sqrtf((float)hidden);
+    uint32_t b2, j;
+    for (b2 = 0; b2 < B; b2++)
+        for (j = 0; j < hidden; j++)
+            e->pb[(size_t)b2 * hidden + j] *= scale;
+    if (e->ple_batch && e->n_ple)
+        gemma4_prepare_ple_batch(e, tokens, B);
+}
+
+void arch_gemma4_refresh_ple_pp(Engine* e, uint32_t token)
+{
+    gemma4_refresh_ple_pp(e, token);
+}
+
+void arch_gemma4_post_logits(Engine* e)
+{
+    float cap = llf_gemma4_final_cap(&e->ws.model.h);
+    if (cap > 0.0f) {
+        uint32_t vi, vocab = e->ws.model.h.vocab;
+        for (vi = 0; vi < vocab; vi++)
+            e->logits[vi] = cap * tanhf(e->logits[vi] / cap);
+    }
+}
+
+static void engine_embed_into(Engine* e, float* dst, uint32_t token)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[0].offset;
+    const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
+    switch (tm->dtype) {
+    case DT_F32: embed_f32(dst, base + tm->offset, token, h->hidden); break;
+    case DT_Q4K: embed_q4k(dst, base + tm->offset, token, h->hidden); break;
+    case DT_Q6K: embed_q6k(dst, base + tm->offset, token, h->hidden); break;
+    case DT_Q5K: embed_q5k(dst, base + tm->offset, token, h->hidden); break;
+    case DT_IQ4XS: embed_iq4xs(dst, base + tm->offset, token, h->hidden); break;
+    default: embed_f16(dst, base + tm->offset, token, h->hidden); break;
+    }
+}
+
 static int cmp_prob_desc(const void* a, const void* b)
 {
     float pa = ((const ProbIdx*)a)->prob;
@@ -378,14 +431,7 @@ static void sched_release_budget(Ws* ws, uint32_t cur)
     }
 }
 
-/* ---- 层前向分派: 各架构实现 ----
- * fwd_block / fwd_block_batch 由 engine_init 按 arch 填一次;
- * 默认(LLAMA/QWEN)与 qwen35 各有一套实现。 */
-static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos);
-static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
-static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos);
-static int fwd_block_qwen35_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
-static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B);
+/* ---- 层前向: CPU 图在 ArchOps; GPU 覆盖在 Device.fwd_block ---- */
 #if YLLM_TENSOR_STREAM
 /* 页对齐的 lm_head 分块行数: 最大 C <= max_rows 使 C*行字节 % 4096 == 0。
  * 非量化(整行矩阵)返回 0 → 不分块整算。 */
@@ -687,9 +733,14 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
             e->mtp_layer = 0;
         }
     }
-    /* 层前向分派: 按架构挂实现(一次) */
+    /* 层前向: 按 header.arch 绑 const 图 */
     e->arch = m->h.arch;
-    engine_attach_cpu_fwd(e);
+    e->ops = arch_lookup(m->h.arch);
+    if (!e->ops) {
+        snprintf(err, errlen, "unknown arch %u", m->h.arch);
+        engine_free(e);
+        return -1;
+    }
 #if defined(__aarch64__)
     {
         int i8mm = 0;
@@ -827,7 +878,7 @@ void engine_free(Engine* e)
 }
 
 /* 批量前向一层: 同时处理 B 个 token(pos 连续: pos_start..pos_start+B-1) */
-static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
+int arch_llama_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -961,23 +1012,11 @@ static int forward_block_batch_default(Engine* e, uint32_t layer, uint32_t pos_s
 /* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
 int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
-    /* GPU: 批 embed + GEMM + 因果 attn, KV 写 d_kv */
-    if (e->device_mode == DEV_MODE_CUDA) {
-        if (cuda_prefill(e, tokens, n, start_pos) == 0)
+    if (e->dev && e->dev->prefill) {
+        if (e->dev->prefill(e, tokens, n, start_pos) == 0)
             return 0;
-        /* 回退逐 token */
-        int i;
-        for (i = 0; i < n; i++) {
-            if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
-                return -1;
-        }
-        return 0;
-    }
-    /* Vulkan: 层外批 prefill(摊销 stream); gemma4/qwen35 走 CPU 批量(含 PLE/GEGLU) */
-    if (e->device_mode == DEV_MODE_VULKAN) {
-        if (vulkan_prefill(e, tokens, n, start_pos) == 0)
-            return 0;
-        if (e->arch != ARCH_GEMMA4 && e->arch != ARCH_QWEN35) {
+        /* GPU 失败: gemma/qwen35 走 CPU 批; 其余退回逐 token */
+        if (!e->ops || !e->ops->cpu_batch_prefill) {
             int i;
             for (i = 0; i < n; i++) {
                 if (engine_forward(e, tokens[i], (uint32_t)(start_pos + i)) != 0)
@@ -990,17 +1029,12 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
     uint32_t hidden = h->hidden;
-    uint32_t hidx0 = m->base_idx[0];
-    const LlfTensorMeta* tm = &m->metas[hidx0];
-    const uint8_t* base = (const uint8_t*)ws->map.base;
     uint32_t B = e->pb_cap ? e->pb_cap : 16;
-    uint32_t batch_min = (h->arch == ARCH_GEMMA4) ? PREFILL_BATCH_MIN_GEMMA4 : PREFILL_BATCH_MIN;
-    size_t ple_stride = (e->n_ple > 0) ? (size_t)e->n_ple * h->n_blocks : 0;
+    uint32_t batch_min = (e->ops && e->ops->id == ARCH_GEMMA4) ? PREFILL_BATCH_MIN_GEMMA4 : PREFILL_BATCH_MIN;
     int off = 0;
     while (off < n) {
         uint32_t nb = (uint32_t)(n - off);
         if (nb > B) nb = B;
-        /* 小批批量收益不抵反量化/调度开销, 回退顺序逐 token */
         if (nb < batch_min) {
             uint32_t i;
             for (i = 0; i < nb; i++)
@@ -1008,42 +1042,24 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             off += (int)nb;
             continue;
         }
-        /* embed 全部 batch token */
         uint32_t b;
-        for (b = 0; b < nb; b++) {
-            const uint8_t* emb = base + m->dir[0].offset;
-            switch (tm->dtype) {
-            case DT_F32: embed_f32(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
-            case DT_Q4K: embed_q4k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
-            case DT_Q6K: embed_q6k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
-            case DT_Q5K: embed_q5k(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
-            case DT_IQ4XS: embed_iq4xs(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
-            default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[off + b], hidden); break;
-            }
-        }
-        /* gemma4: embed × sqrt(hidden), 再为每个 token 准备 PLE */
-        if (h->arch == ARCH_GEMMA4) {
-            float scale = sqrtf((float)hidden);
-            uint32_t b2, j;
-            for (b2 = 0; b2 < nb; b2++)
-                for (j = 0; j < hidden; j++)
-                    e->pb[(size_t)b2 * hidden + j] *= scale;
-            if (e->ple_batch && ple_stride > 0)
-                gemma4_prepare_ple_batch(e, tokens + off, nb);
-        }
+        for (b = 0; b < nb; b++)
+            engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[off + b]);
+        if (e->ops && e->ops->after_embed_batch)
+            e->ops->after_embed_batch(e, tokens + off, nb);
         uint32_t i;
         uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
         for (i = 1; i <= trunk; i++) {
             if (ws->budget > 0) sched_ensure(ws, i);
-            e->fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
+            engine_call_fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
             if (ws->budget > 0) sched_release_budget(ws, i);
         }
         if (e->mtp_h) {
             memcpy(e->mtp_h, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
             e->mtp_h_ready = 1;
         }
-        /* 最后一层: final norm + output(只算最后 token) */
         {
+            const uint8_t* base = (const uint8_t*)ws->map.base;
             const LlfTensorMeta* fn = &m->metas[m->base_idx[h->n_blocks + 1]];
             const LlfTensorMeta* out = &m->metas[m->base_idx[h->n_blocks + 2]];
             float eps;
@@ -1053,8 +1069,6 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
                 rmsnorm(e->x, xlast, base + m->dir[h->n_blocks + 1].offset + fn->offset,
                         hidden, eps, fn->dtype);
 #if YLLM_TENSOR_STREAM
-                /* 受限模式: 量化 lm_head 按页对齐行分块, 每块算完 munmap 释放
-                 * (页缓存保留, 下个 token 重读是 minor fault); 尾块保留驻留。 */
                 if (ws->budget > 0) {
                     size_t rbytes = matmul_row_bytes(out->dtype, h->hidden);
                     uint32_t dl = h->n_blocks + 2;
@@ -1073,15 +1087,8 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
                 matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
                        h->vocab, hidden, out->dtype);
 #endif
-                /* gemma4 final logit soft-capping */
-                if (h->arch == ARCH_GEMMA4) {
-                    float cap = llf_gemma4_final_cap(h);
-                    if (cap > 0.0f) {
-                    uint32_t vi;
-                    for (vi = 0; vi < h->vocab; vi++)
-                        e->logits[vi] = cap * tanhf(e->logits[vi] / cap);
-                    }
-                }
+                if (e->ops && e->ops->post_logits)
+                    e->ops->post_logits(e);
             }
         }
         off += (int)nb;
@@ -1101,7 +1108,7 @@ static uint32_t gdn_index_of(const LlModel* m, uint32_t layer)
 }
 
 /* gemma4 批量前向: QKV/O/FFN 走 matmul_batch; attn/PLE 按 token */
-static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
+int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -1151,7 +1158,7 @@ static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start,
             memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
             if (e->ple && e->ple_batch && ple_stride)
                 memcpy(e->ple, e->ple_batch + (size_t)b * ple_stride, ple_stride * 4);
-            if (e->fwd_block(e, layer, pos_start + b) != 0) return -1;
+            if (e->ops->fwd_block(e, layer, pos_start + b) != 0) return -1;
             memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
         }
         return 0;
@@ -1287,21 +1294,21 @@ static int fwd_block_gemma4_batch(Engine* e, uint32_t layer, uint32_t pos_start,
 }
 
 /* qwen35 混合架构批量前向: GDN 状态在层内连续, 退化为逐 token */
-static int fwd_block_qwen35_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
+int arch_qwen35_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
-    /* 批量输入/输出在 e->pb, 而 fwd_block_qwen35 就地读写 e->x: 逐 token 拷贝进出 */
+    /* 批量输入/输出在 e->pb, 而 arch_qwen35_fwd_block 就地读写 e->x: 逐 token 拷贝进出 */
     uint32_t hidden = e->ws.model.h.hidden;
     uint32_t b;
     for (b = 0; b < B; b++) {
         memcpy(e->x, e->pb + (size_t)b * hidden, (size_t)hidden * 4);
-        if (e->fwd_block(e, layer, pos_start + b) != 0) return -1;
+        if (e->ops->fwd_block(e, layer, pos_start + b) != 0) return -1;
         memcpy(e->pb + (size_t)b * hidden, e->x, (size_t)hidden * 4);
     }
     return 0;
 }
 
 /* qwen35 混合架构单层前向: Gated Attention 层 + GDN 层 */
-static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
+int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -1527,7 +1534,7 @@ static int fwd_block_qwen35(Engine* e, uint32_t layer, uint32_t pos)
     return 0;
 }
 
-static int forward_block_default(Engine* e, uint32_t layer, uint32_t pos)
+int arch_llama_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
     const uint8_t* base = (const uint8_t*)e->ws.map.base + e->ws.model.dir[layer].offset;
     return engine_fwd_block_at(e, layer, pos, base, e->kv);
@@ -1754,25 +1761,10 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
 
 void engine_attach_cpu_fwd(Engine* e)
 {
-    if (e->arch == ARCH_QWEN35) {
-        e->fwd_block = fwd_block_qwen35;
-        e->fwd_block_batch = fwd_block_qwen35_batch;
-    } else if (e->arch == ARCH_GEMMA4) {
-        e->fwd_block = forward_block_default;
-        /* QKV/O/FFN matmul_batch; attn/PLE 按 token */
-        e->fwd_block_batch = fwd_block_gemma4_batch;
-    } else {
-        e->fwd_block = forward_block_default;
-        e->fwd_block_batch = forward_block_batch_default;
+    if (e && e->dev) {
+        e->dev->fwd_block = NULL;
+        e->dev->fwd_block_batch = NULL;
     }
-}
-
-/* 单层是否走 CUDA(含单进程 gpu_layer_end 混合切分) */
-static int layer_on_cuda(const Engine* e, uint32_t i)
-{
-    if (e->device_mode != DEV_MODE_CUDA) return 0;
-    if (!e->gpu_layer_end) return 1;
-    return i < e->gpu_layer_end;
 }
 
 /* 单层前向(含 embed / block / final norm / head 分派) */
@@ -1782,115 +1774,79 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
     const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[i].offset;
-    int on_cuda = layer_on_cuda(e, i);
+    int on_dev = layer_in_gpu_range(e, i);
     if (i == 0) {
-        if (on_cuda && cuda_embed(e, token) == 0) {
-            /* GPU embed: d_x 已权威 */
-        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_embed(e, token) == 0) {
-            /* GPU Q4_K embed → buf_x */
-        } else {
-        const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
-        switch (tm->dtype) {
-        case DT_F32: embed_f32(e->x, base + tm->offset, token, h->hidden); break;
-        case DT_Q4K: embed_q4k(e->x, base + tm->offset, token, h->hidden); break;
-        case DT_Q6K: embed_q6k(e->x, base + tm->offset, token, h->hidden); break;
-        case DT_Q5K: embed_q5k(e->x, base + tm->offset, token, h->hidden); break;
-        case DT_IQ4XS: embed_iq4xs(e->x, base + tm->offset, token, h->hidden); break;
-        default: embed_f16(e->x, base + tm->offset, token, h->hidden); break;
+        int got = 0;
+        if (on_dev && e->dev && e->dev->embed && e->dev->embed(e, token) == 0)
+            got = 1;
+        if (!got) {
+            engine_embed_into(e, e->x, token);
+            engine_dev_mark_x_host(e);
         }
-        cuda_mark_x_host(e); /* CPU embed → 下次 GPU 块从 e->x H2D */
-        vulkan_after_embed(e);
-        }
-        /* gemma4: embed 需乘以 sqrt(hidden), 再算 per-layer embedding */
-        if (h->arch == ARCH_GEMMA4) {
-            float scale = sqrtf((float)h->hidden);
-            uint32_t j;
-            for (j = 0; j < h->hidden; j++) e->x[j] *= scale;
-            gemma4_prepare_ple(e, token);
-        }
+        if (e->ops && e->ops->after_embed)
+            e->ops->after_embed(e, token);
     } else if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
-        /* 必须走 e->fwd_block。勿写死 engine_fwd_block_at, 否则 Qwen3.5 CPU 会走错内核。 */
-        if (e->device_mode == DEV_MODE_CUDA && !on_cuda) {
-            cuda_sync_x_to_host(e);
-            cuda_mark_x_host(e);
+        if (!layer_on_device(e, i) && e->dev && e->dev->fwd_block) {
+            /* 混合切点: GPU 激活 → host, 后续 Arch CPU */
+            engine_dev_sync_x(e);
+            engine_dev_mark_x_host(e);
         }
-        e->fwd_block(e, i, pos);
+        engine_call_fwd_block(e, i, pos);
         if (e->mtp_h && i == (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
-            cuda_sync_x_to_host(e);
+            engine_dev_sync_x(e);
             memcpy(e->mtp_h, e->x, (size_t)h->hidden * 4);
             e->mtp_h_ready = 1;
         }
     } else if (e->mtp_layer && i == e->mtp_layer) {
         /* MTP 块不进主干, 仅 MTP 预测时使用 */
     } else if (i == h->n_blocks + 1) {
-        if (e->device_mode == DEV_MODE_VULKAN && vulkan_lm_fused_active(e)) {
-            /* final norm 合入 lm_fused */
-        } else if (on_cuda && cuda_final_norm(e) == 0) {
-            /* GPU final norm */
-        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_final_norm(e) == 0) {
-            /* Vulkan final norm */
-        } else {
-        if (e->device_mode == DEV_MODE_CUDA) {
-            cuda_sync_x_to_host(e);
-            cuda_mark_x_host(e);
-        }
-        if (e->device_mode == DEV_MODE_VULKAN)
-            vulkan_sync_x(e);
-        float eps;
-        memcpy(&eps, &h->norm_eps_bits, 4);
-        const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-        rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
+        int got = 0;
+        if (on_dev && e->dev && e->dev->final_norm && e->dev->final_norm(e) == 0)
+            got = 1;
+        if (!got) {
+            engine_dev_sync_x(e);
+            engine_dev_mark_x_host(e);
+            float eps;
+            memcpy(&eps, &h->norm_eps_bits, 4);
+            const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
+            rmsnorm(e->x, e->x, base + tm->offset, h->hidden, eps, tm->dtype);
         }
     } else {
-        if (on_cuda && cuda_lm_head(e) == 0) {
-            /* GPU lm_head */
-        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_lm_fused(e) == 0) {
-            /* Vulkan fused norm+q8k+lm */
-        } else if (e->device_mode == DEV_MODE_VULKAN && vulkan_lm_head(e) == 0) {
-            /* Vulkan lm_head */
-        } else {
-        if (e->device_mode == DEV_MODE_CUDA) {
-            cuda_sync_x_to_host(e);
-            cuda_mark_x_host(e);
-        }
-        if (e->device_mode == DEV_MODE_VULKAN)
-            vulkan_sync_x(e);
-        const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
-        if (tm->ndim == 2 && tm->size >= (uint64_t)h->hidden * 4) {
+        int got = 0;
+        if (on_dev && e->dev && e->dev->lm_head && e->dev->lm_head(e) == 0)
+            got = 1;
+        if (!got) {
+            engine_dev_sync_x(e);
+            engine_dev_mark_x_host(e);
+            const LlfTensorMeta* tm = &m->metas[m->base_idx[i]];
+            if (tm->ndim == 2 && tm->size >= (uint64_t)h->hidden * 4) {
 #if YLLM_TENSOR_STREAM
-            /* 受限模式: 量化 lm_head 按页对齐行分块, 每块算完 munmap 释放
-             * (页缓存保留, 下个 token 重读是 minor fault); 尾块保留驻留。 */
-            size_t rbytes = matmul_row_bytes(tm->dtype, h->hidden);
-            if (ws->budget > 0 && rbytes > 0) {
-                lm_head_chunked(e, base + tm->offset,
-                                m->dir[i].offset + tm->offset,
-                                h->hidden, h->vocab, tm->dtype);
-                return;
-            }
-            matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
-            if (ws->budget > 0) ws_release(ws, i);
+                size_t rbytes = matmul_row_bytes(tm->dtype, h->hidden);
+                if (ws->budget > 0 && rbytes > 0) {
+                    lm_head_chunked(e, base + tm->offset,
+                                    m->dir[i].offset + tm->offset,
+                                    h->hidden, h->vocab, tm->dtype);
+                    if (e->ops && e->ops->post_logits)
+                        e->ops->post_logits(e);
+                    return;
+                }
+                matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+                if (ws->budget > 0) ws_release(ws, i);
 #else
-            matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+                matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
 #endif
-        } else {
-            switch (tm->dtype) {
-            case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
-            case DT_Q4K: matmul_q4k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
-            case DT_Q6K: matmul_q6k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
-            case DT_IQ4XS: matmul_iq4xs(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
-            default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+            } else {
+                switch (tm->dtype) {
+                case DT_F32: matmul_f32_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+                case DT_Q4K: matmul_q4k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+                case DT_Q6K: matmul_q6k(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+                case DT_IQ4XS: matmul_iq4xs(e->logits, e->x, base + tm->offset, h->vocab, h->hidden); break;
+                default: matmul_f16_t(e->logits, e->x, base + tm->offset, h->hidden, h->vocab); break;
+                }
             }
         }
-        }
-        /* gemma4 final logit soft-capping(CPU 与 Vulkan/CUDA lm_head 之后都要做) */
-        if (h->arch == ARCH_GEMMA4) {
-            float cap = llf_gemma4_final_cap(h);
-            if (cap > 0.0f) {
-                uint32_t vi;
-                for (vi = 0; vi < h->vocab; vi++)
-                    e->logits[vi] = cap * tanhf(e->logits[vi] / cap);
-            }
-        }
+        if (e->ops && e->ops->post_logits)
+            e->ops->post_logits(e);
     }
 }
 
@@ -1947,10 +1903,9 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
 #endif
     } else if (!need_embed) {
         /* PP 中段等: 调用方已把激活写入 e->x, 设备侧可能仍是旧 d_x */
-        cuda_mark_x_host(e);
-        /* gemma4 PLE 依赖 token embed, 下游无 embed 须按 token 重算 */
-        if (e->n_ple && e->layer_begin > 0 && h->arch == ARCH_GEMMA4)
-            gemma4_refresh_ple_pp(e, token);
+        engine_dev_mark_x_host(e);
+        if (e->ops && e->ops->refresh_ple_pp)
+            e->ops->refresh_ple_pp(e, token);
     }
     for (i = e->layer_begin; i < e->layer_end; i++) {
         uint64_t t0 = 0;
@@ -2035,7 +1990,7 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
         }
     }
     if (x_out) {
-        cuda_sync_x_to_host(e);
+        engine_dev_sync_x(e);
         memcpy(x_out, e->x, (size_t)h->hidden * 4);
     }
     if (logits_out) memcpy(logits_out, e->logits, (size_t)h->vocab * 4);
@@ -2054,8 +2009,8 @@ int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32
     uint32_t hidden = h->hidden;
     uint32_t B = e->pb_cap ? e->pb_cap : 16;
     if (n < 1 || (uint32_t)n > B) return -1;
-    /* CUDA: fwd_block_batch 读 d_pb, 不能走 host e->pb 嵌入; 逐 token range 保正确 */
-    if (e->device_mode == DEV_MODE_CUDA) {
+    /* CUDA/Vulkan 批路径读设备激活; 走逐 token range 保正确 */
+    if (e->dev && e->dev->fwd_block && e->device_mode != DEV_MODE_CPU) {
         int i;
         for (i = 0; i < n; i++) {
             if (engine_forward_range(e, tokens[i], 1, pos + (uint32_t)i,
@@ -2066,36 +2021,16 @@ int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32
         return 0;
     }
     if (e->layer_begin == 0) {
-        uint32_t hidx0 = m->base_idx[0];
-        const LlfTensorMeta* tm = &m->metas[hidx0];
-        const uint8_t* base = (const uint8_t*)ws->map.base;
-        const uint8_t* emb = base + m->dir[0].offset;
         uint32_t b;
-        for (b = 0; b < (uint32_t)n; b++) {
-            switch (tm->dtype) {
-            case DT_F32: embed_f32(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_Q4K: embed_q4k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_Q6K: embed_q6k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_Q5K: embed_q5k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_IQ4XS: embed_iq4xs(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            }
-        }
-        /* gemma4: embed × sqrt(hidden) + PLE(与单机 prefill 一致) */
-        if (h->arch == ARCH_GEMMA4) {
-            float scale = sqrtf((float)hidden);
-            uint32_t b2, j;
-            for (b2 = 0; b2 < (uint32_t)n; b2++)
-                for (j = 0; j < hidden; j++)
-                    e->pb[(size_t)b2 * hidden + j] *= scale;
-            if (e->ple_batch && e->n_ple)
-                gemma4_prepare_ple_batch(e, tokens, (uint32_t)n);
-        }
+        for (b = 0; b < (uint32_t)n; b++)
+            engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[b]);
+        if (e->ops && e->ops->after_embed_batch)
+            e->ops->after_embed_batch(e, tokens, (uint32_t)n);
     }
     uint32_t i;
     for (i = e->layer_begin; i < e->layer_end; i++) {
         if (i == 0 || i > h->n_blocks) continue;
-        e->fwd_block_batch(e, i, pos, (uint32_t)n);
+        engine_call_fwd_block_batch(e, i, pos, (uint32_t)n);
     }
     if (x_out) {
         uint32_t b;
@@ -2112,15 +2047,15 @@ int engine_forward_batch_tokens(Engine* e, const uint32_t* tokens, int n, uint32
 int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
                            float* x_out, float* logits_out, const uint32_t* tokens)
 {
-    if (e->device_mode == DEV_MODE_CUDA) {
-        if (!tokens && cuda_forward_batch_x(e, xin, n, pos, x_out, logits_out) == 0)
+    if (e->dev && e->dev->forward_batch_x) {
+        if (!tokens && e->dev->forward_batch_x(e, xin, n, pos, x_out, logits_out) == 0)
             return 0;
         /* 回退: 逐 token(带 token 时刷新 gemma4 PLE) */
         uint32_t hidden = e->ws.model.h.hidden;
         int i;
         for (i = 0; i < n; i++) {
             memcpy(e->x, xin + (size_t)i * hidden, (size_t)hidden * 4);
-            cuda_mark_x_host(e);
+            engine_dev_mark_x_host(e);
             uint32_t tok = tokens ? tokens[i] : 0;
             if (i + 1 == n && logits_out) {
                 if (engine_forward_range(e, tok, 0, pos + (uint32_t)i, NULL, logits_out) != 0)
@@ -2143,25 +2078,11 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
     uint32_t B = e->pb_cap ? e->pb_cap : 16;
     if (n < 1 || (uint32_t)n > B) return -1;
     /* gemma4 PP: 先用 token embed 填 pb 算 PLE, 再覆盖为上游激活 */
-    if (tokens && e->n_ple && h->arch == ARCH_GEMMA4 && e->ple_batch) {
-        const uint8_t* base = (const uint8_t*)ws->map.base;
-        const LlfTensorMeta* tm = &m->metas[m->base_idx[0]];
-        const uint8_t* emb = base + m->dir[0].offset;
-        float scale = sqrtf((float)hidden);
-        uint32_t b, j;
-        for (b = 0; b < (uint32_t)n; b++) {
-            switch (tm->dtype) {
-            case DT_F32: embed_f32(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_Q4K: embed_q4k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_Q6K: embed_q6k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_Q5K: embed_q5k(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            case DT_IQ4XS: embed_iq4xs(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            default: embed_f16(e->pb + (size_t)b * hidden, emb, tokens[b], hidden); break;
-            }
-            for (j = 0; j < hidden; j++)
-                e->pb[(size_t)b * hidden + j] *= scale;
-        }
-        gemma4_prepare_ple_batch(e, tokens, (uint32_t)n);
+    if (tokens && e->n_ple && e->ops && e->ops->after_embed_batch && e->ple_batch) {
+        uint32_t b;
+        for (b = 0; b < (uint32_t)n; b++)
+            engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[b]);
+        e->ops->after_embed_batch(e, tokens, (uint32_t)n);
     }
     uint32_t b;
     for (b = 0; b < (uint32_t)n; b++)
@@ -2173,7 +2094,7 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
     for (i = e->layer_begin; i < e->layer_end; i++) {
         if (i == 0) continue;
         if (i <= (h->n_blocks - (e->mtp_layer ? 1u : 0u))) {
-            e->fwd_block_batch(e, i, pos, (uint32_t)n);
+            engine_call_fwd_block_batch(e, i, pos, (uint32_t)n);
             if (getenv("YLLM_NANDBG") && e->pb[0] != e->pb[0])
                 fprintf(stderr, "[nandbg] batch NaN after layer %u pos %u\n", i, pos);
         } else if (e->mtp_layer && i == e->mtp_layer) {
@@ -2186,6 +2107,8 @@ int engine_forward_batch_x(Engine* e, const float* xin, int n, uint32_t pos,
             const LlfTensorMeta* out = &m->metas[m->base_idx[i]];
             matmul(e->logits, e->x, base + m->dir[i].offset + out->offset,
                    h->vocab, hidden, out->dtype);
+            if (e->ops && e->ops->post_logits)
+                e->ops->post_logits(e);
         }
     }
     if (x_out) {
@@ -2439,9 +2362,7 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
             return -1;
         }
         engine_forward_prefill(e, prompt, nprompt, 0);
-        /* GPU prefill 已写 d_kv; 仅 CPU batch prefill 需 after_prefill(现已不会走到) */
-        if (e->device_mode == DEV_MODE_CUDA)
-            cuda_sync_x_to_host(e);
+        engine_dev_sync_x(e);
         pos = (uint32_t)nprompt;
     }
 #else

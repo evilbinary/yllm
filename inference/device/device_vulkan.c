@@ -648,6 +648,13 @@ Device* device_create_vulkan(int device_id, char* err, size_t errlen)
     d->free_dev = vk_free_dev;
     d->prefetch_layer = NULL;
     d->release_layer = NULL;
+    d->embed = vulkan_embed;
+    d->after_cpu_embed = vulkan_after_embed;
+    d->final_norm = vulkan_final_norm;
+    d->lm_head = vulkan_lm_or_fused;
+    d->prefill = vulkan_prefill;
+    d->sync_x = vulkan_sync_x;
+    d->mark_x_host = vulkan_after_embed;
     return d;
 #endif
 }
