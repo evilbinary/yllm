@@ -522,6 +522,10 @@ chat-gemma4-e2b: $(BIN) $(G4_E2B_LLF)
 chat-gemma4-e2b-avx2: $(BIN_AVX2) $(G4_E2B_LLF)
 	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
 
+chat-gemma4-e2b-vulkan: vulkan $(G4_E2B_LLF)
+	$(RUN_VULKAN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 # 长序列 chat 吞吐(不进 make test)
 #   make test-long-chat
 #   make test-long-chat LONG_N=14,512,2048,4096 LONG_DECODE=16
@@ -920,4 +924,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan vulkan-avx2 android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess test-long-chat test-long-chat-avx2 chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-avx2-vulkan chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b
+.PHONY: all avx2 cuda vulkan vulkan-avx2 android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess test-long-chat test-long-chat-avx2 chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-vulkan chat-gemma4-e2b-avx2-vulkan chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b
