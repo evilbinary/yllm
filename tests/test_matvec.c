@@ -199,6 +199,15 @@ static void test_matmul_q6k(void)
     matmul_q6k(y, x, w, 1, 512);
     CHECK_NEAR(y[0], -31.0 * 512, 1e-3, "matmul_q6k synthetic");
     {
+        uint8_t w2[2 * 2 * 210];
+        float y2[2];
+        memcpy(w2, w, 2 * 210);
+        memcpy(w2 + 2 * 210, w, 2 * 210);
+        matmul_q6k(y2, x, w2, 2, 512);
+        CHECK_NEAR(y2[0], y[0], 1e-3, "matmul_q6k dual row0");
+        CHECK_NEAR(y2[1], y[0], 1e-3, "matmul_q6k dual row1");
+    }
+    {
         float wr[512], xq[512], ref = 0.0f;
         uint32_t i;
         CHECK(dequant_mat_f32(wr, w, 1, 512, DT_Q6K) == 0, "dequant q6k row");
