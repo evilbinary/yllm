@@ -107,17 +107,6 @@ typedef struct {
     uint64_t swa_mask;           /* bit i = is_swa(i); 0 = 用 swa_pattern */
 } GgufMeta;
 
-typedef struct {
-    uint32_t attn_logit_cap_bits;
-    uint32_t final_logit_cap_bits;
-    uint32_t swa_window;
-    uint32_t swa_pattern;
-    uint32_t n_kv_shared_layers;
-    uint32_t n_embd_per_layer;
-    uint64_t swa_mask;
-    uint32_t rope_theta_swa_bits;
-} LlfGemma4Ext;
-
 static void gg_merges_grow(GgufMeta* g, uint64_t need)
 {
     if (need <= g->cap_merges) return;

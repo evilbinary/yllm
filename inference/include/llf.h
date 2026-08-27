@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #define YLLM_MAGIC "YLLMLLF1"
 #define YLLM_VERSION 6   /* gemma4 PLE 进 llf; 旧 gemma4 文件必须重转 */
@@ -124,6 +125,52 @@ typedef struct {
     uint64_t size;
 } LlfTensorMeta;
 #pragma pack(pop)
+
+/* gemma4 扩展: 写入 header.reserved 前 36 字节(与 convert_gguf 一致, 自然对齐) */
+typedef struct {
+    uint32_t attn_logit_cap_bits;
+    uint32_t final_logit_cap_bits;
+    uint32_t swa_window;
+    uint32_t swa_pattern;
+    uint32_t n_kv_shared_layers;
+    uint32_t n_embd_per_layer;
+    uint64_t swa_mask;
+    uint32_t rope_theta_swa_bits; /* 0 = default 10000 */
+} LlfGemma4Ext;
+
+static inline void llf_gemma4_ext(const LlfHeader* h, LlfGemma4Ext* ext)
+{
+    memset(ext, 0, sizeof(*ext));
+    if (h && h->arch == ARCH_GEMMA4)
+        memcpy(ext, h->reserved, sizeof(*ext));
+}
+
+static inline int llf_gemma4_is_swa(const LlfGemma4Ext* ext, uint32_t il)
+{
+    if (ext->swa_mask) return (int)((ext->swa_mask >> il) & 1ull);
+    uint32_t p = ext->swa_pattern ? ext->swa_pattern : 6;
+    return (il % p) < (p - 1);
+}
+
+static inline float llf_gemma4_rope_theta(const LlfHeader* h, const LlfGemma4Ext* ext, uint32_t il)
+{
+    float theta;
+    memcpy(&theta, &h->rope_theta_bits, 4);
+    if (!llf_gemma4_is_swa(ext, il)) return theta;
+    float swa = 0.0f;
+    memcpy(&swa, &ext->rope_theta_swa_bits, 4);
+    if (!(swa > 0.0f)) swa = 10000.0f;
+    return swa;
+}
+
+static inline float llf_gemma4_final_cap(const LlfHeader* h)
+{
+    LlfGemma4Ext ext;
+    float cap = 0.0f;
+    llf_gemma4_ext(h, &ext);
+    memcpy(&cap, &ext.final_logit_cap_bits, 4);
+    return cap;
+}
 
 typedef struct {
     LlfHeader h;
