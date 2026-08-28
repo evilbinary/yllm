@@ -260,12 +260,51 @@ static void gemm_nn(float* y, const float* x, const float* w, const float* bias,
         }
 #ifdef __AVX2__
         if (nout == 4) {
-            for (m = 0; m < M; m++) {
+            m = 0;
+            for (; m + 2 <= M; m += 2) {
+                const float* xr0 = x + (size_t)m * in;
+                const float* xr1 = xr0 + in;
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
+                __m256 c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
+                float* y0 = y + (size_t)m * out + oo;
+                float* y1 = y0 + out;
+                for (i = 0; i + 8 <= in; i += 8) {
+                    __m256 wv0 = _mm256_loadu_ps(w0 + i);
+                    __m256 wv1 = _mm256_loadu_ps(w1 + i);
+                    __m256 wv2 = _mm256_loadu_ps(w2 + i);
+                    __m256 wv3 = _mm256_loadu_ps(w3 + i);
+                    __m256 x0 = _mm256_loadu_ps(xr0 + i);
+                    __m256 x1 = _mm256_loadu_ps(xr1 + i);
+                    a0 = _mm256_fmadd_ps(x0, wv0, a0);
+                    a1 = _mm256_fmadd_ps(x0, wv1, a1);
+                    a2 = _mm256_fmadd_ps(x0, wv2, a2);
+                    a3 = _mm256_fmadd_ps(x0, wv3, a3);
+                    c0 = _mm256_fmadd_ps(x1, wv0, c0);
+                    c1 = _mm256_fmadd_ps(x1, wv1, c1);
+                    c2 = _mm256_fmadd_ps(x1, wv2, c2);
+                    c3 = _mm256_fmadd_ps(x1, wv3, c3);
+                }
+                {
+                    float s0 = hsum8(a0), s1 = hsum8(a1), s2 = hsum8(a2), s3 = hsum8(a3);
+                    float t0 = hsum8(c0), t1 = hsum8(c1), t2 = hsum8(c2), t3 = hsum8(c3);
+                    for (; i < in; i++) {
+                        float v0 = xr0[i], v1 = xr1[i];
+                        s0 += v0 * w0[i]; s1 += v0 * w1[i]; s2 += v0 * w2[i]; s3 += v0 * w3[i];
+                        t0 += v1 * w0[i]; t1 += v1 * w1[i]; t2 += v1 * w2[i]; t3 += v1 * w3[i];
+                    }
+                    y0[0] = s0 + b0; y0[1] = s1 + b1; y0[2] = s2 + b2; y0[3] = s3 + b3;
+                    y1[0] = t0 + b0; y1[1] = t1 + b1; y1[2] = t2 + b2; y1[3] = t3 + b3;
+                }
+            }
+            for (; m < M; m++) {
                 const float* xr = x + (size_t)m * in;
                 __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
                 __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
                 float* yr = y + (size_t)m * out + oo;
-                for (i = 0; i + 8 <= in; i += 8) {
+                i = 0;
+                for (; i + 8 <= in; i += 8) {
                     __m256 xv = _mm256_loadu_ps(xr + i);
                     a0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w0 + i), a0);
                     a1 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w1 + i), a1);
@@ -524,9 +563,32 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, co
             const float* vh = vpk + (size_t)h * n * dh;
             float mx = -1e30f, sum = 0.f;
             float* o = out + ((size_t)t * n_head + h) * dh;
-            for (j = 0; j < n; j++) {
-                sc[j] = dot_f32(qt, kh + (size_t)j * dh, dh) * scale;
-                if (sc[j] > mx) mx = sc[j];
+#ifdef __AVX2__
+            if (dh == 64) {
+                __m256 q0 = _mm256_loadu_ps(qt + 0), q1 = _mm256_loadu_ps(qt + 8);
+                __m256 q2 = _mm256_loadu_ps(qt + 16), q3 = _mm256_loadu_ps(qt + 24);
+                __m256 q4 = _mm256_loadu_ps(qt + 32), q5 = _mm256_loadu_ps(qt + 40);
+                __m256 q6 = _mm256_loadu_ps(qt + 48), q7 = _mm256_loadu_ps(qt + 56);
+                for (j = 0; j < n; j++) {
+                    const float* kj = kh + (size_t)j * 64;
+                    __m256 a = _mm256_mul_ps(q0, _mm256_loadu_ps(kj + 0));
+                    a = _mm256_fmadd_ps(q1, _mm256_loadu_ps(kj + 8), a);
+                    a = _mm256_fmadd_ps(q2, _mm256_loadu_ps(kj + 16), a);
+                    a = _mm256_fmadd_ps(q3, _mm256_loadu_ps(kj + 24), a);
+                    a = _mm256_fmadd_ps(q4, _mm256_loadu_ps(kj + 32), a);
+                    a = _mm256_fmadd_ps(q5, _mm256_loadu_ps(kj + 40), a);
+                    a = _mm256_fmadd_ps(q6, _mm256_loadu_ps(kj + 48), a);
+                    a = _mm256_fmadd_ps(q7, _mm256_loadu_ps(kj + 56), a);
+                    sc[j] = hsum8(a) * scale;
+                    if (sc[j] > mx) mx = sc[j];
+                }
+            } else
+#endif
+            {
+                for (j = 0; j < n; j++) {
+                    sc[j] = dot_f32(qt, kh + (size_t)j * dh, dh) * scale;
+                    if (sc[j] > mx) mx = sc[j];
+                }
             }
             for (j = 0; j < n; j++) {
                 sc[j] = expf(sc[j] - mx);
@@ -534,21 +596,47 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, co
             }
             {
                 float inv = 1.f / (sum > 0.f ? sum : 1.f);
-                memset(o, 0, (size_t)dh * 4);
-                for (j = 0; j < n; j++) {
-                    float a = sc[j] * inv;
-                    const float* vj = vh + (size_t)j * dh;
 #ifdef __AVX2__
-                    __m256 as = _mm256_set1_ps(a);
-                    for (d = 0; d + 8 <= dh; d += 8) {
-                        __m256 ov = _mm256_loadu_ps(o + d);
-                        ov = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + d), ov);
-                        _mm256_storeu_ps(o + d, ov);
+                if (dh == 64) {
+                    __m256 o0 = _mm256_setzero_ps(), o1 = _mm256_setzero_ps();
+                    __m256 o2 = _mm256_setzero_ps(), o3 = _mm256_setzero_ps();
+                    __m256 o4 = _mm256_setzero_ps(), o5 = _mm256_setzero_ps();
+                    __m256 o6 = _mm256_setzero_ps(), o7 = _mm256_setzero_ps();
+                    for (j = 0; j < n; j++) {
+                        __m256 as = _mm256_set1_ps(sc[j] * inv);
+                        const float* vj = vh + (size_t)j * 64;
+                        o0 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 0), o0);
+                        o1 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 8), o1);
+                        o2 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 16), o2);
+                        o3 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 24), o3);
+                        o4 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 32), o4);
+                        o5 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 40), o5);
+                        o6 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 48), o6);
+                        o7 = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + 56), o7);
                     }
-                    for (; d < dh; d++) o[d] += a * vj[d];
-#else
-                    for (d = 0; d < dh; d++) o[d] += a * vj[d];
+                    _mm256_storeu_ps(o + 0, o0); _mm256_storeu_ps(o + 8, o1);
+                    _mm256_storeu_ps(o + 16, o2); _mm256_storeu_ps(o + 24, o3);
+                    _mm256_storeu_ps(o + 32, o4); _mm256_storeu_ps(o + 40, o5);
+                    _mm256_storeu_ps(o + 48, o6); _mm256_storeu_ps(o + 56, o7);
+                } else
 #endif
+                {
+                    memset(o, 0, (size_t)dh * 4);
+                    for (j = 0; j < n; j++) {
+                        float a = sc[j] * inv;
+                        const float* vj = vh + (size_t)j * dh;
+#ifdef __AVX2__
+                        __m256 as = _mm256_set1_ps(a);
+                        for (d = 0; d + 8 <= dh; d += 8) {
+                            __m256 ov = _mm256_loadu_ps(o + d);
+                            ov = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + d), ov);
+                            _mm256_storeu_ps(o + d, ov);
+                        }
+                        for (; d < dh; d++) o[d] += a * vj[d];
+#else
+                        for (d = 0; d < dh; d++) o[d] += a * vj[d];
+#endif
+                    }
                 }
             }
         }
