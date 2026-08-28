@@ -34,7 +34,9 @@ static int peek_projector(const char* path, char* out, size_t n)
         if (fread(key, 1, (size_t)klen, f) != (size_t)klen) { fclose(f); return -1; }
         key[klen] = 0;
         if (fread(&typ, 4, 1, f) != 1) { fclose(f); return -1; }
-        if (!strcmp(key, "clip.projector_type") && typ == 8) {
+        if (typ == 8 &&
+            (!strcmp(key, "clip.projector_type") ||
+             !strcmp(key, "clip.vision.projector_type"))) {
             uint64_t slen;
             if (fread(&slen, 8, 1, f) != 1 || slen >= n) { fclose(f); return -1; }
             if (fread(out, 1, (size_t)slen, f) != (size_t)slen) { fclose(f); return -1; }
