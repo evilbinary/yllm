@@ -650,9 +650,13 @@ static int cmd_chat(int argc, char** argv)
         vis_nds = vision_n_deepstack(vis);
         if (vis_nds > 0)
             mix_ds = (float*)ymalloc((size_t)vis_nds * (size_t)nvis * (size_t)hid * 4);
-        if (vision_encode_image_ds(vis, image, mix_emb, mix_ds, nvis, err, sizeof(err)) < 0) {
-            fprintf(stderr, "encode image failed: %s\n", err);
-            free(mix_emb); free(mix_ds); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
+        {
+            int got = vision_encode_image_ds(vis, image, mix_emb, mix_ds, nvis, err, sizeof(err));
+            if (got < 0) {
+                fprintf(stderr, "encode image failed: %s\n", err);
+                free(mix_emb); free(mix_ds); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
+            }
+            nvis = got;
         }
         /* 视觉向量暂存在 mix_emb[0..nvis), 组 prompt 后再挪到对应位置 */
         id_ims = vocab_id(&v, "<image>");

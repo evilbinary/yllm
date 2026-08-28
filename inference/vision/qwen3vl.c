@@ -208,8 +208,16 @@ static void gemm_lin(Q3v* vis, float* y, const float* x, const ClipT* w, const C
         for (oo = 0; oo < out; oo++) bf[oo] = tload(bias, oo);
     }
     if (w->dtype == 0) {
-        matmul_batch(y, x, w->p, out, in, DT_F32, M);
-        add_bias_rows(y, bf, M, out);
+#pragma omp parallel for schedule(static)
+        for (oo = 0; oo < out; oo++) {
+            const float* wr = (const float*)w->p + (size_t)oo * in;
+            uint32_t m;
+            for (m = 0; m < M; m++) {
+                float acc = dot_f32(x + (size_t)m * in, wr, in);
+                if (bf) acc += bf[oo];
+                y[(size_t)m * out + oo] = acc;
+            }
+        }
         return;
     }
     if (!vis->gemm_row || in > vis->gemm_in_cap) {
@@ -347,15 +355,17 @@ static void spatial_merge(const float* src, float* dst, uint32_t gh, uint32_t gw
 /* VISION M-RoPE: n_dims=dh/2, sections=dh/4, NEOX pairs over full head */
 static void vision_rope(float* x, const int32_t* pos, uint32_t n, uint32_t nh, uint32_t dh)
 {
-    uint32_t t, h, nd = dh / 2, sec = dh / 4;
+    uint32_t t, nd = dh / 2, sec = dh / 4;
     float theta_scale = powf(10000.f, -2.f / (float)nd);
-    float* cache = (float*)vis_alloca((size_t)dh * 4);
+#pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++) {
+        float cache[256];
         float pt = (float)pos[t], ph = (float)pos[n + t];
         float tt = pt, tht = ph;
-        uint32_t i0, sector;
+        uint32_t i0, h, sector;
+        if (dh > 256) continue;
         for (i0 = 0; i0 < dh; i0 += 2) {
-            sector = (i0 / 2) % dh;
+            sector = i0 / 2;
             if (sector == 0) tt = pt;
             else if (sector == sec) tht = ph;
             {
@@ -379,7 +389,19 @@ static void vision_rope(float* x, const int32_t* pos, uint32_t n, uint32_t nh, u
     }
 }
 
-static void attn_full(Q3v* vis, float* out, const float* q, const float* k, const float* v,
+static void pack_heads(float* dst, const float* src, uint32_t n, uint32_t nh, uint32_t dh)
+{
+    uint32_t h;
+#pragma omp parallel for schedule(static)
+    for (h = 0; h < nh; h++) {
+        uint32_t j;
+        for (j = 0; j < n; j++)
+            memcpy(dst + ((size_t)h * n + j) * dh,
+                   src + ((size_t)j * nh + h) * dh, (size_t)dh * 4);
+    }
+}
+
+static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, const float* vpk,
                      uint32_t n, uint32_t n_head, uint32_t dh, float scale)
 {
     uint32_t t;
@@ -395,11 +417,12 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* k, cons
         sc = vis->sc + (size_t)tid * vis->npos_max;
         for (h = 0; h < n_head; h++) {
             const float* qt = q + ((size_t)t * n_head + h) * dh;
+            const float* kh = kpk + (size_t)h * n * dh;
+            const float* vh = vpk + (size_t)h * n * dh;
             float mx = -1e30f, sum = 0.f;
             uint32_t d;
             for (j = 0; j < n; j++) {
-                const float* kj = k + ((size_t)j * n_head + h) * dh;
-                sc[j] = dot_f32(qt, kj, dh) * scale;
+                sc[j] = dot_f32(qt, kh + (size_t)j * dh, dh) * scale;
                 if (sc[j] > mx) mx = sc[j];
             }
             for (j = 0; j < n; j++) {
@@ -412,7 +435,7 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* k, cons
                 memset(o, 0, (size_t)dh * 4);
                 for (j = 0; j < n; j++) {
                     float a = sc[j] * inv;
-                    const float* vj = v + ((size_t)j * n_head + h) * dh;
+                    const float* vj = vh + (size_t)j * dh;
 #ifdef __AVX2__
                     __m256 as = _mm256_set1_ps(a);
                     for (d = 0; d + 8 <= dh; d += 8) {
@@ -432,13 +455,13 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* k, cons
 
 static void split_qkv(Q3v* vis, uint32_t n)
 {
-    uint32_t e = vis->n_embd, t, i;
+    uint32_t e = vis->n_embd, t;
+#pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++) {
         const float* row = vis->qkv + (size_t)t * 3 * e;
         memcpy(vis->q + (size_t)t * e, row, (size_t)e * 4);
         memcpy(vis->k + (size_t)t * e, row + e, (size_t)e * 4);
         memcpy(vis->v + (size_t)t * e, row + 2 * e, (size_t)e * 4);
-        (void)i;
     }
 }
 
@@ -537,14 +560,11 @@ static void interp_pos(Q3v* vis, float* dst, uint32_t gh, uint32_t gw)
     }
 }
 
-static void patch_embed(Q3v* vis, const float* chw, uint32_t gh, uint32_t gw)
+static void patch_embed(Q3v* vis, const float* chw, uint32_t gh, uint32_t gw, uint32_t sw, uint32_t sh)
 {
     uint32_t ps = vis->patch, e = vis->n_embd, K = 3 * ps * ps;
-    uint32_t n = gh * gw, S = vis->image_size, t;
+    uint32_t n = gh * gw, t;
     float* col = vis->ff;
-    float* bias = (float*)vis_alloca((size_t)e * 4);
-    uint32_t oc;
-    for (oc = 0; oc < e; oc++) bias[oc] = 0.f;
 #pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++) {
         uint32_t py = t / gw, px = t % gw, ic, ky, kx, k = 0;
@@ -553,11 +573,35 @@ static void patch_embed(Q3v* vis, const float* chw, uint32_t gh, uint32_t gw)
             for (ky = 0; ky < ps; ky++)
                 for (kx = 0; kx < ps; kx++) {
                     uint32_t ix = px * ps + kx, iy = py * ps + ky;
-                    c[k++] = chw[(size_t)ic * S * S + iy * S + ix];
+                    c[k++] = chw[(size_t)ic * sh * sw + iy * sw + ix];
                 }
     }
     gemm_f32(vis->x, col, vis->patch_wf, NULL, n, e, K);
-    (void)bias;
+}
+
+static void smart_hw(int w, int h, int factor, int min_px, int max_px, int* ow, int* oh)
+{
+    int wb, hb;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (factor < 1) factor = 1;
+    wb = ((w + factor / 2) / factor) * factor;
+    hb = ((h + factor / 2) / factor) * factor;
+    if (wb < factor) wb = factor;
+    if (hb < factor) hb = factor;
+    if (max_px > 0 && (int64_t)hb * wb > max_px) {
+        float beta = sqrtf((float)h * (float)w / (float)max_px);
+        hb = (int)(floorf((float)h / beta / (float)factor) * (float)factor);
+        wb = (int)(floorf((float)w / beta / (float)factor) * (float)factor);
+        if (hb < factor) hb = factor;
+        if (wb < factor) wb = factor;
+    } else if (min_px > 0 && (int64_t)hb * wb < min_px) {
+        float beta = sqrtf((float)min_px / ((float)h * (float)w));
+        hb = (int)(ceilf((float)h * beta / (float)factor) * (float)factor);
+        wb = (int)(ceilf((float)w * beta / (float)factor) * (float)factor);
+    }
+    *ow = wb;
+    *oh = hb;
 }
 
 Q3v* q3v_load(const char* path, char* err, size_t errlen)
@@ -677,9 +721,17 @@ Q3v* q3v_load(const char* path, char* err, size_t errlen)
             v->ts[i].p = (const uint8_t*)f;
             v->ts[i].dtype = 0;
             v->ts[i].owned = 1;
-        } else if (gt == 0 || gt == 1) {
+        } else if (gt == 1) {
+            float* f = (float*)ymalloc((size_t)ne * 4);
+            uint64_t k;
+            if (!f) { if (err) snprintf(err, errlen, "oom f16 dequant %s", v->ts[i].name); q3v_free(v); return NULL; }
+            for (k = 0; k < ne; k++) f[k] = f16_to_f32(((const uint16_t*)src)[k]);
+            v->ts[i].p = (const uint8_t*)f;
+            v->ts[i].dtype = 0;
+            v->ts[i].owned = 1;
+        } else if (gt == 0) {
             v->ts[i].p = src;
-            v->ts[i].dtype = (gt == 0) ? 0 : 1;
+            v->ts[i].dtype = 0;
         } else {
             if (err) snprintf(err, errlen, "unsupported mmproj dtype %u (%s)", gt, v->ts[i].name);
             q3v_free(v); return NULL;
@@ -801,9 +853,9 @@ int q3v_n_deepstack(const Q3v* v)
     return v ? v->n_ds : 0;
 }
 
-static int encode_run(Q3v* vis, const float* chw, float* out, float* ds)
+static int encode_run(Q3v* vis, const float* chw, uint32_t sw, uint32_t sh, float* out, float* ds)
 {
-    uint32_t gh = vis->image_size / vis->patch, gw = gh;
+    uint32_t gh = sh / vis->patch, gw = sw / vis->patch;
     uint32_t n = gh * gw, e = vis->n_embd, il, t;
     uint32_t n4 = n / 4, nh = vis->n_head, dh = e / nh;
     float scale = 1.f / sqrtf((float)dh);
@@ -813,13 +865,14 @@ static int encode_run(Q3v* vis, const float* chw, float* out, float* ds)
     uint32_t oc;
     float* pbias;
 
-    patch_embed(vis, chw, gh, gw);
+    if (n == 0 || n > vis->npos_max || (n % 4) != 0) return -1;
+    patch_embed(vis, chw, gh, gw, sw, sh);
     spatial_merge(vis->x, vis->res, gh, gw, e);
     memcpy(vis->x, vis->res, (size_t)n * e * 4);
     pbias = (float*)vis_alloca((size_t)e * 4);
     for (oc = 0; oc < e; oc++) pbias[oc] = tload(&vis->patch_b, oc);
     for (t = 0; t < n; t++)
-        for (oc = 0; oc < e; oc++) vis->x[(size_t)t * e + oc] += pbias[oc];
+        add_inplace(vis->x + (size_t)t * e, pbias, e);
     interp_pos(vis, vis->tmp, gh, gw);
     spatial_merge(vis->tmp, vis->res, gh, gw, e);
     add_inplace(vis->x, vis->res, n * e);
@@ -857,7 +910,9 @@ static int encode_run(Q3v* vis, const float* chw, float* out, float* ds)
         split_qkv(vis, n);
         vision_rope(vis->q, pos, n, nh, dh);
         vision_rope(vis->k, pos, n, nh, dh);
-        attn_full(vis, vis->attn, vis->q, vis->k, vis->v, n, nh, dh, scale);
+        pack_heads(vis->ff, vis->k, n, nh, dh);
+        pack_heads(vis->qkv, vis->v, n, nh, dh);
+        attn_full(vis, vis->attn, vis->q, vis->ff, vis->qkv, n, nh, dh, scale);
         gemm_lin(vis, vis->tmp, vis->attn, &L->o_w, L->o_b.p ? &L->o_b : NULL, n, e, e);
         memcpy(vis->x, vis->res, (size_t)n * e * 4);
         add_inplace(vis->x, vis->tmp, n * e);
@@ -909,27 +964,36 @@ static int encode_run(Q3v* vis, const float* chw, float* out, float* ds)
 int q3v_encode(Q3v* v, const char* image_path, float* out, float* ds, int max_tok,
                char* err, size_t errlen)
 {
-    int w = 0, h = 0, c = 0, x, y, ic, ntok;
+    int w = 0, h = 0, c = 0, x, y, ic, ntok, sw, sh;
     unsigned char* img;
     float* chw;
-    uint32_t S;
+    int factor, min_px, max_px;
     if (!v || !image_path || !out) { if (err) snprintf(err, errlen, "bad vision args"); return -1; }
-    ntok = q3v_n_tokens(v);
-    if (max_tok < ntok) { if (err) snprintf(err, errlen, "out tokens %d < %d", max_tok, ntok); return -1; }
     img = stbi_load(image_path, &w, &h, &c, 3);
     if (!img) { if (err) snprintf(err, errlen, "cannot load image %s", image_path); return -1; }
-    S = v->image_size;
-    chw = (float*)ymalloc((size_t)3 * S * S * 4);
+    factor = (int)(v->patch * (v->n_merge ? v->n_merge : 2));
+    if (factor < 2) factor = (int)(v->patch * 2);
+    max_px = (int)(v->image_size * v->image_size);
+    min_px = factor * factor; /* 至少 1 个 merge tile, 小图不拉到 image_size */
+    smart_hw(w, h, factor, min_px, max_px, &sw, &sh);
+    ntok = (sw / (int)v->patch / 2) * (sh / (int)v->patch / 2);
+    if (ntok < 1) { stbi_image_free(img); if (err) snprintf(err, errlen, "image too small"); return -1; }
+    if (max_tok < ntok) {
+        stbi_image_free(img);
+        if (err) snprintf(err, errlen, "out tokens %d < %d", max_tok, ntok);
+        return -1;
+    }
+    chw = (float*)ymalloc((size_t)3 * (size_t)sh * (size_t)sw * 4);
     if (!chw) { stbi_image_free(img); if (err) snprintf(err, errlen, "oom"); return -1; }
-    for (y = 0; y < (int)S; y++) {
-        float fy = ((float)y + 0.5f) * (float)h / (float)S - 0.5f;
+    for (y = 0; y < sh; y++) {
+        float fy = ((float)y + 0.5f) * (float)h / (float)sh - 0.5f;
         int y0 = (int)floorf(fy), y1 = y0 + 1;
         float wy = fy - (float)y0;
         if (y0 < 0) { y0 = 0; wy = 0; }
         if (y1 >= h) y1 = h - 1;
         if (y0 >= h) y0 = h - 1;
-        for (x = 0; x < (int)S; x++) {
-            float fx = ((float)x + 0.5f) * (float)w / (float)S - 0.5f;
+        for (x = 0; x < sw; x++) {
+            float fx = ((float)x + 0.5f) * (float)w / (float)sw - 0.5f;
             int x0 = (int)floorf(fx), x1 = x0 + 1;
             float wx = fx - (float)x0;
             if (x0 < 0) { x0 = 0; wx = 0; }
@@ -941,15 +1005,15 @@ int q3v_encode(Q3v* v, const char* image_path, float* out, float* ds, int max_to
                 float p01 = img[(y1 * w + x0) * 3 + ic];
                 float p11 = img[(y1 * w + x1) * 3 + ic];
                 float p = (p00 * (1 - wx) + p10 * wx) * (1 - wy) + (p01 * (1 - wx) + p11 * wx) * wy;
-                chw[(size_t)ic * S * S + (uint32_t)y * S + (uint32_t)x] = (p / 255.f - v->mean[ic]) / v->std[ic];
+                chw[(size_t)ic * sh * sw + (uint32_t)y * sw + (uint32_t)x] = (p / 255.f - v->mean[ic]) / v->std[ic];
             }
         }
     }
     stbi_image_free(img);
-    ylog_info("vision qwen3vl: encoding %ux%u", S, S);
+    ylog_info("vision qwen3vl: encoding %dx%d (src %dx%d)", sw, sh, w, h);
     {
         uint64_t t0 = ynow_ms();
-        if (encode_run(v, chw, out, ds) < 0) {
+        if (encode_run(v, chw, (uint32_t)sw, (uint32_t)sh, out, ds) < 0) {
             free(chw);
             if (err) snprintf(err, errlen, "encode failed");
             return -1;
