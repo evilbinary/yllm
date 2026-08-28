@@ -161,8 +161,18 @@ static float dot_f32(const float* a, const float* b, uint32_t n)
 #else
 static void f16row_to_f32(float* d, const uint16_t* s, uint32_t n)
 {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16*)(s + i));
+        vst1q_f32(d + i, vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(d + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+    for (; i < n; i++) d[i] = f16_to_f32(s[i]);
+#else
     uint32_t i;
     for (i = 0; i < n; i++) d[i] = f16_to_f32(s[i]);
+#endif
 }
 #if defined(__aarch64__)
 static float hsum4(float32x4_t v)
@@ -246,9 +256,8 @@ static void layernorm(float* y, const float* x, const ClipT* w, const ClipT* b, 
             y[i] = z;
         }
         return;
-    }
-#endif
-#if defined(__aarch64__)
+    } else
+#elif defined(__aarch64__)
     if (n >= 4) {
         float32x4_t acc = vdupq_n_f32(0.f);
         for (; i + 8 <= n; i += 8) {
@@ -293,23 +302,25 @@ static void layernorm(float* y, const float* x, const ClipT* w, const ClipT* b, 
             y[i] = z;
         }
         return;
-    }
+    } else
 #endif
-    for (i = 0; i < n; i++) m += x[i];
-    m /= (float)n;
-    for (i = 0; i < n; i++) {
-        float d = x[i] - m;
-        v += d * d;
-    }
-    inv = 1.f / sqrtf(v / (float)n + eps);
-    if (ww) {
-        for (i = 0; i < n; i++) y[i] = (x[i] - m) * inv * ww[i] + (bb ? bb[i] : 0.f);
-    } else {
+    {
+        for (i = 0; i < n; i++) m += x[i];
+        m /= (float)n;
         for (i = 0; i < n; i++) {
-            float z = (x[i] - m) * inv;
-            if (w && w->p) z *= tload(w, i);
-            if (b && b->p) z += tload(b, i);
-            y[i] = z;
+            float d = x[i] - m;
+            v += d * d;
+        }
+        inv = 1.f / sqrtf(v / (float)n + eps);
+        if (ww) {
+            for (i = 0; i < n; i++) y[i] = (x[i] - m) * inv * ww[i] + (bb ? bb[i] : 0.f);
+        } else {
+            for (i = 0; i < n; i++) {
+                float z = (x[i] - m) * inv;
+                if (w && w->p) z *= tload(w, i);
+                if (b && b->p) z += tload(b, i);
+                y[i] = z;
+            }
         }
     }
 }
@@ -396,10 +407,8 @@ static void gemm_nn(float* y, const float* x, const float* w, const float* bias,
                     yr[0] = s0 + b0; yr[1] = s1 + b1; yr[2] = s2 + b2; yr[3] = s3 + b3;
                 }
             }
-            continue;
-        }
-#endif
-#if defined(__aarch64__)
+        } else
+#elif defined(__aarch64__)
         if (nout == 4) {
             m = 0;
             for (; m + 4 <= M; m += 4) {
@@ -468,15 +477,16 @@ static void gemm_nn(float* y, const float* x, const float* w, const float* bias,
                     yr[0] = s0 + b0; yr[1] = s1 + b1; yr[2] = s2 + b2; yr[3] = s3 + b3;
                 }
             }
-            continue;
-        }
+        } else
 #endif
-        for (m = 0; m < M; m++) {
-            const float* xr = x + (size_t)m * in;
-            float* yr = y + (size_t)m * out + oo;
+        {
             uint32_t k;
-            for (k = 0; k < nout; k++)
-                yr[k] = dot_f32(xr, w0 + (size_t)k * in, in) + (k == 0 ? b0 : k == 1 ? b1 : k == 2 ? b2 : b3);
+            for (m = 0; m < M; m++) {
+                const float* xr = x + (size_t)m * in;
+                float* yr = y + (size_t)m * out + oo;
+                for (k = 0; k < nout; k++)
+                    yr[k] = dot_f32(xr, w0 + (size_t)k * in, in) + (k == 0 ? b0 : k == 1 ? b1 : k == 2 ? b2 : b3);
+            }
         }
     }
 }
@@ -730,8 +740,7 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, co
                     if (sc[j] > mx) mx = sc[j];
                 }
             } else
-#endif
-#if defined(__aarch64__)
+#elif defined(__aarch64__)
             if (dh == 64) {
                 float32x4_t q0 = vld1q_f32(qt + 0), q1 = vld1q_f32(qt + 4);
                 float32x4_t q2 = vld1q_f32(qt + 8), q3 = vld1q_f32(qt + 12);
@@ -799,8 +808,7 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, co
                     _mm256_storeu_ps(o + 32, o4); _mm256_storeu_ps(o + 40, o5);
                     _mm256_storeu_ps(o + 48, o6); _mm256_storeu_ps(o + 56, o7);
                 } else
-#endif
-#if defined(__aarch64__)
+#elif defined(__aarch64__)
                 if (dh == 64) {
                     float32x4_t o0 = vdupq_n_f32(0.f), o1 = vdupq_n_f32(0.f);
                     float32x4_t o2 = vdupq_n_f32(0.f), o3 = vdupq_n_f32(0.f);
