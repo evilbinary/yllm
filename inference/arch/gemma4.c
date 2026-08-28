@@ -221,10 +221,12 @@ void arch_gemma4_after_embed(Engine* e, uint32_t token)
     uint32_t hidden = e->ws.model.h.hidden;
     float scale = sqrtf((float)hidden);
     uint32_t j;
-    /* llama.cpp: 图像 raw embed 不再乘 √hidden */
-    if (!(e->vis_tok >= 0 && e->vis_use && e->vis_tok < e->vis_seq && e->vis_use[e->vis_tok])) {
-        for (j = 0; j < hidden; j++) e->x[j] *= scale;
+    /* llama.cpp: 图像 raw embed 不再乘 √hidden; PLE 用 pad id 0 */
+    if (e->vis_tok >= 0 && e->vis_use && e->vis_tok < e->vis_seq && e->vis_use[e->vis_tok]) {
+        gemma4_prepare_ple_resid(e, 0, e->x);
+        return;
     }
+    for (j = 0; j < hidden; j++) e->x[j] *= scale;
     gemma4_prepare_ple_resid(e, token, e->x);
 }
 
@@ -280,12 +282,18 @@ static void gemma4_prepare_ple_batch(Engine* e, const uint32_t* tokens, uint32_t
     isc = 1.0f / sqrtf(2.0f);
     for (b = 0; b < B; b++) {
         float* pe = c->ple_batch + (size_t)b * width;
+        uint32_t tid = tokens[b];
+        /* llama.cpp multimodal PLE: pad token 0 */
+        if (e->vis_use && e->vis_seq > 0) {
+            int vi = e->vis_off + (int)b;
+            if (vi >= 0 && vi < e->vis_seq && e->vis_use[vi]) tid = 0;
+        }
         switch (tok->dtype) {
-        case DT_F32: embed_f32(pe, ebase + tok->offset, tokens[b], width); break;
-        case DT_Q4K: embed_q4k(pe, ebase + tok->offset, tokens[b], width); break;
-        case DT_Q6K: embed_q6k(pe, ebase + tok->offset, tokens[b], width); break;
-        case DT_Q5K: embed_q5k(pe, ebase + tok->offset, tokens[b], width); break;
-        default: embed_f16(pe, ebase + tok->offset, tokens[b], width); break;
+        case DT_F32: embed_f32(pe, ebase + tok->offset, tid, width); break;
+        case DT_Q4K: embed_q4k(pe, ebase + tok->offset, tid, width); break;
+        case DT_Q6K: embed_q6k(pe, ebase + tok->offset, tid, width); break;
+        case DT_Q5K: embed_q5k(pe, ebase + tok->offset, tid, width); break;
+        default: embed_f16(pe, ebase + tok->offset, tid, width); break;
         }
         for (j = 0; j < width; j++) pe[j] *= ts;
     }
@@ -479,11 +487,14 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
             uint32_t s0 = 0;
             if (swa && g4.swa_window > 0 && pos + 1 > g4.swa_window)
                 s0 = pos + 1 - g4.swa_window;
-            /* 本批 KV 已写完: 图像位看本批末尾, 文本仍因果。不改 PB_MAX / 预填充路径 */
+            /* 本批 KV 已写完. llama.cpp 图像段 non-causal, 但不看未写 KV、也不看图后文本 */
             {
                 uint32_t kend = pos;
-                if (e->vis_use && (int)pos < e->vis_seq && e->vis_use[pos])
+                if (e->vis_use && (int)pos < e->vis_seq && e->vis_use[pos]) {
                     kend = pos_start + B - 1;
+                    while (kend > pos && ((int)kend >= e->vis_seq || !e->vis_use[kend]))
+                        kend--;
+                }
                 attn_kv_f16(att_out, q, kcache, vcache, s0, kend,
                             h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
             }

@@ -463,9 +463,15 @@ static void gemm_lin(G4v* vis, float* y, const float* x, const ClipT* w, const C
     free(xc);
 }
 
-static float gelu_quick(float x)
+static float gelu_tanh_f(float x)
 {
-    return x / (1.0f + expf(-1.702f * x));
+    const float k = 0.7978845608028654f; /* sqrt(2/pi) */
+    float x3 = x * x * x;
+    return 0.5f * x * (1.f + tanhf(k * (x + 0.044715f * x3)));
+}
+static float gelu_quick_f(float x)
+{
+    return x / (1.f + expf(-1.702f * x));
 }
 static void act_gate(float* y, const float* gate, const float* up, uint32_t n, int op)
 {
@@ -478,10 +484,12 @@ static void act_gate(float* y, const float* gate, const float* up, uint32_t n, i
         return;
     }
     if (op == 1) {
-        geglu(y, gate, up, n);
+        /* clip.use_gelu: FFN_GELU / geglu tanh */
+        for (i = 0; i < n; i++) y[i] = gelu_tanh_f(gate[i]) * up[i];
         return;
     }
-    for (i = 0; i < n; i++) y[i] = gelu_quick(gate[i]) * up[i];
+    /* llama.cpp 默认 FFN_GELU_QUICK (mmproj 无 clip.use_gelu) */
+    for (i = 0; i < n; i++) y[i] = gelu_quick_f(gate[i]) * up[i];
 }
 
 static void rms_w(float* y, const float* x, const ClipT* w, uint32_t n, float eps)
@@ -568,45 +576,46 @@ static void attn_full(G4v* vis, float* out, const float* q, const float* k, cons
     }
 }
 
-/* HF Gemma4ImageProcessor.get_aspect_ratio_preserving_size: 放大/缩小到
- * 尽量占满 max_soft_tokens 预算, 边长为 patch*merge 的倍数。 */
-static void g4v_resize_hw(int w, int h, int patch, int merge, uint32_t ntok_max, int* ow, int* oh)
+/* llama.cpp img_tool::calc_size_preserved_ratio (mtmd_image_preprocessor_dyn_size) */
+static int g4v_round_f(float x, int f)
+{
+    return (int)roundf(x / (float)f) * f;
+}
+static int g4v_ceil_f(float x, int f)
+{
+    return (int)ceilf(x / (float)f) * f;
+}
+static int g4v_floor_f(float x, int f)
+{
+    return (int)floorf(x / (float)f) * f;
+}
+static void g4v_resize_hw(int w, int h, int patch, int merge,
+                          uint32_t ntok_min, uint32_t ntok_max, int* ow, int* oh)
 {
     int side = patch * merge;
-    int max_patches = (int)ntok_max * merge * merge;
-    double target_px, factor;
-    int th, tw, max_side;
+    int pa, min_px, max_px, tw, th;
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     if (patch < 1) patch = 1;
     if (merge < 1) merge = 1;
     if (side < 1) side = 1;
-    if (max_patches < merge * merge) max_patches = merge * merge;
-    target_px = (double)max_patches * (double)patch * (double)patch;
-    factor = sqrt(target_px / ((double)w * (double)h));
-    th = (int)(floor(factor * (double)h / (double)side) * (double)side);
-    tw = (int)(floor(factor * (double)w / (double)side) * (double)side);
-    max_side = ((int)ntok_max) * side;
-    if (th < 1 && tw < 1) {
-        th = side;
-        tw = side;
-    } else if (th < 1) {
-        th = side;
-        tw = (w / h) * side;
-        if (tw > max_side) tw = max_side;
-        if (tw < side) tw = side;
-    } else if (tw < 1) {
-        tw = side;
-        th = (h / w) * side;
-        if (th > max_side) th = max_side;
-        if (th < side) th = side;
-    }
-    if ((int64_t)th * (int64_t)tw > (int64_t)target_px) {
-        factor = sqrt(target_px / ((double)th * (double)tw));
-        th = (int)(floor((double)th * factor / (double)side) * (double)side);
-        tw = (int)(floor((double)tw * factor / (double)side) * (double)side);
+    pa = patch * patch * merge * merge;
+    min_px = (int)ntok_min * pa;
+    max_px = (int)ntok_max * pa;
+    tw = g4v_round_f((float)w, side);
+    th = g4v_round_f((float)h, side);
+    if (tw < side) tw = side;
+    if (th < side) th = side;
+    if (max_px > 0 && (int64_t)th * (int64_t)tw > (int64_t)max_px) {
+        float beta = sqrtf((float)h * (float)w / (float)max_px);
+        th = g4v_floor_f((float)h / beta, side);
+        tw = g4v_floor_f((float)w / beta, side);
         if (th < side) th = side;
         if (tw < side) tw = side;
+    } else if (min_px > 0 && (int64_t)th * (int64_t)tw < (int64_t)min_px) {
+        float beta = sqrtf((float)min_px / ((float)h * (float)w));
+        th = g4v_ceil_f((float)h * beta, side);
+        tw = g4v_ceil_f((float)w * beta, side);
     }
     *ow = tw;
     *oh = th;
@@ -1021,7 +1030,8 @@ static int encode_run(G4v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
             act_gate(vis->ff, vis->ffg, vis->ff, n * n_ff, vis->ffn_op);
         } else {
             uint32_t u;
-            for (u = 0; u < n * n_ff; u++) vis->ff[u] = gelu_quick(vis->ff[u]);
+            for (u = 0; u < n * n_ff; u++)
+                vis->ff[u] = (vis->ffn_op == 1) ? gelu_tanh_f(vis->ff[u]) : gelu_quick_f(vis->ff[u]);
         }
         gemm_lin(vis, vis->tmp, vis->ff, &L->down_w, L->down_b.p ? &L->down_b : NULL, n, e, n_ff);
         if (L->ff_post.p) {
@@ -1070,18 +1080,10 @@ static int encode_run(G4v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
     return (int)nout;
 }
 
-static float cubic_cr(float a, float b, float c, float d, float t)
+/* llama.cpp img_tool::resize_bilinear */
+static float g4v_lerp(float a, float b, float t)
 {
-    return b + 0.5f * t * (c - a + t * (2.f * a - 5.f * b + 4.f * c - d + t * (3.f * (b - c) + d - a)));
-}
-
-static float samp3(const unsigned char* img, int w, int h, int x, int y, int ic)
-{
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x >= w) x = w - 1;
-    if (y >= h) y = h - 1;
-    return (float)img[(y * w + x) * 3 + ic];
+    return a + (b - a) * t;
 }
 
 int g4v_encode(G4v* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen)
@@ -1092,7 +1094,8 @@ int g4v_encode(G4v* v, const char* image_path, float* out, int max_tok, char* er
     if (!v || !image_path || !out) { if (err) snprintf(err, errlen, "bad vision args"); return -1; }
     img = stbi_load(image_path, &w, &h, &c, 3);
     if (!img) { if (err) snprintf(err, errlen, "cannot load image %s", image_path); return -1; }
-    g4v_resize_hw(w, h, (int)v->patch, (int)(v->n_merge ? v->n_merge : 3), v->ntok_max, &sw, &sh);
+    g4v_resize_hw(w, h, (int)v->patch, (int)(v->n_merge ? v->n_merge : 3),
+                  v->ntok_min, v->ntok_max, &sw, &sh);
     ntok = (sw / (int)v->patch / (int)v->n_merge) * (sh / (int)v->patch / (int)v->n_merge);
     if (ntok < 1) { stbi_image_free(img); if (err) snprintf(err, errlen, "image too small"); return -1; }
     if (max_tok < ntok) {
@@ -1102,33 +1105,38 @@ int g4v_encode(G4v* v, const char* image_path, float* out, int max_tok, char* er
     }
     chw = (float*)ymalloc((size_t)3 * (size_t)sh * (size_t)sw * 4);
     if (!chw) { stbi_image_free(img); if (err) snprintf(err, errlen, "oom"); return -1; }
-    for (y = 0; y < sh; y++) {
-        float fy = ((float)y + 0.5f) * (float)h / (float)sh - 0.5f;
-        int y0 = (int)floorf(fy);
-        float wy = fy - (float)y0;
-        if (y0 < 0) { y0 = 0; wy = 0; }
-        if (y0 >= h) y0 = h - 1;
-        for (x = 0; x < sw; x++) {
-            float fx = ((float)x + 0.5f) * (float)w / (float)sw - 0.5f;
-            int x0 = (int)floorf(fx);
-            float wx = fx - (float)x0;
-            if (x0 < 0) { x0 = 0; wx = 0; }
-            if (x0 >= w) x0 = w - 1;
-            for (ic = 0; ic < 3; ic++) {
-                float col[4], p, z;
-                int yy, xx;
-                for (yy = 0; yy < 4; yy++) {
-                    float row[4];
-                    int sy = y0 + yy - 1;
-                    for (xx = 0; xx < 4; xx++)
-                        row[xx] = samp3(img, w, h, x0 + xx - 1, sy, ic);
-                    col[yy] = cubic_cr(row[0], row[1], row[2], row[3], wx);
+    {
+        float xr = (sw > 1) ? (float)(w - 1) / (float)(sw - 1) : 0.f;
+        float yr = (sh > 1) ? (float)(h - 1) / (float)(sh - 1) : 0.f;
+        for (y = 0; y < sh; y++) {
+            float py = (float)y * yr;
+            int y0 = (int)py, y1;
+            float yf;
+            if (y0 > h - 1) y0 = h - 1;
+            y1 = y0 + 1;
+            if (y1 > h - 1) y1 = h - 1;
+            yf = py - (float)y0;
+            for (x = 0; x < sw; x++) {
+                float px = (float)x * xr;
+                int x0 = (int)px, x1;
+                float xf;
+                if (x0 > w - 1) x0 = w - 1;
+                x1 = x0 + 1;
+                if (x1 > w - 1) x1 = w - 1;
+                xf = px - (float)x0;
+                for (ic = 0; ic < 3; ic++) {
+                    float p00 = (float)img[(y0 * w + x0) * 3 + ic];
+                    float p10 = (float)img[(y0 * w + x1) * 3 + ic];
+                    float p01 = (float)img[(y1 * w + x0) * 3 + ic];
+                    float p11 = (float)img[(y1 * w + x1) * 3 + ic];
+                    float pv = g4v_lerp(g4v_lerp(p00, p10, xf), g4v_lerp(p01, p11, xf), yf);
+                    unsigned char p;
+                    if (pv < 0.f) pv = 0.f;
+                    if (pv > 255.f) pv = 255.f;
+                    p = (unsigned char)pv;
+                    float z = ((float)p / 255.f - v->mean[ic]) / v->std[ic];
+                    chw[(size_t)ic * sh * sw + (uint32_t)y * sw + (uint32_t)x] = z * 2.f - 1.f;
                 }
-                p = cubic_cr(col[0], col[1], col[2], col[3], wy);
-                if (p < 0.f) p = 0.f;
-                if (p > 255.f) p = 255.f;
-                z = (p / 255.f - v->mean[ic]) / v->std[ic];
-                chw[(size_t)ic * sh * sw + (uint32_t)y * sw + (uint32_t)x] = z * 2.f - 1.f;
             }
         }
     }

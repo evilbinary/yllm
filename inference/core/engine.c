@@ -330,6 +330,7 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     }
     e->ffn = (float*)ycalloc((size_t)2 * inter, 4);
     e->att = (float*)ymalloc((size_t)e->max_seq * m->h.n_heads * 4);
+    e->vis_tok = -1;
     e->logits = (float*)ymalloc((size_t)vocab * 4);
     /* 批量 prefill 工作区 */
     {
@@ -643,7 +644,7 @@ static int engine_forward_prefill_mix(Engine* e, const uint32_t* tokens, int n, 
     int off;
     if (!mix || !use_mix)
         return engine_forward_prefill(e, tokens, n, start_pos);
-    /* 视觉向量走 CPU 批; 不走 GPU prefill */
+    /* 视觉向量走 CPU 批; 不走 GPU prefill。批大小仍为 PB_MAX, 勿整段 vis 一次编 */
     ws = &e->ws;
     m = &ws->model;
     hidden = m->h.hidden;
