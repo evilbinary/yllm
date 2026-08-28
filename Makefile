@@ -692,6 +692,7 @@ chat-minicpm-v-4.6: $(BIN) $(MCPM_V46_LLF)
 	$(RUN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
 
+#  make chat-minicpm-v-4.6-avx2 IMAGE=models/test_red.ppm CHAT_TOKENS=16'
 chat-minicpm-v-4.6-avx2: $(BIN_AVX2) $(MCPM_V46_LLF)
 	$(RUN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)

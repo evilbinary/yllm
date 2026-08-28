@@ -10,6 +10,16 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef _WIN32
+#include <malloc.h>
+#define vis_alloca _alloca
+#else
+#include <alloca.h>
+#define vis_alloca alloca
+#endif
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -51,6 +61,10 @@ struct Vision {
     ClipT vm_ds_ln_w, vm_ds_ln_b, vm_ds_up_w, vm_ds_up_b, vm_ds_down_w, vm_ds_down_b;
     ClipLayer layers[CLIP_MAX_LAYERS];
     float *x, *res, *tmp, *q, *k, *v, *attn, *ff;
+    float *patch_wf; /* [n_embd, 3*ps*ps] 行主序 f32 */
+    float *pos_f;    /* [70*70, n_embd] */
+    float *gemm_row; /* nthr * gemm_in_cap */
+    uint32_t gemm_nthr, gemm_in_cap;
 };
 
 typedef struct {
@@ -120,12 +134,6 @@ static uint64_t align_up_u(uint64_t x, uint64_t a)
     return (x + a - 1) / a * a;
 }
 
-/* ClipT.dtype: 0=F32 1=F16. yllm DT_F16=0, DT_F32=1. */
-static uint32_t ydtype(const ClipT* t)
-{
-    return (t && t->dtype == 0) ? DT_F32 : DT_F16;
-}
-
 static float tload(const ClipT* t, uint64_t i)
 {
     if (!t || !t->p) return 0.f;
@@ -133,11 +141,64 @@ static float tload(const ClipT* t, uint64_t i)
     return f16_to_f32(((const uint16_t*)t->p)[i]);
 }
 
-static void add_bias(float* y, const ClipT* b, uint32_t n)
+#ifdef __AVX2__
+static float hsum8(__m256 v)
+{
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+    return _mm_cvtss_f32(lo);
+}
+static void f16row_to_f32(float* d, const uint16_t* s, uint32_t n)
+{
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i*)(s + i));
+        _mm256_storeu_ps(d + i, _mm256_cvtph_ps(h));
+    }
+    for (; i < n; i++) d[i] = f16_to_f32(s[i]);
+}
+static float dot_f32(const float* a, const float* b, uint32_t n)
+{
+    __m256 s = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s);
+        s = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s);
+    }
+    for (; i + 8 <= n; i += 8)
+        s = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s);
+    {
+        float acc = hsum8(s);
+        for (; i < n; i++) acc += a[i] * b[i];
+        return acc;
+    }
+}
+#else
+static void f16row_to_f32(float* d, const uint16_t* s, uint32_t n)
 {
     uint32_t i;
-    if (!b || !b->p) return;
-    for (i = 0; i < n; i++) y[i] += tload(b, i);
+    for (i = 0; i < n; i++) d[i] = f16_to_f32(s[i]);
+}
+static float dot_f32(const float* a, const float* b, uint32_t n)
+{
+    float acc = 0.f;
+    uint32_t i;
+    for (i = 0; i < n; i++) acc += a[i] * b[i];
+    return acc;
+}
+#endif
+
+static void add_bias_rows(float* y, const float* b, uint32_t M, uint32_t out)
+{
+    uint32_t m, i;
+    if (!b) return;
+    for (m = 0; m < M; m++) {
+        float* row = y + (size_t)m * out;
+        for (i = 0; i < out; i++) row[i] += b[i];
+    }
 }
 
 static void layernorm(float* y, const float* x, const ClipT* w, const ClipT* b, uint32_t n, float eps)
@@ -159,16 +220,56 @@ static void layernorm(float* y, const float* x, const ClipT* w, const ClipT* b, 
     }
 }
 
-static void gemm_lin(float* y, const float* x, const ClipT* w, const ClipT* bias,
+/* y[M,out] = x[M,in] · W[out,in]^T ; F16 权重每行只转一次, 再对整批 token 点积 */
+static void gemm_lin(Vision* vis, float* y, const float* x, const ClipT* w, const ClipT* bias,
                      uint32_t M, uint32_t out, uint32_t in)
 {
-    uint32_t dtype = ydtype(w);
-    uint32_t m;
-    /* 不用 collapse/嵌套 omp: MinGW libgomp 上容易崩 */
-    for (m = 0; m < M; m++) {
-        matmul(y + (size_t)m * out, x + (size_t)m * in, w->p, out, in, dtype);
-        add_bias(y + (size_t)m * out, bias, out);
+    uint32_t oo;
+    float* bf = NULL;
+    if (bias && bias->p) {
+        bf = (float*)vis_alloca((size_t)out * 4);
+        for (oo = 0; oo < out; oo++) bf[oo] = tload(bias, oo);
     }
+    if (w->dtype == 0) {
+        matmul_batch(y, x, w->p, out, in, DT_F32, M);
+        add_bias_rows(y, bf, M, out);
+        return;
+    }
+    if (!vis->gemm_row || in > vis->gemm_in_cap) {
+        uint32_t m;
+        for (m = 0; m < M; m++) {
+            matmul(y + (size_t)m * out, x + (size_t)m * in, w->p, out, in, DT_F16);
+            if (bf) {
+                uint32_t i;
+                for (i = 0; i < out; i++) y[(size_t)m * out + i] += bf[i];
+            }
+        }
+        return;
+    }
+#pragma omp parallel for schedule(static)
+    for (oo = 0; oo < out; oo++) {
+        int tid = 0;
+        float* wr;
+        uint32_t m;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        if (tid < 0 || (uint32_t)tid >= vis->gemm_nthr) tid = 0;
+        wr = vis->gemm_row + (size_t)tid * vis->gemm_in_cap;
+        f16row_to_f32(wr, (const uint16_t*)w->p + (size_t)oo * in, in);
+        for (m = 0; m < M; m++) {
+            float acc = dot_f32(x + (size_t)m * in, wr, in);
+            if (bf) acc += bf[oo];
+            y[(size_t)m * out + oo] = acc;
+        }
+    }
+}
+
+static void gemm_f32(float* y, const float* x, const float* w, const float* bias,
+                     uint32_t M, uint32_t out, uint32_t in)
+{
+    matmul_batch(y, x, (const uint8_t*)w, out, in, DT_F32, M);
+    add_bias_rows(y, bias, M, out);
 }
 
 static float gelu_erf(float x)
@@ -186,17 +287,16 @@ static void attn_full(float* out, const float* q, const float* k, const float* v
                      uint32_t n, uint32_t n_head, uint32_t dh, float scale)
 {
     uint32_t t;
+#pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++) {
-        uint32_t h, j, d;
+        uint32_t h, j;
         for (h = 0; h < n_head; h++) {
             const float* qt = q + ((size_t)t * n_head + h) * dh;
             float mx = -1e30f, sum = 0.f;
             float sc[CLIP_MAX_POS];
             for (j = 0; j < n; j++) {
                 const float* kj = k + ((size_t)j * n_head + h) * dh;
-                float acc = 0.f;
-                for (d = 0; d < dh; d++) acc += qt[d] * kj[d];
-                sc[j] = acc * scale;
+                sc[j] = dot_f32(qt, kj, dh) * scale;
                 if (sc[j] > mx) mx = sc[j];
             }
             for (j = 0; j < n; j++) {
@@ -204,13 +304,24 @@ static void attn_full(float* out, const float* q, const float* k, const float* v
                 sum += sc[j];
             }
             {
-                float inv = 1.f / sum;
+                float inv = 1.f / (sum > 0.f ? sum : 1.f);
                 float* o = out + ((size_t)t * n_head + h) * dh;
+                uint32_t d;
                 memset(o, 0, (size_t)dh * 4);
                 for (j = 0; j < n; j++) {
                     float a = sc[j] * inv;
                     const float* vj = v + ((size_t)j * n_head + h) * dh;
+#ifdef __AVX2__
+                    __m256 as = _mm256_set1_ps(a);
+                    for (d = 0; d + 8 <= dh; d += 8) {
+                        __m256 ov = _mm256_loadu_ps(o + d);
+                        ov = _mm256_fmadd_ps(as, _mm256_loadu_ps(vj + d), ov);
+                        _mm256_storeu_ps(o + d, ov);
+                    }
+                    for (; d < dh; d++) o[d] += a * vj[d];
+#else
                     for (d = 0; d < dh; d++) o[d] += a * vj[d];
+#endif
                 }
             }
         }
@@ -222,6 +333,7 @@ static void attn_win4(float* out, const float* q, const float* k, const float* v
                      uint32_t n, uint32_t n_head, uint32_t dh, float scale)
 {
     uint32_t g, ng = n / 4;
+#pragma omp parallel for schedule(static)
     for (g = 0; g < ng; g++) {
         uint32_t base = g * 4, ii, h, j, d;
         for (ii = 0; ii < 4; ii++) {
@@ -231,14 +343,12 @@ static void attn_win4(float* out, const float* q, const float* k, const float* v
                 float sc[4], mx = -1e30f, sum = 0.f;
                 for (j = 0; j < 4; j++) {
                     const float* kj = k + ((size_t)(base + j) * n_head + h) * dh;
-                    float acc = 0.f;
-                    for (d = 0; d < dh; d++) acc += qt[d] * kj[d];
-                    sc[j] = acc * scale;
+                    sc[j] = dot_f32(qt, kj, dh) * scale;
                     if (sc[j] > mx) mx = sc[j];
                 }
                 for (j = 0; j < 4; j++) { sc[j] = expf(sc[j] - mx); sum += sc[j]; }
                 {
-                    float inv = 1.f / sum;
+                    float inv = 1.f / (sum > 0.f ? sum : 1.f);
                     float* o = out + ((size_t)t * n_head + h) * dh;
                     memset(o, 0, (size_t)dh * 4);
                     for (j = 0; j < 4; j++) {
@@ -258,26 +368,26 @@ static void vit_attn(Vision* vis, const ClipT* qw, const ClipT* qb, const ClipT*
 {
     uint32_t e = vis->n_embd, nh = vis->n_head, dh = e / nh;
     float scale = 1.f / sqrtf((float)dh);
-    gemm_lin(vis->q, vis->tmp, qw, qb, n, e, e);
-    gemm_lin(vis->k, vis->tmp, kw, kb, n, e, e);
-    gemm_lin(vis->v, vis->tmp, vw, vb, n, e, e);
+    gemm_lin(vis, vis->q, vis->tmp, qw, qb, n, e, e);
+    gemm_lin(vis, vis->k, vis->tmp, kw, kb, n, e, e);
+    gemm_lin(vis, vis->v, vis->tmp, vw, vb, n, e, e);
     if (win4) attn_win4(vis->attn, vis->q, vis->k, vis->v, n, nh, dh, scale);
     else attn_full(vis->attn, vis->q, vis->k, vis->v, n, nh, dh, scale);
-    gemm_lin(vis->tmp, vis->attn, ow, ob, n, e, e);
+    gemm_lin(vis, vis->tmp, vis->attn, ow, ob, n, e, e);
 }
 
 static void vit_ffn(Vision* vis, const ClipT* up_w, const ClipT* up_b,
                     const ClipT* down_w, const ClipT* down_b, uint32_t n, uint32_t in, int erf)
 {
     uint32_t n_ff = (uint32_t)up_w->dims[1];
-    gemm_lin(vis->ff, vis->tmp, up_w, up_b, n, n_ff, in);
+    gemm_lin(vis, vis->ff, vis->tmp, up_w, up_b, n, n_ff, in);
     if (erf) {
         uint32_t i;
         for (i = 0; i < n * n_ff; i++) vis->ff[i] = gelu_erf(vis->ff[i]);
     } else {
         gelu_inplace(vis->ff, n * n_ff);
     }
-    gemm_lin(vis->tmp, vis->ff, down_w, down_b, n, vis->n_embd, n_ff);
+    gemm_lin(vis, vis->tmp, vis->ff, down_w, down_b, n, vis->n_embd, n_ff);
 }
 
 static void vit_block(Vision* vis, uint32_t il, uint32_t n)
@@ -285,15 +395,19 @@ static void vit_block(Vision* vis, uint32_t il, uint32_t n)
     ClipLayer* L = &vis->layers[il];
     uint32_t e = vis->n_embd, t;
     memcpy(vis->res, vis->x, (size_t)n * e * 4);
+#pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++)
         layernorm(vis->tmp + (size_t)t * e, vis->x + (size_t)t * e, &L->ln1_w, &L->ln1_b, e, vis->eps);
     vit_attn(vis, &L->q_w, &L->q_b, &L->k_w, &L->k_b, &L->v_w, &L->v_b, &L->o_w, &L->o_b, n, 0);
-    for (t = 0; t < n * e; t++) vis->x[t] = vis->res[t] + vis->tmp[t];
+    memcpy(vis->x, vis->res, (size_t)n * e * 4);
+    add_inplace(vis->x, vis->tmp, n * e);
     memcpy(vis->res, vis->x, (size_t)n * e * 4);
+#pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++)
         layernorm(vis->tmp + (size_t)t * e, vis->x + (size_t)t * e, &L->ln2_w, &L->ln2_b, e, vis->eps);
     vit_ffn(vis, &L->up_w, &L->up_b, &L->down_w, &L->down_b, n, e, 0);
-    for (t = 0; t < n * e; t++) vis->x[t] = vis->res[t] + vis->tmp[t];
+    memcpy(vis->x, vis->res, (size_t)n * e * 4);
+    add_inplace(vis->x, vis->tmp, n * e);
 }
 
 static int load_layer(Vision* v, uint32_t il)
@@ -478,7 +592,33 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
         v->v = (float*)ymalloc(cap * 4);
         v->attn = (float*)ymalloc(cap * 4);
         v->ff = (float*)ymalloc(ffcap * 4);
-        if (!v->x || !v->res || !v->tmp || !v->q || !v->k || !v->v || !v->attn || !v->ff) {
+        {
+            uint32_t ps = v->patch, e = v->n_embd, K = 3 * ps * ps, oc, ic, ky, kx, pi;
+            v->patch_wf = (float*)ymalloc((size_t)e * K * 4);
+            v->pos_f = (float*)ymalloc((size_t)70 * 70 * e * 4);
+            if (v->patch_wf) {
+                for (oc = 0; oc < e; oc++)
+                    for (ic = 0; ic < 3; ic++)
+                        for (ky = 0; ky < ps; ky++)
+                            for (kx = 0; kx < ps; kx++) {
+                                uint64_t wi = (uint64_t)kx + (uint64_t)ps * (ky + ps * (ic + 3 * oc));
+                                uint32_t k = ic * ps * ps + ky * ps + kx;
+                                v->patch_wf[(size_t)oc * K + k] = tload(&v->patch_w, wi);
+                            }
+            }
+            if (v->pos_f)
+                for (pi = 0; pi < 70u * 70u * e; pi++)
+                    v->pos_f[pi] = tload(&v->pos_embd, pi);
+            v->gemm_nthr = 1;
+#ifdef _OPENMP
+            v->gemm_nthr = (uint32_t)omp_get_max_threads();
+            if (v->gemm_nthr < 1) v->gemm_nthr = 1;
+#endif
+            v->gemm_in_cap = 18432;
+            v->gemm_row = (float*)ymalloc((size_t)v->gemm_nthr * v->gemm_in_cap * 4);
+        }
+        if (!v->x || !v->res || !v->tmp || !v->q || !v->k || !v->v || !v->attn || !v->ff ||
+            !v->patch_wf || !v->pos_f || !v->gemm_row) {
             if (err) snprintf(err, errlen, "oom vis buf");
             vision_free(v); return NULL;
         }
@@ -493,6 +633,7 @@ void vision_free(Vision* v)
 {
     if (!v) return;
     free(v->x); free(v->res); free(v->tmp); free(v->q); free(v->k); free(v->v); free(v->attn); free(v->ff);
+    free(v->patch_wf); free(v->pos_f); free(v->gemm_row);
     free(v->ts);
     wmap_close(&v->map);
     free(v);
@@ -514,26 +655,24 @@ int vision_hidden(const Vision* v)
 
 static void patch_embed(Vision* vis, const float* chw, uint32_t gh, uint32_t gw)
 {
-    uint32_t ps = vis->patch, e = vis->n_embd, oc, py, px, ic, ky, kx;
-    /* w layout ggml: [ps, ps, 3, oc]. 不用 OpenMP: MinGW libgomp 在此核上 SIGSEGV */
-    for (py = 0; py < gh; py++) {
-        for (px = 0; px < gw; px++) {
-            uint32_t t = py * gw + px;
-            float* dst = vis->x + (size_t)t * e;
-            for (oc = 0; oc < e; oc++) {
-                float acc = tload(&vis->patch_b, oc);
-                for (ic = 0; ic < 3; ic++)
-                    for (ky = 0; ky < ps; ky++)
-                        for (kx = 0; kx < ps; kx++) {
-                            uint32_t ix = px * ps + kx, iy = py * ps + ky;
-                            float pix = chw[(size_t)ic * vis->image_size * vis->image_size + iy * vis->image_size + ix];
-                            uint64_t wi = (uint64_t)kx + (uint64_t)ps * (ky + ps * (ic + 3 * oc));
-                            acc += pix * tload(&vis->patch_w, wi);
-                        }
-                dst[oc] = acc;
-            }
-        }
+    uint32_t ps = vis->patch, e = vis->n_embd, K = 3 * ps * ps;
+    uint32_t n = gh * gw, S = vis->image_size, t;
+    float* col = vis->ff;
+    float* bias = (float*)vis_alloca((size_t)e * 4);
+    uint32_t oc;
+    for (oc = 0; oc < e; oc++) bias[oc] = tload(&vis->patch_b, oc);
+#pragma omp parallel for schedule(static)
+    for (t = 0; t < n; t++) {
+        uint32_t py = t / gw, px = t % gw, ic, ky, kx, k = 0;
+        float* c = col + (size_t)t * K;
+        for (ic = 0; ic < 3; ic++)
+            for (ky = 0; ky < ps; ky++)
+                for (kx = 0; kx < ps; kx++) {
+                    uint32_t ix = px * ps + kx, iy = py * ps + ky;
+                    c[k++] = chw[(size_t)ic * S * S + iy * S + ix];
+                }
     }
+    gemm_f32(vis->x, col, vis->patch_wf, bias, n, e, K);
 }
 
 static void add_pos(Vision* vis, uint32_t gh, uint32_t gw)
@@ -544,9 +683,7 @@ static void add_pos(Vision* vis, uint32_t gh, uint32_t gw)
         for (j = 0; j < gw; j++, t++) {
             int bw = (int)floor(70.0 * (double)j / (double)gw);
             uint32_t row = (uint32_t)(bh * 70 + bw);
-            float* dst = vis->x + (size_t)t * e;
-            uint32_t c;
-            for (c = 0; c < e; c++) dst[c] += tload(&vis->pos_embd, (uint64_t)row * e + c);
+            add_inplace(vis->x + (size_t)t * e, vis->pos_f + (size_t)row * e, e);
         }
     }
 }
@@ -624,9 +761,9 @@ static int encode_448(Vision* vis, const float* chw, float* out)
         }
         {
             uint32_t n_ff = (uint32_t)vis->vm_ds_up_w.dims[1];
-            gemm_lin(vis->ff, vis->tmp, &vis->vm_ds_up_w, &vis->vm_ds_up_b, ds, n_ff, e * 4);
+            gemm_lin(vis, vis->ff, vis->tmp, &vis->vm_ds_up_w, &vis->vm_ds_up_b, ds, n_ff, e * 4);
             gelu_inplace(vis->ff, ds * n_ff);
-            gemm_lin(vis->tmp, vis->ff, &vis->vm_ds_down_w, &vis->vm_ds_down_b, ds, e, n_ff);
+            gemm_lin(vis, vis->tmp, vis->ff, &vis->vm_ds_down_w, &vis->vm_ds_down_b, ds, e, n_ff);
         }
         for (t = 0; t < ds * e; t++) vis->x[t] = vis->tmp[t] + vis->res[t];
         n = ds; gh = half; gw = half;
@@ -656,9 +793,9 @@ static int encode_448(Vision* vis, const float* chw, float* out)
         }
         {
             uint32_t n_up = (uint32_t)vis->mm_up_w.dims[1];
-            gemm_lin(vis->ff, vis->tmp, &vis->mm_up_w, &vis->mm_up_b, ds, n_up, e * 4);
+            gemm_lin(vis, vis->ff, vis->tmp, &vis->mm_up_w, &vis->mm_up_b, ds, n_up, e * 4);
             gelu_erf_inplace(vis->ff, ds * n_up);
-            gemm_lin(out, vis->ff, &vis->mm_down_w, &vis->mm_down_b, ds, vis->n_out_embd, n_up);
+            gemm_lin(vis, out, vis->ff, &vis->mm_down_w, &vis->mm_down_b, ds, vis->n_out_embd, n_up);
         }
         (void)c;
     }
@@ -706,8 +843,12 @@ int vision_encode_image(Vision* v, const char* image_path, float* out, int max_t
     }
     stbi_image_free(img);
     ylog_info("vision: encoding %ux%u (this is slow on CPU)", S, S);
-    encode_448(v, chw, out);
+    {
+        uint64_t t0 = ynow_ms();
+        encode_448(v, chw, out);
+        ylog_info("vision: encoded %dx%d -> %d tokens hidden=%u in %.2f s",
+                  w, h, ntok, v->n_out_embd, (double)(ynow_ms() - t0) / 1000.0);
+    }
     free(chw);
-    ylog_info("vision: encoded %dx%d -> %d tokens hidden=%u", w, h, ntok, v->n_out_embd);
     return ntok;
 }
