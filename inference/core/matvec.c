@@ -2620,7 +2620,16 @@ void rmsnorm_unit(float* y, const float* x, uint32_t n, float eps)
 void add_inplace(float* y, const float* x, uint32_t n)
 {
     uint32_t i = 0;
-#if defined(__aarch64__)
+#if defined(__AVX2__)
+    for (; i + 32 <= n; i += 32) {
+        _mm256_storeu_ps(y + i,      _mm256_add_ps(_mm256_loadu_ps(y + i),      _mm256_loadu_ps(x + i)));
+        _mm256_storeu_ps(y + i + 8,  _mm256_add_ps(_mm256_loadu_ps(y + i + 8),  _mm256_loadu_ps(x + i + 8)));
+        _mm256_storeu_ps(y + i + 16, _mm256_add_ps(_mm256_loadu_ps(y + i + 16), _mm256_loadu_ps(x + i + 16)));
+        _mm256_storeu_ps(y + i + 24, _mm256_add_ps(_mm256_loadu_ps(y + i + 24), _mm256_loadu_ps(x + i + 24)));
+    }
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
+#elif defined(__aarch64__)
     for (; i + 16 <= n; i += 16) {
         vst1q_f32(y + i, vaddq_f32(vld1q_f32(y + i), vld1q_f32(x + i)));
         vst1q_f32(y + i + 4, vaddq_f32(vld1q_f32(y + i + 4), vld1q_f32(x + i + 4)));

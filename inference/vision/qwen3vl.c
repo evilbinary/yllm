@@ -64,6 +64,8 @@ struct Q3v {
     float *pos_f;
     uint32_t pos_side, pos_n;
     float *gemm_row;
+    float *rope_cs;
+    int32_t *pos_buf;
     uint32_t gemm_nthr, gemm_in_cap, npos_max, sc_nthr;
 };
 
@@ -168,32 +170,128 @@ static float dot_f32(const float* a, const float* b, uint32_t n)
 }
 #endif
 
-static void add_bias_rows(float* y, const float* b, uint32_t M, uint32_t out)
-{
-    uint32_t m, i;
-    if (!b) return;
-    for (m = 0; m < M; m++) {
-        float* row = y + (size_t)m * out;
-        for (i = 0; i < out; i++) row[i] += b[i];
-    }
-}
 
 static void layernorm(float* y, const float* x, const ClipT* w, const ClipT* b, uint32_t n, float eps)
 {
-    double m = 0, v = 0;
-    uint32_t i;
+    const float* ww = (w && w->p && w->dtype == 0) ? (const float*)w->p : NULL;
+    const float* bb = (b && b->p && b->dtype == 0) ? (const float*)b->p : NULL;
+    float m = 0.f, v = 0.f, inv;
+    uint32_t i = 0;
+#ifdef __AVX2__
+    if (n >= 8) {
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 8 <= n; i += 8) acc = _mm256_add_ps(acc, _mm256_loadu_ps(x + i));
+        m = hsum8(acc);
+        for (; i < n; i++) m += x[i];
+        m /= (float)n;
+        {
+            __m256 vm = _mm256_set1_ps(m);
+            __m256 vv = _mm256_setzero_ps();
+            i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), vm);
+                vv = _mm256_fmadd_ps(d, d, vv);
+            }
+            v = hsum8(vv);
+            for (; i < n; i++) {
+                float d = x[i] - m;
+                v += d * d;
+            }
+            inv = 1.f / sqrtf(v / (float)n + eps);
+            if (ww) {
+                __m256 vi = _mm256_set1_ps(inv);
+                i = 0;
+                for (; i + 8 <= n; i += 8) {
+                    __m256 z = _mm256_mul_ps(_mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), vm), vi),
+                                             _mm256_loadu_ps(ww + i));
+                    if (bb) z = _mm256_add_ps(z, _mm256_loadu_ps(bb + i));
+                    _mm256_storeu_ps(y + i, z);
+                }
+                for (; i < n; i++) y[i] = (x[i] - m) * inv * ww[i] + (bb ? bb[i] : 0.f);
+                return;
+            }
+        }
+        for (i = 0; i < n; i++) {
+            float z = (x[i] - m) * inv;
+            if (w && w->p) z *= tload(w, i);
+            if (b && b->p) z += tload(b, i);
+            y[i] = z;
+        }
+        return;
+    }
+#endif
     for (i = 0; i < n; i++) m += x[i];
-    m /= (double)n;
+    m /= (float)n;
     for (i = 0; i < n; i++) {
-        double d = x[i] - m;
+        float d = x[i] - m;
         v += d * d;
     }
-    v = 1.0 / sqrt(v / (double)n + (double)eps);
-    for (i = 0; i < n; i++) {
-        float z = (float)((x[i] - m) * v);
-        if (w && w->p) z *= tload(w, i);
-        if (b && b->p) z += tload(b, i);
-        y[i] = z;
+    inv = 1.f / sqrtf(v / (float)n + eps);
+    if (ww) {
+        for (i = 0; i < n; i++) y[i] = (x[i] - m) * inv * ww[i] + (bb ? bb[i] : 0.f);
+    } else {
+        for (i = 0; i < n; i++) {
+            float z = (x[i] - m) * inv;
+            if (w && w->p) z *= tload(w, i);
+            if (b && b->p) z += tload(b, i);
+            y[i] = z;
+        }
+    }
+}
+
+static void gemm_nn(float* y, const float* x, const float* w, const float* bias,
+                    uint32_t M, uint32_t out, uint32_t in)
+{
+    uint32_t g, ng = (out + 3u) / 4u;
+#pragma omp parallel for schedule(static)
+    for (g = 0; g < ng; g++) {
+        uint32_t oo = g * 4, nout = out - oo, m, i;
+        const float* w0 = w + (size_t)oo * in;
+        const float* w1 = w0 + in;
+        const float* w2 = w1 + in;
+        const float* w3 = w2 + in;
+        float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f;
+        if (nout > 4) nout = 4;
+        if (bias) {
+            b0 = bias[oo];
+            if (nout > 1) b1 = bias[oo + 1];
+            if (nout > 2) b2 = bias[oo + 2];
+            if (nout > 3) b3 = bias[oo + 3];
+        }
+#ifdef __AVX2__
+        if (nout == 4) {
+            for (m = 0; m < M; m++) {
+                const float* xr = x + (size_t)m * in;
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                float* yr = y + (size_t)m * out + oo;
+                for (i = 0; i + 8 <= in; i += 8) {
+                    __m256 xv = _mm256_loadu_ps(xr + i);
+                    a0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w0 + i), a0);
+                    a1 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w1 + i), a1);
+                    a2 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w2 + i), a2);
+                    a3 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w3 + i), a3);
+                }
+                {
+                    float s0 = hsum8(a0), s1 = hsum8(a1), s2 = hsum8(a2), s3 = hsum8(a3);
+                    for (; i < in; i++) {
+                        float xv = xr[i];
+                        s0 += xv * w0[i]; s1 += xv * w1[i];
+                        s2 += xv * w2[i]; s3 += xv * w3[i];
+                    }
+                    yr[0] = s0 + b0; yr[1] = s1 + b1; yr[2] = s2 + b2; yr[3] = s3 + b3;
+                }
+            }
+            continue;
+        }
+#endif
+        for (m = 0; m < M; m++) {
+            const float* xr = x + (size_t)m * in;
+            float* yr = y + (size_t)m * out + oo;
+            uint32_t k;
+            for (k = 0; k < nout; k++)
+                yr[k] = dot_f32(xr, w0 + (size_t)k * in, in) + (k == 0 ? b0 : k == 1 ? b1 : k == 2 ? b2 : b3);
+        }
     }
 }
 
@@ -201,23 +299,19 @@ static void gemm_lin(Q3v* vis, float* y, const float* x, const ClipT* w, const C
                      uint32_t M, uint32_t out, uint32_t in)
 {
     uint32_t oo;
-    float* bf = NULL;
+    const float* bf = NULL;
+    float* bf_tmp = NULL;
     if (!w || !w->p) { memset(y, 0, (size_t)M * out * 4); return; }
     if (bias && bias->p) {
-        bf = (float*)vis_alloca((size_t)out * 4);
-        for (oo = 0; oo < out; oo++) bf[oo] = tload(bias, oo);
+        if (bias->dtype == 0) bf = (const float*)bias->p;
+        else {
+            bf_tmp = (float*)vis_alloca((size_t)out * 4);
+            for (oo = 0; oo < out; oo++) bf_tmp[oo] = tload(bias, oo);
+            bf = bf_tmp;
+        }
     }
     if (w->dtype == 0) {
-#pragma omp parallel for schedule(static)
-        for (oo = 0; oo < out; oo++) {
-            const float* wr = (const float*)w->p + (size_t)oo * in;
-            uint32_t m;
-            for (m = 0; m < M; m++) {
-                float acc = dot_f32(x + (size_t)m * in, wr, in);
-                if (bf) acc += bf[oo];
-                y[(size_t)m * out + oo] = acc;
-            }
-        }
+        gemm_nn(y, x, (const float*)w->p, bf, M, out, in);
         return;
     }
     if (!vis->gemm_row || in > vis->gemm_in_cap) {
@@ -250,13 +344,6 @@ static void gemm_lin(Q3v* vis, float* y, const float* x, const ClipT* w, const C
     }
 }
 
-static void gemm_f32(float* y, const float* x, const float* w, const float* bias,
-                     uint32_t M, uint32_t out, uint32_t in)
-{
-    matmul_batch(y, x, (const uint8_t*)w, out, in, DT_F32, M);
-    add_bias_rows(y, bias, M, out);
-}
-
 static float gelu_quick(float x)
 {
     return x / (1.0f + expf(-1.702f * x));
@@ -270,8 +357,13 @@ static float gelu_tanh_f(float x)
 static void act_inplace(float* y, uint32_t n, int quick)
 {
     uint32_t i;
-    if (quick) for (i = 0; i < n; i++) y[i] = gelu_quick(y[i]);
-    else for (i = 0; i < n; i++) y[i] = gelu_tanh_f(y[i]);
+    if (quick) {
+#pragma omp parallel for schedule(static)
+        for (i = 0; i < n; i++) y[i] = gelu_quick(y[i]);
+    } else {
+#pragma omp parallel for schedule(static)
+        for (i = 0; i < n; i++) y[i] = gelu_tanh_f(y[i]);
+    }
 }
 
 static uint64_t gguf_nbytes(uint32_t gtype, uint64_t ne)
@@ -353,17 +445,17 @@ static void spatial_merge(const float* src, float* dst, uint32_t gh, uint32_t gw
 }
 
 /* VISION M-RoPE: n_dims=dh/2, sections=dh/4, NEOX pairs over full head */
-static void vision_rope(float* x, const int32_t* pos, uint32_t n, uint32_t nh, uint32_t dh)
+static void rope_fill(float* cs, const int32_t* pos, uint32_t n, uint32_t dh)
 {
     uint32_t t, nd = dh / 2, sec = dh / 4;
     float theta_scale = powf(10000.f, -2.f / (float)nd);
+    if (dh > 256) return;
 #pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++) {
-        float cache[256];
         float pt = (float)pos[t], ph = (float)pos[n + t];
         float tt = pt, tht = ph;
-        uint32_t i0, h, sector;
-        if (dh > 256) continue;
+        float* cache = cs + (size_t)t * dh;
+        uint32_t i0, sector;
         for (i0 = 0; i0 < dh; i0 += 2) {
             sector = i0 / 2;
             if (sector == 0) tt = pt;
@@ -376,6 +468,16 @@ static void vision_rope(float* x, const int32_t* pos, uint32_t n, uint32_t nh, u
             tt *= theta_scale;
             tht *= theta_scale;
         }
+    }
+}
+
+static void rope_apply(float* x, const float* cs, uint32_t n, uint32_t nh, uint32_t dh)
+{
+    uint32_t t, nd = dh / 2;
+#pragma omp parallel for schedule(static)
+    for (t = 0; t < n; t++) {
+        const float* cache = cs + (size_t)t * dh;
+        uint32_t h, i0;
         for (h = 0; h < nh; h++) {
             float* row = x + ((size_t)t * nh + h) * dh;
             for (i0 = 0; i0 < dh; i0 += 2) {
@@ -401,13 +503,14 @@ static void pack_heads(float* dst, const float* src, uint32_t n, uint32_t nh, ui
     }
 }
 
+/* q: [token][head][dh]; k/v packed [head][token][dh]; out: [token][head][dh] */
 static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, const float* vpk,
                      uint32_t n, uint32_t n_head, uint32_t dh, float scale)
 {
     uint32_t t;
 #pragma omp parallel for schedule(static)
     for (t = 0; t < n; t++) {
-        uint32_t h, j;
+        uint32_t h, j, d;
         int tid = 0;
         float* sc;
 #ifdef _OPENMP
@@ -420,7 +523,7 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, co
             const float* kh = kpk + (size_t)h * n * dh;
             const float* vh = vpk + (size_t)h * n * dh;
             float mx = -1e30f, sum = 0.f;
-            uint32_t d;
+            float* o = out + ((size_t)t * n_head + h) * dh;
             for (j = 0; j < n; j++) {
                 sc[j] = dot_f32(qt, kh + (size_t)j * dh, dh) * scale;
                 if (sc[j] > mx) mx = sc[j];
@@ -431,7 +534,6 @@ static void attn_full(Q3v* vis, float* out, const float* q, const float* kpk, co
             }
             {
                 float inv = 1.f / (sum > 0.f ? sum : 1.f);
-                float* o = out + ((size_t)t * n_head + h) * dh;
                 memset(o, 0, (size_t)dh * 4);
                 for (j = 0; j < n; j++) {
                     float a = sc[j] * inv;
@@ -473,10 +575,13 @@ static void vit_ffn(Q3v* vis, ClipLayer* L, uint32_t n, uint32_t in)
     if (L->has_gate) {
         uint32_t i;
         gemm_lin(vis, vis->qkv, vis->tmp, &L->gate_w, L->gate_b.p ? &L->gate_b : NULL, n, n_ff, in);
-        for (i = 0; i < n * n_ff; i++) {
-            float g = vis->qkv[i], u = vis->ff[i];
-            if (vis->ffn_quick) vis->ff[i] = gelu_quick(g) * u;
-            else vis->ff[i] = gelu_tanh_f(g) * u;
+        {
+            uint32_t nn = n * n_ff;
+#pragma omp parallel for schedule(static)
+            for (i = 0; i < nn; i++) {
+                float g = vis->qkv[i], u = vis->ff[i];
+                vis->ff[i] = (vis->ffn_quick ? gelu_quick(g) : gelu_tanh_f(g)) * u;
+            }
         }
     } else {
         act_inplace(vis->ff, n * n_ff, vis->ffn_quick);
@@ -576,7 +681,7 @@ static void patch_embed(Q3v* vis, const float* chw, uint32_t gh, uint32_t gw, ui
                     c[k++] = chw[(size_t)ic * sh * sw + iy * sw + ix];
                 }
     }
-    gemm_f32(vis->x, col, vis->patch_wf, NULL, n, e, K);
+    gemm_nn(vis->x, col, vis->patch_wf, NULL, n, e, K);
 }
 
 static void smart_hw(int w, int h, int factor, int min_px, int max_px, int* ow, int* oh)
@@ -797,6 +902,8 @@ Q3v* q3v_load(const char* path, char* err, size_t errlen)
         if (v->gemm_in_cap < 3 * e) v->gemm_in_cap = 3 * e;
         if (v->gemm_in_cap < mm_ff) v->gemm_in_cap = mm_ff;
         v->gemm_row = (float*)ymalloc((size_t)v->gemm_nthr * v->gemm_in_cap * 4);
+        v->rope_cs = (float*)ymalloc((size_t)np * 256 * 4);
+        v->pos_buf = (int32_t*)ymalloc((size_t)np * 4 * 4);
         if (v->patch_wf) {
             unpack_patch(&v->patch_w, v->patch_wf, e, K, ps, 0);
             if (v->has_patch1) unpack_patch(&v->patch_w1, v->patch_wf, e, K, ps, 1);
@@ -808,7 +915,8 @@ Q3v* q3v_load(const char* path, char* err, size_t errlen)
         }
         (void)oc;
         if (!v->x || !v->res || !v->tmp || !v->q || !v->k || !v->v || !v->attn || !v->ff ||
-            !v->qkv || !v->patch_wf || !v->pos_f || !v->gemm_row || !v->sc) {
+            !v->qkv || !v->patch_wf || !v->pos_f || !v->gemm_row || !v->sc ||
+            !v->rope_cs || !v->pos_buf) {
             if (err) snprintf(err, errlen, "oom vis buf");
             q3v_free(v); return NULL;
         }
@@ -830,6 +938,7 @@ void q3v_free(Q3v* v)
     free(v->x); free(v->res); free(v->tmp); free(v->q); free(v->k); free(v->v);
     free(v->attn); free(v->ff); free(v->qkv); free(v->sc);
     free(v->patch_wf); free(v->pos_f); free(v->gemm_row);
+    free(v->rope_cs); free(v->pos_buf);
     free(v->ts);
     wmap_close(&v->map);
     free(v);
@@ -859,20 +968,27 @@ static int encode_run(Q3v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
     uint32_t n = gh * gw, e = vis->n_embd, il, t;
     uint32_t n4 = n / 4, nh = vis->n_head, dh = e / nh;
     float scale = 1.f / sqrtf((float)dh);
-    int32_t* pos;
+    int32_t* pos = vis->pos_buf;
     uint32_t ptr, y, x, dy, dx;
     int dsi = 0;
     uint32_t oc;
+    const float* pbias_f = NULL;
     float* pbias;
 
     if (n == 0 || n > vis->npos_max || (n % 4) != 0) return -1;
+    if (dh > 256) return -1;
     patch_embed(vis, chw, gh, gw, sw, sh);
     spatial_merge(vis->x, vis->res, gh, gw, e);
     memcpy(vis->x, vis->res, (size_t)n * e * 4);
-    pbias = (float*)vis_alloca((size_t)e * 4);
-    for (oc = 0; oc < e; oc++) pbias[oc] = tload(&vis->patch_b, oc);
+    if (vis->patch_b.p && vis->patch_b.dtype == 0)
+        pbias_f = (const float*)vis->patch_b.p;
+    else {
+        pbias = (float*)vis_alloca((size_t)e * 4);
+        for (oc = 0; oc < e; oc++) pbias[oc] = tload(&vis->patch_b, oc);
+        pbias_f = pbias;
+    }
     for (t = 0; t < n; t++)
-        add_inplace(vis->x + (size_t)t * e, pbias, e);
+        add_inplace(vis->x + (size_t)t * e, pbias_f, e);
     interp_pos(vis, vis->tmp, gh, gw);
     spatial_merge(vis->tmp, vis->res, gh, gw, e);
     add_inplace(vis->x, vis->res, n * e);
@@ -885,8 +1001,6 @@ static int encode_run(Q3v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
         memcpy(vis->x, vis->tmp, (size_t)n * e * 4);
     }
 
-    pos = (int32_t*)ymalloc((size_t)n * 4 * 4);
-    if (!pos) return -1;
     ptr = 0;
     for (y = 0; y < gh; y += 2)
         for (x = 0; x < gw; x += 2)
@@ -898,42 +1012,39 @@ static int encode_run(Q3v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
                     pos[3 * n + ptr] = (int32_t)(x + dx);
                     ptr++;
                 }
+    rope_fill(vis->rope_cs, pos, n, dh);
 
     for (il = 0; il < vis->n_layer; il++) {
         ClipLayer* L = &vis->layers[il];
-        memcpy(vis->res, vis->x, (size_t)n * e * 4);
 #pragma omp parallel for schedule(static)
         for (t = 0; t < n; t++)
             layernorm(vis->tmp + (size_t)t * e, vis->x + (size_t)t * e,
                       &L->ln1_w, L->ln1_b.p ? &L->ln1_b : NULL, e, vis->eps);
         gemm_lin(vis, vis->qkv, vis->tmp, &L->qkv_w, L->qkv_b.p ? &L->qkv_b : NULL, n, 3 * e, e);
         split_qkv(vis, n);
-        vision_rope(vis->q, pos, n, nh, dh);
-        vision_rope(vis->k, pos, n, nh, dh);
+        rope_apply(vis->q, vis->rope_cs, n, nh, dh);
+        rope_apply(vis->k, vis->rope_cs, n, nh, dh);
         pack_heads(vis->ff, vis->k, n, nh, dh);
         pack_heads(vis->qkv, vis->v, n, nh, dh);
         attn_full(vis, vis->attn, vis->q, vis->ff, vis->qkv, n, nh, dh, scale);
         gemm_lin(vis, vis->tmp, vis->attn, &L->o_w, L->o_b.p ? &L->o_b : NULL, n, e, e);
-        memcpy(vis->x, vis->res, (size_t)n * e * 4);
         add_inplace(vis->x, vis->tmp, n * e);
-        memcpy(vis->res, vis->x, (size_t)n * e * 4);
 #pragma omp parallel for schedule(static)
         for (t = 0; t < n; t++)
             layernorm(vis->tmp + (size_t)t * e, vis->x + (size_t)t * e,
                       &L->ln2_w, L->ln2_b.p ? &L->ln2_b : NULL, e, vis->eps);
         vit_ffn(vis, L, n, e);
-        memcpy(vis->x, vis->res, (size_t)n * e * 4);
         add_inplace(vis->x, vis->tmp, n * e);
 
         if (L->has_ds) {
-            uint32_t in4 = e * 4, n_ff, i;
+            uint32_t in4 = e * 4, n_ff;
 #pragma omp parallel for schedule(static)
             for (t = 0; t < n4; t++)
                 layernorm(vis->tmp + (size_t)t * in4, vis->x + (size_t)t * in4,
                           &L->ds_ln_w, L->ds_ln_b.p ? &L->ds_ln_b : NULL, in4, vis->eps);
             n_ff = (uint32_t)L->ds_fc1_w.dims[1];
             gemm_lin(vis, vis->ff, vis->tmp, &L->ds_fc1_w, L->ds_fc1_b.p ? &L->ds_fc1_b : NULL, n4, n_ff, in4);
-            for (i = 0; i < n4 * n_ff; i++) vis->ff[i] = gelu_tanh_f(vis->ff[i]);
+            act_inplace(vis->ff, n4 * n_ff, 0);
             gemm_lin(vis, vis->tmp, vis->ff, &L->ds_fc2_w, L->ds_fc2_b.p ? &L->ds_fc2_b : NULL,
                      n4, vis->n_out_embd, n_ff);
             if (ds && dsi < vis->n_ds)
@@ -942,7 +1053,6 @@ static int encode_run(Q3v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
             dsi++;
         }
     }
-    free(pos);
 
     if (vis->has_post_ln) {
 #pragma omp parallel for schedule(static)
@@ -952,9 +1062,9 @@ static int encode_run(Q3v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
         memcpy(vis->x, vis->tmp, (size_t)n * e * 4);
     }
     {
-        uint32_t in4 = e * 4, n_ff = (uint32_t)vis->mm0_w.dims[1], i;
+        uint32_t in4 = e * 4, n_ff = (uint32_t)vis->mm0_w.dims[1];
         gemm_lin(vis, vis->ff, vis->x, &vis->mm0_w, vis->mm0_b.p ? &vis->mm0_b : NULL, n4, n_ff, in4);
-        for (i = 0; i < n4 * n_ff; i++) vis->ff[i] = gelu_tanh_f(vis->ff[i]);
+        act_inplace(vis->ff, n4 * n_ff, 0);
         gemm_lin(vis, out, vis->ff, &vis->mm2_w, vis->mm2_b.p ? &vis->mm2_b : NULL,
                  n4, vis->n_out_embd, n_ff);
     }
