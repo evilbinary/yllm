@@ -257,6 +257,12 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     float temp, float top_p, uint64_t seed, int eos_stop,
                     int (*on_token)(uint32_t id, void* ctx), void* ctx,
                     EngineTimings* timings, char* err, size_t errlen);
+/* mix_emb[i*hidden]、mix_use[i]!=0 时该位置用视觉向量而非 token embed */
+int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
+                        const float* mix_emb, const uint8_t* mix_use,
+                        float temp, float top_p, uint64_t seed, int eos_stop,
+                        int (*on_token)(uint32_t id, void* ctx), void* ctx,
+                        EngineTimings* timings, char* err, size_t errlen);
 uint64_t engine_resident(const Engine* e);
 
 uint64_t ysrand(uint64_t seed);

@@ -1,4 +1,5 @@
 #include "inference/include/yllm.h"
+#include "inference/include/vision.h"
 #include "inference/include/dist.h"
 #include "inference/include/log.h"
 #include "serve/rank.h"
@@ -545,11 +546,13 @@ done_gen:;
 
 static int cmd_chat(int argc, char** argv)
 {
-    Arg a[16];
-    int n = parse_args(argc, argv, 2, a, 16);
+    Arg a[24];
+    int n = parse_args(argc, argv, 2, a, 24);
     const char* m = opt(a, n, "model", NULL);
     const char* vocab = opt(a, n, "vocab", "vocab.txt");
     const char* prompt = opt(a, n, "prompt", NULL);
+    const char* mmproj = opt(a, n, "mmproj", NULL);
+    const char* image = opt(a, n, "image", NULL);
     int ntokens = atoi(opt(a, n, "tokens", "128"));
     const char* budget_str = opt(a, n, "budget", "auto");
     int depth = atoi(opt(a, n, "depth", "2"));
@@ -566,7 +569,7 @@ static int cmd_chat(int argc, char** argv)
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--mmproj <mmproj.gguf> --image <img>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
         return 1;
     }
 
@@ -618,7 +621,65 @@ static int cmd_chat(int argc, char** argv)
     uint32_t sz = (uint32_t)(ntokens + 8192);
     int nprompt;
     int use_bos = no_bos ? 0 : v.add_bos;
-    if (prompt && vocab_has_template(&v) && !no_template) {
+    float* mix_emb = NULL;
+    uint8_t* mix_use = NULL;
+    Vision* vis = NULL;
+    if (image) {
+        int nvis, i, pad, hid;
+        int id_ims, id_ime, id_pad;
+        char prefix[256], suffix[4096];
+        if (!mmproj) {
+            fprintf(stderr, "--image requires --mmproj <mmproj.gguf>\n");
+            engine_free(&e); vocab_free(&v); free(ids); return 1;
+        }
+        vis = vision_load(mmproj, err, sizeof(err));
+        if (!vis) {
+            fprintf(stderr, "mmproj load failed: %s\n", err);
+            engine_free(&e); vocab_free(&v); free(ids); return 1;
+        }
+        nvis = vision_n_tokens(vis);
+        hid = vision_hidden(vis);
+        if (hid != (int)e.ws.model.h.hidden) {
+            fprintf(stderr, "vision hidden %d != llm hidden %u\n", hid, e.ws.model.h.hidden);
+            vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
+        }
+        mix_emb = (float*)ymalloc((size_t)sz * (size_t)hid * 4);
+        mix_use = (uint8_t*)ycalloc(sz, 1);
+        if (vision_encode_image(vis, image, mix_emb, nvis, err, sizeof(err)) < 0) {
+            fprintf(stderr, "encode image failed: %s\n", err);
+            free(mix_emb); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
+        }
+        /* 视觉向量暂存在 mix_emb[0..nvis), 组 prompt 后再挪到对应位置 */
+        id_ims = vocab_id(&v, "<image>");
+        id_ime = vocab_id(&v, "</image>");
+        id_pad = vocab_id(&v, "<|image_pad|>");
+        if (id_ims < 0) id_ims = vocab_id(&v, "<|vision_start|>");
+        if (id_ime < 0) id_ime = vocab_id(&v, "<|vision_end|>");
+        if (id_pad < 0) id_pad = v.unk;
+        snprintf(prefix, sizeof(prefix), "<|im_start|>user\n");
+        snprintf(suffix, sizeof(suffix), "\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                 prompt ? prompt : "Describe this image.");
+        nprompt = vocab_encode(&v, prefix, ids, (int)sz);
+        if (nprompt < (int)sz) ids[nprompt++] = (uint32_t)id_ims;
+        pad = nprompt;
+        for (i = 0; i < nvis && nprompt < (int)sz; i++)
+            ids[nprompt++] = (uint32_t)(id_pad >= 0 ? id_pad : 0);
+        if (nprompt < (int)sz) ids[nprompt++] = (uint32_t)id_ime;
+        {
+            uint32_t tail[4096];
+            int nt = vocab_encode(&v, suffix, tail, 4096);
+            for (i = 0; i < nt && nprompt < (int)sz; i++) ids[nprompt++] = tail[i];
+        }
+        {
+            float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);
+            memset(mix_use, 0, sz);
+            memcpy(placed + (size_t)pad * hid, mix_emb, (size_t)nvis * (size_t)hid * 4);
+            for (i = 0; i < nvis; i++) mix_use[pad + i] = 1;
+            free(mix_emb);
+            mix_emb = placed;
+        }
+        ylog_info("chat image: %d vis tokens at pos %d, prompt=%d", nvis, pad, nprompt);
+    } else if (prompt && vocab_has_template(&v) && !no_template) {
         nprompt = vocab_chat_ids(&v, prompt, ids, (int)sz, use_bos);
         if (nprompt <= 0) {
             fprintf(stderr, "chat template render failed, falling back to plain encode\n");
@@ -643,7 +704,8 @@ static int cmd_chat(int argc, char** argv)
     memset(&tim, 0, sizeof(tim));
     int rc = 0;
     if (nprompt >= 0) {
-        rc = engine_generate(&e, ids, nprompt, ntokens, temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
+        rc = engine_generate_mix(&e, ids, nprompt, ntokens, mix_emb, mix_use,
+                                 temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
     if (tim.n_decode > 0) { fputc('\n', stdout); fflush(stdout); ylog_raw_log("\n"); }   /* 生成文本末尾换行 */
@@ -660,6 +722,8 @@ static int cmd_chat(int argc, char** argv)
     if (rc != 0) ylog_error("chat failed: %s", err);
     engine_free(&e);
     vocab_free(&v);
+    if (vis) vision_free(vis);
+    free(mix_emb); free(mix_use);
     free(ids);
     return rc == 0 ? 0 : 1;
 }

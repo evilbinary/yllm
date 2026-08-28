@@ -520,9 +520,65 @@ void engine_free(Engine* e)
     memset(e, 0, sizeof(*e));
 }
 
+/* pb 已填好后: 层前向; 最后一批算 logits */
+static void prefill_run_batch(Engine* e, int n, int start_pos, int off, uint32_t nb)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    uint32_t hidden = h->hidden;
+    uint32_t i;
+    uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
+    for (i = 1; i <= trunk; i++) {
+        if (ws->budget > 0) sched_ensure(ws, i);
+        engine_call_fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
+        if (ws->budget > 0) sched_release_budget(ws, i);
+    }
+    if (e->mtp_h) {
+        memcpy(e->mtp_h, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
+        e->mtp_h_ready = 1;
+    }
+    if (off + (int)nb != n) return;
+    {
+        const uint8_t* base = (const uint8_t*)ws->map.base;
+        const LlfTensorMeta* fn = &m->metas[m->base_idx[h->n_blocks + 1]];
+        const LlfTensorMeta* out = &m->metas[m->base_idx[h->n_blocks + 2]];
+        float eps;
+        float* xlast = e->pb + (size_t)(nb - 1) * hidden;
+        memcpy(&eps, &h->norm_eps_bits, 4);
+        rmsnorm(e->x, xlast, base + m->dir[h->n_blocks + 1].offset + fn->offset,
+                hidden, eps, fn->dtype);
+#if YLLM_TENSOR_STREAM
+        if (ws->budget > 0) {
+            size_t rbytes = matmul_row_bytes(out->dtype, h->hidden);
+            uint32_t dl = h->n_blocks + 2;
+            if (rbytes > 0)
+                lm_head_chunked(e, base + m->dir[dl].offset + out->offset,
+                                m->dir[dl].offset + out->offset,
+                                h->hidden, h->vocab, out->dtype);
+            else
+                matmul(e->logits, e->x, base + m->dir[dl].offset + out->offset,
+                       h->vocab, hidden, out->dtype);
+        } else {
+            matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
+                   h->vocab, hidden, out->dtype);
+        }
+#else
+        matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
+               h->vocab, hidden, out->dtype);
+#endif
+        if (e->ops && e->ops->post_logits)
+            e->ops->post_logits(e);
+    }
+}
+
 /* 批量 prefill: 一次处理 n 个 prompt token(start_pos 起), 结果 logits 为最后 token */
 int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_pos)
 {
+    Ws* ws;
+    LlModel* m;
+    uint32_t hidden, B, batch_min, b;
+    int off;
     if (e->dev && e->dev->prefill) {
         if (e->dev->prefill(e, tokens, n, start_pos) == 0)
             return 0;
@@ -536,72 +592,78 @@ int engine_forward_prefill(Engine* e, const uint32_t* tokens, int n, int start_p
             return 0;
         }
     }
-    Ws* ws = &e->ws;
-    LlModel* m = &ws->model;
-    const LlfHeader* h = &m->h;
-    uint32_t hidden = h->hidden;
-    uint32_t B = e->pb_cap ? e->pb_cap : 16;
-    uint32_t batch_min = (e->ops && e->ops->prefill_batch_min) ? e->ops->prefill_batch_min : PREFILL_BATCH_MIN;
-    int off = 0;
+    ws = &e->ws;
+    m = &ws->model;
+    hidden = m->h.hidden;
+    B = e->pb_cap ? e->pb_cap : 16;
+    batch_min = (e->ops && e->ops->prefill_batch_min) ? e->ops->prefill_batch_min : PREFILL_BATCH_MIN;
+    off = 0;
     while (off < n) {
         uint32_t nb = (uint32_t)(n - off);
+        uint32_t i;
         if (nb > B) nb = B;
         if (nb < batch_min) {
-            uint32_t i;
-            for (i = 0; i < nb; i++)
-                engine_forward(e, tokens[off + i], (uint32_t)(start_pos + off + i));
+            for (i = 0; i < nb; i++) {
+                if (engine_forward(e, tokens[off + (int)i], (uint32_t)(start_pos + off + (int)i)) != 0)
+                    return -1;
+            }
             off += (int)nb;
             continue;
         }
-        uint32_t b;
         for (b = 0; b < nb; b++)
-            engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[off + b]);
+            engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[off + (int)b]);
         if (e->ops && e->ops->after_embed_batch)
             e->ops->after_embed_batch(e, tokens + off, nb);
+        prefill_run_batch(e, n, start_pos, off, nb);
+        off += (int)nb;
+    }
+    return 0;
+}
+
+static int engine_forward_prefill_mix(Engine* e, const uint32_t* tokens, int n, int start_pos,
+                                      const float* mix, const uint8_t* use_mix)
+{
+    Ws* ws;
+    LlModel* m;
+    uint32_t hidden, B, batch_min, b;
+    int off;
+    if (!mix || !use_mix)
+        return engine_forward_prefill(e, tokens, n, start_pos);
+    /* 视觉向量走 CPU 批; 不走 GPU prefill */
+    ws = &e->ws;
+    m = &ws->model;
+    hidden = m->h.hidden;
+    B = e->pb_cap ? e->pb_cap : 16;
+    batch_min = (e->ops && e->ops->prefill_batch_min) ? e->ops->prefill_batch_min : PREFILL_BATCH_MIN;
+    off = 0;
+    while (off < n) {
+        uint32_t nb = (uint32_t)(n - off);
         uint32_t i;
-        uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
-        for (i = 1; i <= trunk; i++) {
-            if (ws->budget > 0) sched_ensure(ws, i);
-            engine_call_fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
-            if (ws->budget > 0) sched_release_budget(ws, i);
-        }
-        if (e->mtp_h) {
-            memcpy(e->mtp_h, e->pb + (size_t)(nb - 1) * hidden, (size_t)hidden * 4);
-            e->mtp_h_ready = 1;
-        }
-        {
-            const uint8_t* base = (const uint8_t*)ws->map.base;
-            const LlfTensorMeta* fn = &m->metas[m->base_idx[h->n_blocks + 1]];
-            const LlfTensorMeta* out = &m->metas[m->base_idx[h->n_blocks + 2]];
-            float eps;
-            memcpy(&eps, &h->norm_eps_bits, 4);
-            if (off + (int)nb == n) {
-                float* xlast = e->pb + (size_t)(nb - 1) * hidden;
-                rmsnorm(e->x, xlast, base + m->dir[h->n_blocks + 1].offset + fn->offset,
-                        hidden, eps, fn->dtype);
-#if YLLM_TENSOR_STREAM
-                if (ws->budget > 0) {
-                    size_t rbytes = matmul_row_bytes(out->dtype, h->hidden);
-                    uint32_t dl = h->n_blocks + 2;
-                    if (rbytes > 0)
-                        lm_head_chunked(e, base + m->dir[dl].offset + out->offset,
-                                        m->dir[dl].offset + out->offset,
-                                        h->hidden, h->vocab, out->dtype);
-                    else
-                        matmul(e->logits, e->x, base + m->dir[dl].offset + out->offset,
-                               h->vocab, hidden, out->dtype);
-                } else {
-                    matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
-                           h->vocab, hidden, out->dtype);
-                }
-#else
-                matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
-                       h->vocab, hidden, out->dtype);
-#endif
-                if (e->ops && e->ops->post_logits)
-                    e->ops->post_logits(e);
+        if (nb > B) nb = B;
+        if (nb < batch_min) {
+            for (i = 0; i < nb; i++) {
+                uint32_t idx = (uint32_t)(off + i);
+                uint32_t posi = (uint32_t)(start_pos + off + (int)i);
+                if (use_mix[idx]) {
+                    memcpy(e->x, mix + (size_t)idx * hidden, (size_t)hidden * 4);
+                    if (engine_forward_range(e, tokens[idx], 0, posi, NULL, NULL) != 0)
+                        return -1;
+                } else if (engine_forward(e, tokens[idx], posi) != 0)
+                    return -1;
             }
+            off += (int)nb;
+            continue;
         }
+        for (b = 0; b < nb; b++) {
+            uint32_t idx = (uint32_t)(off + b);
+            if (use_mix[idx])
+                memcpy(e->pb + (size_t)b * hidden, mix + (size_t)idx * hidden, (size_t)hidden * 4);
+            else
+                engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[idx]);
+        }
+        if (e->ops && e->ops->after_embed_batch)
+            e->ops->after_embed_batch(e, tokens + off, nb);
+        prefill_run_batch(e, n, start_pos, off, nb);
         off += (int)nb;
     }
     return 0;
@@ -1207,6 +1269,16 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     int (*on_token)(uint32_t id, void* ctx), void* ctx,
                     EngineTimings* timings, char* err, size_t errlen)
 {
+    return engine_generate_mix(e, prompt, nprompt, ntokens, NULL, NULL,
+                               temp, top_p, seed, eos_stop, on_token, ctx, timings, err, errlen);
+}
+
+int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
+                        const float* mix_emb, const uint8_t* mix_use,
+                        float temp, float top_p, uint64_t seed, int eos_stop,
+                        int (*on_token)(uint32_t id, void* ctx), void* ctx,
+                        EngineTimings* timings, char* err, size_t errlen)
+{
     uint64_t rng = ysrand(seed);
     uint32_t pos = 0;
     int i;
@@ -1218,7 +1290,10 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
             if (err) snprintf(err, errlen, "prompt too long");
             return -1;
         }
-        engine_forward_prefill(e, prompt, nprompt, 0);
+        if (mix_emb && mix_use)
+            engine_forward_prefill_mix(e, prompt, nprompt, 0, mix_emb, mix_use);
+        else
+            engine_forward_prefill(e, prompt, nprompt, 0);
         engine_dev_sync_x(e);
         pos = (uint32_t)nprompt;
     }

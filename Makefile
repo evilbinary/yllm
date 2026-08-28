@@ -22,10 +22,11 @@ LDFLAGS    ?=
 LIBS       :=
 
 # 公共头: inference/include; 后端私有头: cuda/ vulkan/
-INFER_INC := -Iinference/include -Iinference/cuda -Iinference/vulkan
+INFER_INC := -Iinference/include -Iinference/cuda -Iinference/vulkan -Iinference/vision
 HDR_PUBLIC := inference/include/yllm.h inference/include/llf.h inference/include/convert.h \
 	inference/include/matvec.h inference/include/dist.h inference/include/device.h \
-	inference/include/arch.h inference/include/log.h inference/include/cache.h
+	inference/include/arch.h inference/include/log.h inference/include/cache.h \
+	inference/include/vision.h
 
 SRC := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
@@ -34,6 +35,7 @@ SRC := \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
 	inference/arch/gemma4.c inference/arch/qwen35.c \
+	inference/vision/minicpmv.c \
 	inference/core/cache.c inference/core/dist.c inference/device/device_cpu.c
 TEST_ENGINE_CORE := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
@@ -42,6 +44,7 @@ TEST_ENGINE_CORE := \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
 	inference/arch/gemma4.c inference/arch/qwen35.c \
+	inference/vision/minicpmv.c \
 	inference/device/device_cpu.c
 
 # ---- CUDA 后端(可选) ----
@@ -674,28 +677,34 @@ chat-qwen3.8-27b-avx2-vulkan: vulkan-avx2 $(Q3_27B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
-# ---- minicpm-v-4.6(文本侧; GGUF arch=qwen35 752M, tied lm_head / 无 vision 权) ----
+# ---- minicpm-v-4.6(qwen35 文本塔 + clip mmproj 视觉; 无 --image 则纯文本) ----
 MCPM_V46_GGUF  ?= models/MiniCPM-V-4_6-Q4_K_M.gguf
 MCPM_V46_LLF   ?= models/minicpm-v-4.6.llf
 MCPM_V46_VOCAB ?= models/minicpm-v-4.6.vocab.txt
+MCPM_V46_MMPROJ ?= models/mmproj-model-f16.gguf
+IMAGE ?=
 
 $(MCPM_V46_LLF): $(MCPM_V46_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(MCPM_V46_GGUF) --out $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --seq 2048
 
 chat-minicpm-v-4.6: $(BIN) $(MCPM_V46_LLF)
-	$(RUN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
 
 chat-minicpm-v-4.6-avx2: $(BIN_AVX2) $(MCPM_V46_LLF)
-	$(RUN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
 
 chat-minicpm-v-4.6-vulkan: vulkan $(MCPM_V46_LLF)
 	$(RUN_VULKAN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
 
 chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
 #   make server-<name> / make infer-<name>  与 chat-* 一一对应
