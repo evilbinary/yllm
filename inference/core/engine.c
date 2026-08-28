@@ -521,6 +521,16 @@ void engine_free(Engine* e)
 }
 
 /* pb 已填好后: 层前向; 最后一批算 logits */
+static void vis_add_ds_row(Engine* e, float* x, uint32_t layer, uint32_t seq_i)
+{
+    uint32_t hidden;
+    if (!e->vis_ds || !e->vis_use || e->vis_nds <= 0) return;
+    if (layer < 1 || layer > (uint32_t)e->vis_nds) return;
+    if (seq_i >= (uint32_t)e->vis_seq || !e->vis_use[seq_i]) return;
+    hidden = e->ws.model.h.hidden;
+    add_inplace(x, e->vis_ds + ((size_t)(layer - 1) * (size_t)e->vis_seq + seq_i) * hidden, hidden);
+}
+
 static void prefill_run_batch(Engine* e, int n, int start_pos, int off, uint32_t nb)
 {
     Ws* ws = &e->ws;
@@ -530,8 +540,12 @@ static void prefill_run_batch(Engine* e, int n, int start_pos, int off, uint32_t
     uint32_t i;
     uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
     for (i = 1; i <= trunk; i++) {
+        uint32_t b;
         if (ws->budget > 0) sched_ensure(ws, i);
         engine_call_fwd_block_batch(e, i, (uint32_t)(start_pos + off), nb);
+        if (e->vis_ds)
+            for (b = 0; b < nb; b++)
+                vis_add_ds_row(e, e->pb + (size_t)b * hidden, i, (uint32_t)(off + (int)b));
         if (ws->budget > 0) sched_release_budget(ws, i);
     }
     if (e->mtp_h) {
@@ -646,8 +660,12 @@ static int engine_forward_prefill_mix(Engine* e, const uint32_t* tokens, int n, 
                 uint32_t posi = (uint32_t)(start_pos + off + (int)i);
                 if (use_mix[idx]) {
                     memcpy(e->x, mix + (size_t)idx * hidden, (size_t)hidden * 4);
-                    if (engine_forward_range(e, tokens[idx], 0, posi, NULL, NULL) != 0)
+                    e->vis_tok = (int)idx;
+                    if (engine_forward_range(e, tokens[idx], 0, posi, NULL, NULL) != 0) {
+                        e->vis_tok = -1;
                         return -1;
+                    }
+                    e->vis_tok = -1;
                 } else if (engine_forward(e, tokens[idx], posi) != 0)
                     return -1;
             }
@@ -832,6 +850,8 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
         if (do_prof) t0 = ynow_ns();
         sched_ensure(ws, i);
         forward_layer(e, i, token, pos);
+        if (e->vis_tok >= 0)
+            vis_add_ds_row(e, e->x, i, (uint32_t)e->vis_tok);
         if (do_prof) {
             uint64_t dt = ynow_ns() - t0;
             if (i <= h->n_blocks) prof_blk_ns += dt;
@@ -1269,12 +1289,13 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                     int (*on_token)(uint32_t id, void* ctx), void* ctx,
                     EngineTimings* timings, char* err, size_t errlen)
 {
-    return engine_generate_mix(e, prompt, nprompt, ntokens, NULL, NULL,
+    return engine_generate_mix(e, prompt, nprompt, ntokens, NULL, NULL, NULL, 0,
                                temp, top_p, seed, eos_stop, on_token, ctx, timings, err, errlen);
 }
 
 int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                         const float* mix_emb, const uint8_t* mix_use,
+                        const float* mix_ds, int mix_nds,
                         float temp, float top_p, uint64_t seed, int eos_stop,
                         int (*on_token)(uint32_t id, void* ctx), void* ctx,
                         EngineTimings* timings, char* err, size_t errlen)
@@ -1284,6 +1305,11 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
     int i;
     uint64_t t0 = 0, t1 = 0;
     if (timings) { memset(timings, 0, sizeof(*timings)); t0 = ynow_ms(); }
+    e->vis_ds = mix_ds;
+    e->vis_use = mix_use;
+    e->vis_nds = mix_nds;
+    e->vis_seq = nprompt;
+    e->vis_tok = -1;
 #if YLLM_BATCH_PREFILL
     if (nprompt > 0) {
         if ((uint32_t)nprompt > e->max_seq) {
@@ -1307,6 +1333,10 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
         pos++;
     }
 #endif
+    e->vis_ds = NULL;
+    e->vis_use = NULL;
+    e->vis_nds = 0;
+    e->vis_tok = -1;
     if (timings) {
         timings->n_prefill = nprompt > 0 ? (uint32_t)nprompt : 0;
         t1 = ynow_ms();

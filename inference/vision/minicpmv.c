@@ -1,5 +1,5 @@
 /* MiniCPM-V 4.6: 直接 mmap clip mmproj GGUF, CPU 前向对齐 llama.cpp clip_graph_minicpmv4_6 */
-#include "vision.h"
+#include "vision_impl.h"
 #include "yllm.h"
 #include "matvec.h"
 #include "log.h"
@@ -48,7 +48,7 @@ typedef struct {
     ClipT up_w, up_b, down_w, down_b;
 } ClipLayer;
 
-struct Vision {
+struct Mcpv {
     WMap map;
     ClipT* ts;
     int n_t;
@@ -113,7 +113,7 @@ static void skip_val(GB* b, uint32_t t)
     }
 }
 
-static ClipT* find_t(Vision* v, const char* name)
+static ClipT* find_t(Mcpv* v, const char* name)
 {
     int i;
     for (i = 0; i < v->n_t; i++)
@@ -121,7 +121,7 @@ static ClipT* find_t(Vision* v, const char* name)
     return NULL;
 }
 
-static int req_t(Vision* v, ClipT* dst, const char* name)
+static int req_t(Mcpv* v, ClipT* dst, const char* name)
 {
     ClipT* t = find_t(v, name);
     if (!t) return -1;
@@ -221,7 +221,7 @@ static void layernorm(float* y, const float* x, const ClipT* w, const ClipT* b, 
 }
 
 /* y[M,out] = x[M,in] · W[out,in]^T ; F16 权重每行只转一次, 再对整批 token 点积 */
-static void gemm_lin(Vision* vis, float* y, const float* x, const ClipT* w, const ClipT* bias,
+static void gemm_lin(Mcpv* vis, float* y, const float* x, const ClipT* w, const ClipT* bias,
                      uint32_t M, uint32_t out, uint32_t in)
 {
     uint32_t oo;
@@ -362,7 +362,7 @@ static void attn_win4(float* out, const float* q, const float* k, const float* v
     }
 }
 
-static void vit_attn(Vision* vis, const ClipT* qw, const ClipT* qb, const ClipT* kw, const ClipT* kb,
+static void vit_attn(Mcpv* vis, const ClipT* qw, const ClipT* qb, const ClipT* kw, const ClipT* kb,
                     const ClipT* vw, const ClipT* vb, const ClipT* ow, const ClipT* ob,
                     uint32_t n, int win4)
 {
@@ -376,7 +376,7 @@ static void vit_attn(Vision* vis, const ClipT* qw, const ClipT* qb, const ClipT*
     gemm_lin(vis, vis->tmp, vis->attn, ow, ob, n, e, e);
 }
 
-static void vit_ffn(Vision* vis, const ClipT* up_w, const ClipT* up_b,
+static void vit_ffn(Mcpv* vis, const ClipT* up_w, const ClipT* up_b,
                     const ClipT* down_w, const ClipT* down_b, uint32_t n, uint32_t in, int erf)
 {
     uint32_t n_ff = (uint32_t)up_w->dims[1];
@@ -390,7 +390,7 @@ static void vit_ffn(Vision* vis, const ClipT* up_w, const ClipT* up_b,
     gemm_lin(vis, vis->tmp, vis->ff, down_w, down_b, n, vis->n_embd, n_ff);
 }
 
-static void vit_block(Vision* vis, uint32_t il, uint32_t n)
+static void vit_block(Mcpv* vis, uint32_t il, uint32_t n)
 {
     ClipLayer* L = &vis->layers[il];
     uint32_t e = vis->n_embd, t;
@@ -410,7 +410,7 @@ static void vit_block(Vision* vis, uint32_t il, uint32_t n)
     add_inplace(vis->x, vis->tmp, n * e);
 }
 
-static int load_layer(Vision* v, uint32_t il)
+static int load_layer(Mcpv* v, uint32_t il)
 {
     ClipLayer* L = &v->layers[il];
     char n[96];
@@ -435,9 +435,9 @@ static int load_layer(Vision* v, uint32_t il)
     return 0;
 }
 
-Vision* vision_load(const char* path, char* err, size_t errlen)
+Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
 {
-    Vision* v = (Vision*)ycalloc(1, sizeof(*v));
+    Mcpv* v = (Mcpv*)ycalloc(1, sizeof(*v));
     const uint8_t* data;
     uint64_t fsize, data_start, n_kv, n_tensors, i;
     uint32_t ver, alignment = 32;
@@ -451,7 +451,7 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
     fsize = v->map.size;
     if (fsize < 24 || memcmp(data, "GGUF", 4) != 0) {
         if (err) snprintf(err, errlen, "not gguf");
-        vision_free(v); return NULL;
+        mcpv_free(v); return NULL;
     }
     b.p = data + 4; b.end = data + fsize; b.err = 0;
     ver = gb_u32(&b);
@@ -512,9 +512,9 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
             }
         } else skip_val(&b, typ);
     }
-    if (b.err) { if (err) snprintf(err, errlen, "bad mmproj kv"); vision_free(v); return NULL; }
+    if (b.err) { if (err) snprintf(err, errlen, "bad mmproj kv"); mcpv_free(v); return NULL; }
     v->ts = (ClipT*)ycalloc((size_t)n_tensors, sizeof(ClipT));
-    if (!v->ts) { vision_free(v); if (err) snprintf(err, errlen, "oom"); return NULL; }
+    if (!v->ts) { mcpv_free(v); if (err) snprintf(err, errlen, "oom"); return NULL; }
     for (i = 0; i < n_tensors && !b.err; i++) {
         uint64_t nlen = gb_u64(&b);
         uint32_t nd, d, gtype;
@@ -531,7 +531,7 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
         t->p = NULL;
         v->n_t++;
     }
-    if (b.err) { if (err) snprintf(err, errlen, "bad mmproj tensors"); vision_free(v); return NULL; }
+    if (b.err) { if (err) snprintf(err, errlen, "bad mmproj tensors"); mcpv_free(v); return NULL; }
     data_start = align_up_u((uint64_t)(b.p - data), alignment ? alignment : 32);
     for (i = 0; i < (uint64_t)v->n_t; i++) {
         uint64_t ne = 1, d, nb;
@@ -540,7 +540,7 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
         nb = ne * (v->ts[i].dtype == 0 ? 4ull : 2ull);
         if (v->ts[i].p < data || v->ts[i].p + nb > data + fsize) {
             if (err) snprintf(err, errlen, "tensor %s out of file", v->ts[i].name);
-            vision_free(v); return NULL;
+            mcpv_free(v); return NULL;
         }
     }
     if (req_t(v, &v->patch_w, "v.patch_embd.weight") != 0 ||
@@ -571,13 +571,13 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
         req_t(v, &v->vm_ds_down_w, "v.vit_merger.ds_ffn_down.weight") != 0 ||
         req_t(v, &v->vm_ds_down_b, "v.vit_merger.ds_ffn_down.bias") != 0) {
         if (err) snprintf(err, errlen, "mmproj missing tensors");
-        vision_free(v); return NULL;
+        mcpv_free(v); return NULL;
     }
-    if (v->n_layer > CLIP_MAX_LAYERS) { if (err) snprintf(err, errlen, "too many vit layers"); vision_free(v); return NULL; }
+    if (v->n_layer > CLIP_MAX_LAYERS) { if (err) snprintf(err, errlen, "too many vit layers"); mcpv_free(v); return NULL; }
     for (i = 0; i < v->n_layer; i++)
         if (load_layer(v, (uint32_t)i) != 0) {
             if (err) snprintf(err, errlen, "missing vit layer %u", (unsigned)i);
-            vision_free(v); return NULL;
+            mcpv_free(v); return NULL;
         }
     {
         uint32_t np = (v->image_size / v->patch) * (v->image_size / v->patch);
@@ -620,7 +620,7 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
         if (!v->x || !v->res || !v->tmp || !v->q || !v->k || !v->v || !v->attn || !v->ff ||
             !v->patch_wf || !v->pos_f || !v->gemm_row) {
             if (err) snprintf(err, errlen, "oom vis buf");
-            vision_free(v); return NULL;
+            mcpv_free(v); return NULL;
         }
     }
     ylog_info("vision: clip %ux%u patch=%u layers=%u embd=%u out=%u insert=%u mean=%.3f std=%.3f",
@@ -629,7 +629,7 @@ Vision* vision_load(const char* path, char* err, size_t errlen)
     return v;
 }
 
-void vision_free(Vision* v)
+void mcpv_free(Mcpv* v)
 {
     if (!v) return;
     free(v->x); free(v->res); free(v->tmp); free(v->q); free(v->k); free(v->v); free(v->attn); free(v->ff);
@@ -639,7 +639,7 @@ void vision_free(Vision* v)
     free(v);
 }
 
-int vision_n_tokens(const Vision* v)
+int mcpv_n_tokens(const Mcpv* v)
 {
     uint32_t g;
     if (!v) return 0;
@@ -648,12 +648,12 @@ int vision_n_tokens(const Vision* v)
     return (int)(g * g);
 }
 
-int vision_hidden(const Vision* v)
+int mcpv_hidden(const Mcpv* v)
 {
     return v ? (int)v->n_out_embd : 0;
 }
 
-static void patch_embed(Vision* vis, const float* chw, uint32_t gh, uint32_t gw)
+static void patch_embed(Mcpv* vis, const float* chw, uint32_t gh, uint32_t gw)
 {
     uint32_t ps = vis->patch, e = vis->n_embd, K = 3 * ps * ps;
     uint32_t n = gh * gw, S = vis->image_size, t;
@@ -675,7 +675,7 @@ static void patch_embed(Vision* vis, const float* chw, uint32_t gh, uint32_t gw)
     gemm_f32(vis->x, col, vis->patch_wf, bias, n, e, K);
 }
 
-static void add_pos(Vision* vis, uint32_t gh, uint32_t gw)
+static void add_pos(Mcpv* vis, uint32_t gh, uint32_t gw)
 {
     uint32_t e = vis->n_embd, i, j, t = 0;
     for (i = 0; i < gh; i++) {
@@ -701,7 +701,7 @@ static void gather_2x2(const float* src, float* dst, uint32_t gh, uint32_t gw, u
         }
 }
 
-static int encode_448(Vision* vis, const float* chw, float* out)
+static int encode_448(Mcpv* vis, const float* chw, float* out)
 {
     uint32_t gh = vis->image_size / vis->patch, gw = gh;
     uint32_t n = gh * gw, e = vis->n_embd, il, t;
@@ -802,7 +802,7 @@ static int encode_448(Vision* vis, const float* chw, float* out)
     return 0;
 }
 
-int vision_encode_image(Vision* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen)
+int mcpv_encode_image(Mcpv* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen)
 {
     int w = 0, h = 0, c = 0, x, y, ic;
     unsigned char* img;
@@ -810,7 +810,7 @@ int vision_encode_image(Vision* v, const char* image_path, float* out, int max_t
     uint32_t S;
     int ntok;
     if (!v || !image_path || !out) { if (err) snprintf(err, errlen, "bad vision args"); return -1; }
-    ntok = vision_n_tokens(v);
+    ntok = mcpv_n_tokens(v);
     if (max_tok < ntok) { if (err) snprintf(err, errlen, "out tokens %d < %d", max_tok, ntok); return -1; }
     img = stbi_load(image_path, &w, &h, &c, 3);
     if (!img) { if (err) snprintf(err, errlen, "cannot load image %s", image_path); return -1; }

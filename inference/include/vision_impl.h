@@ -1,0 +1,24 @@
+#ifndef YLLM_VISION_IMPL_H
+#define YLLM_VISION_IMPL_H
+
+#include "vision.h"
+#include <stddef.h>
+
+typedef struct Mcpv Mcpv;
+typedef struct Q3v Q3v;
+
+Mcpv* mcpv_load(const char* path, char* err, size_t errlen);
+void mcpv_free(Mcpv* v);
+int mcpv_n_tokens(const Mcpv* v);
+int mcpv_hidden(const Mcpv* v);
+int mcpv_encode_image(Mcpv* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen);
+
+Q3v* q3v_load(const char* path, char* err, size_t errlen);
+void q3v_free(Q3v* v);
+int q3v_n_tokens(const Q3v* v);
+int q3v_hidden(const Q3v* v);
+int q3v_n_deepstack(const Q3v* v);
+int q3v_encode(Q3v* v, const char* image_path, float* out, float* ds, int max_tok,
+               char* err, size_t errlen);
+
+#endif

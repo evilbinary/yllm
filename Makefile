@@ -35,7 +35,7 @@ SRC := \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
 	inference/arch/gemma4.c inference/arch/qwen35.c \
-	inference/vision/minicpmv.c \
+	inference/vision/minicpmv.c inference/vision/qwen3vl.c inference/vision/vision.c \
 	inference/core/cache.c inference/core/dist.c inference/device/device_cpu.c
 TEST_ENGINE_CORE := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
@@ -44,7 +44,7 @@ TEST_ENGINE_CORE := \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
 	inference/arch/gemma4.c inference/arch/qwen35.c \
-	inference/vision/minicpmv.c \
+	inference/vision/minicpmv.c inference/vision/qwen3vl.c inference/vision/vision.c \
 	inference/device/device_cpu.c
 
 # ---- CUDA 后端(可选) ----
@@ -625,28 +625,33 @@ chat-qwen3-8b-avx2-vulkan: vulkan-avx2 $(Q3_8B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
 
-# ---- qwen3-vl-2b(文本侧; GGUF arch=qwen3vl, 常无独立 lm_head / 无 vision 权) ----
-Q3VL_2B_GGUF  ?= models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf
-Q3VL_2B_LLF   ?= models/qwen3-vl-2b.llf
-Q3VL_2B_VOCAB ?= models/qwen3-vl-2b.vocab.txt
+# ---- qwen3-vl-2b(文本 + 可选 mmproj 视觉; GGUF arch=qwen3vl) ----
+Q3VL_2B_GGUF   ?= models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf
+Q3VL_2B_LLF    ?= models/qwen3-vl-2b.llf
+Q3VL_2B_VOCAB  ?= models/qwen3-vl-2b.vocab.txt
+Q3VL_2B_MMPROJ ?= models/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
 
 $(Q3VL_2B_LLF): $(Q3VL_2B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(Q3VL_2B_GGUF) --out $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --seq 4096
 
 chat-qwen3-vl-2b: $(BIN) $(Q3VL_2B_LLF)
-	$(RUN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 chat-qwen3-vl-2b-avx2: $(BIN_AVX2) $(Q3VL_2B_LLF)
-	$(RUN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 chat-qwen3-vl-2b-vulkan: vulkan $(Q3VL_2B_LLF)
 	$(RUN_VULKAN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 chat-qwen3-vl-2b-avx2-vulkan: vulkan-avx2 $(Q3VL_2B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 # ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
 Q3_27B_GGUF  ?= models/Qwen3.8-27B-Q4_K_M.gguf

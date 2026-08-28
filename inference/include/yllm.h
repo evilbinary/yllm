@@ -169,6 +169,12 @@ typedef struct Engine {
     uint32_t gpu_layer_end;
     /* 1 = 权常驻 host 打包缓冲, 按层 H2D(prefetch_layer); 0 = load 时整段上卡 */
     int cuda_stream_w;
+    /* 视觉 deepstack: generate_mix prefill 期间有效 */
+    const float* vis_ds;
+    const uint8_t* vis_use;
+    int vis_nds;
+    int vis_seq;
+    int vis_tok;
 } Engine;
 
 /* 混合切分: gpu_layer_end==0 表示本段全部算「设备范围」(能否真 GPU 看 Device 指针)。 */
@@ -260,6 +266,7 @@ int engine_generate(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
 /* mix_emb[i*hidden]、mix_use[i]!=0 时该位置用视觉向量而非 token embed */
 int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntokens,
                         const float* mix_emb, const uint8_t* mix_use,
+                        const float* mix_ds, int mix_nds,
                         float temp, float top_p, uint64_t seed, int eos_stop,
                         int (*on_token)(uint32_t id, void* ctx), void* ctx,
                         EngineTimings* timings, char* err, size_t errlen);

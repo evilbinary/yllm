@@ -622,8 +622,10 @@ static int cmd_chat(int argc, char** argv)
     int nprompt;
     int use_bos = no_bos ? 0 : v.add_bos;
     float* mix_emb = NULL;
+    float* mix_ds = NULL;
     uint8_t* mix_use = NULL;
     Vision* vis = NULL;
+    int vis_nds = 0;
     if (image) {
         int nvis, i, pad, hid;
         int id_ims, id_ime, id_pad;
@@ -645,9 +647,12 @@ static int cmd_chat(int argc, char** argv)
         }
         mix_emb = (float*)ymalloc((size_t)sz * (size_t)hid * 4);
         mix_use = (uint8_t*)ycalloc(sz, 1);
-        if (vision_encode_image(vis, image, mix_emb, nvis, err, sizeof(err)) < 0) {
+        vis_nds = vision_n_deepstack(vis);
+        if (vis_nds > 0)
+            mix_ds = (float*)ymalloc((size_t)vis_nds * (size_t)nvis * (size_t)hid * 4);
+        if (vision_encode_image_ds(vis, image, mix_emb, mix_ds, nvis, err, sizeof(err)) < 0) {
             fprintf(stderr, "encode image failed: %s\n", err);
-            free(mix_emb); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
+            free(mix_emb); free(mix_ds); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
         }
         /* 视觉向量暂存在 mix_emb[0..nvis), 组 prompt 后再挪到对应位置 */
         id_ims = vocab_id(&v, "<image>");
@@ -657,8 +662,12 @@ static int cmd_chat(int argc, char** argv)
         if (id_ime < 0) id_ime = vocab_id(&v, "<|vision_end|>");
         if (id_pad < 0) id_pad = v.unk;
         snprintf(prefix, sizeof(prefix), "<|im_start|>user\n");
-        snprintf(suffix, sizeof(suffix), "\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-                 prompt ? prompt : "Describe this image.");
+        if (vocab_id(&v, "<image>") < 0)
+            snprintf(suffix, sizeof(suffix), "\n%s<|im_end|>\n<|im_start|>assistant\n",
+                     prompt ? prompt : "Describe this image.");
+        else
+            snprintf(suffix, sizeof(suffix), "\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                     prompt ? prompt : "Describe this image.");
         nprompt = vocab_encode(&v, prefix, ids, (int)sz);
         if (nprompt < (int)sz) ids[nprompt++] = (uint32_t)id_ims;
         pad = nprompt;
@@ -672,11 +681,22 @@ static int cmd_chat(int argc, char** argv)
         }
         {
             float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);
+            float* ds_placed = NULL;
+            int d;
             memset(mix_use, 0, sz);
             memcpy(placed + (size_t)pad * hid, mix_emb, (size_t)nvis * (size_t)hid * 4);
             for (i = 0; i < nvis; i++) mix_use[pad + i] = 1;
+            if (vis_nds > 0 && mix_ds) {
+                ds_placed = (float*)ycalloc((size_t)vis_nds * (size_t)nprompt * (size_t)hid, 4);
+                for (d = 0; d < vis_nds; d++)
+                    memcpy(ds_placed + ((size_t)d * (size_t)nprompt + (size_t)pad) * hid,
+                           mix_ds + (size_t)d * (size_t)nvis * hid,
+                           (size_t)nvis * (size_t)hid * 4);
+            }
             free(mix_emb);
+            free(mix_ds);
             mix_emb = placed;
+            mix_ds = ds_placed;
         }
         ylog_info("chat image: %d vis tokens at pos %d, prompt=%d", nvis, pad, nprompt);
     } else if (prompt && vocab_has_template(&v) && !no_template) {
@@ -704,7 +724,7 @@ static int cmd_chat(int argc, char** argv)
     memset(&tim, 0, sizeof(tim));
     int rc = 0;
     if (nprompt >= 0) {
-        rc = engine_generate_mix(&e, ids, nprompt, ntokens, mix_emb, mix_use,
+        rc = engine_generate_mix(&e, ids, nprompt, ntokens, mix_emb, mix_use, mix_ds, vis_nds,
                                  temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
     }
     uint64_t ms = ynow_ms() - t0;
@@ -723,7 +743,7 @@ static int cmd_chat(int argc, char** argv)
     engine_free(&e);
     vocab_free(&v);
     if (vis) vision_free(vis);
-    free(mix_emb); free(mix_use);
+    free(mix_emb); free(mix_ds); free(mix_use);
     free(ids);
     return rc == 0 ? 0 : 1;
 }
