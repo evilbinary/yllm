@@ -137,7 +137,7 @@ typedef struct Engine {
     void* arch_ctx;
     /* MTP 工作区(65536 floats)；GDN scratch 在 qwen35 arch_ctx */
     float* scratch;
-    /* 批量 prefill 工作区(每批 ≤ PB_MAX token) */
+    /* 批量 prefill 工作区 */
     float* pb;      /* [PB_MAX × hidden]  输入/残差 */
     float* pb2;     /* [PB_MAX × hidden]  norm/o 输出 */
     float* pbq;     /* [PB_MAX × pbq_dim] query; gemma4 全局层 pbq_dim=n_heads*hd>hidden */

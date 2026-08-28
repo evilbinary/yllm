@@ -568,29 +568,48 @@ static void attn_full(G4v* vis, float* out, const float* q, const float* k, cons
     }
 }
 
-static void smart_hw(int w, int h, int factor, int min_px, int max_px, int* ow, int* oh)
+/* HF Gemma4ImageProcessor.get_aspect_ratio_preserving_size: 放大/缩小到
+ * 尽量占满 max_soft_tokens 预算, 边长为 patch*merge 的倍数。 */
+static void g4v_resize_hw(int w, int h, int patch, int merge, uint32_t ntok_max, int* ow, int* oh)
 {
-    int wb, hb;
+    int side = patch * merge;
+    int max_patches = (int)ntok_max * merge * merge;
+    double target_px, factor;
+    int th, tw, max_side;
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    if (factor < 1) factor = 1;
-    wb = ((w + factor / 2) / factor) * factor;
-    hb = ((h + factor / 2) / factor) * factor;
-    if (wb < factor) wb = factor;
-    if (hb < factor) hb = factor;
-    if (max_px > 0 && (int64_t)hb * wb > max_px) {
-        float beta = sqrtf((float)h * (float)w / (float)max_px);
-        hb = (int)(floorf((float)h / beta / (float)factor) * (float)factor);
-        wb = (int)(floorf((float)w / beta / (float)factor) * (float)factor);
-        if (hb < factor) hb = factor;
-        if (wb < factor) wb = factor;
-    } else if (min_px > 0 && (int64_t)hb * wb < min_px) {
-        float beta = sqrtf((float)min_px / ((float)h * (float)w));
-        hb = (int)(ceilf((float)h * beta / (float)factor) * (float)factor);
-        wb = (int)(ceilf((float)w * beta / (float)factor) * (float)factor);
+    if (patch < 1) patch = 1;
+    if (merge < 1) merge = 1;
+    if (side < 1) side = 1;
+    if (max_patches < merge * merge) max_patches = merge * merge;
+    target_px = (double)max_patches * (double)patch * (double)patch;
+    factor = sqrt(target_px / ((double)w * (double)h));
+    th = (int)(floor(factor * (double)h / (double)side) * (double)side);
+    tw = (int)(floor(factor * (double)w / (double)side) * (double)side);
+    max_side = ((int)ntok_max) * side;
+    if (th < 1 && tw < 1) {
+        th = side;
+        tw = side;
+    } else if (th < 1) {
+        th = side;
+        tw = (w / h) * side;
+        if (tw > max_side) tw = max_side;
+        if (tw < side) tw = side;
+    } else if (tw < 1) {
+        tw = side;
+        th = (h / w) * side;
+        if (th > max_side) th = max_side;
+        if (th < side) th = side;
     }
-    *ow = wb;
-    *oh = hb;
+    if ((int64_t)th * (int64_t)tw > (int64_t)target_px) {
+        factor = sqrt(target_px / ((double)th * (double)tw));
+        th = (int)(floor((double)th * factor / (double)side) * (double)side);
+        tw = (int)(floor((double)tw * factor / (double)side) * (double)side);
+        if (th < side) th = side;
+        if (tw < side) tw = side;
+    }
+    *ow = tw;
+    *oh = th;
 }
 
 static int load_layer(G4v* v, uint32_t il)
@@ -683,8 +702,8 @@ G4v* g4v_load(const char* path, char* err, size_t errlen)
     v->image_size = 896; v->patch = 14; v->n_embd = 1152; v->n_ff = 4304;
     v->n_layer = 27; v->n_head = 16; v->n_out_embd = 1536; v->n_merge = 3;
     v->eps = 1e-6f; v->rope_theta = 100.f;
-    v->mean[0] = v->mean[1] = v->mean[2] = 0.5f;
-    v->std[0] = v->std[1] = v->std[2] = 0.5f;
+    v->mean[0] = v->mean[1] = v->mean[2] = 0.f;
+    v->std[0] = v->std[1] = v->std[2] = 1.f;
     v->ntok_min = 40; v->ntok_max = 280; v->ffn_op = 0;
     for (i = 0; i < n_kv && !b.err; i++) {
         uint64_t klen = gb_u64(&b);
@@ -1067,16 +1086,13 @@ static float samp3(const unsigned char* img, int w, int h, int x, int y, int ic)
 
 int g4v_encode(G4v* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen)
 {
-    int w = 0, h = 0, c = 0, x, y, ic, ntok, sw, sh, factor, min_px, max_px;
+    int w = 0, h = 0, c = 0, x, y, ic, ntok, sw, sh;
     unsigned char* img;
     float* chw;
     if (!v || !image_path || !out) { if (err) snprintf(err, errlen, "bad vision args"); return -1; }
     img = stbi_load(image_path, &w, &h, &c, 3);
     if (!img) { if (err) snprintf(err, errlen, "cannot load image %s", image_path); return -1; }
-    factor = (int)(v->patch * (v->n_merge ? v->n_merge : 3));
-    min_px = (int)(v->ntok_min * v->patch * v->patch * v->n_merge * v->n_merge);
-    max_px = (int)(v->ntok_max * v->patch * v->patch * v->n_merge * v->n_merge);
-    smart_hw(w, h, factor, min_px, max_px, &sw, &sh);
+    g4v_resize_hw(w, h, (int)v->patch, (int)(v->n_merge ? v->n_merge : 3), v->ntok_max, &sw, &sh);
     ntok = (sw / (int)v->patch / (int)v->n_merge) * (sh / (int)v->patch / (int)v->n_merge);
     if (ntok < 1) { stbi_image_free(img); if (err) snprintf(err, errlen, "image too small"); return -1; }
     if (max_tok < ntok) {

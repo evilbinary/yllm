@@ -479,8 +479,14 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
             uint32_t s0 = 0;
             if (swa && g4.swa_window > 0 && pos + 1 > g4.swa_window)
                 s0 = pos + 1 - g4.swa_window;
-            attn_kv_f16(att_out, q, kcache, vcache, s0, pos,
-                        h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
+            /* 本批 KV 已写完: 图像位看本批末尾, 文本仍因果。不改 PB_MAX / 预填充路径 */
+            {
+                uint32_t kend = pos;
+                if (e->vis_use && (int)pos < e->vis_seq && e->vis_use[pos])
+                    kend = pos_start + B - 1;
+                attn_kv_f16(att_out, q, kcache, vcache, s0, kend,
+                            h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
+            }
         }
     }
 
