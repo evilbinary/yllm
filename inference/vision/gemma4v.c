@@ -53,9 +53,9 @@ struct G4v {
     ClipT std_bias, std_scale;
     int has_pre_ln, has_std;
     ClipLayer layers[G4V_MAX_LAYERS];
-    float *x, *res, *tmp, *q, *k, *v, *attn, *ff, *sc;
-    float *patch_wf, *pos_x, *pos_y;
-    uint32_t pos_n, gemm_nthr;
+    float *x, *res, *tmp, *q, *k, *v, *attn, *ff, *ffg, *sc;
+    float *patch_wf, *pos_x, *pos_y, *gemm_row;
+    uint32_t pos_n, gemm_nthr, gemm_in_cap;
 };
 
 void g4v_free(G4v* v);
@@ -158,6 +158,15 @@ static float dot_f32(const float* a, const float* b, uint32_t n)
         return acc;
     }
 }
+static void f16row_to_f32(float* d, const uint16_t* s, uint32_t n)
+{
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i*)(s + i));
+        _mm256_storeu_ps(d + i, _mm256_cvtph_ps(h));
+    }
+    for (; i < n; i++) d[i] = f16_to_f32(s[i]);
+}
 #elif defined(__aarch64__)
 static float hsum4(float32x4_t v) { return vaddvq_f32(v); }
 static float dot_f32(const float* a, const float* b, uint32_t n)
@@ -178,6 +187,21 @@ static float dot_f32(const float* a, const float* b, uint32_t n)
         return acc;
     }
 }
+static void f16row_to_f32(float* d, const uint16_t* s, uint32_t n)
+{
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16*)(s + i));
+        vst1q_f32(d + i, vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(d + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+    for (; i < n; i++) d[i] = f16_to_f32(s[i]);
+#else
+    uint32_t i;
+    for (i = 0; i < n; i++) d[i] = f16_to_f32(s[i]);
+#endif
+}
 #else
 static float dot_f32(const float* a, const float* b, uint32_t n)
 {
@@ -185,6 +209,11 @@ static float dot_f32(const float* a, const float* b, uint32_t n)
     uint32_t i;
     for (i = 0; i < n; i++) acc += a[i] * b[i];
     return acc;
+}
+static void f16row_to_f32(float* d, const uint16_t* s, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++) d[i] = f16_to_f32(s[i]);
 }
 #endif
 
@@ -203,11 +232,10 @@ static void clamp_buf(float* x, uint32_t n, float lo, float hi)
 static void gemm_lin(G4v* vis, float* y, const float* x, const ClipT* w, const ClipT* bias,
                      uint32_t M, uint32_t out, uint32_t in)
 {
-    uint32_t m, i, dt;
+    uint32_t oo;
     float *xc = NULL;
-    (void)vis;
+    /* 只按 out 维并行, 内层串行扫 M. 禁止再调 matmul(): 其内部也有 omp, MinGW 嵌套会 SIGSEGV */
     if (!w || !w->p) { memset(y, 0, (size_t)M * out * 4); return; }
-    dt = w->dtype == 0 ? DT_F32 : DT_F16;
     if (w->imin > -1e20f || w->imax < 1e20f) {
         xc = (float*)ymalloc((size_t)M * in * 4);
         if (!xc) return;
@@ -215,12 +243,31 @@ static void gemm_lin(G4v* vis, float* y, const float* x, const ClipT* w, const C
         clamp_buf(xc, M * in, w->imin, w->imax);
         x = xc;
     }
+    if (w->dtype == 0) {
 #pragma omp parallel for schedule(static)
-    for (m = 0; m < M; m++) {
-        matmul(y + (size_t)m * out, x + (size_t)m * in, w->p, out, in, dt);
-        if (bias && bias->p) {
-            for (i = 0; i < out; i++)
-                y[(size_t)m * out + i] += tload(bias, i);
+        for (oo = 0; oo < out; oo++) {
+            const float* wr = (const float*)w->p + (size_t)oo * in;
+            float b = (bias && bias->p) ? tload(bias, oo) : 0.f;
+            uint32_t m;
+            for (m = 0; m < M; m++)
+                y[(size_t)m * out + oo] = dot_f32(x + (size_t)m * in, wr, in) + b;
+        }
+    } else {
+#pragma omp parallel for schedule(static)
+        for (oo = 0; oo < out; oo++) {
+            int tid = 0;
+            float* wr;
+            float b;
+            uint32_t m;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            if (tid < 0 || (uint32_t)tid >= vis->gemm_nthr) tid = 0;
+            wr = vis->gemm_row + (size_t)tid * vis->gemm_in_cap;
+            f16row_to_f32(wr, (const uint16_t*)w->p + (size_t)oo * in, in);
+            b = (bias && bias->p) ? tload(bias, oo) : 0.f;
+            for (m = 0; m < M; m++)
+                y[(size_t)m * out + oo] = dot_f32(x + (size_t)m * in, wr, in) + b;
         }
     }
     if (w->omin > -1e20f || w->omax < 1e20f)
@@ -264,8 +311,14 @@ static void rms_w(float* y, const float* x, const ClipT* w, uint32_t n, float ep
 
 static void scale_vec(float* y, const ClipT* s, uint32_t n)
 {
-    uint32_t i;
+    uint32_t i, ne = 1, d;
     if (!s || !s->p) return;
+    for (d = 0; d < s->ndim; d++) ne *= (uint32_t)s->dims[d];
+    if (ne <= 1) {
+        float a = tload(s, 0);
+        for (i = 0; i < n; i++) y[i] *= a;
+        return;
+    }
     if (s->dtype == 0)
         for (i = 0; i < n; i++) y[i] *= ((const float*)s->p)[i];
     else
@@ -563,6 +616,7 @@ G4v* g4v_load(const char* path, char* err, size_t errlen)
         v->v = (float*)ymalloc(cap * 4);
         v->attn = (float*)ymalloc(cap * 4);
         v->ff = (float*)ymalloc(ffcap * 4);
+        v->ffg = (float*)ymalloc(ffcap * 4);
         v->patch_wf = (float*)ymalloc((size_t)e * K * 4);
         if (v->pos_embd.ndim >= 3)
             v->pos_n = (uint32_t)v->pos_embd.dims[1];
@@ -577,6 +631,10 @@ G4v* g4v_load(const char* path, char* err, size_t errlen)
         if (v->gemm_nthr < 1) v->gemm_nthr = 1;
 #endif
         v->sc = (float*)ymalloc((size_t)v->gemm_nthr * v->npos_max * 4);
+        v->gemm_in_cap = e;
+        if (v->gemm_in_cap < v->n_ff) v->gemm_in_cap = v->n_ff;
+        if (v->gemm_in_cap < K) v->gemm_in_cap = K;
+        v->gemm_row = (float*)ymalloc((size_t)v->gemm_nthr * v->gemm_in_cap * 4);
         if (v->patch_wf) {
             for (oc = 0; oc < e; oc++)
                 for (ic = 0; ic < 3; ic++)
@@ -597,7 +655,7 @@ G4v* g4v_load(const char* path, char* err, size_t errlen)
                 }
         }
         if (!v->x || !v->res || !v->tmp || !v->q || !v->k || !v->v || !v->attn || !v->ff ||
-            !v->patch_wf || !v->pos_x || !v->pos_y || !v->sc) {
+            !v->ffg || !v->patch_wf || !v->pos_x || !v->pos_y || !v->sc || !v->gemm_row) {
             if (err) snprintf(err, errlen, "oom vis buf");
             g4v_free(v); return NULL;
         }
@@ -613,7 +671,8 @@ void g4v_free(G4v* v)
 {
     if (!v) return;
     free(v->x); free(v->res); free(v->tmp); free(v->q); free(v->k); free(v->v);
-    free(v->attn); free(v->ff); free(v->sc); free(v->patch_wf); free(v->pos_x); free(v->pos_y);
+    free(v->attn); free(v->ff); free(v->ffg); free(v->sc); free(v->patch_wf); free(v->pos_x); free(v->pos_y);
+    free(v->gemm_row);
     free(v->ts);
     wmap_close(&v->map);
     free(v);
@@ -750,8 +809,8 @@ static int encode_run(G4v* vis, const float* chw, uint32_t sw, uint32_t sh, floa
             rms_w(vis->tmp + (size_t)t * e, vis->x + (size_t)t * e, &L->ln2_w, e, vis->eps);
         gemm_lin(vis, vis->ff, vis->tmp, &L->up_w, L->up_b.p ? &L->up_b : NULL, n, n_ff, e);
         if (L->has_gate) {
-            gemm_lin(vis, vis->q, vis->tmp, &L->gate_w, L->gate_b.p ? &L->gate_b : NULL, n, n_ff, e);
-            act_gate(vis->ff, vis->q, vis->ff, n * n_ff, vis->ffn_op);
+            gemm_lin(vis, vis->ffg, vis->tmp, &L->gate_w, L->gate_b.p ? &L->gate_b : NULL, n, n_ff, e);
+            act_gate(vis->ff, vis->ffg, vis->ff, n * n_ff, vis->ffn_op);
         } else {
             uint32_t u;
             for (u = 0; u < n * n_ff; u++) vis->ff[u] = gelu_quick(vis->ff[u]);
