@@ -9,6 +9,7 @@ set(INFER_INC
   ${INFER}/include
   ${INFER}/cuda
   ${INFER}/vulkan
+  ${INFER}/vision
 )
 
 option(YLLM_VULKAN "Build Vulkan device backend" OFF)
@@ -29,6 +30,9 @@ set(YLLM_CORE_SRCS
   ${INFER}/arch/qwen.c
   ${INFER}/arch/gemma4.c
   ${INFER}/arch/qwen35.c
+  ${INFER}/vision/minicpmv.c
+  ${INFER}/vision/qwen3vl.c
+  ${INFER}/vision/vision.c
   ${INFER}/core/cache.c
   ${INFER}/core/dist.c
   ${INFER}/device/device_cpu.c
