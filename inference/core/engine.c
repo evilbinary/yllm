@@ -661,6 +661,10 @@ static int engine_forward_prefill_mix(Engine* e, const uint32_t* tokens, int n, 
                 if (use_mix[idx]) {
                     memcpy(e->x, mix + (size_t)idx * hidden, (size_t)hidden * 4);
                     e->vis_tok = (int)idx;
+                    if (e->ops && e->ops->after_embed) {
+                        e->ops->after_embed(e, tokens[idx]);
+                        engine_dev_mark_x_host(e);
+                    }
                     if (engine_forward_range(e, tokens[idx], 0, posi, NULL, NULL) != 0) {
                         e->vis_tok = -1;
                         return -1;
@@ -679,6 +683,7 @@ static int engine_forward_prefill_mix(Engine* e, const uint32_t* tokens, int n, 
             else
                 engine_embed_into(e, e->pb + (size_t)b * hidden, tokens[idx]);
         }
+        e->vis_off = off;
         if (e->ops && e->ops->after_embed_batch)
             e->ops->after_embed_batch(e, tokens + off, nb);
         prefill_run_batch(e, n, start_pos, off, nb);
@@ -841,7 +846,8 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
     } else if (!need_embed) {
         /* PP 中段等: 调用方已把激活写入 e->x, 设备侧可能仍是旧 d_x */
         engine_dev_mark_x_host(e);
-        if (e->ops && e->ops->refresh_ple_pp)
+        /* 视觉位 after_embed 已按 residual 算过 PLE, 勿用 pad token 再刷一遍 */
+        if (e->ops && e->ops->refresh_ple_pp && e->vis_tok < 0)
             e->ops->refresh_ple_pp(e, token);
     }
     for (i = e->layer_begin; i < e->layer_end; i++) {
@@ -1310,6 +1316,7 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
     e->vis_nds = mix_nds;
     e->vis_seq = nprompt;
     e->vis_tok = -1;
+    e->vis_off = 0;
 #if YLLM_BATCH_PREFILL
     if (nprompt > 0) {
         if ((uint32_t)nprompt > e->max_seq) {
@@ -1337,6 +1344,7 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
     e->vis_use = NULL;
     e->vis_nds = 0;
     e->vis_tok = -1;
+    e->vis_off = 0;
     if (timings) {
         timings->n_prefill = nprompt > 0 ? (uint32_t)nprompt : 0;
         t1 = ynow_ms();

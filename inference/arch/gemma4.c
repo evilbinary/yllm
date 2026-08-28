@@ -221,7 +221,10 @@ void arch_gemma4_after_embed(Engine* e, uint32_t token)
     uint32_t hidden = e->ws.model.h.hidden;
     float scale = sqrtf((float)hidden);
     uint32_t j;
-    for (j = 0; j < hidden; j++) e->x[j] *= scale;
+    /* llama.cpp: 图像 raw embed 不再乘 √hidden */
+    if (!(e->vis_tok >= 0 && e->vis_use && e->vis_tok < e->vis_seq && e->vis_use[e->vis_tok])) {
+        for (j = 0; j < hidden; j++) e->x[j] *= scale;
+    }
     gemma4_prepare_ple_resid(e, token, e->x);
 }
 
@@ -311,9 +314,14 @@ void arch_gemma4_after_embed_batch(Engine* e, const uint32_t* tokens, uint32_t B
     uint32_t hidden = e->ws.model.h.hidden;
     float scale = sqrtf((float)hidden);
     uint32_t b2, j;
-    for (b2 = 0; b2 < B; b2++)
+    for (b2 = 0; b2 < B; b2++) {
+        int vis = (e->vis_use && e->vis_seq > 0 &&
+                   e->vis_off + (int)b2 >= 0 && e->vis_off + (int)b2 < e->vis_seq &&
+                   e->vis_use[e->vis_off + (int)b2]);
+        if (vis) continue;
         for (j = 0; j < hidden; j++)
             e->pb[(size_t)b2 * hidden + j] *= scale;
+    }
     if (c && c->ple_batch && c->n_ple)
         gemma4_prepare_ple_batch(e, tokens, B);
 }

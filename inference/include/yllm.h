@@ -179,6 +179,7 @@ typedef struct Engine {
     int vis_nds;
     int vis_seq;
     int vis_tok;
+    int vis_off; /* mix 批在 prompt 中的起点, after_embed_batch 用 */
 } Engine;
 
 /* 混合切分: gpu_layer_end==0 表示本段全部算「设备范围」(能否真 GPU 看 Device 指针)。 */

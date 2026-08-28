@@ -17,6 +17,13 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
+#ifdef _WIN32
+#include <malloc.h>
+#define vis_alloca _alloca
+#else
+#include <alloca.h>
+#define vis_alloca alloca
+#endif
 #include "stb_image.h"
 
 #define G4V_MAX_LAYERS 48
@@ -229,12 +236,169 @@ static void clamp_buf(float* x, uint32_t n, float lo, float hi)
     }
 }
 
+/* y[M,out] = x[M,in] · W[out,in]^T ; 内层不再 omp(MinGW 嵌套会 SIGSEGV) */
+static void gemm_nn(float* y, const float* x, const float* w, const float* bias,
+                    uint32_t M, uint32_t out, uint32_t in)
+{
+    uint32_t g, ng = (out + 3u) / 4u;
+#pragma omp parallel for schedule(static) if(out > 8)
+    for (g = 0; g < ng; g++) {
+        uint32_t oo = g * 4, nout = out - oo, m, i, k;
+        const float* w0 = w + (size_t)oo * in;
+        const float* w1 = w0 + in;
+        const float* w2 = w1 + in;
+        const float* w3 = w2 + in;
+        float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f;
+        if (nout > 4) nout = 4;
+        if (bias) {
+            b0 = bias[oo];
+            if (nout > 1) b1 = bias[oo + 1];
+            if (nout > 2) b2 = bias[oo + 2];
+            if (nout > 3) b3 = bias[oo + 3];
+        }
+#ifdef __AVX2__
+        if (nout == 4) {
+            m = 0;
+            for (; m + 2 <= M; m += 2) {
+                const float* xr0 = x + (size_t)m * in;
+                const float* xr1 = xr0 + in;
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
+                __m256 c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
+                float* y0 = y + (size_t)m * out + oo;
+                float* y1 = y0 + out;
+                for (i = 0; i + 8 <= in; i += 8) {
+                    __m256 wv0 = _mm256_loadu_ps(w0 + i), wv1 = _mm256_loadu_ps(w1 + i);
+                    __m256 wv2 = _mm256_loadu_ps(w2 + i), wv3 = _mm256_loadu_ps(w3 + i);
+                    __m256 x0 = _mm256_loadu_ps(xr0 + i), x1 = _mm256_loadu_ps(xr1 + i);
+                    a0 = _mm256_fmadd_ps(x0, wv0, a0); a1 = _mm256_fmadd_ps(x0, wv1, a1);
+                    a2 = _mm256_fmadd_ps(x0, wv2, a2); a3 = _mm256_fmadd_ps(x0, wv3, a3);
+                    c0 = _mm256_fmadd_ps(x1, wv0, c0); c1 = _mm256_fmadd_ps(x1, wv1, c1);
+                    c2 = _mm256_fmadd_ps(x1, wv2, c2); c3 = _mm256_fmadd_ps(x1, wv3, c3);
+                }
+                {
+                    float s0 = hsum8(a0), s1 = hsum8(a1), s2 = hsum8(a2), s3 = hsum8(a3);
+                    float t0 = hsum8(c0), t1 = hsum8(c1), t2 = hsum8(c2), t3 = hsum8(c3);
+                    for (; i < in; i++) {
+                        float v0 = xr0[i], v1 = xr1[i];
+                        s0 += v0 * w0[i]; s1 += v0 * w1[i]; s2 += v0 * w2[i]; s3 += v0 * w3[i];
+                        t0 += v1 * w0[i]; t1 += v1 * w1[i]; t2 += v1 * w2[i]; t3 += v1 * w3[i];
+                    }
+                    y0[0] = s0 + b0; y0[1] = s1 + b1; y0[2] = s2 + b2; y0[3] = s3 + b3;
+                    y1[0] = t0 + b0; y1[1] = t1 + b1; y1[2] = t2 + b2; y1[3] = t3 + b3;
+                }
+            }
+            for (; m < M; m++) {
+                const float* xr = x + (size_t)m * in;
+                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+                __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+                float* yr = y + (size_t)m * out + oo;
+                i = 0;
+                for (; i + 8 <= in; i += 8) {
+                    __m256 xv = _mm256_loadu_ps(xr + i);
+                    a0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w0 + i), a0);
+                    a1 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w1 + i), a1);
+                    a2 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w2 + i), a2);
+                    a3 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w3 + i), a3);
+                }
+                {
+                    float s0 = hsum8(a0), s1 = hsum8(a1), s2 = hsum8(a2), s3 = hsum8(a3);
+                    for (; i < in; i++) {
+                        float xv = xr[i];
+                        s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+                    }
+                    yr[0] = s0 + b0; yr[1] = s1 + b1; yr[2] = s2 + b2; yr[3] = s3 + b3;
+                }
+            }
+        } else
+#elif defined(__aarch64__)
+        if (nout == 4) {
+            m = 0;
+            for (; m + 4 <= M; m += 4) {
+                const float* xr0 = x + (size_t)m * in;
+                const float* xr1 = xr0 + in, *xr2 = xr1 + in, *xr3 = xr2 + in;
+                float32x4_t a00 = vdupq_n_f32(0.f), a01 = vdupq_n_f32(0.f);
+                float32x4_t a02 = vdupq_n_f32(0.f), a03 = vdupq_n_f32(0.f);
+                float32x4_t a10 = vdupq_n_f32(0.f), a11 = vdupq_n_f32(0.f);
+                float32x4_t a12 = vdupq_n_f32(0.f), a13 = vdupq_n_f32(0.f);
+                float32x4_t a20 = vdupq_n_f32(0.f), a21 = vdupq_n_f32(0.f);
+                float32x4_t a22 = vdupq_n_f32(0.f), a23 = vdupq_n_f32(0.f);
+                float32x4_t a30 = vdupq_n_f32(0.f), a31 = vdupq_n_f32(0.f);
+                float32x4_t a32 = vdupq_n_f32(0.f), a33 = vdupq_n_f32(0.f);
+                float* y0 = y + (size_t)m * out + oo;
+                for (i = 0; i + 4 <= in; i += 4) {
+                    float32x4_t wv0 = vld1q_f32(w0 + i), wv1 = vld1q_f32(w1 + i);
+                    float32x4_t wv2 = vld1q_f32(w2 + i), wv3 = vld1q_f32(w3 + i);
+                    float32x4_t x0 = vld1q_f32(xr0 + i), x1 = vld1q_f32(xr1 + i);
+                    float32x4_t x2 = vld1q_f32(xr2 + i), x3 = vld1q_f32(xr3 + i);
+                    a00 = vfmaq_f32(a00, x0, wv0); a01 = vfmaq_f32(a01, x0, wv1);
+                    a02 = vfmaq_f32(a02, x0, wv2); a03 = vfmaq_f32(a03, x0, wv3);
+                    a10 = vfmaq_f32(a10, x1, wv0); a11 = vfmaq_f32(a11, x1, wv1);
+                    a12 = vfmaq_f32(a12, x1, wv2); a13 = vfmaq_f32(a13, x1, wv3);
+                    a20 = vfmaq_f32(a20, x2, wv0); a21 = vfmaq_f32(a21, x2, wv1);
+                    a22 = vfmaq_f32(a22, x2, wv2); a23 = vfmaq_f32(a23, x2, wv3);
+                    a30 = vfmaq_f32(a30, x3, wv0); a31 = vfmaq_f32(a31, x3, wv1);
+                    a32 = vfmaq_f32(a32, x3, wv2); a33 = vfmaq_f32(a33, x3, wv3);
+                }
+                {
+                    float s00 = hsum4(a00), s01 = hsum4(a01), s02 = hsum4(a02), s03 = hsum4(a03);
+                    float s10 = hsum4(a10), s11 = hsum4(a11), s12 = hsum4(a12), s13 = hsum4(a13);
+                    float s20 = hsum4(a20), s21 = hsum4(a21), s22 = hsum4(a22), s23 = hsum4(a23);
+                    float s30 = hsum4(a30), s31 = hsum4(a31), s32 = hsum4(a32), s33 = hsum4(a33);
+                    for (; i < in; i++) {
+                        float v0 = xr0[i], v1 = xr1[i], v2 = xr2[i], v3 = xr3[i];
+                        s00 += v0 * w0[i]; s01 += v0 * w1[i]; s02 += v0 * w2[i]; s03 += v0 * w3[i];
+                        s10 += v1 * w0[i]; s11 += v1 * w1[i]; s12 += v1 * w2[i]; s13 += v1 * w3[i];
+                        s20 += v2 * w0[i]; s21 += v2 * w1[i]; s22 += v2 * w2[i]; s23 += v2 * w3[i];
+                        s30 += v3 * w0[i]; s31 += v3 * w1[i]; s32 += v3 * w2[i]; s33 += v3 * w3[i];
+                    }
+                    y0[0] = s00 + b0; y0[1] = s01 + b1; y0[2] = s02 + b2; y0[3] = s03 + b3;
+                    y0[out + 0] = s10 + b0; y0[out + 1] = s11 + b1; y0[out + 2] = s12 + b2; y0[out + 3] = s13 + b3;
+                    y0[2 * out + 0] = s20 + b0; y0[2 * out + 1] = s21 + b1; y0[2 * out + 2] = s22 + b2; y0[2 * out + 3] = s23 + b3;
+                    y0[3 * out + 0] = s30 + b0; y0[3 * out + 1] = s31 + b1; y0[3 * out + 2] = s32 + b2; y0[3 * out + 3] = s33 + b3;
+                }
+            }
+            for (; m < M; m++) {
+                const float* xr = x + (size_t)m * in;
+                float32x4_t a0 = vdupq_n_f32(0.f), a1 = vdupq_n_f32(0.f);
+                float32x4_t a2 = vdupq_n_f32(0.f), a3 = vdupq_n_f32(0.f);
+                float* yr = y + (size_t)m * out + oo;
+                i = 0;
+                for (; i + 4 <= in; i += 4) {
+                    float32x4_t xv = vld1q_f32(xr + i);
+                    a0 = vfmaq_f32(a0, xv, vld1q_f32(w0 + i));
+                    a1 = vfmaq_f32(a1, xv, vld1q_f32(w1 + i));
+                    a2 = vfmaq_f32(a2, xv, vld1q_f32(w2 + i));
+                    a3 = vfmaq_f32(a3, xv, vld1q_f32(w3 + i));
+                }
+                {
+                    float s0 = hsum4(a0), s1 = hsum4(a1), s2 = hsum4(a2), s3 = hsum4(a3);
+                    for (; i < in; i++) {
+                        float xv = xr[i];
+                        s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+                    }
+                    yr[0] = s0 + b0; yr[1] = s1 + b1; yr[2] = s2 + b2; yr[3] = s3 + b3;
+                }
+            }
+        } else
+#endif
+        {
+            for (m = 0; m < M; m++) {
+                const float* xr = x + (size_t)m * in;
+                float* yr = y + (size_t)m * out + oo;
+                for (k = 0; k < nout; k++)
+                    yr[k] = dot_f32(xr, w0 + (size_t)k * in, in) + (k == 0 ? b0 : k == 1 ? b1 : k == 2 ? b2 : b3);
+            }
+        }
+    }
+}
+
 static void gemm_lin(G4v* vis, float* y, const float* x, const ClipT* w, const ClipT* bias,
                      uint32_t M, uint32_t out, uint32_t in)
 {
     uint32_t oo;
-    float *xc = NULL;
-    /* 只按 out 维并行, 内层串行扫 M. 禁止再调 matmul(): 其内部也有 omp, MinGW 嵌套会 SIGSEGV */
+    float *xc = NULL, *bf = NULL;
     if (!w || !w->p) { memset(y, 0, (size_t)M * out * 4); return; }
     if (w->imin > -1e20f || w->imax < 1e20f) {
         xc = (float*)ymalloc((size_t)M * in * 4);
@@ -243,14 +407,38 @@ static void gemm_lin(G4v* vis, float* y, const float* x, const ClipT* w, const C
         clamp_buf(xc, M * in, w->imin, w->imax);
         x = xc;
     }
+    if (bias && bias->p) {
+        bf = (float*)vis_alloca((size_t)out * 4);
+        for (oo = 0; oo < out; oo++) bf[oo] = tload(bias, oo);
+    }
     if (w->dtype == 0) {
+        gemm_nn(y, x, (const float*)w->p, bf, M, out, in);
+    } else if (vis->gemm_row && (uint64_t)4 * in + (uint64_t)M * 4 <= vis->gemm_in_cap) {
+        uint32_t g, ng = (out + 3u) / 4u;
 #pragma omp parallel for schedule(static)
-        for (oo = 0; oo < out; oo++) {
-            const float* wr = (const float*)w->p + (size_t)oo * in;
-            float b = (bias && bias->p) ? tload(bias, oo) : 0.f;
-            uint32_t m;
+        for (g = 0; g < ng; g++) {
+            int tid = 0;
+            uint32_t o0 = g * 4, nout = out - o0, k, m;
+            float* wr;
+            float* tmp;
+            float b4[4];
+            if (nout > 4) nout = 4;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            if (tid < 0 || (uint32_t)tid >= vis->gemm_nthr) tid = 0;
+            wr = vis->gemm_row + (size_t)tid * vis->gemm_in_cap;
+            tmp = wr + (size_t)4 * in;
+            for (k = 0; k < 4; k++) {
+                if (k < nout)
+                    f16row_to_f32(wr + (size_t)k * in, (const uint16_t*)w->p + (size_t)(o0 + k) * in, in);
+                else
+                    memset(wr + (size_t)k * in, 0, (size_t)in * 4);
+                b4[k] = (bf && k < nout) ? bf[o0 + k] : 0.f;
+            }
+            gemm_nn(tmp, x, wr, b4, M, 4, in);
             for (m = 0; m < M; m++)
-                y[(size_t)m * out + oo] = dot_f32(x + (size_t)m * in, wr, in) + b;
+                memcpy(y + (size_t)m * out + o0, tmp + (size_t)m * 4, (size_t)nout * 4);
         }
     } else {
 #pragma omp parallel for schedule(static)
@@ -634,6 +822,7 @@ G4v* g4v_load(const char* path, char* err, size_t errlen)
         v->gemm_in_cap = e;
         if (v->gemm_in_cap < v->n_ff) v->gemm_in_cap = v->n_ff;
         if (v->gemm_in_cap < K) v->gemm_in_cap = K;
+        v->gemm_in_cap = 4u * v->gemm_in_cap + v->npos_max * 4u;
         v->gemm_row = (float*)ymalloc((size_t)v->gemm_nthr * v->gemm_in_cap * 4);
         if (v->patch_wf) {
             for (oc = 0; oc < e; oc++)

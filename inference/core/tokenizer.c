@@ -1281,6 +1281,11 @@ static int chat_image_markers(const Vocab* v, const char** beg_s, const char** e
         *end_s = pairs[i][1];
         *id_beg = b;
         *id_end = e;
+        /* Gemma 槽位用 <|image> 本身, 避免 <pad> 身份混进 PLE */
+        if (i == 0) {
+            *id_pad = b;
+            return 0;
+        }
         *id_pad = chat_token_id(v, "<|image_pad|>");
         if (*id_pad < 0) *id_pad = chat_token_id(v, "<pad>");
         if (*id_pad < 0) *id_pad = v->unk;
