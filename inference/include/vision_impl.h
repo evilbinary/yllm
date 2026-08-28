@@ -27,5 +27,8 @@ void g4v_free(G4v* v);
 int g4v_n_tokens(const G4v* v);
 int g4v_hidden(const G4v* v);
 int g4v_encode(G4v* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen);
+int g4v_apply_opt(G4v* v, int min_tok, int max_tok, char* err, size_t errlen);
+int q3v_apply_opt(Q3v* v, int min_tok, int max_tok, char* err, size_t errlen);
+int mcpv_apply_opt(Mcpv* v, int downsample, int max_slice, char* err, size_t errlen);
 
 #endif

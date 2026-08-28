@@ -884,6 +884,59 @@ G4v* g4v_load(const char* path, char* err, size_t errlen)
     return v;
 }
 
+static int g4v_realloc_work(G4v* v, uint32_t npos, char* err, size_t errlen)
+{
+    uint32_t e = v->n_embd, ps = v->patch, K = 3 * ps * ps, gin;
+    size_t cap = (size_t)npos * e;
+    size_t ffcap = cap;
+    if (ffcap < (size_t)npos * v->n_ff) ffcap = (size_t)npos * v->n_ff;
+    free(v->x); free(v->res); free(v->tmp); free(v->q); free(v->k); free(v->v);
+    free(v->attn); free(v->ff); free(v->ffg); free(v->sc); free(v->gemm_row);
+    v->x = (float*)ymalloc(cap * 4);
+    v->res = (float*)ymalloc(cap * 4);
+    v->tmp = (float*)ymalloc(cap * 4);
+    v->q = (float*)ymalloc(cap * 4);
+    v->k = (float*)ymalloc(cap * 4);
+    v->v = (float*)ymalloc(cap * 4);
+    v->attn = (float*)ymalloc(cap * 4);
+    v->ff = (float*)ymalloc(ffcap * 4);
+    v->ffg = (float*)ymalloc(ffcap * 4);
+    v->sc = (float*)ymalloc((size_t)v->gemm_nthr * npos * 4);
+    gin = e;
+    if (gin < v->n_ff) gin = v->n_ff;
+    if (gin < K) gin = K;
+    gin = 4u * gin + npos * 4u;
+    v->gemm_in_cap = gin;
+    v->gemm_row = (float*)ymalloc((size_t)v->gemm_nthr * gin * 4);
+    v->npos_max = npos;
+    if (!v->x || !v->res || !v->tmp || !v->q || !v->k || !v->v || !v->attn ||
+        !v->ff || !v->ffg || !v->sc || !v->gemm_row) {
+        if (err) snprintf(err, errlen, "oom vis buf");
+        return -1;
+    }
+    return 0;
+}
+
+int g4v_apply_opt(G4v* v, int min_tok, int max_tok, char* err, size_t errlen)
+{
+    uint32_t merge, npos;
+    if (!v) return -1;
+    if (min_tok > 0) v->ntok_min = (uint32_t)min_tok;
+    if (max_tok > 0) v->ntok_max = (uint32_t)max_tok;
+    if (v->ntok_min < 1) v->ntok_min = 1;
+    if (v->ntok_max < v->ntok_min) {
+        if (err) snprintf(err, errlen, "max_soft_tokens < min_soft_tokens");
+        return -1;
+    }
+    merge = v->n_merge ? v->n_merge : 3;
+    npos = (v->ntok_max + 8) * merge * merge;
+    if (npos < 4096) npos = 4096;
+    if (npos > v->npos_max && g4v_realloc_work(v, npos, err, errlen) != 0)
+        return -1;
+    ylog_info("vision gemma4v: ntok=%u..%u", v->ntok_min, v->ntok_max);
+    return 0;
+}
+
 void g4v_free(G4v* v)
 {
     if (!v) return;

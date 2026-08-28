@@ -70,6 +70,7 @@ struct Q3v {
     float *rope_cs;
     int32_t *pos_buf;
     uint32_t gemm_nthr, gemm_in_cap, npos_max, sc_nthr;
+    int tok_min, tok_max; /* --opt min/max_soft_tokens, 0=默认 */
 };
 
 typedef struct {
@@ -1268,9 +1269,24 @@ void q3v_free(Q3v* v)
 int q3v_n_tokens(const Q3v* v)
 {
     uint32_t g;
+    int n;
     if (!v) return 0;
     g = v->image_size / v->patch / 2;
-    return (int)(g * g);
+    n = (int)(g * g);
+    if (v->tok_max > 0 && v->tok_max < n) n = v->tok_max;
+    return n;
+}
+
+int q3v_apply_opt(Q3v* v, int min_tok, int max_tok, char* err, size_t errlen)
+{
+    if (!v) return -1;
+    if (min_tok > 0) v->tok_min = min_tok;
+    if (max_tok > 0) v->tok_max = max_tok;
+    if (v->tok_min > 0 && v->tok_max > 0 && v->tok_max < v->tok_min) {
+        if (err) snprintf(err, errlen, "max_soft_tokens < min_soft_tokens");
+        return -1;
+    }
+    return 0;
 }
 
 int q3v_hidden(const Q3v* v)
@@ -1406,6 +1422,14 @@ int q3v_encode(Q3v* v, const char* image_path, float* out, float* ds, int max_to
     if (factor < 2) factor = (int)(v->patch * 2);
     max_px = (int)(v->image_size * v->image_size);
     min_px = factor * factor; /* 至少 1 个 merge tile, 小图不拉到 image_size */
+    if (v->tok_max > 0) {
+        int cap = v->tok_max * factor * factor;
+        if (cap > 0 && cap < max_px) max_px = cap;
+    }
+    if (v->tok_min > 0) {
+        int floor_px = v->tok_min * factor * factor;
+        if (floor_px > min_px) min_px = floor_px;
+    }
     smart_hw(w, h, factor, min_px, max_px, &sw, &sh);
     ntok = (sw / (int)v->patch / 2) * (sh / (int)v->patch / 2);
     if (ntok < 1) { stbi_image_free(img); if (err) snprintf(err, errlen, "image too small"); return -1; }

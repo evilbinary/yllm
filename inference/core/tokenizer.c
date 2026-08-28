@@ -166,6 +166,7 @@ static int parse_text(const char* path, Vocab* v)
     int n = atoi(line);
     if (n <= 0 || n > 1000000) { fclose(f); return -1; }
     memset(v, 0, sizeof(*v));   /* 全字段清零: 无 #SCORES#/#MERGES# 段时不得读未初始化内存 */
+    v->chat_think = -1;
     v->pieces = (char**)ycalloc((size_t)n, sizeof(char*));
     v->n = 0;
     v->unk = -1;
@@ -938,6 +939,8 @@ static int chat_spec_len_at(const char* p, const char** which)
         "<|tool_response>", "<tool_response|>",
         "<|tool_call>", "<tool_call|>",
         "<|turn>", "<turn|>",
+        "<|think|>",
+        "<|channel>", "<channel|>",
         "<|image>", "<image|>",
         "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
         "<image>", "</image>",
@@ -1032,8 +1035,8 @@ static void chat_render_generic(Vocab* v, const ChatMsg* msgs, int n_msgs,
     }
     if (im) {
         chat_append_ids(v, "<|im_start|>assistant\n", ids, max, n_out);
-        /* Qwen3.5/3.8 thinking: 模板默认注入 <think>\\n, 否则模型离分布会吐乱码 */
-        if (chat_vocab_has_token(v, "<think>"))
+        /* Qwen: 默认注入 <think>; --opt enable_thinking=0 关掉 */
+        if (v->chat_think != 0 && chat_vocab_has_token(v, "<think>"))
             chat_append_ids(v, "<think>\n", ids, max, n_out);
     } else
         chat_append_ids(v, "assistant: ", ids, max, n_out);
@@ -1057,8 +1060,13 @@ static void chat_render_gemma4(Vocab* v, const ChatMsg* msgs, int n_msgs,
         const char* c = msgs[mi].content ? msgs[mi].content : "";
         need += strlen(role) + strlen(c) + 32;
     }
+    if (v->chat_think == 1) need += 64;
     buf = (char*)ymalloc(need);
     buf[0] = 0;
+    if (v->chat_think == 1) {
+        int w = snprintf(buf, need, "<|turn>system\n<|think|>\n<turn|>\n");
+        if (w > 0) o += (size_t)w;
+    }
     for (mi = 0; mi < n_msgs; mi++) {
         const char* role = msgs[mi].role && msgs[mi].role[0] ? msgs[mi].role : "user";
         const char* c = msgs[mi].content ? msgs[mi].content : "";
@@ -1351,4 +1359,86 @@ int vocab_chat_ids_image(Vocab* v, const char* user_msg, int n_vis,
     free(content);
     if (n <= 0) return -1;
     return chat_expand_image_slots(ids, n, max, id_beg, id_end, id_pad, n_vis, vis_begin);
+}
+
+void yopt_init(YOpt* o)
+{
+    if (!o) return;
+    o->max_soft_tokens = -1;
+    o->min_soft_tokens = -1;
+    o->downsample = -1;
+    o->max_slice_nums = -1;
+    o->enable_thinking = -1;
+}
+
+static int yopt_bool(const char* v, int* out)
+{
+    if (!v || !v[0]) return -1;
+    if (!strcmp(v, "1") || !strcmp(v, "true") || !strcmp(v, "True") || !strcmp(v, "yes")) {
+        *out = 1; return 0;
+    }
+    if (!strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "False") || !strcmp(v, "no")) {
+        *out = 0; return 0;
+    }
+    return -1;
+}
+
+int yopt_parse(YOpt* o, const char* s, char* err, size_t errlen)
+{
+    char buf[1024], *p, *next;
+    if (!o) return -1;
+    if (!s || !s[0]) return 0;
+    if (strlen(s) >= sizeof(buf)) {
+        if (err) snprintf(err, errlen, "opt string too long");
+        return -1;
+    }
+    memcpy(buf, s, strlen(s) + 1);
+    for (p = buf; p; p = next) {
+        char* eq;
+        char* k;
+        char* v;
+        next = strchr(p, ',');
+        if (next) { *next = 0; next++; }
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) continue;
+        eq = strchr(p, '=');
+        if (!eq) {
+            if (err) snprintf(err, errlen, "opt want k=v, got '%s'", p);
+            return -1;
+        }
+        *eq = 0;
+        k = p;
+        v = eq + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        {
+            char* e = k + strlen(k);
+            while (e > k && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        }
+        if (!strcmp(k, "max_soft_tokens")) {
+            int n = atoi(v);
+            if (n < 1) { if (err) snprintf(err, errlen, "bad max_soft_tokens"); return -1; }
+            o->max_soft_tokens = n;
+        } else if (!strcmp(k, "min_soft_tokens")) {
+            int n = atoi(v);
+            if (n < 1) { if (err) snprintf(err, errlen, "bad min_soft_tokens"); return -1; }
+            o->min_soft_tokens = n;
+        } else if (!strcmp(k, "downsample_mode")) {
+            if (!strcmp(v, "16x") || !strcmp(v, "16")) o->downsample = 16;
+            else if (!strcmp(v, "4x") || !strcmp(v, "4")) o->downsample = 4;
+            else { if (err) snprintf(err, errlen, "downsample_mode want 16x|4x"); return -1; }
+        } else if (!strcmp(k, "max_slice_nums")) {
+            int n = atoi(v);
+            if (n < 1) { if (err) snprintf(err, errlen, "bad max_slice_nums"); return -1; }
+            o->max_slice_nums = n;
+        } else if (!strcmp(k, "enable_thinking")) {
+            if (yopt_bool(v, &o->enable_thinking) != 0) {
+                if (err) snprintf(err, errlen, "enable_thinking want 0|1");
+                return -1;
+            }
+        } else {
+            if (err) snprintf(err, errlen, "unknown opt key '%s'", k);
+            return -1;
+        }
+    }
+    return 0;
 }

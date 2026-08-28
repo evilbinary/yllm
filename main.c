@@ -567,20 +567,47 @@ static int cmd_chat(int argc, char** argv)
     const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
     const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
+    YOpt yopt;
+    int ai;
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--mmproj <mmproj.gguf> --image <img>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--mmproj <mmproj.gguf> --image <img>] [--opt k=v,...] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "  --opt keys: max_soft_tokens,min_soft_tokens,downsample_mode,max_slice_nums,enable_thinking\n");
         return 1;
     }
 
     Vocab v;
+    char err[1024];
     if (vocab_load(vocab, &v) != 0) {
         fprintf(stderr, "cannot load vocab: %s\n", vocab);
         return 1;
     }
+    yopt_init(&yopt);
+    for (ai = 0; ai < n; ai++) {
+        if (strcmp(a[ai].key, "opt") != 0) continue;
+        if (yopt_parse(&yopt, a[ai].val, err, sizeof(err)) != 0) {
+            fprintf(stderr, "opt: %s\n", err);
+            vocab_free(&v);
+            return 1;
+        }
+    }
+    if (yopt.enable_thinking >= 0) v.chat_think = yopt.enable_thinking;
+    if (yopt.enable_thinking == 1) {
+        int ok = (vocab_id(&v, "<|think|>") >= 0) || (vocab_id(&v, "<think>") >= 0);
+        if (!ok) {
+            fprintf(stderr, "enable_thinking=1 but vocab has no <|think|> / <think>\n");
+            vocab_free(&v);
+            return 1;
+        }
+    }
+    if (!image && (yopt.max_soft_tokens > 0 || yopt.min_soft_tokens > 0 ||
+                   yopt.downsample > 0 || yopt.max_slice_nums > 0)) {
+        fprintf(stderr, "opt vis keys need --image\n");
+        vocab_free(&v);
+        return 1;
+    }
 
     Engine e;
-    char err[1024];
     uint64_t budget = budget_bytes_from_str(m, budget_str);
     if (engine_init(&e, m, budget, depth, err, sizeof(err)) != 0) {
         fprintf(stderr, "engine init failed: %s\n", err);
@@ -636,6 +663,10 @@ static int cmd_chat(int argc, char** argv)
         if (!vis) {
             fprintf(stderr, "mmproj load failed: %s\n", err);
             engine_free(&e); vocab_free(&v); free(ids); return 1;
+        }
+        if (vision_apply_opt(vis, &yopt, err, sizeof(err)) != 0) {
+            fprintf(stderr, "opt: %s\n", err);
+            vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
         }
         nvis = vision_n_tokens(vis);
         hid = vision_hidden(vis);

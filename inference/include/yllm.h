@@ -50,7 +50,20 @@ typedef struct {
     int32_t byte_ids[256]; /* tiktoken byte -> token id (byte_level 时预计算, -1=无) */
     char* chat_template; /* jinja2 chat template from gguf */
     int add_bos;      /* tokenizer.ggml.add_bos_token */
+    int chat_think;   /* -1 默认(Gemma 关 / Qwen 有 <think> 则开), 0 关, 1 开 */
 } Vocab;
+
+/* chat/视觉可扩展 k=v 袋 (--opt a=1,b=2). -1 表示未设, 用模型默认 */
+typedef struct YOpt {
+    int max_soft_tokens;
+    int min_soft_tokens;
+    int downsample;      /* 16 或 4 */
+    int max_slice_nums;
+    int enable_thinking; /* 0/1 */
+} YOpt;
+
+void yopt_init(YOpt* o);
+int yopt_parse(YOpt* o, const char* s, char* err, size_t errlen);
 
 /* ---- 平台层 ---- */
 void* ymalloc(size_t n);

@@ -105,6 +105,43 @@ Vision* vision_load(const char* mmproj_path, char* err, size_t errlen)
     return v;
 }
 
+int vision_apply_opt(Vision* v, const struct YOpt* o, char* err, size_t errlen)
+{
+    int vis_keys;
+    if (!v || !v->p || !o) { if (err) snprintf(err, errlen, "no vision"); return -1; }
+    vis_keys = (o->max_soft_tokens > 0) || (o->min_soft_tokens > 0) ||
+               (o->downsample > 0) || (o->max_slice_nums > 0);
+    if (!vis_keys) return 0;
+    if (v->kind == 2) { /* gemma4v */
+        if (o->downsample > 0) {
+            if (err) snprintf(err, errlen, "downsample_mode not used by gemma4v");
+            return -1;
+        }
+        if (o->max_slice_nums > 0) {
+            if (err) snprintf(err, errlen, "max_slice_nums not used by gemma4v");
+            return -1;
+        }
+        return g4v_apply_opt(v->p, o->min_soft_tokens, o->max_soft_tokens, err, errlen);
+    }
+    if (v->kind == 1) { /* qwen3vl */
+        if (o->downsample > 0) {
+            if (err) snprintf(err, errlen, "downsample_mode not used by qwen3vl");
+            return -1;
+        }
+        if (o->max_slice_nums > 0) {
+            if (err) snprintf(err, errlen, "max_slice_nums not used by qwen3vl");
+            return -1;
+        }
+        return q3v_apply_opt(v->p, o->min_soft_tokens, o->max_soft_tokens, err, errlen);
+    }
+    /* minicpm */
+    if (o->max_soft_tokens > 0 || o->min_soft_tokens > 0) {
+        if (err) snprintf(err, errlen, "min/max_soft_tokens not used by minicpmv (fixed 448)");
+        return -1;
+    }
+    return mcpv_apply_opt(v->p, o->downsample, o->max_slice_nums, err, errlen);
+}
+
 void vision_free(Vision* v)
 {
     if (!v) return;

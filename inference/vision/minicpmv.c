@@ -891,6 +891,20 @@ int mcpv_hidden(const Mcpv* v)
     return v ? (int)v->n_out_embd : 0;
 }
 
+int mcpv_apply_opt(Mcpv* v, int downsample, int max_slice, char* err, size_t errlen)
+{
+    if (!v) return -1;
+    if (downsample > 0 && downsample != 16) {
+        if (err) snprintf(err, errlen, "downsample_mode=%dx not implemented (only 16x)", downsample);
+        return -1;
+    }
+    if (max_slice > 0 && max_slice != 1) {
+        if (err) snprintf(err, errlen, "max_slice_nums=%d not implemented (only 1)", max_slice);
+        return -1;
+    }
+    return 0;
+}
+
 static void patch_embed(Mcpv* vis, const float* chw, uint32_t gh, uint32_t gw)
 {
     uint32_t ps = vis->patch, e = vis->n_embd, K = 3 * ps * ps;

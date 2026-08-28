@@ -538,7 +538,8 @@ chat-gemma4-e2b: $(BIN) $(G4_E2B_LLF)
 
 chat-gemma4-e2b-avx2: $(BIN_AVX2) $(G4_E2B_LLF)
 	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
-		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
+		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),) \
+		$(if $(OPT),--opt $(OPT),)
 
 chat-gemma4-e2b-vulkan: vulkan $(G4_E2B_LLF)
 	$(RUN_VULKAN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
