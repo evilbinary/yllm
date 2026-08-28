@@ -32,6 +32,7 @@ set(YLLM_CORE_SRCS
   ${INFER}/arch/qwen35.c
   ${INFER}/vision/minicpmv.c
   ${INFER}/vision/qwen3vl.c
+  ${INFER}/vision/gemma4v.c
   ${INFER}/vision/vision.c
   ${INFER}/core/cache.c
   ${INFER}/core/dist.c

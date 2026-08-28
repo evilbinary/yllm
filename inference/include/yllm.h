@@ -111,6 +111,10 @@ int vocab_id(Vocab* v, const char* piece);
 int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int add_bos);
 int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* contents,
                          int n_msgs, uint32_t* ids, int max, int add_bos);
+/* 单轮 user + 图: 走同一套 chat 模板, 在图像起止 token 之间插入 n_vis 个占位。
+ * *vis_begin 为第一位视觉 token。无图像标记或渲染失败返回 -1。 */
+int vocab_chat_ids_image(Vocab* v, const char* user_msg, int n_vis,
+                         uint32_t* ids, int max, int add_bos, int* vis_begin);
 int vocab_has_template(Vocab* v);
 /* ---- 引擎 ---- */
 typedef struct Engine {

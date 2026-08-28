@@ -628,8 +628,6 @@ static int cmd_chat(int argc, char** argv)
     int vis_nds = 0;
     if (image) {
         int nvis, i, pad, hid;
-        int id_ims, id_ime, id_pad;
-        char prefix[256], suffix[4096];
         if (!mmproj) {
             fprintf(stderr, "--image requires --mmproj <mmproj.gguf>\n");
             engine_free(&e); vocab_free(&v); free(ids); return 1;
@@ -659,29 +657,10 @@ static int cmd_chat(int argc, char** argv)
             nvis = got;
         }
         /* 视觉向量暂存在 mix_emb[0..nvis), 组 prompt 后再挪到对应位置 */
-        id_ims = vocab_id(&v, "<image>");
-        id_ime = vocab_id(&v, "</image>");
-        id_pad = vocab_id(&v, "<|image_pad|>");
-        if (id_ims < 0) id_ims = vocab_id(&v, "<|vision_start|>");
-        if (id_ime < 0) id_ime = vocab_id(&v, "<|vision_end|>");
-        if (id_pad < 0) id_pad = v.unk;
-        snprintf(prefix, sizeof(prefix), "<|im_start|>user\n");
-        if (vocab_id(&v, "<image>") < 0)
-            snprintf(suffix, sizeof(suffix), "\n%s<|im_end|>\n<|im_start|>assistant\n",
-                     prompt ? prompt : "Describe this image.");
-        else
-            snprintf(suffix, sizeof(suffix), "\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-                     prompt ? prompt : "Describe this image.");
-        nprompt = vocab_encode(&v, prefix, ids, (int)sz);
-        if (nprompt < (int)sz) ids[nprompt++] = (uint32_t)id_ims;
-        pad = nprompt;
-        for (i = 0; i < nvis && nprompt < (int)sz; i++)
-            ids[nprompt++] = (uint32_t)(id_pad >= 0 ? id_pad : 0);
-        if (nprompt < (int)sz) ids[nprompt++] = (uint32_t)id_ime;
-        {
-            uint32_t tail[4096];
-            int nt = vocab_encode(&v, suffix, tail, 4096);
-            for (i = 0; i < nt && nprompt < (int)sz; i++) ids[nprompt++] = tail[i];
+        nprompt = vocab_chat_ids_image(&v, prompt, nvis, ids, (int)sz, use_bos, &pad);
+        if (nprompt <= 0) {
+            fprintf(stderr, "image chat template failed (vocab missing image markers?)\n");
+            free(mix_emb); free(mix_ds); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
         }
         {
             float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);

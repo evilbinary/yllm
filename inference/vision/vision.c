@@ -1,4 +1,4 @@
-/* 按 mmproj projector_type 分发 MiniCPM-V / Qwen3-VL */
+/* 按 mmproj projector_type 分发 MiniCPM-V / Qwen3-VL / Gemma4v */
 #include "vision.h"
 #include "vision_impl.h"
 #include "yllm.h"
@@ -7,7 +7,7 @@
 #include <stdlib.h>
 
 struct Vision {
-    int kind; /* 0 mcpv 1 q3v */
+    int kind; /* 0 mcpv 1 q3v 2 g4v */
     void* p;
 };
 
@@ -84,9 +84,17 @@ Vision* vision_load(const char* mmproj_path, char* err, size_t errlen)
     if (!v) { if (err) snprintf(err, errlen, "oom"); return NULL; }
     proj[0] = 0;
     peek_projector(mmproj_path, proj, sizeof(proj));
+    if (strstr(proj, "gemma4uv")) {
+        if (err) snprintf(err, errlen, "gemma4uv mmproj not supported (E2B/E4B use gemma4v)");
+        free(v);
+        return NULL;
+    }
     if (strstr(proj, "qwen3vl")) {
         v->kind = 1;
         v->p = q3v_load(mmproj_path, err, errlen);
+    } else if (strstr(proj, "gemma4v")) {
+        v->kind = 2;
+        v->p = g4v_load(mmproj_path, err, errlen);
     } else {
         v->kind = 0;
         v->p = mcpv_load(mmproj_path, err, errlen);
@@ -99,6 +107,7 @@ void vision_free(Vision* v)
 {
     if (!v) return;
     if (v->kind == 1) q3v_free((Q3v*)v->p);
+    else if (v->kind == 2) g4v_free((G4v*)v->p);
     else mcpv_free((Mcpv*)v->p);
     free(v);
 }
@@ -106,13 +115,17 @@ void vision_free(Vision* v)
 int vision_n_tokens(const Vision* v)
 {
     if (!v || !v->p) return 0;
-    return v->kind == 1 ? q3v_n_tokens((const Q3v*)v->p) : mcpv_n_tokens((const Mcpv*)v->p);
+    if (v->kind == 1) return q3v_n_tokens((const Q3v*)v->p);
+    if (v->kind == 2) return g4v_n_tokens((const G4v*)v->p);
+    return mcpv_n_tokens((const Mcpv*)v->p);
 }
 
 int vision_hidden(const Vision* v)
 {
     if (!v || !v->p) return 0;
-    return v->kind == 1 ? q3v_hidden((const Q3v*)v->p) : mcpv_hidden((const Mcpv*)v->p);
+    if (v->kind == 1) return q3v_hidden((const Q3v*)v->p);
+    if (v->kind == 2) return g4v_hidden((const G4v*)v->p);
+    return mcpv_hidden((const Mcpv*)v->p);
 }
 
 int vision_n_deepstack(const Vision* v)
@@ -134,5 +147,7 @@ int vision_encode_image_ds(Vision* v, const char* image_path, float* out, float*
     if (v->kind == 1)
         return q3v_encode(v->p, image_path, out, ds, max_tok, err, errlen);
     (void)ds;
+    if (v->kind == 2)
+        return g4v_encode(v->p, image_path, out, max_tok, err, errlen);
     return mcpv_encode_image((Mcpv*)v->p, image_path, out, max_tok, err, errlen);
 }

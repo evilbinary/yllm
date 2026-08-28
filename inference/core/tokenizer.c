@@ -509,6 +509,8 @@ static void build_byte_ids(Vocab* v)
 /* qwen 特殊 token: 编码前整体匹配(含 thinking 启停, 切成 BPE 会让模型看到乱码) */
 static const char* k_qwen_specials[] = {
     "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+    "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
+    "<image>", "</image>",
     "<think>", "</think>",
     "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>",
     NULL
@@ -936,6 +938,9 @@ static int chat_spec_len_at(const char* p, const char** which)
         "<|tool_response>", "<tool_response|>",
         "<|tool_call>", "<tool_call|>",
         "<|turn>", "<turn|>",
+        "<|image>", "<image|>",
+        "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
+        "<image>", "</image>",
         "<|tool>", "<tool|>",
         "<think>", "</think>",
         "<bos>", "<eos>", "<pad>", "<unk>",
@@ -1248,4 +1253,97 @@ int vocab_chat_ids(Vocab* v, const char* user_msg, uint32_t* ids, int max, int a
     const char* roles[1] = {"user"};
     const char* contents[1] = {user_msg};
     return vocab_chat_ids_multi(v, roles, contents, 1, ids, max, add_bos);
+}
+
+static int chat_token_id(const Vocab* v, const char* s)
+{
+    int id;
+    if (!s || vocab_bsearch_sorted(v, v->sorted, s, strlen(s), &id) != 0) return -1;
+    return id;
+}
+
+/* Gemma4: <|image>…<image|>; MiniCPM: <image>…</image>; Qwen-VL: <|vision_start|>…<|vision_end|> */
+static int chat_image_markers(const Vocab* v, const char** beg_s, const char** end_s,
+                              int* id_beg, int* id_end, int* id_pad)
+{
+    static const char* pairs[][2] = {
+        {"<|image>", "<image|>"},
+        {"<image>", "</image>"},
+        {"<|vision_start|>", "<|vision_end|>"},
+        {NULL, NULL}
+    };
+    int i;
+    for (i = 0; pairs[i][0]; i++) {
+        int b = chat_token_id(v, pairs[i][0]);
+        int e = chat_token_id(v, pairs[i][1]);
+        if (b < 0 || e < 0) continue;
+        *beg_s = pairs[i][0];
+        *end_s = pairs[i][1];
+        *id_beg = b;
+        *id_end = e;
+        *id_pad = chat_token_id(v, "<|image_pad|>");
+        if (*id_pad < 0) *id_pad = chat_token_id(v, "<pad>");
+        if (*id_pad < 0) *id_pad = v->unk;
+        if (*id_pad < 0) *id_pad = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static int chat_expand_image_slots(uint32_t* ids, int n, int max, int id_beg, int id_end,
+                                   int id_pad, int n_vis, int* vis_begin)
+{
+    int i, b = -1, e = -1, mid, delta;
+    for (i = 0; i < n; i++) {
+        if (ids[i] == (uint32_t)id_beg) { b = i; break; }
+    }
+    if (b < 0) return -1;
+    for (i = b + 1; i < n; i++) {
+        if (ids[i] == (uint32_t)id_end) { e = i; break; }
+    }
+    if (e < 0) return -1;
+    mid = e - b - 1;
+    delta = n_vis - mid;
+    if (n + delta > max) return -1;
+    if (delta != 0)
+        memmove(ids + e + delta, ids + e, (size_t)(n - e) * 4);
+    for (i = 0; i < n_vis; i++)
+        ids[b + 1 + i] = (uint32_t)id_pad;
+    if (vis_begin) *vis_begin = b + 1;
+    return n + delta;
+}
+
+int vocab_chat_ids_image(Vocab* v, const char* user_msg, int n_vis,
+                         uint32_t* ids, int max, int add_bos, int* vis_begin)
+{
+    const char *beg_s, *end_s;
+    int id_beg, id_end, id_pad, n;
+    const char* msg = (user_msg && user_msg[0]) ? user_msg : "Describe this image.";
+    size_t need;
+    char* content;
+    if (!v || !ids || n_vis < 0 || max <= 0) return -1;
+    if (chat_image_markers(v, &beg_s, &end_s, &id_beg, &id_end, &id_pad) != 0) return -1;
+    need = strlen(beg_s) + strlen(end_s) + strlen(msg) + 8;
+    content = (char*)ymalloc(need);
+    if (!content) return -1;
+    snprintf(content, need, "%s%s\n%s", beg_s, end_s, msg);
+    n = vocab_chat_ids(v, content, ids, max, add_bos);
+    if (n > 0) {
+        int got = chat_expand_image_slots(ids, n, max, id_beg, id_end, id_pad, n_vis, vis_begin);
+        if (got >= 0) { free(content); return got; }
+    }
+    {
+        ChatMsg one;
+        n = 0;
+        one.role = "user";
+        one.content = content;
+        if (add_bos && v->bos >= 0 && n < max) ids[n++] = (uint32_t)v->bos;
+        if (chat_is_gemma4(v))
+            chat_render_gemma4(v, &one, 1, ids, max, &n);
+        else
+            chat_render_generic(v, &one, 1, ids, max, &n);
+    }
+    free(content);
+    if (n <= 0) return -1;
+    return chat_expand_image_slots(ids, n, max, id_beg, id_end, id_pad, n_vis, vis_begin);
 }

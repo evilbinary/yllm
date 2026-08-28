@@ -6,6 +6,7 @@
 
 typedef struct Mcpv Mcpv;
 typedef struct Q3v Q3v;
+typedef struct G4v G4v;
 
 Mcpv* mcpv_load(const char* path, char* err, size_t errlen);
 void mcpv_free(Mcpv* v);
@@ -20,5 +21,11 @@ int q3v_hidden(const Q3v* v);
 int q3v_n_deepstack(const Q3v* v);
 int q3v_encode(Q3v* v, const char* image_path, float* out, float* ds, int max_tok,
                char* err, size_t errlen);
+
+G4v* g4v_load(const char* path, char* err, size_t errlen);
+void g4v_free(G4v* v);
+int g4v_n_tokens(const G4v* v);
+int g4v_hidden(const G4v* v);
+int g4v_encode(G4v* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen);
 
 #endif

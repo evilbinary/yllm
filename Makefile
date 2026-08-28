@@ -35,7 +35,7 @@ SRC := \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
 	inference/arch/gemma4.c inference/arch/qwen35.c \
-	inference/vision/minicpmv.c inference/vision/qwen3vl.c inference/vision/vision.c \
+	inference/vision/minicpmv.c inference/vision/qwen3vl.c inference/vision/gemma4v.c inference/vision/vision.c \
 	inference/core/cache.c inference/core/dist.c inference/device/device_cpu.c
 TEST_ENGINE_CORE := \
 	inference/core/platform.c inference/core/log.c inference/core/llf.c \
@@ -44,7 +44,7 @@ TEST_ENGINE_CORE := \
 	inference/core/tokenizer.c inference/core/matvec.c inference/core/engine.c \
 	inference/arch/arch.c inference/arch/llama.c inference/arch/qwen.c \
 	inference/arch/gemma4.c inference/arch/qwen35.c \
-	inference/vision/minicpmv.c inference/vision/qwen3vl.c inference/vision/vision.c \
+	inference/vision/minicpmv.c inference/vision/qwen3vl.c inference/vision/gemma4v.c inference/vision/vision.c \
 	inference/device/device_cpu.c
 
 # ---- CUDA 后端(可选) ----
@@ -404,11 +404,13 @@ chat-cuda: cuda $(MODEL_LLF)
 
 chat-gemma4-e2b-cuda: cuda $(G4_E2B_LLF)
 	$(RUN_CUDA) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) \
+		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b-cuda: cuda $(G4_E4B_LLF)
 	$(RUN_CUDA) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) \
+		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 # ---- Vulkan: 独立目录; 默认尝试原生 VkDevice, YLLM_VULKAN_HOST=1 强制 shim ----
 # make vulkan = 标量 CPU fallback + Vulkan(无 -mavx2)
@@ -517,9 +519,12 @@ android-cpu:
 G4_E2B_GGUF  ?= models/gemma-4-E2B-it-Q4_K_M.gguf
 G4_E2B_LLF   ?= models/gemma-4-E2B-it-Q4_K_M.llf
 G4_E2B_VOCAB ?= models/gemma4.vocab.txt
+G4_E2B_MMPROJ ?= models/mmproj-gemma-4-E2B-f16.gguf
 G4_E4B_GGUF  ?= models/gemma-4-E4B-it-Q4_K_M.gguf
 G4_E4B_LLF   ?= models/gemma-4-E4B-it-Q4_K_M.llf
 G4_E4B_VOCAB ?= models/gemma4.vocab.txt
+G4_E4B_MMPROJ ?= models/mmproj-gemma-4-E4B-f16.gguf
+IMAGE ?=
 
 $(G4_E2B_LLF): $(G4_E2B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(G4_E2B_GGUF) --out $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --seq 8192
@@ -528,14 +533,17 @@ $(G4_E4B_LLF): $(G4_E4B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(G4_E4B_GGUF) --out $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --seq 8192
 
 chat-gemma4-e2b: $(BIN) $(G4_E2B_LLF)
-	$(RUN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e2b-avx2: $(BIN_AVX2) $(G4_E2B_LLF)
-	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e2b-vulkan: vulkan $(G4_E2B_LLF)
 	$(RUN_VULKAN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 # 长序列 chat 吞吐(不进 make test)
 #   make test-long-chat
@@ -548,17 +556,21 @@ test-long-chat-avx2: test-long-chat
 
 chat-gemma4-e2b-avx2-vulkan: vulkan-avx2 $(G4_E2B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b: $(BIN) $(G4_E4B_LLF)
-	$(RUN) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b-avx2: $(BIN_AVX2) $(G4_E4B_LLF)
-	$(RUN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b-avx2-vulkan: vulkan-avx2 $(G4_E4B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
 Q25_GGUF  ?= models/qwen2.5-1.5b-instruct-q4_k_m.gguf
