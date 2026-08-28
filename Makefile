@@ -708,22 +708,26 @@ $(MCPM_V46_LLF): $(MCPM_V46_GGUF) | $(BIN)
 
 chat-minicpm-v-4.6: $(BIN) $(MCPM_V46_LLF)
 	$(RUN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
-		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
+		$(if $(OPT),--opt $(OPT),)
 
 #  make chat-minicpm-v-4.6-avx2 IMAGE=models/test_red.ppm CHAT_TOKENS=16'
 chat-minicpm-v-4.6-avx2: $(BIN_AVX2) $(MCPM_V46_LLF)
 	$(RUN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
-		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
+		$(if $(OPT),--opt $(OPT),)
 
 chat-minicpm-v-4.6-vulkan: vulkan $(MCPM_V46_LLF)
 	$(RUN_VULKAN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
-		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
+		$(if $(OPT),--opt $(OPT),)
 
 chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
-		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),)
+		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
+		$(if $(OPT),--opt $(OPT),)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
 #   make server-<name> / make infer-<name>  与 chat-* 一一对应

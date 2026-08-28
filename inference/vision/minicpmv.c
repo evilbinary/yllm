@@ -57,6 +57,7 @@ struct Mcpv {
     int n_t;
     uint32_t image_size, patch, n_embd, n_ff, n_layer, n_head, n_out_embd;
     uint32_t insert_lid, n_merge;
+    int downsample; /* 16 或 4 (--opt downsample_mode) */
     float mean[3], std[3], eps;
     ClipT patch_w, patch_b, pos_embd, post_ln_w, post_ln_b;
     ClipT mm_in_w, mm_in_b, mm_up_w, mm_up_b, mm_down_w, mm_down_b;
@@ -698,6 +699,7 @@ Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
     v->image_size = 448; v->patch = 14; v->n_embd = 1152; v->n_ff = 4304;
     v->n_layer = 27; v->n_head = 16; v->n_out_embd = 1024; v->insert_lid = 6;
     v->n_merge = 4; v->eps = 1e-6f;
+    v->downsample = 16;
     v->mean[0] = v->mean[1] = v->mean[2] = 0.5f;
     v->std[0] = v->std[1] = v->std[2] = 0.5f;
     (void)ver;
@@ -751,6 +753,8 @@ Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
         } else skip_val(&b, typ);
     }
     if (b.err) { if (err) snprintf(err, errlen, "bad mmproj kv"); mcpv_free(v); return NULL; }
+    if (v->n_merge == 2) v->downsample = 4;
+    else v->downsample = 16;
     v->ts = (ClipT*)ycalloc((size_t)n_tensors, sizeof(ClipT));
     if (!v->ts) { mcpv_free(v); if (err) snprintf(err, errlen, "oom"); return NULL; }
     for (i = 0; i < n_tensors && !b.err; i++) {
@@ -861,9 +865,9 @@ Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
             mcpv_free(v); return NULL;
         }
     }
-    ylog_info("vision: clip %ux%u patch=%u layers=%u embd=%u out=%u insert=%u mean=%.3f std=%.3f",
+    ylog_info("vision: clip %ux%u patch=%u layers=%u embd=%u out=%u insert=%u downsample=%dx mean=%.3f std=%.3f",
               v->image_size, v->image_size, v->patch, v->n_layer, v->n_embd, v->n_out_embd,
-              v->insert_lid, (double)v->mean[0], (double)v->std[0]);
+              v->insert_lid, v->downsample, (double)v->mean[0], (double)v->std[0]);
     return v;
 }
 
@@ -879,10 +883,11 @@ void mcpv_free(Mcpv* v)
 
 int mcpv_n_tokens(const Mcpv* v)
 {
-    uint32_t g;
+    uint32_t g, div;
     if (!v) return 0;
     g = v->image_size / v->patch;
-    g /= 4; /* 16x: 2x2 vit merger + 2x2 final */
+    div = (v->downsample == 4) ? 2u : 4u;
+    g /= div;
     return (int)(g * g);
 }
 
@@ -894,9 +899,13 @@ int mcpv_hidden(const Mcpv* v)
 int mcpv_apply_opt(Mcpv* v, int downsample, int max_slice, char* err, size_t errlen)
 {
     if (!v) return -1;
-    if (downsample > 0 && downsample != 16) {
-        if (err) snprintf(err, errlen, "downsample_mode=%dx not implemented (only 16x)", downsample);
-        return -1;
+    if (downsample > 0) {
+        if (downsample != 16 && downsample != 4) {
+            if (err) snprintf(err, errlen, "downsample_mode want 16x|4x");
+            return -1;
+        }
+        v->downsample = downsample;
+        ylog_info("vision minicpmv: downsample=%dx -> %d tokens", v->downsample, mcpv_n_tokens(v));
     }
     if (max_slice > 0 && max_slice != 1) {
         if (err) snprintf(err, errlen, "max_slice_nums=%d not implemented (only 1)", max_slice);
@@ -958,11 +967,18 @@ static int encode_448(Mcpv* vis, const float* chw, float* out)
     uint32_t gh = vis->image_size / vis->patch, gw = gh;
     uint32_t n = gh * gw, e = vis->n_embd, il, t;
     uint32_t half = gh / 2;
+    int is_4x = (vis->downsample == 4);
     patch_embed(vis, chw, gh, gw);
     add_pos(vis, gh, gw);
-    for (il = 0; il <= vis->insert_lid && il < vis->n_layer; il++)
-        vit_block(vis, il, n);
+    if (is_4x) {
+        for (il = 0; il < vis->n_layer; il++)
+            vit_block(vis, il, n);
+    } else {
+        for (il = 0; il <= vis->insert_lid && il < vis->n_layer; il++)
+            vit_block(vis, il, n);
+    }
 
+    if (!is_4x) {
     /* window reorder + window attn + residual */
     {
         float* re = vis->res; /* reuse as scratch order */
@@ -1023,6 +1039,8 @@ static int encode_448(Mcpv* vis, const float* chw, float* out)
 
     for (il = vis->insert_lid + 1; il < vis->n_layer; il++)
         vit_block(vis, il, n);
+    } /* !is_4x: skip vit window merger */
+
     for (t = 0; t < n; t++)
         layernorm(vis->tmp + (size_t)t * e, vis->x + (size_t)t * e, &vis->post_ln_w, &vis->post_ln_b, e, vis->eps);
     memcpy(vis->x, vis->tmp, (size_t)n * e * 4);
@@ -1098,8 +1116,8 @@ int mcpv_encode_image(Mcpv* v, const char* image_path, float* out, int max_tok, 
     {
         uint64_t t0 = ynow_ms();
         encode_448(v, chw, out);
-        ylog_info("vision: encoded %dx%d -> %d tokens hidden=%u in %.2f s",
-                  w, h, ntok, v->n_out_embd, (double)(ynow_ms() - t0) / 1000.0);
+        ylog_info("vision: encoded %dx%d -> %d tokens hidden=%u downsample=%dx in %.2f s",
+                  w, h, ntok, v->n_out_embd, v->downsample, (double)(ynow_ms() - t0) / 1000.0);
     }
     free(chw);
     return ntok;
