@@ -159,6 +159,22 @@ int vision_n_tokens(const Vision* v)
     return mcpv_n_tokens((const Mcpv*)v->p);
 }
 
+int vision_tile_tokens(const Vision* v)
+{
+    if (!v || !v->p) return 0;
+    if (v->kind == 1) return q3v_n_tokens((const Q3v*)v->p);
+    if (v->kind == 2) return g4v_n_tokens((const G4v*)v->p);
+    return mcpv_tile_tokens((const Mcpv*)v->p);
+}
+
+int vision_slice_grid(const Vision* v, int* n_row, int* n_col)
+{
+    if (n_row) *n_row = 0;
+    if (n_col) *n_col = 0;
+    if (!v || !v->p || v->kind != 0) return 0;
+    return mcpv_slice_grid((const Mcpv*)v->p, n_row, n_col);
+}
+
 int vision_hidden(const Vision* v)
 {
     if (!v || !v->p) return 0;

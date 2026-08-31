@@ -512,6 +512,7 @@ static const char* k_qwen_specials[] = {
     "<|im_start|>", "<|im_end|>", "<|endoftext|>",
     "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
     "<image>", "</image>",
+    "<slice>", "</slice>",
     "<think>", "</think>",
     "<|extra_0|>", "<|extra_1|>", "<|extra_2|>", "<|extra_3|>",
     NULL
@@ -944,6 +945,7 @@ static int chat_spec_len_at(const char* p, const char** which)
         "<|image>", "<image|>",
         "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
         "<image>", "</image>",
+        "<slice>", "</slice>",
         "<|tool>", "<tool|>",
         "<think>", "</think>",
         "<bos>", "<eos>", "<pad>", "<unk>",
@@ -1361,6 +1363,89 @@ int vocab_chat_ids_image(Vocab* v, const char* user_msg, int n_vis,
     free(content);
     if (n <= 0) return -1;
     return chat_expand_image_slots(ids, n, max, id_beg, id_end, id_pad, n_vis, vis_begin);
+}
+
+static int chat_expand_mcpv_slots(uint32_t* ids, int n, int max,
+                                   int id_img_b, int id_img_e, int id_sli_b, int id_sli_e,
+                                   int id_pad, int n_pad, int* vis_pos, int n_pos_max, int* n_slots)
+{
+    int i = 0, npos = 0;
+    while (i < n) {
+        int close = -1, e = -1, j, mid, delta, k;
+        if (ids[i] == (uint32_t)id_img_b) close = id_img_e;
+        else if (id_sli_b >= 0 && ids[i] == (uint32_t)id_sli_b) close = id_sli_e;
+        else { i++; continue; }
+        for (j = i + 1; j < n; j++)
+            if (ids[j] == (uint32_t)close) { e = j; break; }
+        if (e < 0) return -1;
+        mid = e - i - 1;
+        delta = n_pad - mid;
+        if (n + delta > max) return -1;
+        if (delta != 0)
+            memmove(ids + e + delta, ids + e, (size_t)(n - e) * 4);
+        for (k = 0; k < n_pad; k++)
+            ids[i + 1 + k] = (uint32_t)id_pad;
+        if (npos >= n_pos_max) return -1;
+        vis_pos[npos++] = i + 1;
+        n += delta;
+        i = i + 1 + n_pad + 1;
+    }
+    if (n_slots) *n_slots = npos;
+    return npos > 0 ? n : -1;
+}
+
+int vocab_chat_ids_image_grid(Vocab* v, const char* user_msg, int n_per,
+                              int n_row, int n_col, uint32_t* ids, int max, int add_bos,
+                              int* vis_pos, int n_pos_max)
+{
+    const char *beg_s, *end_s;
+    int id_beg, id_end, id_pad, id_sb, id_se, n, n_expect, vis0;
+    const char* msg = (user_msg && user_msg[0]) ? user_msg : "Describe this image.";
+    size_t need;
+    char* content;
+    int y, x, o;
+    if (!v || !ids || n_per < 0 || max <= 0 || !vis_pos || n_pos_max < 1) return -1;
+    if (n_row <= 0 || n_col <= 0)
+        return vocab_chat_ids_image(v, user_msg, n_per, ids, max, add_bos, vis_pos);
+    if (chat_image_markers(v, &beg_s, &end_s, &id_beg, &id_end, &id_pad) != 0) return -1;
+    id_sb = chat_token_id(v, "<slice>");
+    id_se = chat_token_id(v, "</slice>");
+    if (id_sb < 0 || id_se < 0) return -1;
+    n_expect = 1 + n_row * n_col;
+    if (n_pos_max < n_expect) return -1;
+    need = strlen(beg_s) + strlen(end_s) + strlen(msg) + (size_t)n_expect * 16 + 8;
+    content = (char*)ymalloc(need);
+    if (!content) return -1;
+    o = snprintf(content, need, "%s%s", beg_s, end_s);
+    for (y = 0; y < n_row; y++) {
+        for (x = 0; x < n_col; x++) {
+            int w = snprintf(content + o, need - (size_t)o, "<slice></slice>");
+            if (w > 0) o += w;
+        }
+        if (y != n_row - 1) {
+            int w = snprintf(content + o, need - (size_t)o, "\n");
+            if (w > 0) o += w;
+        }
+    }
+    snprintf(content + o, need - (size_t)o, "\n%s", msg);
+    n = vocab_chat_ids(v, content, ids, max, add_bos);
+    if (n <= 0) {
+        ChatMsg one;
+        n = 0;
+        one.role = "user";
+        one.content = content;
+        if (add_bos && v->bos >= 0 && n < max) ids[n++] = (uint32_t)v->bos;
+        if (chat_is_gemma4(v))
+            chat_render_gemma4(v, &one, 1, ids, max, &n);
+        else
+            chat_render_generic(v, &one, 1, ids, max, &n);
+    }
+    free(content);
+    if (n <= 0) return -1;
+    vis0 = 0;
+    n = chat_expand_mcpv_slots(ids, n, max, id_beg, id_end, id_sb, id_se, id_pad, n_per, vis_pos, n_pos_max, &vis0);
+    if (n < 0 || vis0 != n_expect) return -1;
+    return n;
 }
 
 void yopt_init(YOpt* o)

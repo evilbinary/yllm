@@ -687,32 +687,49 @@ static int cmd_chat(int argc, char** argv)
             }
             nvis = got;
         }
-        /* 视觉向量暂存在 mix_emb[0..nvis), 组 prompt 后再挪到对应位置 */
-        nprompt = vocab_chat_ids_image(&v, prompt, nvis, ids, (int)sz, use_bos, &pad);
-        if (nprompt <= 0) {
-            fprintf(stderr, "image chat template failed (vocab missing image markers?)\n");
-            free(mix_emb); free(mix_ds); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
-        }
         {
-            float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);
-            float* ds_placed = NULL;
-            int d;
-            memset(mix_use, 0, sz);
-            memcpy(placed + (size_t)pad * hid, mix_emb, (size_t)nvis * (size_t)hid * 4);
-            for (i = 0; i < nvis; i++) mix_use[pad + i] = 1;
-            if (vis_nds > 0 && mix_ds) {
-                ds_placed = (float*)ycalloc((size_t)vis_nds * (size_t)nprompt * (size_t)hid, 4);
-                for (d = 0; d < vis_nds; d++)
-                    memcpy(ds_placed + ((size_t)d * (size_t)nprompt + (size_t)pad) * hid,
-                           mix_ds + (size_t)d * (size_t)nvis * hid,
-                           (size_t)nvis * (size_t)hid * 4);
+            int nr = 0, nc = 0, n_per, vis_pos[40], n_chunk, k;
+            vision_slice_grid(vis, &nr, &nc);
+            n_per = vision_tile_tokens(vis);
+            if (nr > 0 && nc > 0)
+                nprompt = vocab_chat_ids_image_grid(&v, prompt, n_per, nr, nc, ids, (int)sz, use_bos, vis_pos, 40);
+            else
+                nprompt = vocab_chat_ids_image(&v, prompt, nvis, ids, (int)sz, use_bos, &pad);
+            if (nprompt <= 0) {
+                fprintf(stderr, "image chat template failed (vocab missing image markers?)\n");
+                free(mix_emb); free(mix_ds); free(mix_use); vision_free(vis); engine_free(&e); vocab_free(&v); free(ids); return 1;
             }
-            free(mix_emb);
-            free(mix_ds);
-            mix_emb = placed;
-            mix_ds = ds_placed;
+            {
+                float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);
+                float* ds_placed = NULL;
+                int d;
+                memset(mix_use, 0, sz);
+                if (nr > 0 && nc > 0) {
+                    n_chunk = nvis / n_per;
+                    for (k = 0; k < n_chunk; k++) {
+                        memcpy(placed + (size_t)vis_pos[k] * hid, mix_emb + (size_t)k * n_per * hid,
+                               (size_t)n_per * (size_t)hid * 4);
+                        for (i = 0; i < n_per; i++) mix_use[vis_pos[k] + i] = 1;
+                    }
+                    pad = vis_pos[0];
+                } else {
+                    memcpy(placed + (size_t)pad * hid, mix_emb, (size_t)nvis * (size_t)hid * 4);
+                    for (i = 0; i < nvis; i++) mix_use[pad + i] = 1;
+                }
+                if (vis_nds > 0 && mix_ds) {
+                    ds_placed = (float*)ycalloc((size_t)vis_nds * (size_t)nprompt * (size_t)hid, 4);
+                    for (d = 0; d < vis_nds; d++)
+                        memcpy(ds_placed + ((size_t)d * (size_t)nprompt + (size_t)pad) * hid,
+                               mix_ds + (size_t)d * (size_t)nvis * hid,
+                               (size_t)nvis * (size_t)hid * 4);
+                }
+                free(mix_emb);
+                free(mix_ds);
+                mix_emb = placed;
+                mix_ds = ds_placed;
+            }
+            ylog_info("chat image: %d vis tokens at pos %d, prompt=%d", nvis, pad, nprompt);
         }
-        ylog_info("chat image: %d vis tokens at pos %d, prompt=%d", nvis, pad, nprompt);
     } else if (prompt && vocab_has_template(&v) && !no_template) {
         nprompt = vocab_chat_ids(&v, prompt, ids, (int)sz, use_bos);
         if (nprompt <= 0) {

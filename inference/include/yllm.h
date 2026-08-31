@@ -128,6 +128,11 @@ int vocab_chat_ids_multi(Vocab* v, const char* const* roles, const char* const* 
  * *vis_begin 为第一位视觉 token。无图像标记或渲染失败返回 -1。 */
 int vocab_chat_ids_image(Vocab* v, const char* user_msg, int n_vis,
                          uint32_t* ids, int max, int add_bos, int* vis_begin);
+/* MiniCPM 切片: <image>n_per</image> 后跟 n_row×n_col 个 <slice>n_per</slice>, 行间换行。
+ * vis_pos 写入每块视觉起点, 长度 ≥ 1+n_row*n_col; n_row<=0 则只有总览。 */
+int vocab_chat_ids_image_grid(Vocab* v, const char* user_msg, int n_per,
+                              int n_row, int n_col, uint32_t* ids, int max, int add_bos,
+                              int* vis_pos, int n_pos_max);
 int vocab_has_template(Vocab* v);
 /* ---- 引擎 ---- */
 typedef struct Engine {

@@ -11,6 +11,8 @@ typedef struct G4v G4v;
 Mcpv* mcpv_load(const char* path, char* err, size_t errlen);
 void mcpv_free(Mcpv* v);
 int mcpv_n_tokens(const Mcpv* v);
+int mcpv_tile_tokens(const Mcpv* v);
+int mcpv_slice_grid(const Mcpv* v, int* n_row, int* n_col);
 int mcpv_hidden(const Mcpv* v);
 int mcpv_encode_image(Mcpv* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen);
 

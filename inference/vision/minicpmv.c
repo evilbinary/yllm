@@ -58,6 +58,8 @@ struct Mcpv {
     uint32_t image_size, patch, n_embd, n_ff, n_layer, n_head, n_out_embd;
     uint32_t insert_lid, n_merge;
     int downsample; /* 16 或 4 (--opt downsample_mode) */
+    int max_slice;  /* 1=仅总览; >1 为 llava-uhd 切片上限 */
+    int n_row, n_col; /* 最近一次 encode 的切片网格; 0=无切片 */
     float mean[3], std[3], eps;
     ClipT patch_w, patch_b, pos_embd, post_ln_w, post_ln_b;
     ClipT mm_in_w, mm_in_b, mm_up_w, mm_up_b, mm_down_w, mm_down_b;
@@ -700,6 +702,9 @@ Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
     v->n_layer = 27; v->n_head = 16; v->n_out_embd = 1024; v->insert_lid = 6;
     v->n_merge = 4; v->eps = 1e-6f;
     v->downsample = 16;
+    v->max_slice = 1;
+    v->n_row = 0;
+    v->n_col = 0;
     v->mean[0] = v->mean[1] = v->mean[2] = 0.5f;
     v->std[0] = v->std[1] = v->std[2] = 0.5f;
     (void)ver;
@@ -881,7 +886,7 @@ void mcpv_free(Mcpv* v)
     free(v);
 }
 
-int mcpv_n_tokens(const Mcpv* v)
+int mcpv_tile_tokens(const Mcpv* v)
 {
     uint32_t g, div;
     if (!v) return 0;
@@ -889,6 +894,22 @@ int mcpv_n_tokens(const Mcpv* v)
     div = (v->downsample == 4) ? 2u : 4u;
     g /= div;
     return (int)(g * g);
+}
+
+int mcpv_n_tokens(const Mcpv* v)
+{
+    int t = mcpv_tile_tokens(v);
+    if (!v || t <= 0) return 0;
+    if (v->max_slice > 1) return t * (1 + v->max_slice);
+    return t;
+}
+
+int mcpv_slice_grid(const Mcpv* v, int* n_row, int* n_col)
+{
+    if (!v) return -1;
+    if (n_row) *n_row = v->n_row;
+    if (n_col) *n_col = v->n_col;
+    return 0;
 }
 
 int mcpv_hidden(const Mcpv* v)
@@ -905,11 +926,15 @@ int mcpv_apply_opt(Mcpv* v, int downsample, int max_slice, char* err, size_t err
             return -1;
         }
         v->downsample = downsample;
-        ylog_info("vision minicpmv: downsample=%dx -> %d tokens", v->downsample, mcpv_n_tokens(v));
+        ylog_info("vision minicpmv: downsample=%dx -> %d tok/tile", v->downsample, mcpv_tile_tokens(v));
     }
-    if (max_slice > 0 && max_slice != 1) {
-        if (err) snprintf(err, errlen, "max_slice_nums=%d not implemented (only 1)", max_slice);
-        return -1;
+    if (max_slice > 0) {
+        if (max_slice > 36) {
+            if (err) snprintf(err, errlen, "max_slice_nums=%d want 1..36", max_slice);
+            return -1;
+        }
+        v->max_slice = max_slice;
+        ylog_info("vision minicpmv: max_slice_nums=%d (max %d vis tokens)", v->max_slice, mcpv_n_tokens(v));
     }
     return 0;
 }
@@ -960,6 +985,138 @@ static void gather_2x2(const float* src, float* dst, uint32_t gh, uint32_t gw, u
             float* dp = dst + ((size_t)i * ds_w + j) * e;
             for (c = 0; c < e; c++) dp[c] = sp[c];
         }
+}
+
+static int mcpv_ensure_div(int length, int patch)
+{
+    int x = (int)(roundf((float)length / (float)patch) * (float)patch);
+    return x < patch ? patch : x;
+}
+
+static void mcpv_best_resize(int ow, int oh, int scale, int patch, int allow_up, int* dw, int* dh)
+{
+    int width = ow, height = oh;
+    if ((width * height > scale * scale) || allow_up) {
+        float r = (float)width / (float)height;
+        height = (int)((float)scale / sqrtf(r));
+        width = (int)((float)height * r);
+    }
+    *dw = mcpv_ensure_div(width, patch);
+    *dh = mcpv_ensure_div(height, patch);
+}
+
+static void mcpv_best_grid(int max_slice, int multiple, float log_ratio, int* gw, int* gh)
+{
+    int cand_n[8], nc = 0, i, m, best_w = 1, best_h = 1;
+    float best_err = 1e30f;
+    int extras[3];
+    extras[0] = multiple - 1;
+    extras[1] = multiple;
+    extras[2] = multiple + 1;
+    for (i = 0; i < 3; i++) {
+        int n = extras[i];
+        if (n == 1 || n > max_slice) continue;
+        cand_n[nc++] = n;
+    }
+    for (i = 0; i < nc; i++) {
+        int split = cand_n[i];
+        for (m = 1; m <= split; m++) {
+            float err;
+            int cw, ch;
+            if (split % m) continue;
+            cw = m;
+            ch = split / m;
+            err = fabsf(log_ratio - logf((float)cw / (float)ch));
+            if (err < best_err) {
+                best_err = err;
+                best_w = cw;
+                best_h = ch;
+            }
+        }
+    }
+    *gw = best_w;
+    *gh = best_h;
+}
+
+static void mcpv_refine_size(int ow, int oh, int gw, int gh, int scale, int patch, int* rw, int* rh)
+{
+    int bw, bh;
+    int fw = mcpv_ensure_div(ow, gw);
+    int fh = mcpv_ensure_div(oh, gh);
+    mcpv_best_resize(fw / gw, fh / gh, scale, patch, 1, &bw, &bh);
+    *rw = bw * gw;
+    *rh = bh * gh;
+}
+
+static void resize_u8(const unsigned char* src, int sw, int sh, unsigned char* dst, int dw, int dh)
+{
+    int x, y, ic;
+    for (y = 0; y < dh; y++) {
+        float fy = ((float)y + 0.5f) * (float)sh / (float)dh - 0.5f;
+        int y0 = (int)floorf(fy), y1 = y0 + 1;
+        float wy = fy - (float)y0;
+        if (y0 < 0) { y0 = 0; wy = 0; }
+        if (y1 >= sh) y1 = sh - 1;
+        if (y0 >= sh) y0 = sh - 1;
+        for (x = 0; x < dw; x++) {
+            float fx = ((float)x + 0.5f) * (float)sw / (float)dw - 0.5f;
+            int x0 = (int)floorf(fx), x1 = x0 + 1;
+            float wx = fx - (float)x0;
+            if (x0 < 0) { x0 = 0; wx = 0; }
+            if (x1 >= sw) x1 = sw - 1;
+            if (x0 >= sw) x0 = sw - 1;
+            for (ic = 0; ic < 3; ic++) {
+                float p00 = src[(y0 * sw + x0) * 3 + ic];
+                float p10 = src[(y0 * sw + x1) * 3 + ic];
+                float p01 = src[(y1 * sw + x0) * 3 + ic];
+                float p11 = src[(y1 * sw + x1) * 3 + ic];
+                float p = (p00 * (1 - wx) + p10 * wx) * (1 - wy) + (p01 * (1 - wx) + p11 * wx) * wy;
+                dst[(y * dw + x) * 3 + ic] = (unsigned char)(p < 0 ? 0 : (p > 255 ? 255 : p + 0.5f));
+            }
+        }
+    }
+}
+
+static void crop_u8(const unsigned char* src, int sw, int sh, int x0, int y0, int cw, int ch, unsigned char* dst)
+{
+    int y;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x0 + cw > sw) cw = sw - x0;
+    if (y0 + ch > sh) ch = sh - y0;
+    for (y = 0; y < ch; y++)
+        memcpy(dst + (size_t)y * cw * 3, src + ((size_t)(y0 + y) * sw + x0) * 3, (size_t)cw * 3);
+    (void)sh;
+}
+
+static void rgb_to_chw(const Mcpv* vis, const unsigned char* rgb, int w, int h, float* chw)
+{
+    uint32_t S = vis->image_size;
+    int x, y, ic;
+    for (y = 0; y < (int)S; y++) {
+        float fy = ((float)y + 0.5f) * (float)h / (float)S - 0.5f;
+        int y0 = (int)floorf(fy), y1 = y0 + 1;
+        float wy = fy - (float)y0;
+        if (y0 < 0) { y0 = 0; wy = 0; }
+        if (y1 >= h) y1 = h - 1;
+        if (y0 >= h) y0 = h - 1;
+        for (x = 0; x < (int)S; x++) {
+            float fx = ((float)x + 0.5f) * (float)w / (float)S - 0.5f;
+            int x0 = (int)floorf(fx), x1 = x0 + 1;
+            float wx = fx - (float)x0;
+            if (x0 < 0) { x0 = 0; wx = 0; }
+            if (x1 >= w) x1 = w - 1;
+            if (x0 >= w) x0 = w - 1;
+            for (ic = 0; ic < 3; ic++) {
+                float p00 = rgb[(y0 * w + x0) * 3 + ic];
+                float p10 = rgb[(y0 * w + x1) * 3 + ic];
+                float p01 = rgb[(y1 * w + x0) * 3 + ic];
+                float p11 = rgb[(y1 * w + x1) * 3 + ic];
+                float p = (p00 * (1 - wx) + p10 * wx) * (1 - wy) + (p01 * (1 - wx) + p11 * wx) * wy;
+                chw[(size_t)ic * S * S + (uint32_t)y * S + (uint32_t)x] = (p / 255.f - vis->mean[ic]) / vis->std[ic];
+            }
+        }
+    }
 }
 
 static int encode_448(Mcpv* vis, const float* chw, float* out)
@@ -1074,51 +1231,71 @@ static int encode_448(Mcpv* vis, const float* chw, float* out)
 
 int mcpv_encode_image(Mcpv* v, const char* image_path, float* out, int max_tok, char* err, size_t errlen)
 {
-    int w = 0, h = 0, c = 0, x, y, ic;
+    int w = 0, h = 0, c = 0, n_tile, n_chunk, hid, patch_al, slice;
     unsigned char* img;
     float* chw;
     uint32_t S;
-    int ntok;
+    uint64_t t0;
     if (!v || !image_path || !out) { if (err) snprintf(err, errlen, "bad vision args"); return -1; }
-    ntok = mcpv_n_tokens(v);
-    if (max_tok < ntok) { if (err) snprintf(err, errlen, "out tokens %d < %d", max_tok, ntok); return -1; }
+    n_tile = mcpv_tile_tokens(v);
+    hid = (int)v->n_out_embd;
+    if (max_tok < n_tile) { if (err) snprintf(err, errlen, "out tokens %d < %d", max_tok, n_tile); return -1; }
     img = stbi_load(image_path, &w, &h, &c, 3);
     if (!img) { if (err) snprintf(err, errlen, "cannot load image %s", image_path); return -1; }
     S = v->image_size;
+    slice = (int)S;
+    patch_al = (int)(v->patch * (v->n_merge ? v->n_merge : 4));
+    v->n_row = 0;
+    v->n_col = 0;
     chw = (float*)ymalloc((size_t)3 * S * S * 4);
     if (!chw) { stbi_image_free(img); if (err) snprintf(err, errlen, "oom"); return -1; }
-    for (y = 0; y < (int)S; y++) {
-        float fy = ((float)y + 0.5f) * (float)h / (float)S - 0.5f;
-        int y0 = (int)floorf(fy), y1 = y0 + 1;
-        float wy = fy - (float)y0;
-        if (y0 < 0) { y0 = 0; wy = 0; }
-        if (y1 >= h) { y1 = h - 1; }
-        if (y0 >= h) y0 = h - 1;
-        for (x = 0; x < (int)S; x++) {
-            float fx = ((float)x + 0.5f) * (float)w / (float)S - 0.5f;
-            int x0 = (int)floorf(fx), x1 = x0 + 1;
-            float wx = fx - (float)x0;
-            if (x0 < 0) { x0 = 0; wx = 0; }
-            if (x1 >= w) x1 = w - 1;
-            if (x0 >= w) x0 = w - 1;
-            for (ic = 0; ic < 3; ic++) {
-                float p00 = img[(y0 * w + x0) * 3 + ic];
-                float p10 = img[(y0 * w + x1) * 3 + ic];
-                float p01 = img[(y1 * w + x0) * 3 + ic];
-                float p11 = img[(y1 * w + x1) * 3 + ic];
-                float p = (p00 * (1 - wx) + p10 * wx) * (1 - wy) + (p01 * (1 - wx) + p11 * wx) * wy;
-                chw[(size_t)ic * S * S + (uint32_t)y * S + (uint32_t)x] = (p / 255.f - v->mean[ic]) / v->std[ic];
+    rgb_to_chw(v, img, w, h, chw);
+    t0 = ynow_ms();
+    ylog_info("vision: encoding %ux%u (this is slow on CPU)", S, S);
+    encode_448(v, chw, out);
+    n_chunk = 1;
+    if (v->max_slice > 1 && (w > slice || h > slice)) {
+        float ratio = (float)w * (float)h / ((float)slice * (float)slice);
+        int multiple = (int)ceilf(ratio);
+        int gw, gh, rw, rh, cell_w, cell_h, iy, ix, si;
+        unsigned char *refined, *tile;
+        if (multiple > v->max_slice) multiple = v->max_slice;
+        if (multiple < 1) multiple = 1;
+        mcpv_best_grid(v->max_slice, multiple, logf((float)w / (float)h), &gw, &gh);
+        mcpv_refine_size(w, h, gw, gh, slice, patch_al, &rw, &rh);
+        cell_w = rw / gw;
+        cell_h = rh / gh;
+        refined = (unsigned char*)ymalloc((size_t)rw * rh * 3);
+        tile = (unsigned char*)ymalloc((size_t)cell_w * cell_h * 3);
+        if (!refined || !tile) {
+            free(refined); free(tile); free(chw); stbi_image_free(img);
+            if (err) snprintf(err, errlen, "oom slice");
+            return -1;
+        }
+        resize_u8(img, w, h, refined, rw, rh);
+        si = 0;
+        for (iy = 0; iy < gh; iy++) {
+            for (ix = 0; ix < gw; ix++, si++) {
+                if (max_tok < n_tile * (n_chunk + 1)) {
+                    free(refined); free(tile); free(chw); stbi_image_free(img);
+                    if (err) snprintf(err, errlen, "out tokens %d < %d", max_tok, n_tile * (n_chunk + 1));
+                    return -1;
+                }
+                crop_u8(refined, rw, rh, ix * cell_w, iy * cell_h, cell_w, cell_h, tile);
+                rgb_to_chw(v, tile, cell_w, cell_h, chw);
+                encode_448(v, chw, out + (size_t)n_chunk * n_tile * hid);
+                n_chunk++;
             }
         }
+        v->n_col = gw;
+        v->n_row = gh;
+        free(refined);
+        free(tile);
+        ylog_info("vision: slices %dx%d refined=%dx%d (%d extra)", gw, gh, rw, rh, n_chunk - 1);
     }
     stbi_image_free(img);
-    ylog_info("vision: encoding %ux%u (this is slow on CPU)", S, S);
-    {
-        uint64_t t0 = ynow_ms();
-        encode_448(v, chw, out);
-        ylog_info("vision: encoded %dx%d -> %d tokens hidden=%u downsample=%dx in %.2f s",
-                  w, h, ntok, v->n_out_embd, v->downsample, (double)(ynow_ms() - t0) / 1000.0);
-    }
+    ylog_info("vision: encoded %dx%d -> %d tokens (%d tiles) hidden=%u downsample=%dx in %.2f s",
+              w, h, n_chunk * n_tile, n_chunk, v->n_out_embd, v->downsample, (double)(ynow_ms() - t0) / 1000.0);
     free(chw);
-    return ntok;
+    return n_chunk * n_tile;
 }
