@@ -699,7 +699,7 @@ Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
     v->image_size = 448; v->patch = 14; v->n_embd = 1152; v->n_ff = 4304;
     v->n_layer = 27; v->n_head = 16; v->n_out_embd = 1024; v->insert_lid = 6;
     v->n_merge = 4; v->eps = 1e-6f;
-    v->downsample = 4; /* 默认 4x(细); 16x 用 --opt downsample_mode=16x */
+    v->downsample = 16;
     v->mean[0] = v->mean[1] = v->mean[2] = 0.5f;
     v->std[0] = v->std[1] = v->std[2] = 0.5f;
     (void)ver;
@@ -753,7 +753,8 @@ Mcpv* mcpv_load(const char* path, char* err, size_t errlen)
         } else skip_val(&b, typ);
     }
     if (b.err) { if (err) snprintf(err, errlen, "bad mmproj kv"); mcpv_free(v); return NULL; }
-    /* gguf scale_factor=4 对应官方 16x 默认; 细粒度任务 4x 明显更好, 默认走 4x */
+    if (v->n_merge == 2) v->downsample = 4;
+    else v->downsample = 16;
     v->ts = (ClipT*)ycalloc((size_t)n_tensors, sizeof(ClipT));
     if (!v->ts) { mcpv_free(v); if (err) snprintf(err, errlen, "oom"); return NULL; }
     for (i = 0; i < n_tensors && !b.err; i++) {

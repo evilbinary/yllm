@@ -1034,15 +1034,11 @@ static void chat_render_generic(Vocab* v, const ChatMsg* msgs, int n_msgs,
         }
     }
     if (im) {
-        int want_think = 0;
+        int mcpv = chat_vocab_has_token(v, "<image>") && chat_vocab_has_token(v, "</image>");
         chat_append_ids(v, "<|im_start|>assistant\n", ids, max, n_out);
-        /* MiniCPM 词表也有 <think>, 但官方模板不开思考; 仅 Qwen 默认注入 */
-        if (v->chat_think == 1)
-            want_think = 1;
-        else if (v->chat_think != 0 && chat_vocab_has_token(v, "<think>") &&
-                 !(chat_vocab_has_token(v, "<image>") && chat_vocab_has_token(v, "</image>")))
-            want_think = 1;
-        if (want_think)
+        /* MiniCPM 默认不开思考; Qwen 有 <think> 则开. --opt enable_thinking=0|1 可覆盖 */
+        if (v->chat_think == 1 ||
+            (v->chat_think != 0 && !mcpv && chat_vocab_has_token(v, "<think>")))
             chat_append_ids(v, "<think>\n", ids, max, n_out);
     } else
         chat_append_ids(v, "assistant: ", ids, max, n_out);
