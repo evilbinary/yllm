@@ -734,40 +734,40 @@ chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 #   make server-qwen38  兼容旧名(= server-qwen3.8-27b, yaml name=qwen3.8)
 server-tinyllama: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=tinyllama); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen2.5-1.5b: $(BIN_AVX2) $(Q25_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5-1.5b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5-1.5b > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen2.5-1.5b); 用 make infer-qwen2.5-1.5b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen3-8b: $(BIN_AVX2) $(Q3_8B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen3-8b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3-8b > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen3-8b); 用 make infer-qwen3-8b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen3-vl-2b: $(BIN_AVX2) $(Q3VL_2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen3-vl-2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3-vl-2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen3-vl-2b); 用 make infer-qwen3-vl-2b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen3.8-27b: $(BIN_AVX2) $(Q3_27B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model qwen3.8 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3.8 > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen3.8); 用 make infer-qwen3.8-27b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen38: server-qwen3.8-27b
 
 server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (gemma4-e2b ranks=2 local=1 → 本机 rank0 :9410)"
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (gemma4-e2b ranks=2 local=1 → 本机 rank0 :9410, timeout=$(YLLM_SRV_TIMEOUT)s)"
 	@echo "远端 rank1(无需 --peers), 见 docs/serve-cli.md, 例:"
 	@echo "  LD_LIBRARY_PATH=. ./yllm rank --model gemma-4-E2B-it-Q4_K_M.llf --vocab gemma4.vocab.txt \\"
 	@echo "    --model-name gemma4-e2b --port 9411 --rank 1 --ranks 2 \\"
@@ -776,8 +776,8 @@ server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
 
 server-gemma4-e4b: $(BIN_AVX2) $(G4_E4B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e4b > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started (serve.yaml, model=gemma4-e4b); 用 make infer-gemma4-e4b 发请求 (HTTP 127.0.0.1:8000)"
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e4b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=gemma4-e4b, timeout=$(YLLM_SRV_TIMEOUT)s); 用 make infer-gemma4-e4b 发请求 (HTTP 127.0.0.1:8000)"
 
 # 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 name)
 infer-tinyllama: $(BIN)
@@ -820,6 +820,8 @@ infer-gemma4-e4b: $(BIN)
 
 SERVE_CONFIG ?= serve.yaml
 SERVE_LOGDIR ?= logs
+# server→rank 读超时(秒); 大 prompt/视觉 prefill 常 >60s, 默认放宽
+YLLM_SRV_TIMEOUT ?= 300
 # 模型名须匹配 serve.yaml 的 name; hub/infer 共用
 SERVER_MODEL ?= tinyllama
 SERVE_PROMPT ?= Once upon a time
@@ -843,9 +845,9 @@ serve-avx2: $(BIN_AVX2) $(MODEL_LLF)
 hub: $(BIN_AVX2)
 	@mkdir -p $(SERVE_LOGDIR)
 	@echo "== hub --config $(SERVE_CONFIG)$(if $(SERVER_MODEL), --model $(SERVER_MODEL),) (avx2) =="
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2) hub --config $(SERVE_CONFIG) \
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config $(SERVE_CONFIG) \
 		$(if $(SERVER_MODEL),--model $(SERVER_MODEL),) > $(SERVE_LOGDIR)/hub.out 2>&1 &
-	@echo "hub started$(if $(SERVER_MODEL), (model=$(SERVER_MODEL)),); 用 make infer 发请求"
+	@echo "hub started$(if $(SERVER_MODEL), (model=$(SERVER_MODEL)),) timeout=$(YLLM_SRV_TIMEOUT)s; 用 make infer 发请求"
 
 # 分开模式(独立进程, 同一份 config)
 supervisor: $(BIN)

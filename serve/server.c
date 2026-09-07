@@ -31,7 +31,7 @@
 static long srv_timeout_ms(void)
 {
     const char* e = getenv("YLLM_SRV_TIMEOUT");
-    return e ? atol(e) * 1000 : 60000;
+    return e ? atol(e) * 1000 : 120000;
 }
 
 #define SRV_MAX_LINE 8192
