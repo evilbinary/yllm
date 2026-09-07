@@ -337,11 +337,20 @@ int cmd_ctl(ServeConfig* cfg, int argc, char** argv)
                                 ? cfg->models[mi].vocab : cfg->vocab;
             const char* mname = mi < cfg->n_models && cfg->models[mi].name[0]
                                 ? cfg->models[mi].name : "default";
-            snprintf(cmd, sizeof(cmd),
-                     "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %d "
-                     "--supervisor %s:%d --id rank-%d --log %s/%s-rank-%d.log",
-                     cfg->bin, model, vocab, cfg->rank_port_base + idx,
-                     cfg->sv_host, cfg->sv_port, idx, logdir, mname, rr);
+            const char* mmproj = mi < cfg->n_models && cfg->models[mi].mmproj[0]
+                                 ? cfg->models[mi].mmproj : cfg->mmproj;
+            if (mmproj && mmproj[0])
+                snprintf(cmd, sizeof(cmd),
+                         "\"%s\" rank --model \"%s\" --vocab \"%s\" --mmproj \"%s\" --port %d "
+                         "--supervisor %s:%d --id rank-%d --log %s/%s-rank-%d.log",
+                         cfg->bin, model, vocab, mmproj, cfg->rank_port_base + idx,
+                         cfg->sv_host, cfg->sv_port, idx, logdir, mname, rr);
+            else
+                snprintf(cmd, sizeof(cmd),
+                         "\"%s\" rank --model \"%s\" --vocab \"%s\" --port %d "
+                         "--supervisor %s:%d --id rank-%d --log %s/%s-rank-%d.log",
+                         cfg->bin, model, vocab, cfg->rank_port_base + idx,
+                         cfg->sv_host, cfg->sv_port, idx, logdir, mname, rr);
         } else {
             fprintf(stderr, "ctl start: 未知目标 '%s'(支持 hub / sv / rt / s<N> / r<N>)\n", target);
             return 1;

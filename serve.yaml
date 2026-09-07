@@ -62,15 +62,23 @@ models:
   - name: qwen3-vl-2b
     model: models/qwen3-vl-2b.llf
     vocab: models/qwen3-vl-2b.vocab.txt
+    mmproj: models/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
     ranks: 1
   - name: gemma4-e2b
     model: models/gemma-4-E2B-it-Q4_K_M.llf
     vocab: models/gemma4.vocab.txt
+    mmproj: models/mmproj-gemma-4-E2B-F16.gguf
     ranks: 1           # PP 两段
     local: 1           # 本机 hub 只拉 rank0; rank1 远程手工起
   - name: gemma4-e4b
     model: models/gemma-4-E4B-it-Q4_K_M.llf
     vocab: models/gemma4.vocab.txt
+    mmproj: models/mmproj-gemma-4-E4B-f16.gguf
+    ranks: 1
+  - name: minicpm-v-4.6
+    model: models/minicpm-v-4.6.llf
+    vocab: models/minicpm-v-4.6.vocab.txt
+    mmproj: models/mmproj-model-f16.gguf
     ranks: 1
   - name: qwen2.5-1.5b
     model: models/qwen2.5-1.5b.llf

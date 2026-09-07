@@ -147,9 +147,13 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --rank %d --ranks %d%s "
              "--dist-fp16 %d %s "
+             "%s%s%s"
              "--cache-dir \"%s\" --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
              mi * model_stride(s) + r, r, ranks, peers_arg, mc->dist_fp16, bud,
+             mc->mmproj[0] ? "--mmproj \"" : "",
+             mc->mmproj[0] ? mc->mmproj : "",
+             mc->mmproj[0] ? "\" " : "",
              s->cache_dir[0] ? s->cache_dir : ".", mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u cmd=%s", r, mc->name, rport, cmd);
     int pid = spawn_proc(cmd);

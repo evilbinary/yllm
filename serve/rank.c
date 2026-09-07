@@ -16,6 +16,7 @@
 #include "node.h"
 #include "sock.h"
 #include "../inference/include/yllm.h"
+#include "../inference/include/vision.h"
 #include "../inference/include/cache.h"
 #include "../inference/include/dist.h"
 #include "../inference/include/log.h"
@@ -62,6 +63,7 @@ typedef struct {
 typedef struct {
     Engine engine;
     Vocab vocab;
+    Vision* vis;         /* mmproj 非空时加载; 视觉 INFER 用 */
     float temp;
     float top_p;
     uint64_t seed;
@@ -543,6 +545,197 @@ static int handle_infer_cache(int fd, Rank* r, const char* key, uint32_t max_tok
     return 0;
 }
 
+/* OpenAI/HTTP 视觉载荷: YLLMVIS1\nTEXT n\n...\nIMG n\n<bytes>... */
+static int rank_write_temp_img(const unsigned char* data, size_t n, char* path, size_t pathsz)
+{
+    static unsigned seq;
+    FILE* f;
+#ifdef _WIN32
+    char tmpdir[MAX_PATH];
+    DWORD ntmp = GetTempPathA((DWORD)sizeof(tmpdir), tmpdir);
+    if (ntmp == 0 || ntmp >= sizeof(tmpdir)) snprintf(tmpdir, sizeof(tmpdir), ".");
+    snprintf(path, pathsz, "%syllm_vis_%u_%u.bin", tmpdir, (unsigned)GetCurrentProcessId(), ++seq);
+#else
+    snprintf(path, pathsz, "/tmp/yllm_vis_%u_%u.bin", (unsigned)getpid(), ++seq);
+#endif
+    f = fopen(path, "wb");
+    if (!f) return -1;
+    if (fwrite(data, 1, n, f) != n) { fclose(f); remove(path); return -1; }
+    fclose(f);
+    return 0;
+}
+
+static int handle_infer_vision(int fd, Rank* r, char* pb, long nbytes, int max_tokens)
+{
+    const char* p;
+    const char* end;
+    char* prompt = NULL;
+    char img_paths[8][512];
+    int n_img = 0, i, pad = 0, nvis = 0, hid, nprompt = 0, vis_nds = 0;
+    float* mix_emb = NULL;
+    float* mix_ds = NULL;
+    uint8_t* mix_use = NULL;
+    uint32_t* ids = NULL;
+    char err[512];
+    EngineTimings tim;
+    TokenCtx tc;
+    uint64_t t0;
+    int rc;
+
+    if (!r->vis) {
+        free(pb);
+        send_line(fd, PROTO_ERROR " vision: model has no mmproj");
+        return 0;
+    }
+    if (nbytes < 9 || memcmp(pb, "YLLMVIS1\n", 9) != 0) {
+        free(pb);
+        send_line(fd, PROTO_ERROR " vision: bad payload");
+        return 0;
+    }
+    p = pb + 9;
+    end = pb + nbytes;
+    while (p < end && n_img < 8) {
+        if (strncmp(p, "TEXT ", 5) == 0) {
+            unsigned long n = 0;
+            const char* nl = strchr(p, '\n');
+            if (!nl || nl >= end) break;
+            n = strtoul(p + 5, NULL, 10);
+            p = nl + 1;
+            if (p + n > end) break;
+            prompt = (char*)ymalloc(n + 1);
+            if (!prompt) break;
+            memcpy(prompt, p, n);
+            prompt[n] = '\0';
+            p += n;
+            continue;
+        }
+        if (strncmp(p, "IMG ", 4) == 0) {
+            unsigned long n = 0;
+            const char* nl = strchr(p, '\n');
+            if (!nl || nl >= end) break;
+            n = strtoul(p + 4, NULL, 10);
+            p = nl + 1;
+            if (p + n > end) break;
+            if (rank_write_temp_img((const unsigned char*)p, (size_t)n, img_paths[n_img], sizeof(img_paths[0])) != 0) {
+                free(prompt); free(pb);
+                send_line(fd, PROTO_ERROR " vision: cannot write temp image");
+                return 0;
+            }
+            n_img++;
+            p += n;
+            continue;
+        }
+        break;
+    }
+    free(pb);
+    if (!prompt || n_img <= 0) {
+        free(prompt);
+        for (i = 0; i < n_img; i++) remove(img_paths[i]);
+        send_line(fd, PROTO_ERROR " vision: need TEXT and IMG");
+        return 0;
+    }
+    /* v1: 单图(OpenAI 多图时取第一张; 多图拼接后续再做) */
+    if (n_img > 1)
+        ylog_warn("rank: vision %d images, using first only", n_img);
+
+    nvis = vision_n_tokens(r->vis);
+    hid = vision_hidden(r->vis);
+    if (hid != (int)r->engine.ws.model.h.hidden) {
+        free(prompt);
+        for (i = 0; i < n_img; i++) remove(img_paths[i]);
+        send_line(fd, PROTO_ERROR " vision: hidden mismatch");
+        return 0;
+    }
+    ids = (uint32_t*)ymalloc((size_t)(nvis + 8192) * 4);
+    mix_emb = (float*)ymalloc((size_t)(nvis + 8192) * (size_t)hid * 4);
+    mix_use = (uint8_t*)ycalloc((size_t)(nvis + 8192), 1);
+    vis_nds = vision_n_deepstack(r->vis);
+    if (vis_nds > 0)
+        mix_ds = (float*)ymalloc((size_t)vis_nds * (size_t)nvis * (size_t)hid * 4);
+    if (!ids || !mix_emb || !mix_use) {
+        free(ids); free(mix_emb); free(mix_ds); free(mix_use); free(prompt);
+        for (i = 0; i < n_img; i++) remove(img_paths[i]);
+        send_line(fd, PROTO_ERROR " vision: oom");
+        return 0;
+    }
+    {
+        int got = vision_encode_image_ds(r->vis, img_paths[0], mix_emb, mix_ds, nvis, err, sizeof(err));
+        for (i = 0; i < n_img; i++) remove(img_paths[i]);
+        if (got < 0) {
+            free(ids); free(mix_emb); free(mix_ds); free(mix_use); free(prompt);
+            send_line(fd, PROTO_ERROR " vision encode: %s", err);
+            return 0;
+        }
+        nvis = got;
+    }
+    {
+        int nr = 0, nc = 0, n_per;
+        vision_slice_grid(r->vis, &nr, &nc);
+        n_per = vision_tile_tokens(r->vis);
+        if (nr > 0 && nc > 0) {
+            int vis_pos[40], n_chunk, k;
+            nprompt = vocab_chat_ids_image_grid(&r->vocab, prompt, n_per, nr, nc,
+                                               ids, nvis + 8192, r->vocab.add_bos, vis_pos, 40);
+            if (nprompt > 0) {
+                float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);
+                memset(mix_use, 0, (size_t)(nvis + 8192));
+                n_chunk = nvis / n_per;
+                for (k = 0; k < n_chunk && k < 40; k++) {
+                    memcpy(placed + (size_t)vis_pos[k] * hid, mix_emb + (size_t)k * n_per * hid,
+                           (size_t)n_per * (size_t)hid * 4);
+                    for (i = 0; i < n_per; i++) mix_use[vis_pos[k] + i] = 1;
+                }
+                free(mix_emb);
+                mix_emb = placed;
+                pad = vis_pos[0];
+            }
+        } else {
+            nprompt = vocab_chat_ids_image(&r->vocab, prompt, nvis, ids, nvis + 8192,
+                                           r->vocab.add_bos, &pad);
+            if (nprompt > 0) {
+                float* placed = (float*)ymalloc((size_t)nprompt * (size_t)hid * 4);
+                memset(mix_use, 0, (size_t)(nvis + 8192));
+                memcpy(placed + (size_t)pad * hid, mix_emb, (size_t)nvis * (size_t)hid * 4);
+                for (i = 0; i < nvis; i++) mix_use[pad + i] = 1;
+                free(mix_emb);
+                mix_emb = placed;
+            }
+        }
+    }
+    free(prompt);
+    if (nprompt <= 0) {
+        free(ids); free(mix_emb); free(mix_ds); free(mix_use);
+        send_line(fd, PROTO_ERROR " vision: chat template failed");
+        return 0;
+    }
+    ylog_info("rank: vision nvis=%d pad=%d prompt=%d", nvis, pad, nprompt);
+
+    memset(&tim, 0, sizeof(tim));
+    tc.fd = fd;
+    tc.vocab = &r->vocab;
+    tc.n_tokens = 0;
+    tc.cache_frame = 0;
+    t0 = ynow_ms();
+    pthread_mutex_lock(&r->engine_lock);
+    if (r->dist_ranks > 1) {
+        pthread_mutex_unlock(&r->engine_lock);
+        free(ids); free(mix_emb); free(mix_ds); free(mix_use);
+        send_line(fd, PROTO_ERROR " vision: not supported with pipeline parallel");
+        return 0;
+    }
+    rc = engine_generate_mix(&r->engine, ids, nprompt, max_tokens, mix_emb, mix_use, mix_ds, vis_nds,
+                             r->temp, r->top_p, r->seed, r->vocab.eos,
+                             on_token_rank, &tc, &tim, err, sizeof(err));
+    pthread_mutex_unlock(&r->engine_lock);
+    free(ids); free(mix_emb); free(mix_ds); free(mix_use);
+    if (rc != 0) {
+        send_line(fd, PROTO_ERROR " vision generate: %s", err);
+        return 0;
+    }
+    send_line(fd, PROTO_DONE " %u %d %llu", tc.n_tokens, 0, (unsigned long long)(ynow_ms() - t0));
+    return 0;
+}
+
 static int handle_infer(int fd, Rank* r, char* args, char* pb, long nbytes)
 {
     int max_tokens = 0;
@@ -574,6 +767,9 @@ static int handle_infer(int fd, Rank* r, char* args, char* pb, long nbytes)
         if (pp) r->top_p = (float)atof(pp);
     }
     if (!pb) { send_line(fd, PROTO_ERROR " oom"); return 0; }
+    /* 视觉载荷: 不走会话 tokenize, 由 rank 编码 mmproj + mix generate */
+    if (nbytes >= 9 && memcmp(pb, "YLLMVIS1\n", 9) == 0)
+        return handle_infer_vision(fd, r, pb, nbytes, max_tokens);
     /* 会话模式: 带 key= 字段时 payload 为增量 token 二进制(server 已渲染, 不 tokenize) */
     {
         const char* key = proto_get(args, "key");
@@ -1166,6 +1362,18 @@ int cmd_rank(ServeConfig* cfg)
         vocab_free(&r.vocab);
         return 1;
     }
+    r.vis = NULL;
+    if (cfg->mmproj[0]) {
+        r.vis = vision_load(cfg->mmproj, err, sizeof(err));
+        if (!r.vis) {
+            ylog_error("rank: mmproj load failed: %s", err);
+            engine_free(&r.engine);
+            vocab_free(&r.vocab);
+            return 1;
+        }
+        ylog_info("rank: vision mmproj=%s ntok=%d hidden=%d",
+                  cfg->mmproj, vision_n_tokens(r.vis), vision_hidden(r.vis));
+    }
 
     /* 设备绑定: 默认 cpu; --device cuda 需 YLLM_CUDA=1 构建 */
     {
@@ -1250,6 +1458,7 @@ int cmd_rank(ServeConfig* cfg)
 
     int rc = run_rank(cfg->rank_port_base, &r);
 
+    if (r.vis) vision_free(r.vis);
     engine_free(&r.engine);
     vocab_free(&r.vocab);
     return rc;

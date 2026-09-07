@@ -290,10 +290,12 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
 | 字段 | 说明 |
 |---|---|
 | `model` | 模型名(匹配 serve.yaml `model-name`) |
-| `messages`(chat) | `[{"role":"user","content":"..."}]` |
+| `messages`(chat) | `[{"role":"user","content":"..."}]`；视觉模型可用 OpenAI 多模态 content 数组：`[{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]`（也支持 `file://` / 本地路径；暂不拉远程 http） |
 | `prompt`(completions) | 提示文本 |
-| `max_tokens` | 最大生成 token(默认 32) |
+| `max_tokens` | 最大生成 token(默认 1024) |
 | `stream` | `true` 时 SSE 分块输出 |
+
+视觉模型需在 `serve.yaml` 对应条目配置 `mmproj:`（如 `qwen3-vl-2b` / `gemma4-e2b` / `minicpm-v-4.6`）。带图请求走非会话 INFER，由 rank 编码后 `engine_generate_mix`。
 
 ### 响应
 

@@ -20,7 +20,8 @@
 #include <stdint.h>
 #include <pthread.h>
 
-#define HTTP_MAX_BODY (1 << 20)
+#define HTTP_MAX_BODY (16 << 20)
+#define HTTP_MAX_IMGS 8
 
 /* API 请求/响应日志开关(默认开启; hub/router 按 --api-log 配置) */
 static int g_api_log = 1;
@@ -271,12 +272,175 @@ static int pack_chat_msgs(char* out, size_t cap, char** roles, char** contents, 
     return 0;
 }
 
-/* 提取 chat 请求的全部消息(role/content), 返回消息数 */
+static int http_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int http_b64_decode(const char* s, size_t n, unsigned char** out, size_t* outlen)
+{
+    size_t cap = (n / 4) * 3 + 4, o = 0;
+    unsigned char* buf = (unsigned char*)malloc(cap);
+    size_t i = 0;
+    if (!buf) return -1;
+    while (i < n) {
+        int v[4];
+        int k, pad = 0;
+        for (k = 0; k < 4 && i < n; ) {
+            char c = s[i++];
+            if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+                if (c == '=') { v[k++] = 0; pad++; }
+                continue;
+            }
+            v[k] = http_b64_val(c);
+            if (v[k] < 0) { free(buf); return -1; }
+            k++;
+        }
+        if (k == 0) break;
+        if (k < 4) { free(buf); return -1; }
+        if (o + 3 > cap) { free(buf); return -1; }
+        buf[o++] = (unsigned char)((v[0] << 2) | (v[1] >> 4));
+        if (pad < 2) buf[o++] = (unsigned char)((v[1] << 4) | (v[2] >> 2));
+        if (pad < 1) buf[o++] = (unsigned char)((v[2] << 6) | v[3]);
+    }
+    *out = buf;
+    *outlen = o;
+    return 0;
+}
+
+static int http_load_image_url(const char* url, unsigned char** out, size_t* outlen, char* err, size_t errlen)
+{
+    if (!url || !url[0]) {
+        if (err) snprintf(err, errlen, "empty image_url");
+        return -1;
+    }
+    if (strncmp(url, "data:", 5) == 0) {
+        const char* comma = strchr(url, ',');
+        if (!comma || !strstr(url, ";base64,")) {
+            if (err) snprintf(err, errlen, "image_url data: need ;base64,");
+            return -1;
+        }
+        return http_b64_decode(comma + 1, strlen(comma + 1), out, outlen);
+    }
+    if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
+        if (err) snprintf(err, errlen, "remote image_url not supported; use data: or file:");
+        return -1;
+    }
+    {
+        const char* path = url;
+        FILE* f;
+        long sz;
+        unsigned char* buf;
+        if (strncmp(url, "file://", 7) == 0) {
+            path = url + 7;
+            if (path[0] == '/' && ((path[1] >= 'A' && path[1] <= 'Z') || (path[1] >= 'a' && path[1] <= 'z')) && path[2] == ':')
+                path++; /* file:///C:/... */
+        }
+        f = fopen(path, "rb");
+        if (!f) {
+            if (err) snprintf(err, errlen, "cannot open image %s", path);
+            return -1;
+        }
+        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+        sz = ftell(f);
+        if (sz < 0 || sz > (16 << 20)) { fclose(f); if (err) snprintf(err, errlen, "image too large"); return -1; }
+        rewind(f);
+        buf = (unsigned char*)malloc((size_t)sz);
+        if (!buf) { fclose(f); return -1; }
+        if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -1; }
+        fclose(f);
+        *out = buf;
+        *outlen = (size_t)sz;
+        return 0;
+    }
+}
+
+typedef struct {
+    unsigned char* data;
+    size_t len;
+} HttpImg;
+
+/* 解析 OpenAI content: 字符串, 或 [{type:text|image_url}, ...] */
+static int extract_content_parts(const char* body, int msg_i,
+                                 char* text, size_t textsz,
+                                 HttpImg* imgs, int max_imgs, int* n_imgs,
+                                 char* err, size_t errlen)
+{
+    char path[96];
+    JsonVal v;
+    size_t toff = 0;
+    int j;
+    text[0] = '\0';
+    snprintf(path, sizeof(path), "messages.%d.content", msg_i);
+    if (!json_find(body, path, &v)) return 0;
+    if (v.type == JSON_STR) {
+        if (v.len + 1 > textsz) {
+            if (err) snprintf(err, errlen, "content too long");
+            return -1;
+        }
+        json_str_unescape(v.start, v.len, text);
+        return 0;
+    }
+    if (v.type != JSON_ARR) return 0;
+    for (j = 0; j < 32; j++) {
+        char tpath[128], typ[32];
+        JsonVal tv, xv;
+        snprintf(tpath, sizeof(tpath), "messages.%d.content.%d.type", msg_i, j);
+        if (!json_find(body, tpath, &tv) || tv.type != JSON_STR) break;
+        {
+            size_t tl = tv.len < sizeof(typ) - 1 ? tv.len : sizeof(typ) - 1;
+            memcpy(typ, tv.start, tl);
+            typ[tl] = '\0';
+        }
+        if (strcmp(typ, "text") == 0) {
+            snprintf(tpath, sizeof(tpath), "messages.%d.content.%d.text", msg_i, j);
+            if (json_find(body, tpath, &xv) && xv.type == JSON_STR && toff + xv.len + 2 < textsz) {
+                if (toff) text[toff++] = '\n';
+                toff += json_str_unescape(xv.start, xv.len, text + toff);
+            }
+        } else if (strcmp(typ, "image_url") == 0) {
+            char* url;
+            snprintf(tpath, sizeof(tpath), "messages.%d.content.%d.image_url.url", msg_i, j);
+            if (!json_find(body, tpath, &xv) || xv.type != JSON_STR) {
+                if (err) snprintf(err, errlen, "image_url missing url");
+                return -1;
+            }
+            url = (char*)malloc(xv.len + 1);
+            if (!url) {
+                if (err) snprintf(err, errlen, "oom");
+                return -1;
+            }
+            json_str_unescape(xv.start, xv.len, url);
+            if (*n_imgs >= max_imgs) {
+                free(url);
+                if (err) snprintf(err, errlen, "too many images");
+                return -1;
+            }
+            if (http_load_image_url(url, &imgs[*n_imgs].data, &imgs[*n_imgs].len, err, errlen) != 0) {
+                free(url);
+                return -1;
+            }
+            free(url);
+            (*n_imgs)++;
+        }
+    }
+    return 0;
+}
+
+/* 提取 chat 请求的全部消息(role/content), 返回消息数; 同时收集 image_url */
 static int extract_chat_messages(const char* body, char* pool, size_t poolsz,
-                                 char** roles, char** contents, int max_msgs)
+                                 char** roles, char** contents, int max_msgs,
+                                 HttpImg* imgs, int max_imgs, int* n_imgs,
+                                 char* err, size_t errlen)
 {
     int n = 0, i;
     size_t off = 0;
+    if (n_imgs) *n_imgs = 0;
     for (i = 0; i < 32 && n < max_msgs; i++) {
         char path[64];
         JsonVal v;
@@ -288,25 +452,43 @@ static int extract_chat_messages(const char* body, char* pool, size_t poolsz,
             roles[n] = pool + off;
             off += rlen + 1;
         }
-        if (!roles[n]) break;   /* 没有更多消息 */
-        snprintf(path, sizeof(path), "messages.%d.content", i);
-        if (json_find(body, path, &v) && v.type == JSON_STR && off + 64 < poolsz) {
-            contents[n] = pool + off;
-            off += json_str_unescape(v.start, v.len, pool + off) + 1;
-        } else {
-            contents[n] = pool + off;
-            pool[off++] = '\0';
-        }
+        if (!roles[n]) break;
+        if (off + 8 >= poolsz) break;
+        contents[n] = pool + off;
+        if (extract_content_parts(body, i, pool + off, poolsz - off,
+                                  imgs, max_imgs, n_imgs, err, errlen) != 0)
+            return -1;
+        off += strlen(pool + off) + 1;
         n++;
     }
     return n;
 }
 
-/* 提取 chat 请求的最后一条 content 作为 prompt */
+static int pack_vision_payload(char* out, size_t cap, const char* text,
+                               HttpImg* imgs, int n_imgs, size_t* olen)
+{
+    size_t o = 0, tl = text ? strlen(text) : 0;
+    int i, w;
+    w = snprintf(out, cap, "YLLMVIS1\nTEXT %zu\n", tl);
+    if (w < 0 || (size_t)w >= cap) return -1;
+    o = (size_t)w;
+    if (o + tl > cap) return -1;
+    if (tl) { memcpy(out + o, text, tl); o += tl; }
+    for (i = 0; i < n_imgs; i++) {
+        w = snprintf(out + o, cap - o, "IMG %zu\n", imgs[i].len);
+        if (w < 0 || o + (size_t)w + imgs[i].len > cap) return -1;
+        o += (size_t)w;
+        memcpy(out + o, imgs[i].data, imgs[i].len);
+        o += imgs[i].len;
+    }
+    *olen = o;
+    return 0;
+}
+
+/* 提取 chat 请求的最后一条 content 作为 prompt(仅字符串 content) */
 static size_t extract_chat_prompt(const char* body, char* out, size_t outsz)
 {
     JsonVal v;
-    /* 尝试 messages.<i>.content, 从后往前(最后一条消息) */
     int i;
     for (i = 31; i >= 0; i--) {
         char path[64];
@@ -361,12 +543,33 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     char* contents[32];
     int n_msgs = 0;
     int sess_ok = 0;
+    int n_imgs = 0;
+    HttpImg imgs[HTTP_MAX_IMGS];
     char sess_key[128] = "";
     char* packed = NULL;
     size_t packlen = 0;
+    char extr_err[256] = "";
+    memset(imgs, 0, sizeof(imgs));
     if (pool) {
-        n_msgs = extract_chat_messages(body, pool, HTTP_MAX_BODY, roles, contents, 32);
-        if (n_msgs > 0) {
+        n_msgs = extract_chat_messages(body, pool, HTTP_MAX_BODY, roles, contents, 32,
+                                       imgs, HTTP_MAX_IMGS, &n_imgs, extr_err, sizeof(extr_err));
+        if (n_msgs < 0) {
+            int ii;
+            for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
+            free(pool);
+            free(prompt);
+            free(collected);
+            {
+                HttpResponse rr;
+                char ej[320];
+                snprintf(ej, sizeof(ej), "{\"error\":{\"message\":\"%s\"}}",
+                         extr_err[0] ? extr_err : "bad messages");
+                http_begin(&rr, fd, 400, NULL);
+                http_reply(&rr, ej);
+            }
+            return;
+        }
+        if (n_msgs > 0 && n_imgs == 0) {
             pick_client_sess_id(httpreq, body, sess_key, sizeof(sess_key));
             packed = (char*)malloc(HTTP_MAX_BODY);
             if (packed && pack_chat_msgs(packed, HTTP_MAX_BODY, roles, contents, n_msgs, &packlen) == 0)
@@ -375,13 +578,42 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                 free(packed);
                 packed = NULL;
             }
+        } else if (n_msgs > 0 && n_imgs > 0) {
+            /* 视觉: 非会话; 用最后一条 user 文本 + 图片 */
+            int li;
+            const char* utext = "";
+            for (li = n_msgs - 1; li >= 0; li--) {
+                if (roles[li] && strcmp(roles[li], "user") == 0) {
+                    utext = contents[li] ? contents[li] : "";
+                    break;
+                }
+            }
+            packed = (char*)malloc(HTTP_MAX_BODY);
+            if (!packed || pack_vision_payload(packed, HTTP_MAX_BODY, utext, imgs, n_imgs, &packlen) != 0) {
+                int ii;
+                for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
+                free(packed); free(pool); free(prompt); free(collected);
+                {
+                    HttpResponse rr;
+                    http_begin(&rr, fd, 400, NULL);
+                    http_reply(&rr, "{\"error\":{\"message\":\"vision payload too large\"}}");
+                }
+                return;
+            }
+            plen = packlen;
+            memcpy(prompt, packed, packlen);
+            free(packed);
+            packed = NULL;
         }
 #if YLLM_SESS_DEBUG
-        ylog_info("router_http: sess_ok=%d n_msgs=%d key=%s", sess_ok, n_msgs, sess_key[0] ? sess_key : "-");
+        ylog_info("router_http: sess_ok=%d n_msgs=%d n_imgs=%d key=%s",
+                  sess_ok, n_msgs, n_imgs, sess_key[0] ? sess_key : "-");
 #endif
     }
 
     if (plen == 0 && n_msgs == 0) {
+        int ii;
+        for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
         if (pool) free(pool);
         free(packed);
         free(prompt);
@@ -446,6 +678,8 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
             HttpResponse rr;
+            int ii;
+            for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
             if (rc == -2) {
                 http_begin(&rr, fd, 404, NULL);
                 http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
@@ -462,7 +696,11 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
             return;
         }
         char* json = (char*)malloc(HTTP_MAX_BODY + 512);
-        if (!json) { free(packed); if (pool) free(pool); free(prompt); free(collected); return; }
+        if (!json) {
+            int ii;
+            for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
+            free(packed); if (pool) free(pool); free(prompt); free(collected); return;
+        }
         snprintf(json, HTTP_MAX_BODY + 512,
                  "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\","
                  "\"created\":%lld,\"model\":\"%s\","
@@ -475,6 +713,10 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d ptoken=%d", cc.n_tokens, ptoken); ylog_body("HTTP CHAT reply-json", json); }
         free(json);
+    }
+    {
+        int ii;
+        for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
     }
     if (pool) free(pool);
     free(packed);
