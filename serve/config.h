@@ -62,6 +62,7 @@ typedef struct {
 
     /* 拓扑 */
     char sv_host[CFG_STR_MAX];      /* supervisor 地址(rank/server 心跳目标) */
+    char bind_host[CFG_STR_MAX];    /* 监听绑定: 默认 127.0.0.1; 0.0.0.0/*=全网卡 */
     char router_addrs[CFG_STR_MAX]; /* router 列表(supervisor 通知目标) */
     char leader[CFG_STR_MAX];       /* server 的 leader rank 地址 ip:port */
     int  ranks;                     /* 每 server 的 rank 段数 */
@@ -157,6 +158,7 @@ static inline void config_defaults(ServeConfig* c)
     snprintf(c->model_name, sizeof(c->model_name), "%s", "default");
     snprintf(c->bin, sizeof(c->bin), "%s", "./build/avx2/yllm");
     snprintf(c->sv_host, sizeof(c->sv_host), "%s", "127.0.0.1");
+    snprintf(c->bind_host, sizeof(c->bind_host), "%s", "127.0.0.1");
     snprintf(c->strategy, sizeof(c->strategy), "%s", "least");
     snprintf(c->lease_strategy, sizeof(c->lease_strategy), "%s", "request");
     c->sv_port = 9500;
@@ -247,6 +249,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         } else {
             snprintf(c->sv_host, sizeof(c->sv_host), "%s", val);
         }
+    } else if (strcmp(key, "bind-host") == 0 || strcmp(key, "bind") == 0) {
+        snprintf(c->bind_host, sizeof(c->bind_host), "%s", val);
     } else if (strcmp(key, "router") == 0 || strcmp(key, "router-addrs") == 0) {
         snprintf(c->router_addrs, sizeof(c->router_addrs), "%s", val);
     } else if (strcmp(key, "leader") == 0 || strcmp(key, "server-leader") == 0) {
@@ -496,6 +500,17 @@ static inline void config_filter_models(ServeConfig* c, const char* names)
     for (mi = 0; mi < nk; mi++) c->models[mi] = kept[mi];
 }
 
+/* 把 bind_host 同步到环境变量, 供 sock_listen / 子进程(rank)继承 */
+static inline void config_apply_bind_host(const ServeConfig* c)
+{
+    const char* h = c->bind_host[0] ? c->bind_host : "127.0.0.1";
+#ifdef _WIN32
+    _putenv_s("YLLM_BIND_HOST", h);
+#else
+    setenv("YLLM_BIND_HOST", h, 1);
+#endif
+}
+
 static inline void config_load(ServeConfig* c, int argc, char** argv, int start)
 {
     config_defaults(c);
@@ -519,6 +534,7 @@ static inline void config_load(ServeConfig* c, int argc, char** argv, int start)
     }
     if (cfg_path) config_load_yaml(c, cfg_path);
     config_load_args(c, argc, argv, start);
+    config_apply_bind_host(c);
 }
 
 #endif /* YLLM_SERVE_CONFIG_H */

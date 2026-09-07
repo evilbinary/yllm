@@ -207,7 +207,9 @@ static inline void sock_sleep_ms(int ms)
 #endif
 }
 
-/* 创建 TCP 监听 socket(INADDR_ANY), 成功返回 fd, 失败返回 -1 */
+/* 创建 TCP 监听 socket。
+ * 绑定地址: YLLM_BIND_HOST(默认环回; 0.0.0.0/* = 全网卡; 其它为指定 IPv4)。
+ * 成功返回 fd, 失败返回 -1。 */
 static inline int sock_listen(uint16_t port, int backlog)
 {
     int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
@@ -220,8 +222,22 @@ static inline int sock_listen(uint16_t port, int backlog)
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
+    {
+        const char* host = getenv("YLLM_BIND_HOST");
+        if (host && (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0)) {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        } else if (!host || !host[0] || strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0) {
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        } else {
+            unsigned long a = inet_addr(host);
+            if (a == (unsigned long)INADDR_NONE) {
+                sock_close(srv);
+                return -1;
+            }
+            addr.sin_addr.s_addr = (uint32_t)a;
+        }
+    }
     if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { sock_close(srv); return -1; }
     if (listen(srv, backlog) != 0) { sock_close(srv); return -1; }
     return srv;
