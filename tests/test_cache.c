@@ -115,9 +115,10 @@ int main(void)
         ee.kv_dim = 4;
         ee.max_seq = 8;
         ee.ws.model.h = hh;
-        ee.kv = (uint16_t*)calloc((2 * hh.n_blocks + 1) * ee.max_seq * ee.kv_dim, 2);
+        ee.kv_row_sz = ee.kv_dim * 2;   /* f16 行 */
+        ee.kv = (uint8_t*)calloc((2 * hh.n_blocks + 1) * ee.max_seq * ee.kv_row_sz, 1);
         uint32_t total = (2 * hh.n_blocks + 1) * ee.max_seq * ee.kv_dim;
-        for (uint32_t i = 0; i < total; i++) ee.kv[i] = (uint16_t)(i * 7);
+        for (uint32_t i = 0; i < total; i++) ((uint16_t*)ee.kv)[i] = (uint16_t)(i * 7);
         CHECK(sess_kv_save(&ee, 5, kp) == 0, "kv_save ok");
         memset(ee.kv, 0, (size_t)total * 2);
         uint32_t rp = 0;
@@ -127,8 +128,8 @@ int main(void)
         for (uint32_t l = 1; l <= hh.n_blocks; l++)   /* 落盘覆盖块 1..nb */
             for (uint32_t p = 0; p < 5; p++)
                 for (uint32_t j = 0; j < ee.kv_dim; j++) {
-                    uint16_t* k = ee.kv + l * ee.max_seq * ee.kv_dim;
-                    uint16_t* v2 = ee.kv + (hh.n_blocks + l) * ee.max_seq * ee.kv_dim;
+                    uint16_t* k = (uint16_t*)ee.kv + l * ee.max_seq * ee.kv_dim;
+                    uint16_t* v2 = (uint16_t*)ee.kv + (hh.n_blocks + l) * ee.max_seq * ee.kv_dim;
                     if (k[p * ee.kv_dim + j] != (uint16_t)((l * ee.max_seq + p) * ee.kv_dim + j) * 7) ok = 0;
                     if (v2[p * ee.kv_dim + j] != (uint16_t)(((hh.n_blocks + l) * ee.max_seq + p) * ee.kv_dim + j) * 7) ok = 0;
                 }

@@ -2899,3 +2899,118 @@ void attn_kv_f16(float* out, const float* q,
                            kcache, vcache, s0, pos, 0, hd, kv_dim, inv_d, attn_cap);
     }
 }
+
+/* ---- KV q8 行([2B f16 scale][int8 × kv_dim]) ---- */
+
+/* 单 KV 头(GQA 组): 行内解 scale → int8→f32 → 与 f16 路径相同的 online softmax */
+static void attn_gqa_kv_q8(float* out, const float* q,
+                           const uint8_t* kcache, const uint8_t* vcache, uint32_t row_sz,
+                           uint32_t s0, uint32_t pos,
+                           uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                           uint32_t kv_head, float inv_d, float attn_cap)
+{
+    uint32_t gqa = n_kv_heads ? (n_heads / n_kv_heads) : n_heads;
+    uint32_t hh0, g, s, i;
+    float* m;
+    float* l;
+    float* ktmp;
+    float* vtmp;
+    if (gqa == 0) gqa = 1;
+    hh0 = kv_head * gqa;
+    m = (float*)alloca((size_t)gqa * 4);
+    l = (float*)alloca((size_t)gqa * 4);
+    ktmp = (float*)alloca((size_t)hd * 4);
+    vtmp = (float*)alloca((size_t)hd * 4);
+    for (g = 0; g < gqa; g++) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        memset(out + (size_t)(hh0 + g) * hd, 0, (size_t)hd * 4);
+    }
+    for (s = s0; s <= pos; s++) {
+        const uint8_t* kr = kcache + (size_t)s * row_sz;
+        const uint8_t* vr = vcache + (size_t)s * row_sz;
+        uint16_t ks16 = (uint16_t)(kr[0] | ((uint16_t)kr[1] << 8));
+        uint16_t vs16 = (uint16_t)(vr[0] | ((uint16_t)vr[1] << 8));
+        float ks = f16_to_f32(ks16), vs = f16_to_f32(vs16);
+        const int8_t* ki = (const int8_t*)(kr + 2) + (size_t)kv_head * hd;
+        const int8_t* vi = (const int8_t*)(vr + 2) + (size_t)kv_head * hd;
+        for (i = 0; i < hd; i++) { ktmp[i] = ks * (float)ki[i]; vtmp[i] = vs * (float)vi[i]; }
+        for (g = 0; g < gqa; g++) {
+            float sc = vec_dot_f32(q + (size_t)(hh0 + g) * hd, ktmp, hd) * inv_d;
+            float mnew, alpha, p;
+            float* og;
+            if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
+            mnew = (sc > m[g]) ? sc : m[g];
+            alpha = (m[g] == -INFINITY) ? 0.0f : expf(m[g] - mnew);
+            p = expf(sc - mnew);
+            l[g] = l[g] * alpha + p;
+            og = out + (size_t)(hh0 + g) * hd;
+            if (alpha != 1.0f) vec_scale_f32(og, alpha, hd);
+            vec_axpy_f32(og, vtmp, p, hd);
+            m[g] = mnew;
+        }
+    }
+    for (g = 0; g < gqa; g++) {
+        if (l[g] > 0.0f) vec_scale_f32(out + (size_t)(hh0 + g) * hd, 1.0f / l[g], hd);
+    }
+}
+
+static void attn_qh_kv_q8(float* og, const float* qh,
+                          const uint8_t* kcache, const uint8_t* vcache, uint32_t row_sz,
+                          uint32_t s0, uint32_t pos,
+                          uint32_t kv_head, uint32_t hd, uint32_t kv_dim,
+                          float inv_d, float attn_cap)
+{
+    uint32_t s, i;
+    float m = -INFINITY, l = 0.0f;
+    float* ktmp = (float*)alloca((size_t)hd * 4);
+    float* vtmp = (float*)alloca((size_t)hd * 4);
+    (void)kv_dim;
+    memset(og, 0, (size_t)hd * 4);
+    for (s = s0; s <= pos; s++) {
+        const uint8_t* kr = kcache + (size_t)s * row_sz;
+        const uint8_t* vr = vcache + (size_t)s * row_sz;
+        uint16_t ks16 = (uint16_t)(kr[0] | ((uint16_t)kr[1] << 8));
+        uint16_t vs16 = (uint16_t)(vr[0] | ((uint16_t)vr[1] << 8));
+        float ks = f16_to_f32(ks16), vs = f16_to_f32(vs16);
+        const int8_t* ki = (const int8_t*)(kr + 2) + (size_t)kv_head * hd;
+        const int8_t* vi = (const int8_t*)(vr + 2) + (size_t)kv_head * hd;
+        float sc, mnew, alpha, p;
+        for (i = 0; i < hd; i++) { ktmp[i] = ks * (float)ki[i]; vtmp[i] = vs * (float)vi[i]; }
+        sc = vec_dot_f32(qh, ktmp, hd) * inv_d;
+        if (attn_cap > 0.0f) sc = attn_cap * tanhf(sc / attn_cap);
+        mnew = (sc > m) ? sc : m;
+        alpha = (m == -INFINITY) ? 0.0f : expf(m - mnew);
+        p = expf(sc - mnew);
+        l = l * alpha + p;
+        if (alpha != 1.0f) vec_scale_f32(og, alpha, hd);
+        vec_axpy_f32(og, vtmp, p, hd);
+        m = mnew;
+    }
+    if (l > 0.0f) vec_scale_f32(og, 1.0f / l, hd);
+}
+
+void attn_kv_q8(float* out, const float* q,
+                const uint8_t* kcache, const uint8_t* vcache, uint32_t row_sz,
+                uint32_t s0, uint32_t pos,
+                uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                float inv_d, float attn_cap)
+{
+    uint32_t nkv = n_kv_heads ? n_kv_heads : 1;
+    uint32_t gqa = n_heads / nkv;
+    uint32_t kvh, hh;
+    int nseq = (int)(pos + 1 - s0);
+    if (n_heads == 0 || hd == 0 || s0 > pos) return;
+    if (gqa == 0) gqa = 1;
+    if (nkv >= 2) {
+        #pragma omp parallel for schedule(static) if (nseq >= 64)
+        for (kvh = 0; kvh < nkv; kvh++)
+            attn_gqa_kv_q8(out, q, kcache, vcache, row_sz, s0, pos, n_heads, nkv, hd, kv_dim,
+                           kvh, inv_d, attn_cap);
+    } else {
+        #pragma omp parallel for schedule(static) if (nseq >= 64)
+        for (hh = 0; hh < n_heads; hh++)
+            attn_qh_kv_q8(out + (size_t)hh * hd, q + (size_t)hh * hd,
+                          kcache, vcache, row_sz, s0, pos, 0, hd, kv_dim, inv_d, attn_cap);
+    }
+}

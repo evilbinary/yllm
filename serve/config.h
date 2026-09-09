@@ -94,6 +94,7 @@ typedef struct {
     int64_t budget;         /* rank KV 内存预算(MB; -1 = auto)。解析时由 "auto"/"1024MB"/"1.5G" 转成 */
     int depth;
     char device[32];        /* cpu | cuda | vulkan(见 design-gpu / design-mobile) */
+    char kv_dtype[8];       /* KV cache 格式: f16(默认) | q8(per-token int8, 仅 CPU) */
     int gpu;                /* CUDA device index(默认 0) */
     char gpu_weights[16];   /* auto | q4k | fp16(CUDA 线性权上卡格式) */
     int gpu_layers;         /* -1=全 GPU; >=0 单进程混合: 前 N 个 block(+embed) 在 GPU */
@@ -178,6 +179,7 @@ static inline void config_defaults(ServeConfig* c)
     c->budget = -1;   /* 默认自动 */
     c->depth = 2;
     snprintf(c->device, sizeof(c->device), "cpu");
+    snprintf(c->kv_dtype, sizeof(c->kv_dtype), "f16");
     c->gpu = 0;
     snprintf(c->gpu_weights, sizeof(c->gpu_weights), "auto");
     c->gpu_layers = -1;
@@ -300,6 +302,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->depth = atoi(val);
     } else if (strcmp(key, "device") == 0) {
         snprintf(c->device, sizeof(c->device), "%s", val);
+    } else if (strcmp(key, "kv") == 0 || strcmp(key, "kv-dtype") == 0) {
+        snprintf(c->kv_dtype, sizeof(c->kv_dtype), "%s", val);
     } else if (strcmp(key, "gpu") == 0) {
         c->gpu = atoi(val);
     } else if (strcmp(key, "gpu-weights") == 0 || strcmp(key, "gpu_weights") == 0) {

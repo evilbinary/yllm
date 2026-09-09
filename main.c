@@ -401,9 +401,10 @@ static int cmd_gen(int argc, char** argv)
     const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
     const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
+    const char* kv_s = opt(a, n, "kv", "f16");
 
     if (!m) {
-        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1]\n");
+        fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--kv f16|q8]\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -450,6 +451,20 @@ static int cmd_gen(int argc, char** argv)
                 vocab_free(&v);
                 return 1;
             }
+        }
+        if (strcmp(kv_s, "q8") == 0) {
+            if (dk != DEV_CPU) {
+                fprintf(stderr, "--kv q8 only supports --device cpu\n");
+                engine_free(&e);
+                vocab_free(&v);
+                return 1;
+            }
+            engine_set_kv_q8(&e);
+        } else if (kv_s[0] && strcmp(kv_s, "f16") != 0) {
+            fprintf(stderr, "bad --kv %s (want f16|q8)\n", kv_s);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
         }
     }
     e.mtp_enable = mtp && e.mtp_eh_slot;
@@ -567,11 +582,12 @@ static int cmd_chat(int argc, char** argv)
     const char* gpu_w_s = opt(a, n, "gpu-weights", "auto");
     const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
+    const char* kv_s = opt(a, n, "kv", "f16");
     YOpt yopt;
     int ai;
 
     if (!m) {
-        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--mmproj <mmproj.gguf> --image <img>] [--opt k=v,...] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--mmproj <mmproj.gguf> --image <img>] [--opt k=v,...] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--kv f16|q8] [--no-template 1] [--no-bos 1]\n");
         fprintf(stderr, "  --opt keys: max_soft_tokens,min_soft_tokens,downsample_mode,max_slice_nums,enable_thinking\n");
         return 1;
     }
@@ -638,6 +654,20 @@ static int cmd_chat(int argc, char** argv)
                 vocab_free(&v);
                 return 1;
             }
+        }
+        if (strcmp(kv_s, "q8") == 0) {
+            if (dk != DEV_CPU) {
+                fprintf(stderr, "--kv q8 only supports --device cpu\n");
+                engine_free(&e);
+                vocab_free(&v);
+                return 1;
+            }
+            engine_set_kv_q8(&e);
+        } else if (kv_s[0] && strcmp(kv_s, "f16") != 0) {
+            fprintf(stderr, "bad --kv %s (want f16|q8)\n", kv_s);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
         }
     }
     e.mtp_enable = mtp && e.mtp_eh_slot;

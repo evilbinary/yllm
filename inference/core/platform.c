@@ -580,6 +580,30 @@ void bf16_to_f16_buf(const uint16_t* src, uint16_t* dst, size_t n)
     for (i = 0; i < n; i++) dst[i] = bf16_to_f16(src[i]);
 }
 
+/* KV q8 行编码: [2B f16 scale][int8 × n], 对称量化 scale = amax/127 */
+void f32_to_q8_buf(const float* src, uint8_t* dst, uint32_t n)
+{
+    float amax = 0.0f, scale, inv;
+    uint16_t s16;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        float a = src[i] < 0 ? -src[i] : src[i];
+        if (a > amax) amax = a;
+    }
+    scale = amax / 127.0f;
+    if (!(scale > 0.0f)) scale = 1e-30f;   /* 全 0 行: scale 取最小正值, int8 全 0 */
+    inv = 1.0f / scale;
+    s16 = f32_to_f16(scale);
+    dst[0] = (uint8_t)(s16 & 0xff);
+    dst[1] = (uint8_t)(s16 >> 8);
+    for (i = 0; i < n; i++) {
+        int v = (int)lrintf(src[i] * inv);
+        if (v > 127) v = 127;
+        else if (v < -127) v = -127;
+        dst[2 + i] = (uint8_t)v;
+    }
+}
+
 uint64_t ysrand(uint64_t seed)
 {
     if (seed == 0) seed = 0x9e3779b97f4a7c15ull;

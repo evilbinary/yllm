@@ -290,14 +290,23 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
             rope_inplace_mrope(k + (size_t)hh * hd, hd, n_rot, pos, theta);
 
         /* 写 KV cache + attention(复用现有逻辑) */
-        uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
-        uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
-        uint64_t kvp = (uint64_t)pos * kv_dim;
-        f32_to_f16_buf(k, kcache + kvp, kv_dim);
-        f32_to_f16_buf(v, vcache + kvp, kv_dim);
+        uint8_t* kcache = (uint8_t*)e->kv + (size_t)layer * e->max_seq * e->kv_row_sz;
+        uint8_t* vcache = (uint8_t*)e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * e->kv_row_sz;
+        size_t kvp = (size_t)pos * e->kv_row_sz;
+        if (e->kv_q8) {
+            f32_to_q8_buf(k, kcache + kvp, kv_dim);
+            f32_to_q8_buf(v, vcache + kvp, kv_dim);
+        } else {
+            f32_to_f16_buf(k, (uint16_t*)(kcache + kvp), kv_dim);
+            f32_to_f16_buf(v, (uint16_t*)(vcache + kvp), kv_dim);
+        }
         float inv_d = 1.0f / sqrtf((float)hd);
-        attn_kv_f16(att_out, q, kcache, vcache, 0, pos,
-                    n_heads, n_kv, hd, kv_dim, inv_d, 0.0f);
+        if (e->kv_q8)
+            attn_kv_q8(att_out, q, kcache, vcache, e->kv_row_sz, 0, pos,
+                       n_heads, n_kv, hd, kv_dim, inv_d, 0.0f);
+        else
+            attn_kv_f16(att_out, q, (const uint16_t*)kcache, (const uint16_t*)vcache, 0, pos,
+                        n_heads, n_kv, hd, kv_dim, inv_d, 0.0f);
         /* gate 门控: att_out *= sigmoid(gate) */
         for (ii = 0; ii < qdim; ii++)
             att_out[ii] *= 1.0f / (1.0f + expf(-gate[ii]));

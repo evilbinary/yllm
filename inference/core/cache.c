@@ -319,20 +319,22 @@ int sess_kv_save(Engine* e, uint32_t pos, const char* path)
 {
     const LlfHeader* h = &e->ws.model.h;
     uint32_t kv_dim = e->kv_dim, max_seq = e->max_seq, nb = h->n_blocks;
+    uint32_t flags = e->kv_q8 ? 1u : 0u;
     FILE* f = fopen(path, "wb");
     if (!f) return -1;
     int rc = 0;
     if (write_all(f, SESS_KV_MAGIC, 8) != 0 ||
         write_all(f, &nb, 4) != 0 || write_all(f, &kv_dim, 4) != 0 ||
-        write_all(f, &max_seq, 4) != 0 || write_all(f, &pos, 4) != 0)
+        write_all(f, &max_seq, 4) != 0 || write_all(f, &pos, 4) != 0 ||
+        write_all(f, &flags, 4) != 0)
         rc = -1;
-    size_t row = (size_t)pos * kv_dim;
+    size_t rowb = (size_t)pos * e->kv_row_sz;
     uint32_t l;
     /* 前向用块 1..nb 的 kv 分区(区域 1..nb 为 K, nb+1..2nb 为 V); 区域 0 未用 */
     for (l = 1; !rc && l <= nb; l++) {
-        const uint16_t* k = e->kv + (size_t)l * max_seq * kv_dim;
-        const uint16_t* v = e->kv + (size_t)(h->n_blocks + l) * max_seq * kv_dim;
-        if (write_all(f, k, row * 2) != 0 || write_all(f, v, row * 2) != 0) rc = -1;
+        const uint8_t* k = (const uint8_t*)e->kv + (size_t)l * max_seq * e->kv_row_sz;
+        const uint8_t* v = (const uint8_t*)e->kv + (size_t)(h->n_blocks + l) * max_seq * e->kv_row_sz;
+        if (write_all(f, k, rowb) != 0 || write_all(f, v, rowb) != 0) rc = -1;
     }
     fclose(f);
     return rc;
@@ -366,23 +368,24 @@ int sess_kv_load(Engine* e, const char* path, uint32_t* pos)
     FILE* f = fopen(path, "rb");
     if (!f) return -1;
     char magic[8];
-    uint32_t nb = 0, kv_dim = 0, max_seq = 0, pos0 = 0;
+    uint32_t nb = 0, kv_dim = 0, max_seq = 0, pos0 = 0, flags = 0;
     int rc = 0;
     if (read_all(f, magic, 8) != 0 || memcmp(magic, SESS_KV_MAGIC, 8) != 0) rc = -1;
     else if (read_all(f, &nb, 4) != 0 || read_all(f, &kv_dim, 4) != 0 ||
-             read_all(f, &max_seq, 4) != 0 || read_all(f, &pos0, 4) != 0)
+             read_all(f, &max_seq, 4) != 0 || read_all(f, &pos0, 4) != 0 ||
+             read_all(f, &flags, 4) != 0)
         rc = -1;
-    /* 结构与引擎不符 → 拒绝载入(防错模型/错配置) */
+    /* 结构与引擎不符 → 拒绝载入(防错模型/错配置; flags: 旧文件无此字段也读失败, 一并拒绝) */
     else if (nb != h->n_blocks || kv_dim != e->kv_dim || max_seq != e->max_seq ||
-             pos0 > max_seq)
+             pos0 > max_seq || flags != (e->kv_q8 ? 1u : 0u))
         rc = -1;
     else {
-        size_t row = (size_t)pos0 * kv_dim;
+        size_t rowb = (size_t)pos0 * e->kv_row_sz;
         uint32_t l;
         for (l = 1; !rc && l <= nb; l++) {
-            uint16_t* k = e->kv + (size_t)l * max_seq * kv_dim;
-            uint16_t* v = e->kv + (size_t)(h->n_blocks + l) * max_seq * kv_dim;
-            if (read_all(f, k, row * 2) != 0 || read_all(f, v, row * 2) != 0) rc = -1;
+            uint8_t* k = (uint8_t*)e->kv + (size_t)l * max_seq * e->kv_row_sz;
+            uint8_t* v = (uint8_t*)e->kv + (size_t)(h->n_blocks + l) * max_seq * e->kv_row_sz;
+            if (read_all(f, k, rowb) != 0 || read_all(f, v, rowb) != 0) rc = -1;
         }
         if (!rc && pos) *pos = pos0;
     }

@@ -98,6 +98,8 @@ uint16_t f32_to_f16(float f);
 uint16_t bf16_to_f16(uint16_t b);
 void f32_to_f16_buf(const float* src, uint16_t* dst, size_t n);
 void bf16_to_f16_buf(const uint16_t* src, uint16_t* dst, size_t n);
+/* KV q8: per-token 对称量化. dst = [2B f16 scale][int8 × n], scale = amax/127 */
+void f32_to_q8_buf(const float* src, uint8_t* dst, uint32_t n);
 
 /* ---- 转换层 ---- */
 int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_seq, char* err, size_t errlen);
@@ -137,7 +139,9 @@ int vocab_has_template(Vocab* v);
 /* ---- 引擎 ---- */
 typedef struct Engine {
     Ws ws;
-    uint16_t* kv;
+    uint8_t* kv;      /* KV 缓冲(字节寻址): f16 行 = 2*kv_dim B; q8 行 = 2B scale + kv_dim int8 */
+    uint32_t kv_row_sz;  /* 每 token 每段字节数(kv_dim*2 或 kv_dim+2) */
+    int      kv_q8;      /* 1 = KV int8 per-token 量化(--kv q8, 仅 CPU 路径) */
     uint32_t kv_dim;
     uint32_t max_seq;
     uint32_t inter;   /* FFN 中间维度(gate/up 输出宽) */
@@ -258,9 +262,12 @@ int engine_load_weights(Engine* e, char* err, size_t errlen);
 /* 用显式 layer_base / kv 跑默认块前向(CPU 算子)。
  * CUDA host-shim 的 load_weights 把权拷到 w_dev 后复用此函数校验/过渡。 */
 int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
-                        const uint8_t* layer_base, uint16_t* kv);
+                        const uint8_t* layer_base, uint8_t* kv);
 /* 清掉 Device 上的层内核覆盖(回到 Arch CPU)。load_weights / host-shim 会再挂 GPU。 */
 void engine_attach_cpu_fwd(Engine* e);
+/* KV cache 切 q8(per-token int8 + f16 scale, 内存减半)。须在首次前向/会话恢复前调用;
+ * 仅支持 CPU 前向路径(--device cpu), GPU 后端保持 F16。 */
+void engine_set_kv_q8(Engine* e);
 int engine_forward(Engine* e, uint32_t token, uint32_t pos);
 int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos,
                          float* x_out, float* logits_out);

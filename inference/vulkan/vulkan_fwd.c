@@ -483,7 +483,7 @@ static int vulkan_fwd_block_ex(Engine* e, uint32_t layer, uint32_t pos, int sync
 {
     VulkanCtx* ctx = (VulkanCtx*)e->w_dev;
     const uint8_t* base = (const uint8_t*)e->ws.map.base + e->ws.model.dir[layer].offset;
-    uint16_t* kv = e->kv;
+    uint16_t* kv = (uint16_t*)e->kv;   /* GPU 路径仅 f16 布局(q8 由 CLI 拒绝) */
 
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;

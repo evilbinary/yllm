@@ -1362,6 +1362,16 @@ int cmd_rank(ServeConfig* cfg)
         vocab_free(&r.vocab);
         return 1;
     }
+    /* --kv q8: KV cache per-token int8 量化(内存减半; 仅 CPU 路径) */
+    if (strcmp(cfg->kv_dtype, "q8") == 0) {
+        if (cfg->device[0] && strcmp(cfg->device, "cpu") != 0) {
+            ylog_error("rank: --kv q8 only supports device=cpu (got %s)", cfg->device);
+            engine_free(&r.engine);
+            vocab_free(&r.vocab);
+            return 1;
+        }
+        engine_set_kv_q8(&r.engine);
+    }
     r.vis = NULL;
     if (cfg->mmproj[0]) {
         r.vis = vision_load(cfg->mmproj, err, sizeof(err));

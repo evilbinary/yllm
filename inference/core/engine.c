@@ -319,7 +319,9 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
     e->layer_end = m->n_layers;
     e->kv_dim = kv_dim;
     e->max_seq = m->h.max_seq;
-    e->kv = (uint16_t*)ycalloc((size_t)(2 * m->h.n_blocks + 1) * e->max_seq * kv_dim, 2);
+    e->kv = (uint8_t*)ycalloc((size_t)(2 * m->h.n_blocks + 1) * e->max_seq * kv_dim * 2, 1);
+    e->kv_row_sz = kv_dim * 2;   /* f16 行 */
+    e->kv_q8 = 0;
     e->x = (float*)ycalloc(hidden, 4);
     e->hb = (float*)ycalloc(hidden, 4 * 9);
     /* hb2 需容纳 q(q_dim) + k(kv_dim) + v(kv_dim) + att_out(hidden); 至少 9*hidden */
@@ -694,10 +696,23 @@ static int engine_forward_prefill_mix(Engine* e, const uint32_t* tokens, int n, 
 }
 
 int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
-                        const uint8_t* base, uint16_t* kv)
+                        const uint8_t* base, uint8_t* kv)
 {
     int qwen = e->ops && e->ops->qwen_rope;
     return arch_llama_fwd_block_at(e, layer, pos, base, kv, qwen);
+}
+
+/* KV cache 切 q8: 释放 f16 缓冲重分配 q8 布局(空 cache 时无损)。
+ * 仅 CPU 路径; GPU 后端(cuda_fwd/vulkan_fwd 按 f16 布局上卡)由调用方禁止组合。 */
+void engine_set_kv_q8(Engine* e)
+{
+    if (!e || e->kv_q8) return;
+    free(e->kv);
+    e->kv_row_sz = e->kv_dim + 2;   /* [2B scale][int8 × kv_dim] */
+    e->kv = (uint8_t*)ycalloc((size_t)(2 * e->ws.model.h.n_blocks + 1) * e->max_seq * e->kv_row_sz, 1);
+    e->kv_q8 = 1;
+    ylog_info("engine: kv cache q8 (row=%u B, mem -%.0f%%)",
+              e->kv_row_sz, 100.0 - 100.0 * (double)e->kv_row_sz / (double)(e->kv_dim * 2));
 }
 
 void engine_attach_cpu_fwd(Engine* e)

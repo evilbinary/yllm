@@ -28,7 +28,7 @@ const float* cuda_tensor_f32(const Engine* e, uint32_t layer, uint32_t slot, uin
 static int cuda_fwd_block_shim(Engine* e, uint32_t layer, uint32_t pos)
 {
     const uint8_t* base = cuda_layer_base(e, layer);
-    uint16_t* kv = e->d_kv ? (uint16_t*)e->d_kv : e->kv;
+    uint16_t* kv = e->d_kv ? (uint16_t*)e->d_kv : (uint16_t*)e->kv;
     if (!base)
         base = (const uint8_t*)e->ws.map.base + e->ws.model.dir[layer].offset;
     return engine_fwd_block_at(e, layer, pos, base, kv);

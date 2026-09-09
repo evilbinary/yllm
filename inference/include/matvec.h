@@ -85,6 +85,12 @@ void attn_kv_f16(float* out, const float* q,
                  uint32_t s0, uint32_t pos,
                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
                  float inv_d, float attn_cap);
+/* KV q8 行([2B f16 scale][int8 × kv_dim]) 版本; row_sz = 每 token 行字节数 */
+void attn_kv_q8(float* out, const float* q,
+                const uint8_t* kcache, const uint8_t* vcache, uint32_t row_sz,
+                uint32_t s0, uint32_t pos,
+                uint32_t n_heads, uint32_t n_kv_heads, uint32_t hd, uint32_t kv_dim,
+                float inv_d, float attn_cap);
 
 /* 单块解量化(导出供测试/embed 使用) */
 void q4k_block(float* y, const uint8_t* blk, uint32_t stride);

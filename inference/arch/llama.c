@@ -120,13 +120,18 @@ int arch_llama_fwd_block_batch_rope(Engine* e, uint32_t layer, uint32_t pos_star
                 rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, pos, theta);
         }
         {
-            uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
-            uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
-            uint64_t kvp = (uint64_t)pos * kv_dim;
+            uint8_t* kcache = (uint8_t*)e->kv + (size_t)layer * e->max_seq * e->kv_row_sz;
+            uint8_t* vcache = (uint8_t*)e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * e->kv_row_sz;
+            size_t ofp = (size_t)pos * e->kv_row_sz;
             const float* kvk = e->pbk + (size_t)b * kv_dim;
             const float* kvv = e->pbv + (size_t)b * kv_dim;
-            f32_to_f16_buf(kvk, kcache + kvp, kv_dim);
-            f32_to_f16_buf(kvv, vcache + kvp, kv_dim);
+            if (e->kv_q8) {
+                f32_to_q8_buf(kvk, kcache + ofp, kv_dim);
+                f32_to_q8_buf(kvv, vcache + ofp, kv_dim);
+            } else {
+                f32_to_f16_buf(kvk, (uint16_t*)(kcache + ofp), kv_dim);
+                f32_to_f16_buf(kvv, (uint16_t*)(vcache + ofp), kv_dim);
+            }
         }
     }
 
@@ -134,14 +139,19 @@ int arch_llama_fwd_block_batch_rope(Engine* e, uint32_t layer, uint32_t pos_star
     {
         uint32_t bb;
         float inv_d = 1.0f / sqrtf((float)h->head_dim);
-        uint16_t* kcache = e->kv + (size_t)layer * e->max_seq * kv_dim;
-        uint16_t* vcache = e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
+        uint8_t* kcache = (uint8_t*)e->kv + (size_t)layer * e->max_seq * e->kv_row_sz;
+        uint8_t* vcache = (uint8_t*)e->kv + (size_t)(h->n_blocks + layer) * e->max_seq * e->kv_row_sz;
         #pragma omp parallel for schedule(static)
         for (bb = 0; bb < B; bb++) {
             uint32_t pos = pos_start + bb;
-            attn_kv_f16(e->pb2 + (size_t)bb * hidden, e->pbq + (size_t)bb * hidden,
-                        kcache, vcache, 0, pos,
-                        h->n_heads, h->n_kv_heads, h->head_dim, kv_dim, inv_d, 0.0f);
+            if (e->kv_q8)
+                attn_kv_q8(e->pb2 + (size_t)bb * hidden, e->pbq + (size_t)bb * hidden,
+                           kcache, vcache, e->kv_row_sz, 0, pos,
+                           h->n_heads, h->n_kv_heads, h->head_dim, kv_dim, inv_d, 0.0f);
+            else
+                attn_kv_f16(e->pb2 + (size_t)bb * hidden, e->pbq + (size_t)bb * hidden,
+                            (const uint16_t*)kcache, (const uint16_t*)vcache, 0, pos,
+                            h->n_heads, h->n_kv_heads, h->head_dim, kv_dim, inv_d, 0.0f);
         }
     }
 
@@ -168,7 +178,7 @@ int arch_llama_fwd_block_batch_rope(Engine* e, uint32_t layer, uint32_t pos_star
 }
 
 int arch_llama_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
-                            const uint8_t* base, uint16_t* kv, int qwen_rope)
+                            const uint8_t* base, uint8_t* kv, int qwen_rope)
 {
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -250,9 +260,9 @@ int arch_llama_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
                     base + mt[SLOT_KNORM].offset, hd, eps, mt[SLOT_KNORM].dtype);
     }
 
-    uint16_t* kcache = kv + (size_t)layer * e->max_seq * kv_dim;
-    uint16_t* vcache = kv + (size_t)(h->n_blocks + layer) * e->max_seq * kv_dim;
-    uint64_t kvp = (uint64_t)pos * kv_dim;
+    uint8_t* kcache = kv + (size_t)layer * e->max_seq * e->kv_row_sz;
+    uint8_t* vcache = kv + (size_t)(h->n_blocks + layer) * e->max_seq * e->kv_row_sz;
+    size_t kvp = (size_t)pos * e->kv_row_sz;
     uint32_t hh;
     for (hh = 0; hh < h->n_heads; hh++) {
         if (qwen_rope)
@@ -267,13 +277,22 @@ int arch_llama_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
             else
                 rope_inplace(k + (size_t)hh * hd, hd, pos, theta);
         }
-        f32_to_f16_buf(k, kcache + kvp, kvd);
-        f32_to_f16_buf(v, vcache + kvp, kvd);
+        if (e->kv_q8) {
+            f32_to_q8_buf(k, kcache + kvp, kvd);
+            f32_to_q8_buf(v, vcache + kvp, kvd);
+        } else {
+            f32_to_f16_buf(k, (uint16_t*)(kcache + kvp), kvd);
+            f32_to_f16_buf(v, (uint16_t*)(vcache + kvp), kvd);
+        }
     }
 
     float inv_d = 1.0f / sqrtf((float)hd);
-    attn_kv_f16(att_out, q, kcache, vcache, 0, pos,
-                h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
+    if (e->kv_q8)
+        attn_kv_q8(att_out, q, kcache, vcache, e->kv_row_sz, 0, pos,
+                   h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
+    else
+        attn_kv_f16(att_out, q, (const uint16_t*)kcache, (const uint16_t*)vcache, 0, pos,
+                    h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
     memcpy(x2, att_out, (size_t)q_dim * 4);
     matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, q_dim, mt[SLOT_O].dtype);
     add_inplace(x, att_out, hidden);

@@ -436,8 +436,8 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
     }
 
     {
-        uint16_t* kcache = e->kv + (size_t)kv_layer * e->max_seq * kv_dim;
-        uint16_t* vcache = e->kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * kv_dim;
+        uint8_t* kcache = (uint8_t*)e->kv + (size_t)kv_layer * e->max_seq * e->kv_row_sz;
+        uint8_t* vcache = (uint8_t*)e->kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * e->kv_row_sz;
         for (b = 0; b < B; b++) {
             uint32_t pos = pos_start + b;
             float* q = e->pbq + (size_t)b * q_dim;
@@ -475,8 +475,16 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
                     if (rope_if) rope_inplace_neox_if(k + (size_t)hh * hd, hd, pos, rope_if);
                     else rope_inplace_qwen_ff(k + (size_t)hh * hd, hd, pos, theta, NULL);
                 }
-                f32_to_f16_buf(k, kcache + (uint64_t)pos * kv_dim, kvd);
-                f32_to_f16_buf(v, vcache + (uint64_t)pos * kv_dim, kvd);
+                {
+                    size_t kvp = (size_t)pos * e->kv_row_sz;
+                    if (e->kv_q8) {
+                        f32_to_q8_buf(k, kcache + kvp, kvd);
+                        f32_to_q8_buf(v, vcache + kvp, kvd);
+                    } else {
+                        f32_to_f16_buf(k, (uint16_t*)(kcache + kvp), kvd);
+                        f32_to_f16_buf(v, (uint16_t*)(vcache + kvp), kvd);
+                    }
+                }
             }
         }
         #pragma omp parallel for schedule(static)
@@ -495,8 +503,12 @@ int arch_gemma4_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, u
                     while (kend > pos && ((int)kend >= e->vis_seq || !e->vis_use[kend]))
                         kend--;
                 }
-                attn_kv_f16(att_out, q, kcache, vcache, s0, kend,
-                            h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
+                if (e->kv_q8)
+                    attn_kv_q8(att_out, q, kcache, vcache, e->kv_row_sz, s0, kend,
+                               h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
+                else
+                    attn_kv_f16(att_out, q, (const uint16_t*)kcache, (const uint16_t*)vcache, s0, kend,
+                                h->n_heads, h->n_kv_heads, hd, kv_dim, inv_d, 0.0f);
             }
         }
     }
@@ -565,7 +577,7 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     LlModel* m = &ws->model;
     const LlfHeader* h = &m->h;
     const uint8_t* base = (const uint8_t*)ws->map.base + ws->model.dir[layer].offset;
-    uint16_t* kv = e->kv;
+    uint8_t* kv = e->kv;
     uint32_t hidden = h->hidden;
     uint32_t kv_dim = h->n_kv_heads * h->head_dim;
     float eps, theta;
@@ -664,9 +676,9 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
     }
 
     {
-        uint16_t* kcache = kv + (size_t)kv_layer * e->max_seq * kv_dim;
-        uint16_t* vcache = kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * kv_dim;
-        uint64_t kvp = (uint64_t)pos * kv_dim;
+        uint8_t* kcache = kv + (size_t)kv_layer * e->max_seq * e->kv_row_sz;
+        uint8_t* vcache = kv + (size_t)(h->n_blocks + kv_layer) * e->max_seq * e->kv_row_sz;
+        size_t kvp = (size_t)pos * e->kv_row_sz;
         int swa = llf_gemma4_is_swa(&g4, il);
         if (swa && c->rope_if_swa && c->n_rope_if_swa == hd / 2)
             rope_if = c->rope_if_swa;
@@ -685,13 +697,22 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
                 else
                     rope_inplace_qwen_ff(k + (size_t)hh * hd, hd, pos, theta, NULL);
             }
-            f32_to_f16_buf(k, kcache + kvp, kvd);
-            f32_to_f16_buf(v, vcache + kvp, kvd);
+            if (e->kv_q8) {
+                f32_to_q8_buf(k, kcache + kvp, kvd);
+                f32_to_q8_buf(v, vcache + kvp, kvd);
+            } else {
+                f32_to_f16_buf(k, (uint16_t*)(kcache + kvp), kvd);
+                f32_to_f16_buf(v, (uint16_t*)(vcache + kvp), kvd);
+            }
         }
         if (swa && g4.swa_window > 0 && pos + 1 > g4.swa_window)
             s0 = pos + 1 - g4.swa_window;
-        attn_kv_f16(att_out, q, kcache, vcache, s0, pos,
-                    h->n_heads, h->n_kv_heads, hd, kv_dim, 1.0f, 0.0f);
+        if (e->kv_q8)
+            attn_kv_q8(att_out, q, kcache, vcache, e->kv_row_sz, s0, pos,
+                       h->n_heads, h->n_kv_heads, hd, kv_dim, 1.0f, 0.0f);
+        else
+            attn_kv_f16(att_out, q, (const uint16_t*)kcache, (const uint16_t*)vcache, s0, pos,
+                        h->n_heads, h->n_kv_heads, hd, kv_dim, 1.0f, 0.0f);
     }
     memcpy(x2, att_out, (size_t)q_dim * 4);
     matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, q_dim, mt[SLOT_O].dtype);

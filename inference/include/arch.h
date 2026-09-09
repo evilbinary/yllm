@@ -40,7 +40,7 @@ const ArchOps* arch_lookup(uint32_t arch_id);
 int  arch_llama_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
 int  arch_llama_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
 int  arch_llama_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
-                            const uint8_t* layer_base, uint16_t* kv, int qwen_rope);
+                            const uint8_t* layer_base, uint8_t* kv, int qwen_rope);
 int  arch_llama_fwd_block_batch_rope(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B, int qwen_rope);
 int  arch_qwen_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
 int  arch_qwen_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
