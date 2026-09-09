@@ -27,6 +27,11 @@ typedef struct ArchOps {
 
     int (*fwd_block)(Engine* e, uint32_t layer, uint32_t pos);
     int (*fwd_block_batch)(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
+    /* 多槽位批量 decode(--parallel N): B 条独立序列各自 KV slot / pos,
+     * 每层一次权重搬运(matmul_batch 反量化一次)服务全部序列。
+     * 仅 llama/qwen 实现(CPU); 其他架构为 NULL, 运行期回退串行并提示。 */
+    int (*fwd_block_batch_slots)(Engine* e, uint32_t layer,
+                                 const uint32_t* slots, const uint32_t* pos, uint32_t B);
 } ArchOps;
 
 extern const ArchOps arch_llama_ops;
@@ -42,6 +47,8 @@ int  arch_llama_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32
 int  arch_llama_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
                             const uint8_t* layer_base, uint8_t* kv, int qwen_rope);
 int  arch_llama_fwd_block_batch_rope(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B, int qwen_rope);
+int  arch_llama_fwd_block_batch_slots(Engine* e, uint32_t layer,
+                                      const uint32_t* slots, const uint32_t* pos, uint32_t B);
 int  arch_qwen_fwd_block(Engine* e, uint32_t layer, uint32_t pos);
 int  arch_qwen_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);
 int  arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos);

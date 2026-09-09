@@ -22,6 +22,7 @@ const ArchOps arch_llama_ops = {
     .qwen_rope = 0,
     .fwd_block = arch_llama_fwd_block,
     .fwd_block_batch = arch_llama_fwd_block_batch,
+    .fwd_block_batch_slots = arch_llama_fwd_block_batch_slots,
 };
 
 int arch_llama_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
@@ -33,6 +34,157 @@ int arch_llama_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 int arch_llama_fwd_block_batch(Engine* e, uint32_t layer, uint32_t pos_start, uint32_t B)
 {
     return arch_llama_fwd_block_batch_rope(e, layer, pos_start, B, 0);
+}
+
+/* 多槽位批量 decode: B 条独立序列(各自 KV slot 与 pos)共用一次权重搬运。
+ * 与 fwd_block_batch_rope 的差别仅在 KV 寻址(加 slot 维)与每序列独立 pos;
+ * 全部线性层走 matmul_batch —— 量化块反量化一次、B 条序列共享,
+ * 这就是"一次权重搬运服务多个 token"的算子级实现。
+ * qwen 复用本函数(经 e->ops->qwen_rope 区分 RoPE 风格)。 */
+int arch_llama_fwd_block_batch_slots(Engine* e, uint32_t layer,
+                                     const uint32_t* slots, const uint32_t* pos, uint32_t B)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base + m->dir[layer].offset;
+    uint32_t hidden = h->hidden;
+    uint32_t kv_dim = h->n_kv_heads * h->head_dim;
+    float eps, theta;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    memcpy(&theta, &h->rope_theta_bits, 4);
+    int qwen_rope = e->ops ? e->ops->qwen_rope : 0;
+    uint32_t hidx = m->base_idx[layer];
+    const LlfTensorMeta* mt = &m->metas[hidx];
+    uint32_t inter = mt[SLOT_GATE].shape[0] * mt[SLOT_GATE].shape[1] / hidden;
+    uint32_t b;
+    uint64_t slot_stride = e->kv_slot_stride;
+
+    /* 1) norm + QKV(批量) */
+    for (b = 0; b < B; b++)
+        rmsnorm(e->pb2 + (size_t)b * hidden, e->pb + (size_t)b * hidden,
+                base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
+    matmul_batch(e->pbq, e->pb2, base + mt[SLOT_Q].offset, hidden, hidden, mt[SLOT_Q].dtype, B);
+    matmul_batch(e->pbk, e->pb2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype, B);
+    matmul_batch(e->pbv, e->pb2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype, B);
+
+    /* 2) bias + QK-norm */
+    if (mt[SLOT_QBIAS].size > 0) {
+        const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
+        for (b = 0; b < B; b++) {
+            float* q = e->pbq + (size_t)b * hidden;
+            uint32_t j;
+            for (j = 0; j < hidden; j++) q[j] += bq[j];
+        }
+    }
+    if (mt[SLOT_KBIAS].size > 0) {
+        const float* bk = (const float*)(base + mt[SLOT_KBIAS].offset);
+        for (b = 0; b < B; b++) {
+            float* k = e->pbk + (size_t)b * kv_dim;
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) k[j] += bk[j];
+        }
+    }
+    if (mt[SLOT_VBIAS].size > 0) {
+        const float* bv = (const float*)(base + mt[SLOT_VBIAS].offset);
+        for (b = 0; b < B; b++) {
+            float* v = e->pbv + (size_t)b * kv_dim;
+            uint32_t j;
+            for (j = 0; j < kv_dim; j++) v[j] += bv[j];
+        }
+    }
+    if (mt[SLOT_QNORM].size > 0 || mt[SLOT_KNORM].size > 0) {
+        for (b = 0; b < B; b++) {
+            float* q = e->pbq + (size_t)b * hidden;
+            float* k = e->pbk + (size_t)b * kv_dim;
+            uint32_t hh;
+            if (mt[SLOT_QNORM].size > 0)
+                for (hh = 0; hh < h->n_heads; hh++)
+                    rmsnorm(q + (size_t)hh * h->head_dim, q + (size_t)hh * h->head_dim,
+                            base + mt[SLOT_QNORM].offset, h->head_dim, eps, mt[SLOT_QNORM].dtype);
+            if (mt[SLOT_KNORM].size > 0)
+                for (hh = 0; hh < h->n_kv_heads; hh++)
+                    rmsnorm(k + (size_t)hh * h->head_dim, k + (size_t)hh * h->head_dim,
+                            base + mt[SLOT_KNORM].offset, h->head_dim, eps, mt[SLOT_KNORM].dtype);
+        }
+    }
+
+    /* 3) RoPE(各自 pos) + KV 写入(各自 slot) */
+    for (b = 0; b < B; b++) {
+        uint32_t p = pos[b];
+        float* q = e->pbq + (size_t)b * hidden;
+        float* k = e->pbk + (size_t)b * kv_dim;
+        uint32_t hh;
+        for (hh = 0; hh < h->n_heads; hh++) {
+            if (qwen_rope)
+                rope_inplace_qwen(q + (size_t)hh * h->head_dim, h->head_dim, p, theta);
+            else
+                rope_inplace(q + (size_t)hh * h->head_dim, h->head_dim, p, theta);
+        }
+        for (hh = 0; hh < h->n_kv_heads; hh++) {
+            if (qwen_rope)
+                rope_inplace_qwen(k + (size_t)hh * h->head_dim, h->head_dim, p, theta);
+            else
+                rope_inplace(k + (size_t)hh * h->head_dim, h->head_dim, p, theta);
+        }
+        {
+            uint8_t* kcache = (uint8_t*)e->kv + (size_t)slots[b] * slot_stride
+                            + (size_t)layer * e->max_seq * e->kv_row_sz;
+            uint8_t* vcache = (uint8_t*)e->kv + (size_t)slots[b] * slot_stride
+                            + (size_t)(h->n_blocks + layer) * e->max_seq * e->kv_row_sz;
+            size_t ofp = (size_t)p * e->kv_row_sz;
+            const float* kvk = e->pbk + (size_t)b * kv_dim;
+            const float* kvv = e->pbv + (size_t)b * kv_dim;
+            if (e->kv_q8) {
+                f32_to_q8_buf(kvk, kcache + ofp, kv_dim);
+                f32_to_q8_buf(kvv, vcache + ofp, kv_dim);
+            } else {
+                f32_to_f16_buf(kvk, (uint16_t*)(kcache + ofp), kv_dim);
+                f32_to_f16_buf(kvv, (uint16_t*)(vcache + ofp), kv_dim);
+            }
+        }
+    }
+
+    /* 4) 注意力: 各序列因果关注自己 slot 的 0..pos_b; OpenMP 切 B 维 */
+    {
+        uint32_t bb;
+        float inv_d = 1.0f / sqrtf((float)h->head_dim);
+        #pragma omp parallel for schedule(static)
+        for (bb = 0; bb < B; bb++) {
+            uint8_t* kcache = (uint8_t*)e->kv + (size_t)slots[bb] * slot_stride
+                            + (size_t)layer * e->max_seq * e->kv_row_sz;
+            uint8_t* vcache = (uint8_t*)e->kv + (size_t)slots[bb] * slot_stride
+                            + (size_t)(h->n_blocks + layer) * e->max_seq * e->kv_row_sz;
+            if (e->kv_q8)
+                attn_kv_q8(e->pb2 + (size_t)bb * hidden, e->pbq + (size_t)bb * hidden,
+                           kcache, vcache, e->kv_row_sz, 0, pos[bb],
+                           h->n_heads, h->n_kv_heads, h->head_dim, kv_dim, inv_d, 0.0f);
+            else
+                attn_kv_f16(e->pb2 + (size_t)bb * hidden, e->pbq + (size_t)bb * hidden,
+                            (const uint16_t*)kcache, (const uint16_t*)vcache, 0, pos[bb],
+                            h->n_heads, h->n_kv_heads, h->head_dim, kv_dim, inv_d, 0.0f);
+        }
+    }
+
+    /* 5) o_proj + 残差, norm2, FFN */
+    matmul_batch(e->pbq, e->pb2, base + mt[SLOT_O].offset, hidden, hidden, mt[SLOT_O].dtype, B);
+    for (b = 0; b < B; b++) {
+        float* xb = e->pb + (size_t)b * hidden;
+        float* ob = e->pbq + (size_t)b * hidden;
+        add_inplace(xb, ob, hidden);
+        rmsnorm(e->pb2 + (size_t)b * hidden, xb, base + mt[SLOT_NORM2].offset,
+                hidden, eps, mt[SLOT_NORM2].dtype);
+    }
+    matmul_batch(e->pbg, e->pb2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype, B);
+    matmul_batch(e->pbu, e->pb2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype, B);
+    for (b = 0; b < B; b++)
+        swiglu(e->pbg + (size_t)b * inter, e->pbg + (size_t)b * inter, e->pbu + (size_t)b * inter, inter);
+    matmul_batch(e->pbq, e->pbg, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype, B);
+    for (b = 0; b < B; b++) {
+        float* xb = e->pb + (size_t)b * hidden;
+        add_inplace(xb, e->pbq + (size_t)b * hidden, hidden);
+    }
+    return 0;
 }
 
 /* 批量前向一层: 同时处理 B 个 token(pos 连续: pos_start..pos_start+B-1) */

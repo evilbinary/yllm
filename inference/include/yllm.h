@@ -142,6 +142,8 @@ typedef struct Engine {
     uint8_t* kv;      /* KV 缓冲(字节寻址): f16 行 = 2*kv_dim B; q8 行 = 2B scale + kv_dim int8 */
     uint32_t kv_row_sz;  /* 每 token 每段字节数(kv_dim*2 或 kv_dim+2) */
     int      kv_q8;      /* 1 = KV int8 per-token 量化(--kv q8, 仅 CPU 路径) */
+    uint32_t n_slots;        /* 并行共享权重解码的 KV 槽位数(0/1 = 单序列, 默认) */
+    uint64_t kv_slot_stride; /* 每 slot 字节跨度 = (2*n_blocks+1)*max_seq*kv_row_sz */
     uint32_t kv_dim;
     uint32_t max_seq;
     uint32_t inter;   /* FFN 中间维度(gate/up 输出宽) */
@@ -301,6 +303,20 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
                         int (*on_token)(uint32_t id, void* ctx), void* ctx,
                         EngineTimings* timings, char* err, size_t errlen);
 uint64_t engine_resident(const Engine* e);
+
+/* ---- 并行共享权重解码(--parallel N, 仅 llama/qwen + CPU) ----
+ * N 条独立序列的 KV 各占一个 slot, 每步把 N 条序列堆成 batch 走一次前向:
+ * matmul_batch 每层反量化一次权重块服务全部序列(一次权重搬运, N 倍产出)。
+ * 须在首次前向前调用 engine_set_parallel_slots(KV 尚空时无损扩容)。 */
+void engine_set_parallel_slots(Engine* e, uint32_t n);
+/* 多序列并行生成: prompts[s]/nprompts[s] 各自 prefill 后 batch decode。
+ * on_token(seq, id, ctx) 按序列回调; ntokens 为每序列生成上限。
+ * 仅支持 llama/qwen 架构 + --device cpu; 其余情况 err 返回 -1。 */
+int engine_generate_parallel(Engine* e, const uint32_t* const* prompts,
+                             const int* nprompts, int nseq, int ntokens,
+                             float temp, float top_p, uint64_t seed, int eos_stop,
+                             int (*on_token)(int seq, uint32_t id, void* ctx), void* ctx,
+                             EngineTimings* timings, char* err, size_t errlen);
 
 uint64_t ysrand(uint64_t seed);
 uint64_t yrng(uint64_t* s);

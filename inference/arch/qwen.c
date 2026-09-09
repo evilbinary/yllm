@@ -22,4 +22,5 @@ const ArchOps arch_qwen_ops = {
     .qwen_rope = 1,
     .fwd_block = arch_qwen_fwd_block,
     .fwd_block_batch = arch_qwen_fwd_block_batch,
+    .fwd_block_batch_slots = arch_llama_fwd_block_batch_slots, /* 内部读 e->ops->qwen_rope */
 };

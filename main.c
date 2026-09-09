@@ -377,10 +377,21 @@ static uint64_t budget_bytes_from_str(const char* model_path, const char* s)
     return (uint64_t)mb * 1024 * 1024;
 }
 
+/* --parallel: 按序列缓存生成 token, 结束后统一解码打印 */
+typedef struct { uint32_t** buf; int* len; int cap; } ParTokCtx;
+
+static int par_on_token_cb(int seq, uint32_t id, void* ud)
+{
+    ParTokCtx* c = (ParTokCtx*)ud;
+    if (seq < 0 || !c || !c->buf || !c->buf[seq]) return 0;
+    if (c->len[seq] < c->cap) c->buf[seq][c->len[seq]++] = id;
+    return 0;
+}
+
 static int cmd_gen(int argc, char** argv)
 {
-    Arg a[16];
-    int n = parse_args(argc, argv, 2, a, 16);
+    Arg a[24];
+    int n = parse_args(argc, argv, 2, a, 24);
     const char* m = opt(a, n, "model", NULL);
     const char* vocab = opt(a, n, "vocab", "vocab.txt");
     const char* prompt = opt(a, n, "prompt", "Once upon a time");
@@ -402,9 +413,12 @@ static int cmd_gen(int argc, char** argv)
     const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
     const char* kv_s = opt(a, n, "kv", "f16");
+    int parallel = atoi(opt(a, n, "parallel", "0"));
+    const char* par_prompt_file = opt(a, n, "parallel-prompt", NULL);
 
     if (!m) {
         fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--kv f16|q8]\n");
+        fprintf(stderr, "      [--parallel N] [--parallel-prompt FILE]  (并行共享权重解码: N 条序列 batch, 一次权重搬运服务全部; llama/qwen + CPU)\n");
         fprintf(stderr, "   or: yllm gen --model <file.llf> --ranks N --rank R [--port-base P]  (分布式层流水线, 所有 rank 相同命令)\n");
         return 1;
     }
@@ -470,6 +484,45 @@ static int cmd_gen(int argc, char** argv)
     e.mtp_enable = mtp && e.mtp_eh_slot;
     if (mtp && !e.mtp_eh_slot)
         fprintf(stderr, "warning: --mtp requested but model has no MTP weights\n");
+    /* 并行共享权重解码: 开关检查 + KV 扩容为 N 个槽位(须在首次前向前) */
+    if (parallel > 1) {
+        DeviceKind par_dk = DEV_CPU;
+        device_kind_parse(device_s, &par_dk);
+        if (ranks > 1) {
+            fprintf(stderr, "--parallel 不支持与 --ranks 分布式同用\n");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (par_dk != DEV_CPU) {
+            fprintf(stderr, "--parallel only supports --device cpu\n");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (!e.ops || !e.ops->fwd_block_batch_slots) {
+            fprintf(stderr, "--parallel: arch %s 不支持(仅 llama/qwen)\n",
+                    e.ops ? e.ops->name : "?");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (parallel > (int)e.pb_cap) {
+            fprintf(stderr, "--parallel %d 超过批容量上限 %u\n", parallel, e.pb_cap);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        engine_set_parallel_slots(&e, (uint32_t)parallel);
+        if (e.n_slots < 2) {
+            fprintf(stderr, "--parallel: KV 扩容失败\n");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (mtp) fprintf(stderr, "warning: --parallel 与 --mtp 不同用, 已关闭 MTP\n");
+        e.mtp_enable = 0;
+    }
     /* 分布式分片: 按字节均衡切层 */
     if (ranks > 1) {
         if (dist_split_layers(&e, rank, ranks) != 0) {
@@ -499,6 +552,83 @@ static int cmd_gen(int argc, char** argv)
         /* 分布式层流水线各 rank 均执行 dist_gen */
         rc = dist_gen(&e, &v, ids, nprompt, ntokens, temp, top_p, seed,
                       rank, ranks, port_base, dist_addrs, dist_fp16, t0, on_token_cb, &v, NULL);
+        engine_free(&e);
+        vocab_free(&v);
+        free(ids);
+        return rc == 0 ? 0 : 1;
+    }
+
+    if (parallel > 1) {
+        /* 并行共享权重解码: N 条序列 batch, 每步每层一次权重搬运服务全部。
+         * 默认同一 prompt 复制 N 份(便于对照测加速比);
+         * --parallel-prompt FILE 则每行一条独立 prompt。 */
+        uint32_t** pids = (uint32_t**)ycalloc((size_t)parallel, sizeof(uint32_t*));
+        uint32_t** outs = (uint32_t**)ycalloc((size_t)parallel, sizeof(uint32_t*));
+        int* plens = (int*)ycalloc((size_t)parallel, sizeof(int));
+        int* olens = (int*)ycalloc((size_t)parallel, sizeof(int));
+        uint64_t tpar = ynow_ms();
+        ParTokCtx pctx;
+        int s, ok = pids && outs && plens && olens;
+        for (s = 0; s < parallel && ok; s++) {
+            pids[s] = (uint32_t*)ymalloc(4096 * 4);
+            outs[s] = (uint32_t*)ymalloc(((size_t)ntokens + 16) * 4);
+            if (!pids[s] || !outs[s]) ok = 0;
+        }
+        pctx.buf = outs; pctx.len = olens; pctx.cap = ntokens;
+        if (ok && par_prompt_file) {
+            FILE* f = fopen(par_prompt_file, "r");
+            char line[4096];
+            if (!f) {
+                fprintf(stderr, "cannot open %s\n", par_prompt_file);
+                ok = 0;
+            } else {
+                for (s = 0; s < parallel && ok; s++) {
+                    if (!fgets(line, sizeof(line), f)) {
+                        fprintf(stderr, "parallel-prompt: need %d lines, got %d\n", parallel, s);
+                        ok = 0;
+                        break;
+                    }
+                    line[strcspn(line, "\r\n")] = 0;
+                    plens[s] = vocab_encode(&v, line, pids[s], 4096);
+                    if (plens[s] <= 0) {
+                        fprintf(stderr, "parallel-prompt line %d: empty or too long\n", s + 1);
+                        ok = 0;
+                    }
+                }
+                fclose(f);
+            }
+        } else if (ok) {
+            for (s = 0; s < parallel; s++) {
+                memcpy(pids[s], ids, (size_t)nprompt * 4);
+                plens[s] = nprompt;
+            }
+        }
+        if (ok)
+            rc = engine_generate_parallel(&e, (const uint32_t* const*)pids, plens, parallel,
+                                          ntokens, temp, top_p, seed, -1,   /* 与串行 gen 一致: 不因 EOS 停 */
+                                          par_on_token_cb, &pctx, &tim, err, sizeof(err));
+        else if (err[0])
+            ylog_error("%s", err);
+        /* 各分支输出对照打印 */
+        for (s = 0; s < parallel; s++) {
+            char* txt = (char*)ycalloc(((size_t)olens[s] + 2) * 8, 1);
+            if (txt && olens[s] > 0)
+                vocab_decode(&v, outs[s], olens[s], txt, (int)(((size_t)olens[s] + 1) * 8));
+            printf("\n===== branch %d (%d tokens) =====\n", s + 1, olens[s]);
+            printf("%s\n", txt ? txt : "");
+            free(txt);
+        }
+        ylog_info("prefill: %u tokens in %.2f s (%.2f tok/s)", tim.n_prefill,
+                (double)tim.prefill_ms / 1000.0,
+                tim.prefill_ms > 0 ? (double)tim.n_prefill * 1000.0 / (double)tim.prefill_ms : 0.0);
+        ylog_info("decode:  %u tokens in %.2f s (%.2f tok/s aggregate, %.2f tok/s per seq)",
+                tim.n_decode, (double)tim.decode_ms / 1000.0,
+                tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / (double)tim.decode_ms : 0.0,
+                tim.decode_ms > 0 ? (double)tim.n_decode * 1000.0 / ((double)tim.decode_ms * parallel) : 0.0);
+        ylog_info("total:   %.2f s (%d parallel seqs)", (double)(tim.prefill_ms + tim.decode_ms) / 1000.0,
+                parallel);
+        for (s = 0; s < parallel; s++) { free(pids[s]); free(outs[s]); }
+        free(pids); free(outs); free(plens); free(olens);
         engine_free(&e);
         vocab_free(&v);
         free(ids);

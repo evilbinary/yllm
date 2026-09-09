@@ -706,13 +706,38 @@ int engine_fwd_block_at(Engine* e, uint32_t layer, uint32_t pos,
  * 仅 CPU 路径; GPU 后端(cuda_fwd/vulkan_fwd 按 f16 布局上卡)由调用方禁止组合。 */
 void engine_set_kv_q8(Engine* e)
 {
+    uint32_t ns;
     if (!e || e->kv_q8) return;
+    ns = e->n_slots > 0 ? e->n_slots : 1;
     free(e->kv);
     e->kv_row_sz = e->kv_dim + 2;   /* [2B scale][int8 × kv_dim] */
-    e->kv = (uint8_t*)ycalloc((size_t)(2 * e->ws.model.h.n_blocks + 1) * e->max_seq * e->kv_row_sz, 1);
+    e->kv = (uint8_t*)ycalloc((size_t)ns * (2 * e->ws.model.h.n_blocks + 1) * e->max_seq * e->kv_row_sz, 1);
+    e->kv_slot_stride = (uint64_t)(2 * e->ws.model.h.n_blocks + 1) * e->max_seq * e->kv_row_sz;
     e->kv_q8 = 1;
     ylog_info("engine: kv cache q8 (row=%u B, mem -%.0f%%)",
               e->kv_row_sz, 100.0 - 100.0 * (double)e->kv_row_sz / (double)(e->kv_dim * 2));
+}
+
+/* 并行共享权重解码: 扩容 KV 为 n 个槽位(须在首次前向前调用, KV 尚空时无损) */
+void engine_set_parallel_slots(Engine* e, uint32_t n)
+{
+    uint64_t one;
+    uint8_t* nk;
+    if (!e || n <= 1 || e->n_slots) return;
+    if (n > e->pb_cap) n = e->pb_cap;
+    one = (uint64_t)(2 * e->ws.model.h.n_blocks + 1) * e->max_seq * e->kv_row_sz;
+    nk = (uint8_t*)ycalloc((size_t)n * one, 1);
+    if (!nk) {
+        ylog_error("engine: parallel slots=%u kv alloc failed (%.1f MB)",
+                   n, (double)(one * n) / 1048576.0);
+        return;
+    }
+    free(e->kv);
+    e->kv = nk;
+    e->n_slots = n;
+    e->kv_slot_stride = one;
+    ylog_info("engine: parallel shared-weight decode, slots=%u (kv %.1f MB)",
+              n, (double)(one * n) / 1048576.0);
 }
 
 void engine_attach_cpu_fwd(Engine* e)
@@ -1427,6 +1452,187 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
         timings->decode_ms = ynow_ms() - t1;
     }
     return 0;
+}
+
+/* ---- 并行共享权重解码(--parallel N) ---- */
+
+/* 单槽位 final norm + lm_head: e->logits = logits(该序列当前步)。
+ * 复用 prefill_run_batch 尾部逻辑(含张量流式 lm_head)。 */
+static void parallel_slot_logits(Engine* e, const float* xrow)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base;
+    const LlfTensorMeta* fn = &m->metas[m->base_idx[h->n_blocks + 1]];
+    const LlfTensorMeta* out = &m->metas[m->base_idx[h->n_blocks + 2]];
+    float eps;
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    rmsnorm(e->x, xrow, base + m->dir[h->n_blocks + 1].offset + fn->offset,
+            h->hidden, eps, fn->dtype);
+#if YLLM_TENSOR_STREAM
+    if (ws->budget > 0) {
+        size_t rbytes = matmul_row_bytes(out->dtype, h->hidden);
+        uint32_t dl = h->n_blocks + 2;
+        if (rbytes > 0) {
+            lm_head_chunked(e, base + m->dir[dl].offset + out->offset,
+                            m->dir[dl].offset + out->offset,
+                            h->hidden, h->vocab, out->dtype);
+            return;
+        }
+    }
+#endif
+    matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
+           h->vocab, h->hidden, out->dtype);
+}
+
+int engine_generate_parallel(Engine* e, const uint32_t* const* prompts,
+                             const int* nprompts, int nseq, int ntokens,
+                             float temp, float top_p, uint64_t seed, int eos_stop,
+                             int (*on_token)(int seq, uint32_t id, void* ctx), void* ctx,
+                             EngineTimings* timings, char* err, size_t errlen)
+{
+    Ws* ws = &e->ws;
+    LlModel* m = &ws->model;
+    const LlfHeader* h = &m->h;
+    uint32_t hidden = h->hidden;
+    uint32_t vocab = h->vocab;
+    uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
+    uint64_t rng = ysrand(seed);
+    uint64_t t0 = 0, t1 = 0;
+    uint8_t* kv_root = e->kv;
+    uint32_t* act_slot = NULL, *act_pos = NULL, *act_last = NULL, *gencnt = NULL;
+    int* act_seq = NULL;
+    int nact = 0, s, rc = 0;
+    uint64_t ngen = 0;
+
+    if (err) err[0] = 0;
+    if (!e->ops || !e->ops->fwd_block_batch_slots) {
+        snprintf(err, errlen, "parallel decode: arch %s has no slots batch op (llama/qwen only)",
+                 e->ops ? e->ops->name : "?");
+        return -1;
+    }
+    if (e->device_mode != DEV_MODE_CPU) {
+        snprintf(err, errlen, "parallel decode: only supports --device cpu");
+        return -1;
+    }
+    if (!e->n_slots || nseq < 1 || (uint32_t)nseq > e->n_slots) {
+        snprintf(err, errlen, "parallel decode: nseq %d but slots %u (call engine_set_parallel_slots)",
+                 nseq, e->n_slots);
+        return -1;
+    }
+    e->mtp_enable = 0;   /* 并行路径不叠 MTP */
+    if (timings) { memset(timings, 0, sizeof(*timings)); t0 = ynow_ms(); }
+
+    act_slot = (uint32_t*)ymalloc((size_t)nseq * 4);
+    act_pos  = (uint32_t*)ymalloc((size_t)nseq * 4);
+    act_last = (uint32_t*)ymalloc((size_t)nseq * 4);
+    act_seq  = (int*)ymalloc((size_t)nseq * sizeof(int));
+    gencnt   = (uint32_t*)ycalloc((size_t)nseq, 4);
+    if (!act_slot || !act_pos || !act_last || !act_seq || !gencnt) {
+        snprintf(err, errlen, "parallel decode: oom");
+        rc = -1;
+        goto out;
+    }
+
+    /* 逐槽位 prefill: 期间把 e->kv 指向该 slot(复用全部现有前向路径);
+     * prefill 末位 logits 有效, 直接采出各序列第一个 token */
+    for (s = 0; s < nseq; s++) {
+        uint32_t nxt = 0;
+        if (nprompts[s] <= 0 || nprompts[s] > (int)e->max_seq) {
+            snprintf(err, errlen, "parallel decode: prompt %d length %d invalid (max %u)",
+                     s, nprompts[s], e->max_seq);
+            rc = -1;
+            goto out;
+        }
+        e->kv = kv_root + (size_t)s * e->kv_slot_stride;
+        if (engine_forward_prefill(e, prompts[s], nprompts[s], 0) != 0) {
+            snprintf(err, errlen, "parallel decode: prefill seq %d failed", s);
+            e->kv = kv_root;
+            rc = -1;
+            goto out;
+        }
+        if (engine_sample(e, vocab, temp, top_p, &rng, &nxt) != 0) {
+            e->kv = kv_root;
+            snprintf(err, errlen, "parallel decode: sample seq %d failed", s);
+            rc = -1;
+            goto out;
+        }
+        if (getenv("YLLM_PARDBG")) {
+            uint32_t k;
+            float mx = e->logits[0];
+            for (k = 1; k < vocab; k++) if (e->logits[k] > mx) mx = e->logits[k];
+            fprintf(stderr, "[pardbg] slot%d np=%d nxt=%u logits0..3=%.3f %.3f %.3f %.3f max=%.3f\n",
+                    s, nprompts[s], nxt, (double)e->logits[0], (double)e->logits[1],
+                    (double)e->logits[2], (double)e->logits[3], (double)mx);
+        }
+        e->kv = kv_root;
+        if (eos_stop >= 0 && (int)nxt == eos_stop)
+            continue;   /* 该序列一步即止 */
+        act_slot[nact] = (uint32_t)s;
+        act_pos[nact] = (uint32_t)nprompts[s];
+        act_last[nact] = nxt;
+        act_seq[nact] = s;
+        nact++;
+        gencnt[s] = 1;
+        ngen++;
+        if (on_token && on_token(s, nxt, ctx) != 0) {
+            nact--;   /* 回调中止该序列 */
+        }
+    }
+    if (timings) {
+        for (s = 0; s < nseq; s++) timings->n_prefill += (uint32_t)nprompts[s];
+        t1 = ynow_ms();
+        timings->prefill_ms = t1 - t0;
+    }
+
+    /* batch decode: 活跃序列堆成 batch, 每步每层一次权重搬运服务全部 */
+    while (nact > 0) {
+        uint32_t i;
+        int j, w = 0;
+        for (j = 0; j < nact; j++)
+            engine_embed_into(e, e->pb + (size_t)j * hidden, act_last[j]);
+        for (i = 1; i <= trunk; i++) {
+            if (ws->budget > 0) sched_ensure(ws, i);
+            e->ops->fwd_block_batch_slots(e, i, act_slot, act_pos, (uint32_t)nact);
+            if (ws->budget > 0) sched_release_budget(ws, i);
+        }
+        for (j = 0; j < nact; j++) {
+            uint32_t nxt = 0;
+            int seq = act_seq[j];
+            parallel_slot_logits(e, e->pb + (size_t)j * hidden);
+            if (engine_sample(e, vocab, temp, top_p, &rng, &nxt) != 0) {
+                snprintf(err, errlen, "parallel decode: sample seq %d failed", seq);
+                rc = -1;
+                goto out;
+            }
+            if (eos_stop >= 0 && (int)nxt == eos_stop) continue;      /* 序列完成 */
+            if (gencnt[seq] >= (uint32_t)ntokens) continue;           /* 达到每序列上限 */
+            gencnt[seq]++;
+            ngen++;
+            if (on_token && on_token(seq, nxt, ctx) != 0) continue;   /* 回调中止 */
+            if (act_pos[j] + 1 >= e->max_seq) continue;               /* 序列写满 */
+            act_last[w] = nxt;
+            act_pos[w] = act_pos[j] + 1;
+            act_slot[w] = act_slot[j];
+            act_seq[w] = seq;
+            w++;
+        }
+        nact = w;
+    }
+
+out:
+    e->kv = kv_root;
+    if (timings) {
+        timings->n_decode = (uint32_t)ngen;
+        timings->decode_ms = ynow_ms() - t1;
+    }
+    free(act_slot);
+    free(act_pos);
+    free(act_last);
+    free(act_seq);
+    free(gencnt);
+    return rc;
 }
 
 uint64_t engine_resident(const Engine* e)
