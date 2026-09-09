@@ -92,3 +92,8 @@ models:
     model: models/minicpm5-2b.llf
     vocab: models/minicpm5-2b.vocab.txt
     ranks: 1
+    # opt: chat --opt 同款 k=v 参数(enable_thinking 控制思考模板;
+    #      max_soft_tokens/min_soft_tokens/downsample/max_slice_nums 需配 mmproj)
+    # opt: enable_thinking=0
+    # mtp: 1 开启 MTP 投机解码(minicpm5 带 blk.64 MTP 块, decode 提速明显; 0 关闭)
+    mtp: 1

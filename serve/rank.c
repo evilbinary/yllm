@@ -1374,6 +1374,42 @@ int cmd_rank(ServeConfig* cfg)
         ylog_info("rank: vision mmproj=%s ntok=%d hidden=%d",
                   cfg->mmproj, vision_n_tokens(r.vis), vision_hidden(r.vis));
     }
+    /* --opt k=v,...(serve.yaml opt: 或 --opt): enable_thinking → vocab 聊天模板,
+     * 视觉键(max_soft_tokens/min_soft_tokens/downsample/max_slice_nums) → mmproj 视觉塔 */
+    if (cfg->opt[0]) {
+        YOpt yo;
+        yopt_init(&yo);
+        if (yopt_parse(&yo, cfg->opt, err, sizeof(err)) != 0) {
+            ylog_error("rank: bad --opt '%s': %s", cfg->opt, err);
+            engine_free(&r.engine);
+            if (r.vis) vision_free(r.vis);
+            vocab_free(&r.vocab);
+            return 1;
+        }
+        if (yo.enable_thinking >= 0) r.vocab.chat_think = yo.enable_thinking;
+        if (r.vis) {
+            if (vision_apply_opt(r.vis, &yo, err, sizeof(err)) != 0) {
+                ylog_error("rank: apply opt '%s': %s", cfg->opt, err);
+                engine_free(&r.engine);
+                vision_free(r.vis);
+                vocab_free(&r.vocab);
+                return 1;
+            }
+        } else if (yo.max_soft_tokens > 0 || yo.min_soft_tokens > 0 ||
+                   yo.downsample > 0 || yo.max_slice_nums > 0) {
+            ylog_warn("rank: opt vis keys ignored (model has no mmproj)");
+        }
+        ylog_info("rank: opt=%s applied", cfg->opt);
+    }
+    /* --mtp 1: MTP 投机解码(模型需带 MTP 块, 如 minicpm5 的 blk.64) */
+    if (cfg->mtp) {
+        if (r.engine.mtp_eh_slot) {
+            r.engine.mtp_enable = 1;
+            ylog_info("rank: mtp=1 (MTP speculative decode enabled)");
+        } else {
+            ylog_warn("rank: --mtp requested but model has no MTP weights");
+        }
+    }
 
     /* 设备绑定: 默认 cpu; --device cuda 需 YLLM_CUDA=1 构建 */
     {

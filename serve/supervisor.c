@@ -143,17 +143,25 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
         snprintf(bud, sizeof(bud), "--budget %" PRId64 "MB", s->budget);
     else
         snprintf(bud, sizeof(bud), "--budget auto");
+    char opt_arg[1100] = "";
+    if (mc->opt[0])
+        snprintf(opt_arg, sizeof(opt_arg), "--opt \"%s\" ", mc->opt);
+    char mtp_arg[32] = "";
+    if (mc->mtp)
+        snprintf(mtp_arg, sizeof(mtp_arg), "--mtp %d ", mc->mtp);
     snprintf(cmd, sizeof(cmd),
              "\"%s\" rank --model \"%s\" --vocab \"%s\" --model-name \"%s\" --port %u "
              "--supervisor %s:%u --id rank-%d --rank %d --ranks %d%s "
              "--dist-fp16 %d %s "
              "%s%s%s"
+             "%s%s"
              "--cache-dir \"%s\" --log logs/%s-rank-%d.log",
              s->bin, mc->model, mc->vocab, mc->name, rport, s->sv_host, s->port,
              mi * model_stride(s) + r, r, ranks, peers_arg, mc->dist_fp16, bud,
              mc->mmproj[0] ? "--mmproj \"" : "",
              mc->mmproj[0] ? mc->mmproj : "",
              mc->mmproj[0] ? "\" " : "",
+             opt_arg, mtp_arg,
              s->cache_dir[0] ? s->cache_dir : ".", mc->name, r);
     ylog_info("supervisor: spawn rank %d (model %s) on port %u cmd=%s", r, mc->name, rport, cmd);
     int pid = spawn_proc(cmd);

@@ -737,22 +737,25 @@ chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 MCPM5_2B_GGUF  ?= models/MiniCPM5-2B-Q4_K_M.gguf
 MCPM5_2B_LLF   ?= models/minicpm5-2b.llf
 MCPM5_2B_VOCAB ?= models/minicpm5-2b.vocab.txt
+# MiniCPM5 自带 MTP 块(blk.64): --mtp 1 开启投机解码, decode 提速明显; make MCPM5_MTP=0 关闭
+MCPM5_MTP ?= 1
+MCPM5_MTPFLAG = $(if $(filter 1,$(MCPM5_MTP)),--mtp 1,)
 
 $(MCPM5_2B_LLF): $(MCPM5_2B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(MCPM5_2B_GGUF) --out $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --seq 4096
 
 chat-minicpm5-2b: $(BIN) $(MCPM5_2B_LLF)
-	$(RUN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
 
 gen-minicpm5-2b: $(BIN) $(MCPM5_2B_LLF)
-	$(RUN) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
 
 chat-minicpm5-2b-avx2: $(BIN_AVX2) $(MCPM5_2B_LLF)
-	$(RUN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
 
 gen-minicpm5-2b-avx2: $(BIN_AVX2) $(MCPM5_2B_LLF)
-	$(RUN_AVX2) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
 
 chat-minicpm5-2b-vulkan: vulkan $(MCPM5_2B_LLF)
 	$(RUN_VULKAN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) \

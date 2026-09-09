@@ -29,6 +29,8 @@ typedef struct {
     char model[CFG_STR_MAX];  /* llf 路径 */
     char vocab[CFG_STR_MAX];  /* vocab 路径 */
     char mmproj[CFG_STR_MAX]; /* 视觉 mmproj.gguf(空 = 纯文本) */
+    char opt[CFG_STR_MAX];    /* --opt k=v,...(chat 同款; enable_thinking 走 vocab, 视觉键走 mmproj) */
+    int  mtp;                 /* 1 = MTP 投机解码(模型需带 MTP 块, 如 minicpm5 blk.64) */
     char peers[CFG_STR_MAX];  /* 组内各段节点 IP(可选; 缺省由 QUERY_RANKS/LEASE 发现) */
     int  ranks;               /* 该模型的 rank 段数(总) */
     int  local;               /* 本机拉起的段数(默认 = ranks; 0 = 全部外部; 1 = 只 rank0 本地) */
@@ -47,6 +49,8 @@ typedef struct {
     char model[CFG_STR_MAX];        /* llf 路径(= models[0].model) */
     char vocab[CFG_STR_MAX];        /* vocab 路径 */
     char mmproj[CFG_STR_MAX];       /* 视觉 mmproj(= models[0].mmproj) */
+    char opt[CFG_STR_MAX];          /* --opt k=v,...(= models[0].opt) */
+    int  mtp;                       /* MTP 投机解码(= models[0].mtp) */
     char model_name[CFG_STR_MAX];   /* 注册名(router 路由用) */
     char cache_dir[CFG_STR_MAX]; /* 会话缓存落盘目录(空 = 纯内存) */
     char bin[CFG_STR_MAX];          /* yllm 二进制路径 */
@@ -178,6 +182,7 @@ static inline void config_defaults(ServeConfig* c)
     snprintf(c->gpu_weights, sizeof(c->gpu_weights), "auto");
     c->gpu_layers = -1;
     c->gpu_stream = 0;
+    c->mtp = 0;
     c->api_log = 1;   /* 默认开启 */
     snprintf(c->work_mode, sizeof(c->work_mode), "serial");
     c->work_threads = 1;
@@ -220,6 +225,10 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         snprintf(c->vocab, sizeof(c->vocab), "%s", val);
     } else if (strcmp(key, "mmproj") == 0) {
         snprintf(c->mmproj, sizeof(c->mmproj), "%s", val);
+    } else if (strcmp(key, "opt") == 0) {
+        snprintf(c->opt, sizeof(c->opt), "%s", val);
+    } else if (strcmp(key, "mtp") == 0) {
+        c->mtp = atoi(val);
     } else if (strcmp(key, "model-name") == 0 || strcmp(key, "server-model") == 0) {
         snprintf(c->model_name, sizeof(c->model_name), "%s", val);
     } else if (strcmp(key, "bin") == 0) {
@@ -364,6 +373,8 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
                         else if (strcmp(key, "model") == 0) snprintf(mc->model, sizeof(mc->model), "%s", val);
                         else if (strcmp(key, "vocab") == 0) snprintf(mc->vocab, sizeof(mc->vocab), "%s", val);
                         else if (strcmp(key, "mmproj") == 0) snprintf(mc->mmproj, sizeof(mc->mmproj), "%s", val);
+                        else if (strcmp(key, "opt") == 0) snprintf(mc->opt, sizeof(mc->opt), "%s", val);
+                        else if (strcmp(key, "mtp") == 0) mc->mtp = atoi(val);
                         else if (strcmp(key, "ranks") == 0) mc->ranks = atoi(val);
                         else if (strcmp(key, "local") == 0) mc->local = atoi(val);
                         else if (strcmp(key, "dist-fp16") == 0) mc->dist_fp16 = atoi(val);
@@ -406,6 +417,9 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
         snprintf(c->models[0].vocab, sizeof(c->models[0].vocab), "%s", c->vocab);
         if (c->mmproj[0])
             snprintf(c->models[0].mmproj, sizeof(c->models[0].mmproj), "%s", c->mmproj);
+        if (c->opt[0])
+            snprintf(c->models[0].opt, sizeof(c->models[0].opt), "%s", c->opt);
+        if (c->mtp) c->models[0].mtp = c->mtp;
         c->models[0].ranks = c->ranks > 0 ? c->ranks : 1;
     }
     /* 反向: models[0] 同步到顶层(rank/server 直接读顶层字段) */
@@ -413,6 +427,8 @@ static inline void config_load_yaml(ServeConfig* c, const char* path)
         if (c->models[0].model[0]) snprintf(c->model, sizeof(c->model), "%s", c->models[0].model);
         if (c->models[0].vocab[0]) snprintf(c->vocab, sizeof(c->vocab), "%s", c->models[0].vocab);
         if (c->models[0].mmproj[0]) snprintf(c->mmproj, sizeof(c->mmproj), "%s", c->models[0].mmproj);
+        if (c->models[0].opt[0]) snprintf(c->opt, sizeof(c->opt), "%s", c->models[0].opt);
+        if (c->models[0].mtp) c->mtp = c->models[0].mtp;
         if (c->models[0].name[0]) snprintf(c->model_name, sizeof(c->model_name), "%s", c->models[0].name);
         if (c->models[0].ranks > 0) c->ranks = c->models[0].ranks;
     }
