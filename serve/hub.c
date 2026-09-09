@@ -84,6 +84,7 @@ int cmd_hub(ServeConfig* cfg)
     snprintf(sv.sv_host, sizeof(sv.sv_host), "%s", cfg->sv_host);
     snprintf(sv.bin, sizeof(sv.bin), "%s", cfg->bin);
     if (cfg->kv_dtype[0]) snprintf(sv.kv_dtype, sizeof(sv.kv_dtype), "%s", cfg->kv_dtype);
+    sv.mtp = cfg->mtp;
     if (cfg->model[0]) snprintf(sv.model, sizeof(sv.model), "%s", cfg->model);
     if (cfg->vocab[0]) snprintf(sv.vocab, sizeof(sv.vocab), "%s", cfg->vocab);
     if (cfg->model_name[0]) snprintf(sv.model_name, sizeof(sv.model_name), "%s", cfg->model_name);

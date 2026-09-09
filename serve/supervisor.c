@@ -147,8 +147,11 @@ static int supervisor_spawn_rank(Supervisor* s, int mi, int r)
     if (mc->opt[0])
         snprintf(opt_arg, sizeof(opt_arg), "--opt \"%s\" ", mc->opt);
     char mtp_arg[32] = "";
-    if (mc->mtp)
-        snprintf(mtp_arg, sizeof(mtp_arg), "--mtp %d ", mc->mtp);
+    {
+        int mtp = mc->mtp ? mc->mtp : s->mtp;   /* 模型条目优先, 全局 --mtp 兜底 */
+        if (mtp)
+            snprintf(mtp_arg, sizeof(mtp_arg), "--mtp %d ", mtp);
+    }
     char kv_arg[32] = "";
     if (s->kv_dtype[0] && strcmp(s->kv_dtype, "f16") != 0)
         snprintf(kv_arg, sizeof(kv_arg), "--kv %s ", s->kv_dtype);
@@ -640,6 +643,7 @@ int cmd_supervisor(ServeConfig* cfg)
     snprintf(s.sv_host, sizeof(s.sv_host), "%s", cfg->sv_host);
     snprintf(s.bin, sizeof(s.bin), "%s", cfg->bin);
     if (cfg->kv_dtype[0]) snprintf(s.kv_dtype, sizeof(s.kv_dtype), "%s", cfg->kv_dtype);
+    s.mtp = cfg->mtp;
     if (cfg->model[0]) snprintf(s.model, sizeof(s.model), "%s", cfg->model);
     if (cfg->vocab[0]) snprintf(s.vocab, sizeof(s.vocab), "%s", cfg->vocab);
     if (cfg->model_name[0]) snprintf(s.model_name, sizeof(s.model_name), "%s", cfg->model_name);

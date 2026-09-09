@@ -38,6 +38,7 @@ typedef struct {
     uint16_t server_port_base;/* server 端口基址 */
     char sv_host[128];      /* supervisor 自身地址(rank/server 心跳目标) */
     char kv_dtype[8];       /* 传给 rank 的 KV cache 格式(f16|q8; 空=f16) */
+    int  mtp;               /* 全局 MTP 默认值(--mtp 1); 模型条目 mtp 优先 */
     int auto_heal;          /* 自愈开关 */
     int64_t budget;         /* 传给 rank 的内存预算(MB; -1=auto) */
     volatile int quit;      /* 收到 QUIT 后退出主循环 */

@@ -32,7 +32,7 @@ rank-port-base: 9410   # 模型0 rank 推理口基址
 http-port: 8000        # OpenAI 兼容 HTTP(可选, 0 关闭)
 cache-dir: ./sessions   # 会话缓存落盘目录(空 = 纯内存; server 存 token 列表, rank 存 KV)
 budget: auto            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n>KB(如 2048MB / 1.5G)
-# kv: q8               # KV cache 量化: q8 = per-token int8(rank 内存减半, 仅 CPU; 默认 f16)
+kv: q8               # KV cache 量化: q8 = per-token int8(rank 内存减半, 仅 CPU; 默认 f16)
 
 # 拓扑
 sv-host: 127.0.0.1     # 本机 hub 用; 远程 rank 须显式 --supervisor <本机LAN>:9500
@@ -70,6 +70,7 @@ models:
     model: models/gemma-4-E2B-it-Q4_K_M.llf
     vocab: models/gemma4.vocab.txt
     mmproj: models/mmproj-gemma-4-E2B-F16.gguf
+    mtp: 1
     ranks: 1           # PP 两段
     local: 1           # 本机 hub 只拉 rank0; rank1 远程手工起
   - name: gemma4-e4b

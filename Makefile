@@ -376,8 +376,8 @@ NTHREADS ?= $(shell nproc 2>/dev/null || echo 4)
 MTP ?= 0
 KV  ?= f16
 RUNARGS = $(if $(filter 1,$(MTP)),--mtp 1,) $(if $(filter q8,$(KV)),--kv q8,)
-# serve/hub 透传(hub/supervisor → rank): 目前仅 KV; MTP 走 serve.yaml 模型条目 mtp: 1
-HUBKV = $(if $(filter q8,$(KV)),--kv q8,)
+# serve/hub 透传(hub/supervisor → rank): --kv q8 全模型生效; --mtp 为全局默认(serve.yaml 模型条目 mtp 优先)
+HUBKV = $(if $(filter q8,$(KV)),--kv q8,) $(if $(filter 1,$(MTP)),--mtp 1,)
 RUN = OMP_NUM_THREADS=$(NTHREADS) $(BIN)
 RUN_AVX2 = OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2)
 

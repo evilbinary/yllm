@@ -95,6 +95,7 @@ typedef struct {
     int depth;
     char device[32];        /* cpu | cuda | vulkan(见 design-gpu / design-mobile) */
     char kv_dtype[8];       /* KV cache 格式: f16(默认) | q8(per-token int8, 仅 CPU) */
+    /* mtp 已有字段(上方): 全局 --mtp 1 作为各模型默认, 模型条目 mtp 优先 */
     int gpu;                /* CUDA device index(默认 0) */
     char gpu_weights[16];   /* auto | q4k | fp16(CUDA 线性权上卡格式) */
     int gpu_layers;         /* -1=全 GPU; >=0 单进程混合: 前 N 个 block(+embed) 在 GPU */
@@ -230,7 +231,7 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
     } else if (strcmp(key, "opt") == 0) {
         snprintf(c->opt, sizeof(c->opt), "%s", val);
     } else if (strcmp(key, "mtp") == 0) {
-        c->mtp = atoi(val);
+        c->mtp = atoi(val);   /* 全局默认; 模型条目 mtp 优先(supervisor spawn 时取 mc->mtp ?: c->mtp) */
     } else if (strcmp(key, "model-name") == 0 || strcmp(key, "server-model") == 0) {
         snprintf(c->model_name, sizeof(c->model_name), "%s", val);
     } else if (strcmp(key, "bin") == 0) {
