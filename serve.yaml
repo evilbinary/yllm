@@ -35,6 +35,7 @@ budget: auto            # rank KV 内存预算模式: auto | <n>MB | <n>G | <n>K
 
 # 拓扑
 sv-host: 127.0.0.1     # 本机 hub 用; 远程 rank 须显式 --supervisor <本机LAN>:9500
+bind-host: 0.0.0.0     # rank 上报/监听用本机 LAN IP, 须全网卡(0.0.0.0), 否则 server 连 leader 被拒
 router-addrs: 127.0.0.1:9400
 servers: 1
 

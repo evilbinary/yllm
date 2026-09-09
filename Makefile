@@ -220,7 +220,7 @@ $(OBJDIR)/router.o: serve/router.c serve/protocol.h serve/router.h serve/sock.h 
 $(OBJDIR)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h $(HDR_PUBLIC) | $(OBJDIR)
+$(OBJDIR)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Iserve -c -o $@ $<
 
 $(OBJDIR)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR)
@@ -259,7 +259,7 @@ $(OBJDIR_AVX2)/router.o: serve/router.c serve/protocol.h serve/router.h serve/so
 $(OBJDIR_AVX2)/supervisor.o: serve/supervisor.c serve/protocol.h serve/supervisor.h serve/sock.h serve/frame.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
-$(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/hub.o: serve/hub.c serve/hub.h serve/supervisor.h serve/router.h serve/server.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Iserve -c -o $@ $<
 
 $(OBJDIR_AVX2)/status.o: serve/status.c serve/status.h serve/protocol.h serve/frame.h serve/sock.h serve/node.h serve/config.h $(HDR_PUBLIC) | $(OBJDIR_AVX2)
