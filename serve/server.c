@@ -36,10 +36,25 @@ static long srv_timeout_ms(void)
 
 #define SRV_MAX_LINE 8192
 
+/* 连接 leader rank。
+ * rank 心跳上报的是本机 LAN IP, 若 bind-host=127.0.0.1(单机模式)则按上报地址回连会被拒;
+ * 同机部署时回退 127.0.0.1 再试一次(跨机场景回退必然失败, 仅多一次快速 ECONNREFUSED)。 */
+static int server_connect_leader(const Server* s)
+{
+    int fd = sock_connect(s->leader_host, s->leader_port, 5);
+    if (fd < 0 && strcmp(s->leader_host, "127.0.0.1") != 0) {
+        fd = sock_connect("127.0.0.1", s->leader_port, 5);
+        if (fd >= 0)
+            ylog_info("server: connect leader %s:%u refused, fallback 127.0.0.1 OK",
+                      s->leader_host, s->leader_port);
+    }
+    return fd;
+}
+
 /* INFER 转发: 连 leader rank → 发 INFER → 逐帧透传回客户端 */
 static void forward_infer(int client_fd, Server* s, const char* args)
 {
-    int fd = sock_connect(s->leader_host, s->leader_port, 5);
+    int fd = server_connect_leader(s);
     if (fd < 0) {
         sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader %s:%u",
                        s->leader_host, s->leader_port);
@@ -333,7 +348,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     uint32_t* gen = NULL;
     uint32_t ngen = 0, gcap = 0;
     for (;;) {
-        int fd = sock_connect(s->leader_host, s->leader_port, 5);
+        int fd = server_connect_leader(s);
         if (fd < 0) {
             free(gen); free(full_ids); free(tokens); free(store); free(msg);
             pthread_mutex_unlock(&s->infer_lock);
