@@ -9,6 +9,8 @@
 #   make android-cpu  同上但不编 Vulkan
 #   make gen-cuda / chat-cuda   用 --device cuda 冒烟
 #   make gen-vulkan / chat-vulkan / chat-*-avx2-vulkan
+#   make chat-* MTP=1           追加 --mtp 1(投机解码; 模型需带 nextn 权重, 默认无)
+#   make chat-* KV=q8           追加 --kv q8(KV int8 量化, 仅 CPU, 默认无; server 目标透传 hub)
 #   make test       运行测试
 #   make clean
 #
@@ -367,6 +369,15 @@ CHAT_TOKENS ?= 30
 
 # 推理线程数(OpenMP)。默认使用本机全部核心, 可用 NTHREADS=N 覆盖。
 NTHREADS ?= $(shell nproc 2>/dev/null || echo 4)
+# 运行参数(默认无): MTP=1 开投机解码(模型需带 MTP/nextn 权重); KV=q8 开 KV int8 量化(仅 CPU, 内存减半)
+#   make chat-avx2 MTP=1            / make gen-avx2 KV=q8
+#   make chat-minicpm5-2b-avx2 MTP=1 KV=q8
+# server 目标: KV=q8 会透传给 hub(→ rank); MTP 仅 serve.yaml 模型条目 mtp: 1 支持
+MTP ?= 0
+KV  ?= f16
+RUNARGS = $(if $(filter 1,$(MTP)),--mtp 1,) $(if $(filter q8,$(KV)),--kv q8,)
+# serve/hub 透传(hub/supervisor → rank): 目前仅 KV; MTP 走 serve.yaml 模型条目 mtp: 1
+HUBKV = $(if $(filter q8,$(KV)),--kv q8,)
 RUN = OMP_NUM_THREADS=$(NTHREADS) $(BIN)
 RUN_AVX2 = OMP_NUM_THREADS=$(NTHREADS) $(BIN_AVX2)
 
@@ -376,16 +387,16 @@ $(MODEL_LLF): $(MODEL_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(MODEL_GGUF) --out $(MODEL_LLF) --vocab $(MODEL_VOCAB) --seq 2048
 
 chat: $(BIN) $(MODEL_LLF)
-	$(RUN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 gen: $(BIN) $(MODEL_LLF)
-	$(RUN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-avx2: $(BIN_AVX2) $(MODEL_LLF)
-	$(RUN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 gen-avx2: $(BIN_AVX2) $(MODEL_LLF)
-	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 # ---- CUDA: 独立目录构建 + 设备冒烟 ----
 # 有 nvcc → FP16 权 + cublas decode; 无 nvcc → host-shim
@@ -396,20 +407,20 @@ RUN_CUDA = OMP_NUM_THREADS=$(NTHREADS) $(BIN_CUDA)
 
 gen-cuda: cuda $(MODEL_LLF)
 	$(RUN_CUDA) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) $(RUNARGS)
 
 chat-cuda: cuda $(MODEL_LLF)
 	$(RUN_CUDA) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS)
+		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) $(RUNARGS)
 
 chat-gemma4-e2b-cuda: cuda $(G4_E2B_LLF)
 	$(RUN_CUDA) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) \
 		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b-cuda: cuda $(G4_E4B_LLF)
 	$(RUN_CUDA) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) \
 		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 # ---- Vulkan: 独立目录; 默认尝试原生 VkDevice, YLLM_VULKAN_HOST=1 强制 shim ----
@@ -425,19 +436,19 @@ RUN_VULKAN_AVX2 = OMP_NUM_THREADS=$(NTHREADS) $(BIN_VULKAN_AVX2)
 
 gen-vulkan: vulkan $(MODEL_LLF)
 	$(RUN_VULKAN) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) $(RUNARGS)
 
 chat-vulkan: vulkan $(MODEL_LLF)
 	$(RUN_VULKAN) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU) $(RUNARGS)
 
 # AVX2 CPU fallback + Vulkan(产物 build/avx2-vulkan)
 chat-avx2-vulkan: vulkan-avx2 $(MODEL_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --temp 0 --no-template 1 --device vulkan --gpu $(GPU) $(RUNARGS)
 gen-avx2-vulkan: vulkan-avx2 $(MODEL_LLF)
 	$(RUN_VULKAN_AVX2) gen --model $(MODEL_LLF) --vocab $(MODEL_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) $(RUNARGS)
 
 # ---- Android: platform/android CMake + NDK (arm64-v8a) ----
 #   make android          Vulkan ON  → build/android/yllm + libyllm.so
@@ -533,17 +544,17 @@ $(G4_E4B_LLF): $(G4_E4B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(G4_E4B_GGUF) --out $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --seq 8192
 
 chat-gemma4-e2b: $(BIN) $(G4_E2B_LLF)
-	$(RUN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e2b-avx2: $(BIN_AVX2) $(G4_E2B_LLF)
-	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),) \
 		$(if $(OPT),--opt $(OPT),)
 
 chat-gemma4-e2b-vulkan: vulkan $(G4_E2B_LLF)
 	$(RUN_VULKAN) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 # 长序列 chat 吞吐(不进 make test)
@@ -557,20 +568,20 @@ test-long-chat-avx2: test-long-chat
 
 chat-gemma4-e2b-avx2-vulkan: vulkan-avx2 $(G4_E2B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(G4_E2B_LLF) --vocab $(G4_E2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(G4_E2B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b: $(BIN) $(G4_E4B_LLF)
-	$(RUN) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b-avx2: $(BIN_AVX2) $(G4_E4B_LLF)
-	$(RUN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 chat-gemma4-e4b-avx2-vulkan: vulkan-avx2 $(G4_E4B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(G4_E4B_LLF) --vocab $(G4_E4B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(G4_E4B_MMPROJ) --image $(IMAGE),)
 
 # ---- 指定模型的 chat 快捷目标(qwen2.5 / qwen3) ----
@@ -597,46 +608,46 @@ $(Q3_8B_LLF): $(Q3_8B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(Q3_8B_GGUF) --out $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --seq 2048
 
 chat-qwen2.5-1.5b: $(BIN) $(Q25_LLF)
-	$(RUN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen2.5-1.5b-avx2: $(BIN_AVX2) $(Q25_LLF)
-	$(RUN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen2.5-1.5b-vulkan: vulkan $(Q25_LLF)
 	$(RUN_VULKAN) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-qwen2.5-1.5b-avx2-vulkan: vulkan-avx2 $(Q25_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q25_LLF) --vocab $(Q25_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-qwen2.5-7b: $(BIN) $(Q25_7B_LLF)
-	$(RUN) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen2.5-7b-avx2: $(BIN_AVX2) $(Q25_7B_LLF)
-	$(RUN_AVX2) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen2.5-7b-vulkan: vulkan $(Q25_7B_LLF)
 	$(RUN_VULKAN) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-qwen2.5-7b-avx2-vulkan: vulkan-avx2 $(Q25_7B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q25_7B_LLF) --vocab $(Q25_7B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-qwen3-8b: $(BIN) $(Q3_8B_LLF)
-	$(RUN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen3-8b-avx2: $(BIN_AVX2) $(Q3_8B_LLF)
-	$(RUN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen3-8b-vulkan: vulkan $(Q3_8B_LLF)
 	$(RUN_VULKAN) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-qwen3-8b-avx2-vulkan: vulkan-avx2 $(Q3_8B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q3_8B_LLF) --vocab $(Q3_8B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 # ---- qwen3-vl-2b(文本 + 可选 mmproj 视觉; GGUF arch=qwen3vl) ----
 Q3VL_2B_GGUF   ?= models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf
@@ -649,21 +660,21 @@ $(Q3VL_2B_LLF): $(Q3VL_2B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(Q3VL_2B_GGUF) --out $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --seq 4096
 
 chat-qwen3-vl-2b: $(BIN) $(Q3VL_2B_LLF)
-	$(RUN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 chat-qwen3-vl-2b-avx2: $(BIN_AVX2) $(Q3VL_2B_LLF)
-	$(RUN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 chat-qwen3-vl-2b-vulkan: vulkan $(Q3VL_2B_LLF)
 	$(RUN_VULKAN) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 chat-qwen3-vl-2b-avx2-vulkan: vulkan-avx2 $(Q3VL_2B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q3VL_2B_LLF) --vocab $(Q3VL_2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(Q3VL_2B_MMPROJ) --image $(IMAGE),)
 
 # ---- qwen3.8-27b(Gated Attention + GDN 混合架构) ----
@@ -676,24 +687,24 @@ $(Q3_27B_LLF): $(Q3_27B_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(Q3_27B_GGUF) --out $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --seq 2048
 
 gen-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
-	$(RUN) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 gen-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
-	$(RUN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 gen-qwen3.8-27b-avx2-vulkan: vulkan-avx2 $(Q3_27B_LLF)
 	$(RUN_VULKAN_AVX2) gen --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-qwen3.8-27b: $(BIN) $(Q3_27B_LLF)
-	$(RUN) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen3.8-27b-avx2: $(BIN_AVX2) $(Q3_27B_LLF)
-	$(RUN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+	$(RUN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-qwen3.8-27b-avx2-vulkan: vulkan-avx2 $(Q3_27B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 # ---- minicpm-v-4.6(qwen35 文本塔 + clip mmproj 视觉; 无 --image 则纯文本) ----
 MCPM_V46_GGUF  ?= models/MiniCPM-V-4_6-Q4_K_M.gguf
@@ -707,25 +718,25 @@ $(MCPM_V46_LLF): $(MCPM_V46_GGUF) | $(BIN)
 	$(BIN) convert --gguf $(MCPM_V46_GGUF) --out $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --seq 2048
 
 chat-minicpm-v-4.6: $(BIN) $(MCPM_V46_LLF)
-	$(RUN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
 		$(if $(OPT),--opt $(OPT),)
 
 #  make chat-minicpm-v-4.6-avx2 IMAGE=models/test_red.ppm CHAT_TOKENS=16'
 chat-minicpm-v-4.6-avx2: $(BIN_AVX2) $(MCPM_V46_LLF)
-	$(RUN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) \
+	$(RUN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS) \
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
 		$(if $(OPT),--opt $(OPT),)
 
 chat-minicpm-v-4.6-vulkan: vulkan $(MCPM_V46_LLF)
 	$(RUN_VULKAN) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
 		$(if $(OPT),--opt $(OPT),)
 
 chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(MCPM_V46_LLF) --vocab $(MCPM_V46_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU) \
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU) \
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
 		$(if $(OPT),--opt $(OPT),)
 
@@ -734,76 +745,74 @@ chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 #   make chat-minicpm5-2b-avx2 / gen-minicpm5-2b-avx2
 #   make chat-minicpm5-2b-vulkan / chat-minicpm5-2b-avx2-vulkan
 #   make server-minicpm5-2b → make infer-minicpm5-2b
+# MTP/KV 用全局参数: make chat-minicpm5-2b-avx2 MTP=1 KV=q8
+# (MTP 仅当 GGUF 含 nextn. 张量才生效, 普通 Q4_K_M 量化没有 → 警告并回退)
 MCPM5_2B_GGUF  ?= models/MiniCPM5-2B-Q4_K_M.gguf
 MCPM5_2B_LLF   ?= models/minicpm5-2b.llf
 MCPM5_2B_VOCAB ?= models/minicpm5-2b.vocab.txt
-# MiniCPM5 MTP 块: 仅当 GGUF 含 MTP 权重(张量名带 nextn., 如 blk.42.nextn.eh_proj)时才生效;
-# 普通 Q4_K_M 量化不含 MTP → --mtp 1 只会警告并回退。默认 0
-MCPM5_MTP ?= 0
-MCPM5_MTPFLAG = $(if $(filter 1,$(MCPM5_MTP)),--mtp 1,)
 
 $(MCPM5_2B_LLF): $(MCPM5_2B_GGUF) | $(BIN)
 	@mkdir -p $(dir $@)
 	$(BIN) convert --gguf $(MCPM5_2B_GGUF) --out $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --seq 4096
 
 chat-minicpm5-2b: $(BIN) $(MCPM5_2B_LLF)
-	$(RUN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
+	$(RUN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 gen-minicpm5-2b: $(BIN) $(MCPM5_2B_LLF)
-	$(RUN) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
+	$(RUN) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-minicpm5-2b-avx2: $(BIN_AVX2) $(MCPM5_2B_LLF)
-	$(RUN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
+	$(RUN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 gen-minicpm5-2b-avx2: $(BIN_AVX2) $(MCPM5_2B_LLF)
-	$(RUN_AVX2) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(MCPM5_MTPFLAG)
+	$(RUN_AVX2) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
 
 chat-minicpm5-2b-vulkan: vulkan $(MCPM5_2B_LLF)
 	$(RUN_VULKAN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 chat-minicpm5-2b-avx2-vulkan: vulkan-avx2 $(MCPM5_2B_LLF)
 	$(RUN_VULKAN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) \
-		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+		--tokens $(CHAT_TOKENS) $(RUNARGS) --device vulkan --gpu $(GPU)
 
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
 #   make server-<name> / make infer-<name>  与 chat-* 一一对应
 #   make server-qwen38  兼容旧名(= server-qwen3.8-27b, yaml name=qwen3.8)
 server-tinyllama: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model tinyllama > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model tinyllama $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=tinyllama); 用 make infer-tinyllama 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen2.5-1.5b: $(BIN_AVX2) $(Q25_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5-1.5b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5-1.5b $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen2.5-1.5b); 用 make infer-qwen2.5-1.5b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen2.5-7b: $(BIN_AVX2) $(Q25_7B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen2.5 $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen2.5); 用 make infer-qwen2.5-7b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen3-8b: $(BIN_AVX2) $(Q3_8B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3-8b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3-8b $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen3-8b); 用 make infer-qwen3-8b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen3-vl-2b: $(BIN_AVX2) $(Q3VL_2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3-vl-2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3-vl-2b $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen3-vl-2b); 用 make infer-qwen3-vl-2b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen3.8-27b: $(BIN_AVX2) $(Q3_27B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3.8 > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model qwen3.8 $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=qwen3.8); 用 make infer-qwen3.8-27b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-qwen38: server-qwen3.8-27b
 
 server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e2b $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (gemma4-e2b ranks=2 local=1 → 本机 rank0 :9410, timeout=$(YLLM_SRV_TIMEOUT)s)"
 	@echo "远端 rank1(无需 --peers), 见 docs/serve-cli.md, 例:"
 	@echo "  LD_LIBRARY_PATH=. ./yllm rank --model gemma-4-E2B-it-Q4_K_M.llf --vocab gemma4.vocab.txt \\"
@@ -813,12 +822,12 @@ server-gemma4-e2b: $(BIN_AVX2) $(G4_E2B_LLF)
 
 server-gemma4-e4b: $(BIN_AVX2) $(G4_E4B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e4b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e4b $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=gemma4-e4b, timeout=$(YLLM_SRV_TIMEOUT)s); 用 make infer-gemma4-e4b 发请求 (HTTP 127.0.0.1:8000)"
 
 server-minicpm5-2b: $(BIN_AVX2) $(MCPM5_2B_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
-	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model minicpm5-2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model minicpm5-2b $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=minicpm5-2b, timeout=$(YLLM_SRV_TIMEOUT)s); 用 make infer-minicpm5-2b 发请求 (HTTP 127.0.0.1:8000)"
 
 # 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 name)
@@ -874,13 +883,13 @@ SERVE_PROMPT ?= Once upon a time
 serve: $(BIN) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
 	@echo "== supervisor --config $(SERVE_CONFIG) =="
-	@nohup $(BIN) supervisor --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/serve.out 2>&1 &
+	@nohup $(BIN) supervisor --config $(SERVE_CONFIG) $(HUBKV) > $(SERVE_LOGDIR)/serve.out 2>&1 &
 	@echo "serve started (supervisor auto-spawns rank+server)"
 
 serve-avx2: $(BIN_AVX2) $(MODEL_LLF)
 	@mkdir -p $(SERVE_LOGDIR)
 	@echo "== supervisor --config $(SERVE_CONFIG) (avx2) =="
-	@nohup $(BIN_AVX2) supervisor --config $(SERVE_CONFIG) > $(SERVE_LOGDIR)/serve.out 2>&1 &
+	@nohup $(BIN_AVX2) supervisor --config $(SERVE_CONFIG) $(HUBKV) > $(SERVE_LOGDIR)/serve.out 2>&1 &
 	@echo "serve started (avx2)"
 
 # 合并模式: supervisor+router+server 同进程, 自动拉起 rank; 之后 make infer 即可
@@ -891,7 +900,7 @@ hub: $(BIN_AVX2)
 	@mkdir -p $(SERVE_LOGDIR)
 	@echo "== hub --config $(SERVE_CONFIG)$(if $(SERVER_MODEL), --model $(SERVER_MODEL),) (avx2) =="
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config $(SERVE_CONFIG) \
-		$(if $(SERVER_MODEL),--model $(SERVER_MODEL),) > $(SERVE_LOGDIR)/hub.out 2>&1 &
+		$(if $(SERVER_MODEL),--model $(SERVER_MODEL),) $(HUBKV) > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started$(if $(SERVER_MODEL), (model=$(SERVER_MODEL)),) timeout=$(YLLM_SRV_TIMEOUT)s; 用 make infer 发请求"
 
 # 分开模式(独立进程, 同一份 config)
