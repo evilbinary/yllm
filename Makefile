@@ -737,8 +737,9 @@ chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 MCPM5_2B_GGUF  ?= models/MiniCPM5-2B-Q4_K_M.gguf
 MCPM5_2B_LLF   ?= models/minicpm5-2b.llf
 MCPM5_2B_VOCAB ?= models/minicpm5-2b.vocab.txt
-# MiniCPM5 自带 MTP 块(blk.64): --mtp 1 开启投机解码, decode 提速明显; make MCPM5_MTP=0 关闭
-MCPM5_MTP ?= 1
+# MiniCPM5 MTP 块: 仅当 GGUF 含 MTP 权重(张量名带 nextn., 如 blk.42.nextn.eh_proj)时才生效;
+# 普通 Q4_K_M 量化不含 MTP → --mtp 1 只会警告并回退。默认 0
+MCPM5_MTP ?= 0
 MCPM5_MTPFLAG = $(if $(filter 1,$(MCPM5_MTP)),--mtp 1,)
 
 $(MCPM5_2B_LLF): $(MCPM5_2B_GGUF) | $(BIN)
