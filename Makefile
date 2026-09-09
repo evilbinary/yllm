@@ -729,6 +729,39 @@ chat-minicpm-v-4.6-avx2-vulkan: vulkan-avx2 $(MCPM_V46_LLF)
 		$(if $(IMAGE),--mmproj $(MCPM_V46_MMPROJ) --image $(IMAGE),) \
 		$(if $(OPT),--opt $(OPT),)
 
+# ---- minicpm5-2b(纯文本; GGUF: MiniCPM5-2B-Q4_K_M.gguf) ----
+#   make chat-minicpm5-2b / gen-minicpm5-2b
+#   make chat-minicpm5-2b-avx2 / gen-minicpm5-2b-avx2
+#   make chat-minicpm5-2b-vulkan / chat-minicpm5-2b-avx2-vulkan
+#   make server-minicpm5-2b → make infer-minicpm5-2b
+MCPM5_2B_GGUF  ?= models/MiniCPM5-2B-Q4_K_M.gguf
+MCPM5_2B_LLF   ?= models/minicpm5-2b.llf
+MCPM5_2B_VOCAB ?= models/minicpm5-2b.vocab.txt
+
+$(MCPM5_2B_LLF): $(MCPM5_2B_GGUF) | $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(MCPM5_2B_GGUF) --out $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --seq 4096
+
+chat-minicpm5-2b: $(BIN) $(MCPM5_2B_LLF)
+	$(RUN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+gen-minicpm5-2b: $(BIN) $(MCPM5_2B_LLF)
+	$(RUN) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-minicpm5-2b-avx2: $(BIN_AVX2) $(MCPM5_2B_LLF)
+	$(RUN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+gen-minicpm5-2b-avx2: $(BIN_AVX2) $(MCPM5_2B_LLF)
+	$(RUN_AVX2) gen --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS)
+
+chat-minicpm5-2b-vulkan: vulkan $(MCPM5_2B_LLF)
+	$(RUN_VULKAN) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
+chat-minicpm5-2b-avx2-vulkan: vulkan-avx2 $(MCPM5_2B_LLF)
+	$(RUN_VULKAN_AVX2) chat --model $(MCPM5_2B_LLF) --vocab $(MCPM5_2B_VOCAB) --prompt $(CHAT_PROMPT) \
+		--tokens $(CHAT_TOKENS) --device vulkan --gpu $(GPU)
+
 # ---- 指定模型的 serve 快捷目标(serve.yaml 多模型, 用 --model <名字> 只拉起对应模型) ----
 #   make server-<name> / make infer-<name>  与 chat-* 一一对应
 #   make server-qwen38  兼容旧名(= server-qwen3.8-27b, yaml name=qwen3.8)
@@ -779,6 +812,11 @@ server-gemma4-e4b: $(BIN_AVX2) $(G4_E4B_LLF)
 	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model gemma4-e4b > $(SERVE_LOGDIR)/hub.out 2>&1 &
 	@echo "hub started (serve.yaml, model=gemma4-e4b, timeout=$(YLLM_SRV_TIMEOUT)s); 用 make infer-gemma4-e4b 发请求 (HTTP 127.0.0.1:8000)"
 
+server-minicpm5-2b: $(BIN_AVX2) $(MCPM5_2B_LLF)
+	@mkdir -p $(SERVE_LOGDIR)
+	@nohup env OMP_NUM_THREADS=$(NTHREADS) YLLM_SRV_TIMEOUT=$(YLLM_SRV_TIMEOUT) $(BIN_AVX2) hub --config serve.yaml --model minicpm5-2b > $(SERVE_LOGDIR)/hub.out 2>&1 &
+	@echo "hub started (serve.yaml, model=minicpm5-2b, timeout=$(YLLM_SRV_TIMEOUT)s); 用 make infer-minicpm5-2b 发请求 (HTTP 127.0.0.1:8000)"
+
 # 对应模型的 infer 快捷目标(模型名需匹配 serve.yaml 的 name)
 infer-tinyllama: $(BIN)
 	$(BIN) router --config serve.yaml --send "tinyllama $(CHAT_TOKENS) $(SERVE_PROMPT)"
@@ -805,6 +843,9 @@ infer-gemma4-e2b: $(BIN)
 
 infer-gemma4-e4b: $(BIN)
 	$(BIN) router --config serve.yaml --send "gemma4-e4b $(CHAT_TOKENS) $(SERVE_PROMPT)"
+
+infer-minicpm5-2b: $(BIN)
+	$(BIN) router --config serve.yaml --send "minicpm5-2b $(CHAT_TOKENS) $(SERVE_PROMPT)"
 
 # ---- 常驻推理服务(serve 层) ----
 # 统一配置: serve.yaml(所有角色共用)
@@ -1005,4 +1046,4 @@ dist-stop:
 	  ssh $(USER)@$$h "cd $(DIST_DIR) && ./build/avx2/dist-worker --host 127.0.0.1 --port $(DIST_PORT) --send stop" || echo "stop $$h failed"; \
 	done
 
-.PHONY: all avx2 cuda vulkan vulkan-avx2 android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess test-long-chat test-long-chat-avx2 chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-vulkan chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-vulkan chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-vulkan chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-minicpm-v-4.6 chat-minicpm-v-4.6-avx2 chat-minicpm-v-4.6-vulkan chat-minicpm-v-4.6-avx2-vulkan chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-vulkan chat-gemma4-e2b-avx2-vulkan chat-gemma4-e2b-cuda chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan chat-gemma4-e4b-cuda gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b
+.PHONY: all avx2 cuda vulkan vulkan-avx2 android android-vulkan android-cpu clean test test-base test-avx2 test-pp-sess test-long-chat test-long-chat-avx2 chat gen chat-avx2 gen-avx2 gen-cuda chat-cuda gen-vulkan chat-vulkan chat-avx2-vulkan gen-avx2-vulkan chat-qwen2.5-1.5b chat-qwen2.5-1.5b-avx2 chat-qwen2.5-1.5b-vulkan chat-qwen2.5-1.5b-avx2-vulkan chat-qwen2.5-7b chat-qwen2.5-7b-avx2 chat-qwen2.5-7b-vulkan chat-qwen2.5-7b-avx2-vulkan chat-qwen3-8b chat-qwen3-8b-avx2 chat-qwen3-8b-vulkan chat-qwen3-8b-avx2-vulkan chat-qwen3-vl-2b chat-qwen3-vl-2b-avx2 chat-qwen3-vl-2b-vulkan chat-qwen3-vl-2b-avx2-vulkan chat-qwen3.8-27b chat-qwen3.8-27b-avx2 chat-qwen3.8-27b-avx2-vulkan chat-minicpm-v-4.6 chat-minicpm-v-4.6-avx2 chat-minicpm-v-4.6-vulkan chat-minicpm-v-4.6-avx2-vulkan chat-minicpm5-2b chat-minicpm5-2b-avx2 chat-minicpm5-2b-vulkan chat-minicpm5-2b-avx2-vulkan gen-minicpm5-2b gen-minicpm5-2b-avx2 server-minicpm5-2b infer-minicpm5-2b chat-gemma4-e2b chat-gemma4-e2b-avx2 chat-gemma4-e2b-vulkan chat-gemma4-e2b-avx2-vulkan chat-gemma4-e2b-cuda chat-gemma4-e4b chat-gemma4-e4b-avx2 chat-gemma4-e4b-avx2-vulkan chat-gemma4-e4b-cuda gen-qwen3.8-27b gen-qwen3.8-27b-avx2 gen-qwen3.8-27b-avx2-vulkan dump dist dist-deploy dist-serve dist-stop serve serve-avx2 hub supervisor router server rank infer status ctl sync-serve sync-push serve-stop server-tinyllama server-qwen2.5-1.5b server-qwen2.5-7b server-qwen3-8b server-qwen3-vl-2b server-qwen3.8-27b server-qwen38 server-gemma4-e2b server-gemma4-e4b infer-tinyllama infer-qwen2.5-1.5b infer-qwen2.5-7b infer-qwen3-8b infer-qwen3-vl-2b infer-qwen3.8-27b infer-qwen38 infer-gemma4-e2b infer-gemma4-e4b

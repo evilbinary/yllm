@@ -88,3 +88,7 @@ models:
     model: models/qwen3-8b.llf
     vocab: models/qwen3-8b.vocab.txt
     ranks: 1
+  - name: minicpm5-2b
+    model: models/minicpm5-2b.llf
+    vocab: models/minicpm5-2b.vocab.txt
+    ranks: 1
