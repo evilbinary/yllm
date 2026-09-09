@@ -689,6 +689,170 @@ done_gen:;
     return rc == 0 ? 0 : 1;
 }
 
+/* chat --parallel N: SoT(中心句+扩写)模式。
+ * 第一阶段串行生成骨架(N 条中心句); 第二阶段各中心句作为独立序列
+ * 走 engine_generate_parallel 并行扩写(一次权重搬运服务全部序列)。 */
+typedef struct { uint32_t* ids; int len; int cap; } TokBuf;
+
+static int tokbuf_cb(uint32_t id, void* ud)
+{
+    TokBuf* b = (TokBuf*)ud;
+    if (b->len < b->cap) b->ids[b->len++] = id;
+    return 0;
+}
+
+static int chat_sot_generate(Engine* e, Vocab* v, const char* prompt, int parallel,
+                             int ntokens, float temp, float top_p, uint64_t seed,
+                             int use_bos, EngineTimings* tim, char* err, size_t errlen)
+{
+    char msg[4096];
+    uint32_t* sids = (uint32_t*)ymalloc(4096 * 4);
+    uint32_t* sgen = (uint32_t*)ymalloc(512 * 4);
+    TokBuf sk;
+    char* txt = NULL;
+    char** points = NULL;
+    uint32_t** pids = NULL, ** outs = NULL;
+    int* plens = NULL, * olens = NULL;
+    int sn, npoints = 0, i, rc = 0;
+    ParTokCtx pctx;
+    EngineTimings t1m, t2m;
+
+    sk.ids = sgen; sk.len = 0; sk.cap = 512;
+    if (!sids || !sgen) { snprintf(err, errlen, "oom"); rc = -1; goto out; }
+
+    /* 1) 骨架: 串行短生成, 只要中心句 */
+    snprintf(msg, sizeof(msg),
+             "%s\n\n(Answer with %d short key points only: one line each, "
+             "numbered like '1. ...'. Do NOT expand the points.)",
+             prompt, parallel);
+    sn = vocab_chat_ids(v, msg, sids, 4096, use_bos);
+    if (sn <= 0) { snprintf(err, errlen, "skeleton chat render failed"); rc = -1; goto out; }
+    memset(&t1m, 0, sizeof(t1m));
+    rc = engine_generate(e, sids, sn, 96, temp, top_p, seed, v->eos,
+                         tokbuf_cb, &sk, &t1m, err, errlen);
+    if (rc != 0) goto out;
+
+    /* 骨架文本 → 解析中心句 */
+    txt = (char*)ycalloc((size_t)sk.len * 8 + 16, 1);
+    points = (char**)ycalloc((size_t)parallel, sizeof(char*));
+    if (!txt || !points) { snprintf(err, errlen, "oom"); rc = -1; goto out; }
+    if (sk.len > 0)
+        vocab_decode(v, sgen, sk.len, txt, (int)((size_t)sk.len * 8));
+    {
+        char* line = strtok(txt, "\n");
+        while (line && npoints < parallel) {
+            char* p = line;
+            while (*p == ' ' || *p == '*' || *p == '-') p++;
+            if (*p >= '0' && *p <= '9' && (p[1] == '.' || p[1] == '、' || p[1] == ')')) {
+                p += 2;
+                while (*p == ' ') p++;
+                if (*p) points[npoints++] = ystrdup(p);
+            }
+            line = strtok(NULL, "\n");
+        }
+    }
+    if (npoints == 0) {
+        snprintf(err, errlen, "skeleton parse failed (model gave no numbered points)");
+        rc = -1;
+        goto out;
+    }
+
+    /* 2) 各中心句作为独立序列并行扩写 */
+    pids = (uint32_t**)ycalloc((size_t)npoints, sizeof(uint32_t*));
+    outs = (uint32_t**)ycalloc((size_t)npoints, sizeof(uint32_t*));
+    plens = (int*)ycalloc((size_t)npoints, sizeof(int));
+    olens = (int*)ycalloc((size_t)npoints, sizeof(int));
+    for (i = 0; i < npoints; i++) {
+        pids[i] = (uint32_t*)ymalloc(4096 * 4);
+        outs[i] = (uint32_t*)ymalloc(((size_t)ntokens + 16) * 4);
+        if (!pids[i] || !outs[i]) { snprintf(err, errlen, "oom"); rc = -1; goto out; }
+    }
+    for (i = 0; i < npoints; i++) {
+        snprintf(msg, sizeof(msg),
+                 "%s\n\n(Expand ONLY point %d below into a short paragraph. "
+                 "Do not repeat the other points.)\n%s",
+                 prompt, i + 1, points[i]);
+        plens[i] = vocab_chat_ids(v, msg, pids[i], 4096, use_bos);
+        if (plens[i] <= 0) { snprintf(err, errlen, "expand render failed"); rc = -1; goto out; }
+    }
+    memset(&t2m, 0, sizeof(t2m));
+    pctx.buf = outs; pctx.len = olens; pctx.cap = ntokens;
+    rc = engine_generate_parallel(e, (const uint32_t* const*)pids, plens, npoints,
+                                  ntokens, temp, top_p, seed, v->eos,
+                                  par_on_token_cb, &pctx, &t2m, err, errlen);
+
+    /* 汇总两阶段耗时 */
+    if (tim) {
+        tim->n_prefill = t1m.n_prefill + t2m.n_prefill;
+        tim->prefill_ms = t1m.prefill_ms + t2m.prefill_ms;
+        tim->n_decode = t1m.n_decode + t2m.n_decode;
+        tim->decode_ms = t1m.decode_ms + t2m.decode_ms;
+    }
+
+    /* 输出: 骨架 + 各点并行扩写 */
+    printf("\n[skeleton]\n");
+    for (i = 0; i < npoints; i++)
+        printf("%d. %s\n", i + 1, points[i]);
+    printf("\n[parallel expansion]\n");
+    for (i = 0; i < npoints; i++) {
+        char* txt2 = (char*)ycalloc(((size_t)olens[i] + 2) * 8, 1);
+        if (txt2 && olens[i] > 0)
+            vocab_decode(v, outs[i], olens[i], txt2, (int)(((size_t)olens[i] + 1) * 8));
+        printf("\n(%d) %s\n", i + 1, txt2 ? txt2 : "");
+        free(txt2);
+    }
+
+out:
+    free(sids);
+    free(sgen);
+    free(txt);
+    if (points) {
+        for (i = 0; i < npoints; i++) free(points[i]);
+        free(points);
+    }
+    if (pids) for (i = 0; i < npoints; i++) free(pids[i]);
+    if (outs) for (i = 0; i < npoints; i++) free(outs[i]);
+    free(pids); free(outs); free(plens); free(olens);
+    return rc;
+}
+
+/* chat --parallel N(默认, 非 --sot): 同一 prompt 复制 N 份槽位,
+ * 纯共享权重 batch 解码, 无骨架阶段。
+ * temp>0 时各分支 rng 交错采样 → N 个不同候选(等价 OpenAI API n=N);
+ * temp=0 时各分支输出相同(纯吞吐基准)。 */
+static int chat_parallel_plain(Engine* e, Vocab* v, const uint32_t* ids, int nprompt,
+                               int parallel, int ntokens, float temp, float top_p,
+                               uint64_t seed, EngineTimings* tim, char* err, size_t errlen)
+{
+    uint32_t** pids = (uint32_t**)ycalloc((size_t)parallel, sizeof(uint32_t*));
+    uint32_t** outs = (uint32_t**)ycalloc((size_t)parallel, sizeof(uint32_t*));
+    int* plens = (int*)ycalloc((size_t)parallel, sizeof(int));
+    int* olens = (int*)ycalloc((size_t)parallel, sizeof(int));
+    ParTokCtx pctx;
+    int s, rc;
+    for (s = 0; s < parallel; s++) {
+        pids[s] = (uint32_t*)ymalloc((size_t)nprompt * 4 + 16);
+        outs[s] = (uint32_t*)ymalloc(((size_t)ntokens + 16) * 4);
+        if (!pids[s] || !outs[s]) { snprintf(err, errlen, "oom"); return -1; }
+        memcpy(pids[s], ids, (size_t)nprompt * 4);
+        plens[s] = nprompt;
+    }
+    pctx.buf = outs; pctx.len = olens; pctx.cap = ntokens;
+    rc = engine_generate_parallel(e, (const uint32_t* const*)pids, plens, parallel,
+                                  ntokens, temp, top_p, seed, v->eos,
+                                  par_on_token_cb, &pctx, tim, err, errlen);
+    for (s = 0; s < parallel; s++) {
+        char* txt = (char*)ycalloc(((size_t)olens[s] + 2) * 8, 1);
+        if (txt && olens[s] > 0)
+            vocab_decode(v, outs[s], olens[s], txt, (int)(((size_t)olens[s] + 1) * 8));
+        printf("\n===== branch %d (%d tokens) =====\n%s\n", s + 1, olens[s], txt ? txt : "");
+        free(txt);
+    }
+    for (s = 0; s < parallel; s++) { free(pids[s]); free(outs[s]); }
+    free(pids); free(outs); free(plens); free(olens);
+    return rc;
+}
+
 static int cmd_chat(int argc, char** argv)
 {
     Arg a[24];
@@ -713,11 +877,14 @@ static int cmd_chat(int argc, char** argv)
     const char* gpu_layers_s = opt(a, n, "gpu-layers", NULL);
     int gpu_stream = atoi(opt(a, n, "gpu-stream", "0"));
     const char* kv_s = opt(a, n, "kv", "f16");
+    int parallel = atoi(opt(a, n, "parallel", "0"));
+    int sot = atoi(opt(a, n, "sot", "0"));
     YOpt yopt;
     int ai;
 
     if (!m) {
         fprintf(stderr, "usage: yllm chat --model <file.llf> --prompt <text> [--vocab <file>] [--mmproj <mmproj.gguf> --image <img>] [--opt k=v,...] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--kv f16|q8] [--no-template 1] [--no-bos 1]\n");
+        fprintf(stderr, "      [--parallel N] [--sot 0|1]  (并行共享权重: N 路独立续写/候选, --sot 1 为骨架+并行扩写; llama/qwen + CPU)\n");
         fprintf(stderr, "  --opt keys: max_soft_tokens,min_soft_tokens,downsample_mode,max_slice_nums,enable_thinking\n");
         return 1;
     }
@@ -804,6 +971,39 @@ static int cmd_chat(int argc, char** argv)
     if (mtp && !e.mtp_eh_slot)
         fprintf(stderr, "warning: --mtp requested but model has no MTP weights\n");
 
+    /* 并行共享权重解码(SoT): 开关检查 + KV 槽位扩容(须在首次前向前) */
+    if (parallel > 1) {
+        DeviceKind par_dk = DEV_CPU;
+        device_kind_parse(device_s, &par_dk);
+        if (par_dk != DEV_CPU) {
+            fprintf(stderr, "--parallel only supports --device cpu\n");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (!e.ops || !e.ops->fwd_block_batch_slots) {
+            fprintf(stderr, "--parallel: arch %s 不支持(仅 llama/qwen)\n",
+                    e.ops ? e.ops->name : "?");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (parallel > (int)e.pb_cap) {
+            fprintf(stderr, "--parallel %d 超过批容量上限 %u\n", parallel, e.pb_cap);
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        engine_set_parallel_slots(&e, (uint32_t)parallel);
+        if (e.n_slots < 2) {
+            fprintf(stderr, "--parallel: KV 扩容失败\n");
+            engine_free(&e);
+            vocab_free(&v);
+            return 1;
+        }
+        if (mtp) fprintf(stderr, "warning: --parallel 与 --mtp 不同用, 已关闭 MTP\n");
+        e.mtp_enable = 0;
+    }
     uint32_t* ids = (uint32_t*)ymalloc(((size_t)ntokens + 8192) * 4);
     uint32_t sz = (uint32_t)(ntokens + 8192);
     int nprompt;
@@ -914,9 +1114,27 @@ static int cmd_chat(int argc, char** argv)
     EngineTimings tim;
     memset(&tim, 0, sizeof(tim));
     int rc = 0;
-    if (nprompt >= 0) {
-        rc = engine_generate_mix(&e, ids, nprompt, ntokens, mix_emb, mix_use, mix_ds, vis_nds,
-                                 temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
+    if (parallel > 1 && !image) {
+        if (!(prompt && prompt[0])) {
+            fprintf(stderr, "--parallel 需要 --prompt\n");
+            rc = -1;
+        } else if (sot) {
+            /* SoT 模式: 骨架串行 + 各点并行扩写 */
+            rc = chat_sot_generate(&e, &v, prompt, parallel, ntokens, temp, top_p, seed,
+                                   use_bos, &tim, err, sizeof(err));
+        } else {
+            /* 默认: N 路独立并行续写, 纯共享权重(等价 OpenAI API n=N) */
+            rc = chat_parallel_plain(&e, &v, ids, nprompt, parallel, ntokens,
+                                     temp, top_p, seed, &tim, err, sizeof(err));
+        }
+    } else if (parallel > 1 && image) {
+        fprintf(stderr, "warning: --parallel 不支持 --image, 回退串行\n");
+    }
+    if (rc == 0 && !(parallel > 1 && !image && prompt && prompt[0])) {
+        if (nprompt >= 0) {
+            rc = engine_generate_mix(&e, ids, nprompt, ntokens, mix_emb, mix_use, mix_ds, vis_nds,
+                                     temp, top_p, seed, v.eos, on_token_cb, &v, &tim, err, sizeof(err));
+        }
     }
     uint64_t ms = ynow_ms() - t0;
     if (tim.n_decode > 0) { fputc('\n', stdout); fflush(stdout); ylog_raw_log("\n"); }   /* 生成文本末尾换行 */

@@ -24,9 +24,40 @@ build/avx2/yllm.exe gen --model m.llf --vocab vocab.txt \
 # N 条独立 prompt(每行一条)
 build/avx2/yllm.exe gen --model m.llf --vocab vocab.txt \
     --parallel-prompt prompts.txt --parallel 4 --tokens 48
+
+# chat: N 路独立并行续写(默认, 等价 OpenAI API n=N)
+#   temp>0 → N 个不同候选; temp=0 → 各分支相同(纯吞吐基准)
+build/avx2/yllm.exe chat --model m.llf --vocab vocab.txt \
+    --prompt "Once upon a time" --tokens 48 --parallel 4
+
+# chat SoT 模式(--sot 1): 串行出骨架(N 条中心句) → N 点并行扩写
+build/avx2/yllm.exe chat --model m.llf --vocab vocab.txt \
+    --prompt "..." --tokens 48 --parallel 4 --sot 1
 ```
 
 输出按分支打印，并给出 prefill/decode 耗时与聚合吞吐。
+
+## chat 两种模式
+
+- **默认（纯共享权重）**：同一 prompt 复制 N 份槽位，一次 batch 解码。
+  不引入任何任务拆分——temp>0 时各分支 rng 交错采样产生 N 个不同候选
+  （即 `n=N` 候选采样，可用 nucleus 重排挑最优），temp=0 时分支相同。
+- **--sot 1（中心句+扩写）**：阶段 1 串行生成骨架(N 条编号中心句，
+  96 tok 上限)；阶段 2 每点渲染为独立 prompt → 各槽位 prefill →
+  batch 扩写。指令跟随质量取决于模型能力（tinyllama 勉强，qwen2.5-7b+ 好）。
+
+## chat SoT 两阶段流程
+
+```
+用户问题 ──► [阶段1 串行] 骨架: 只输出 N 条编号中心句(~96 tok 上限)
+         ──► 解析中心句(逐行, 支持中英编号)
+         ──► [阶段2 并行] 每点渲染为独立 prompt → 各槽位 prefill
+             → engine_generate_parallel batch 扩写(共享权重搬运)
+         ──► 输出: [骨架] + [parallel expansion] 各点
+```
+
+骨架/扩写的指令跟随质量取决于模型能力：tinyllama-1.1B 勉强可用，
+qwen2.5-7b 及以上效果明显更好。
 
 ## 实现要点
 
