@@ -65,7 +65,7 @@ qwen2.5-7b 及以上效果明显更好。
 |---|---|---|
 | 开关解析 | `main.c cmd_gen` | `--parallel N` / `--parallel-prompt FILE`；限制 CPU + llama/qwen |
 | KV 槽位 | `engine.c engine_set_parallel_slots` | KV 扩容 N 份，`kv_slot_stride` 为槽位跨度；单槽位布局与原版完全一致 |
-| 多槽位批量前向 | `arch/llama.c arch_llama_fwd_block_batch_slots` | 复用 `matmul_batch`（量化块反量化一次、B 序列共享——内核级摊薄）；RoPE 按各自 pos、KV 读写/注意力按各自 slot；qwen 经 `e->ops->qwen_rope` 复用 |
+| 多槽位批量前向 | `arch/llama.c arch_llama_fwd_block_batch_slots` | 复用 `matmul_batch`——Q4K 走 int8 激活批量内核（激活量化一次、权重 nibble 反打包每行块一次由 B 序列共享，内层与单流 GEMV 同构；微基准 1.06-1.5×，`YLLM_BATCH_F32=1` 回退 f32 路径）；RoPE 按各自 pos、KV 读写/注意力按各自 slot；qwen 经 `e->ops->qwen_rope` 复用 |
 | 多序列生成循环 | `engine.c engine_generate_parallel` | 逐槽位 prefill（期间 e->kv 指向该 slot，复用现有全部路径）→ batch decode（活跃序列压缩、每序列独立采样/计数） |
 | API | `yllm.h` | `engine_set_parallel_slots` / `engine_generate_parallel`（供 serve 层后续接入） |
 
