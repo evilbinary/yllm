@@ -184,6 +184,7 @@ typedef struct Engine {
     float* mtp_h;            /* [hidden] 主干最后一层 norm 前 hidden(MTP 输入) */
     float* mtp_logits;       /* [vocab] MTP 预测 logits */
     int mtp_enable;          /* 运行期开关: 1 = speculative decoding */
+    int ngram_max;           /* >0 = n-gram 草稿投机解码(免训练, 贪心+CPU), 0 关闭 */
     int mtp_h_ready;         /* mtp_h 已由最近一次主干前向刷新 */
     /* 设备后端(docs/design-gpu-inference.md): 默认 CPU; CUDA 经 engine_bind_device */
     Device* dev;
@@ -303,6 +304,13 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
                         int (*on_token)(uint32_t id, void* ctx), void* ctx,
                         EngineTimings* timings, char* err, size_t errlen);
 uint64_t engine_resident(const Engine* e);
+
+/* 免训练 n-gram 草稿投机解码(--ngram-spec K): 每步在已生成历史里查
+ * 末尾 4-gram 的最近匹配, 沿用其后最多 K 个 token 作为草稿,
+ * 一次批量前向(fwd_block_batch)验证整段, 接受最长前缀。
+ * 零训练/零额外权重; 仅贪心(temp=0)+CPU 路径生效, 其余情况自动忽略。
+ * 关闭时每步仅一次整型分支, 零性能影响。须在首次前向前调用。 */
+void engine_set_ngram(Engine* e, int max_draft);
 
 /* ---- 并行共享权重解码(--parallel N, 仅 llama/qwen + CPU) ----
  * N 条独立序列的 KV 各占一个 slot, 每步把 N 条序列堆成 batch 走一次前向:

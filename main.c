@@ -415,6 +415,7 @@ static int cmd_gen(int argc, char** argv)
     const char* kv_s = opt(a, n, "kv", "f16");
     int parallel = atoi(opt(a, n, "parallel", "0"));
     const char* par_prompt_file = opt(a, n, "parallel-prompt", NULL);
+    int ngram = atoi(opt(a, n, "ngram-spec", "0"));
 
     if (!m) {
         fprintf(stderr, "usage: yllm gen --model <file.llf> [--vocab <file>] [--prompt <text>] [--tokens N] [--budget auto|NMB|NG] [--depth N] [--temp F] [--top-p F] [--seed N] [--device cpu|cuda|vulkan] [--gpu N] [--gpu-weights auto|q4k|fp16] [--gpu-layers N] [--gpu-stream 0|1] [--kv f16|q8]\n");
@@ -480,10 +481,21 @@ static int cmd_gen(int argc, char** argv)
             vocab_free(&v);
             return 1;
         }
+        if (ngram > 0) {
+            if (dk != DEV_CPU) fprintf(stderr, "warning: --ngram-spec 仅 --device cpu 生效, 已忽略\n");
+            else engine_set_ngram(&e, ngram);
+        }
     }
     e.mtp_enable = mtp && e.mtp_eh_slot;
     if (mtp && !e.mtp_eh_slot)
         fprintf(stderr, "warning: --mtp requested but model has no MTP weights\n");
+    if (ngram > 0 && mtp) {
+        fprintf(stderr, "warning: --ngram-spec 与 --mtp 不同用, 已关闭 MTP\n");
+        mtp = 0;
+        e.mtp_enable = 0;
+    }
+    if (ngram > 0 && temp > 0)
+        fprintf(stderr, "warning: --ngram-spec 仅在 --temp 0 (贪心) 下无损生效\n");
     /* 并行共享权重解码: 开关检查 + KV 扩容为 N 个槽位(须在首次前向前) */
     if (parallel > 1) {
         DeviceKind par_dk = DEV_CPU;
@@ -879,6 +891,7 @@ static int cmd_chat(int argc, char** argv)
     const char* kv_s = opt(a, n, "kv", "f16");
     int parallel = atoi(opt(a, n, "parallel", "0"));
     int sot = atoi(opt(a, n, "sot", "0"));
+    int ngram = atoi(opt(a, n, "ngram-spec", "0"));
     YOpt yopt;
     int ai;
 
@@ -966,10 +979,21 @@ static int cmd_chat(int argc, char** argv)
             vocab_free(&v);
             return 1;
         }
+        if (ngram > 0) {
+            if (dk != DEV_CPU) fprintf(stderr, "warning: --ngram-spec 仅 --device cpu 生效, 已忽略\n");
+            else engine_set_ngram(&e, ngram);
+        }
     }
     e.mtp_enable = mtp && e.mtp_eh_slot;
     if (mtp && !e.mtp_eh_slot)
         fprintf(stderr, "warning: --mtp requested but model has no MTP weights\n");
+    if (ngram > 0 && mtp) {
+        fprintf(stderr, "warning: --ngram-spec 与 --mtp 不同用, 已关闭 MTP\n");
+        mtp = 0;
+        e.mtp_enable = 0;
+    }
+    if (ngram > 0 && temp > 0)
+        fprintf(stderr, "warning: --ngram-spec 仅在 --temp 0 (贪心) 下无损生效\n");
 
     /* 并行共享权重解码(SoT): 开关检查 + KV 槽位扩容(须在首次前向前) */
     if (parallel > 1) {

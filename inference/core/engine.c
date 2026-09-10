@@ -740,6 +740,95 @@ void engine_set_parallel_slots(Engine* e, uint32_t n)
               n, (double)(one * n) / 1048576.0);
 }
 
+/* ---- 免训练 n-gram 草稿投机解码(--ngram-spec K) ---- */
+
+void engine_set_ngram(Engine* e, int max_draft)
+{
+    if (!e || max_draft <= 0) return;
+    if (e->device_mode != DEV_MODE_CPU) {
+        ylog_warn("engine: ngram-spec only supports CPU path, ignored");
+        return;
+    }
+    e->ngram_max = max_draft > 16 ? 16 : max_draft;
+    ylog_info("engine: n-gram speculative draft enabled (max_draft=%u, greedy only)",
+              e->ngram_max);
+}
+
+/* 在历史里查末尾 4-gram 的最近匹配, 沿用其后最多 k 个 token 作草稿(连续段)。
+ * 线性回扫: 相比一次 0.2s 的 forward, 查表成本可忽略; 关闭时零开销。 */
+static int ngram_draft(const uint32_t* hist, int hist_len, int k, uint32_t* out)
+{
+    enum { N = 4 };
+    const uint32_t* tail;
+    int p, avail, m;
+    if (hist_len < N + 1) return 0;
+    tail = hist + hist_len - N;
+    for (p = hist_len - N - 1; p >= 0; p--) {
+        if (memcmp(hist + p, tail, N * sizeof(uint32_t)) == 0) {
+            avail = hist_len - (p + N);
+            m = avail < k ? avail : k;
+            if (m > 0) memcpy(out, hist + p + N, (size_t)m * sizeof(uint32_t));
+            return m;
+        }
+    }
+    return 0;
+}
+
+/* 批量验证: 把 [确认token + 草稿] 作为一段(pos0..)走一次批量前向,
+ * 每行 final norm + lm_head + argmax → preds[j] = 位置 pos0+j 的模型预测。
+ * 权重整段只搬运一次 —— decode 塌缩为 prefill 的核心收益点。 */
+static void engine_verify_segment(Engine* e, const uint32_t* seg, int m,
+                                  uint32_t pos0, uint32_t* preds)
+{
+    Ws* ws = &e->ws;
+    LlModel* mdl = &ws->model;
+    const LlfHeader* h = &mdl->h;
+    const uint8_t* base = (const uint8_t*)ws->map.base;
+    uint32_t hidden = h->hidden, vocab = h->vocab;
+    uint32_t trunk = h->n_blocks - (e->mtp_layer ? 1u : 0u);
+    const LlfTensorMeta* fn = &mdl->metas[mdl->base_idx[h->n_blocks + 1]];
+    const LlfTensorMeta* out = &mdl->metas[mdl->base_idx[h->n_blocks + 2]];
+    float eps;
+    int j;
+    uint32_t i, t, best;
+
+    memcpy(&eps, &h->norm_eps_bits, 4);
+    for (j = 0; j < m; j++)
+        engine_embed_into(e, e->pb + (size_t)j * hidden, seg[j]);
+    if (e->ops && e->ops->after_embed_batch)
+        e->ops->after_embed_batch(e, seg, (uint32_t)m);
+    for (i = 1; i <= trunk; i++) {
+        if (ws->budget > 0) sched_ensure(ws, i);
+        engine_call_fwd_block_batch(e, i, pos0, (uint32_t)m);
+        if (ws->budget > 0) sched_release_budget(ws, i);
+    }
+    for (j = 0; j < m; j++) {
+        rmsnorm(e->x, e->pb + (size_t)j * hidden,
+                base + mdl->dir[h->n_blocks + 1].offset + fn->offset,
+                hidden, eps, fn->dtype);
+#if YLLM_TENSOR_STREAM
+        if (ws->budget > 0) {
+            size_t rbytes = matmul_row_bytes(out->dtype, hidden);
+            uint32_t dl = h->n_blocks + 2;
+            if (rbytes > 0)
+                lm_head_chunked(e, base + mdl->dir[dl].offset + out->offset,
+                                mdl->dir[dl].offset + out->offset,
+                                hidden, vocab, out->dtype);
+            else
+                matmul(e->logits, e->x, base + mdl->dir[dl].offset + out->offset,
+                       vocab, hidden, out->dtype);
+        } else
+#endif
+        matmul(e->logits, e->x, base + mdl->dir[h->n_blocks + 2].offset + out->offset,
+               vocab, hidden, out->dtype);
+        if (e->ops && e->ops->post_logits) e->ops->post_logits(e);
+        best = 0;
+        for (t = 1; t < vocab; t++)
+            if (e->logits[t] > e->logits[best]) best = t;
+        preds[j] = best;
+    }
+}
+
 void engine_attach_cpu_fwd(Engine* e)
 {
     if (e && e->dev) {
@@ -1396,15 +1485,33 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
     int pending = 0;              /* 上一轮 MTP 接受: 本轮跳过采样直接 forward */
     uint32_t pending_tok = 0;
     uint32_t vocab = e->ws.model.h.vocab;
+    /* n-gram 草稿历史(prompt + 已生成), 仅供 --ngram-spec; 关闭时为 NULL 零开销 */
+    uint32_t* hist = NULL;
+    int hist_len = 0, hcap = 0;
+    int nxt_counted = 0;          /* 当前 nxt 是否已计入 ngen(防双重/遗漏计数) */
+    if (e->ngram_max > 0) {
+        hcap = (int)e->max_seq + 8;
+        hist = (uint32_t*)ymalloc((size_t)hcap * 4);
+        if (hist) {
+            int hn = nprompt < hcap ? nprompt : hcap;
+            memcpy(hist, prompt, (size_t)hn * 4);
+            hist_len = hn;
+        }
+    }
     for (i = 0; i < ntokens; i++) {
-        if (pos >= e->max_seq) break;
+        if (pos >= e->max_seq || (ntokens > 0 && ngen >= (uint32_t)ntokens)) break;
         uint32_t nxt;
-        if (pending) { nxt = pending_tok; pending = 0; }
+        if (pending) { nxt = pending_tok; pending = 0; nxt_counted = 1; }
         else {
-            if (engine_sample(e, vocab, temp, top_p, &rng, &nxt) != 0) return -1;
+            if (engine_sample(e, vocab, temp, top_p, &rng, &nxt) != 0) {
+                free(hist);
+                return -1;
+            }
             if (eos_stop >= 0 && (int)nxt == eos_stop) break;
             if (on_token && on_token(nxt, ctx) != 0) break;     /* 回调可中止(如对端断开) */
+            nxt_counted = 0;
         }
+        if (hist && hist_len < hcap) hist[hist_len++] = nxt;
         /* MTP draft: 输入 hidden(pos-1 主干输出) + embed(nxt=pos) → 预测 pos+1 */
         uint32_t draft = 0xFFFFFFFFu;
         if (e->mtp_enable && e->mtp_eh_slot && e->mtp_h_ready) {
@@ -1415,10 +1522,62 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
                 draft = best;
             }
         }
+        /* n-gram 草稿投机(贪心专用): 命中时把 [确认token+草稿] 一次批量前向验证,
+         * 权重整段只搬运一次; 未接受尾部回拨 pos(脏行被后续覆写), 无需删除。 */
+        if (e->ngram_max > 0 && temp <= 0.0f && !e->vis_ds && !e->mtp_enable && hist) {
+            uint32_t dseg[16], preds[17], seg[17];
+            int m = ngram_draft(hist, hist_len, e->ngram_max, dseg);
+            fprintf(stderr, "[ng1] enter m=%d pos=%u\n", m, pos);
+            if (m > 0 && pos + m + 1 < e->max_seq) {
+                int j, acc = 0, stop = 0;
+                seg[0] = nxt;
+                for (j = 0; j < m; j++) seg[j + 1] = dseg[j];
+                fprintf(stderr, "[ng2] before verify\n");
+                engine_verify_segment(e, seg, m + 1, pos, preds);
+                fprintf(stderr, "[ng3] after verify\n");
+                if (!nxt_counted) { ngen++; nxt_counted = 1; }   /* nxt 首次计数 */
+                if (getenv("YLLM_NGRAMDBG")) {
+                    fprintf(stderr, "[ngdbg] pos=%u m=%d seg:", pos, m);
+                    for (j = 0; j < m + 1; j++) fprintf(stderr, " %u", seg[j]);
+                    fprintf(stderr, "  preds:");
+                    for (j = 0; j < m + 1; j++) fprintf(stderr, " %u", preds[j]);
+                    fprintf(stderr, "\n");
+                }
+                for (j = 0; j < m; j++) {             /* 贪心核对: 预测==草稿? */
+                    if (preds[j] != seg[j + 1]) break;
+                    if (ngen >= (uint32_t)ntokens) { stop = 1; break; }
+                    ngen++;
+                    if (eos_stop >= 0 && (int)seg[j + 1] == eos_stop) { stop = 1; break; }
+                    if (on_token && on_token(seg[j + 1], ctx) != 0) { stop = 1; break; }
+                    if (hist_len < hcap) hist[hist_len++] = seg[j + 1];
+                    acc++;
+                }
+                pos += acc + 1;                       /* 提交已接受段; 未接受段回拨, 脏行覆写 */
+                if (!stop) {
+                    /* 白送的下一 token: 先 emit 再挂 pending —— 与 MTP 约定一致
+                     * (pending 消费路径不调 on_token, 否则该 token 永远不会输出) */
+                    if (eos_stop >= 0 && (int)preds[acc] == eos_stop) stop = 1;
+                    else if (ngen >= (uint32_t)ntokens) stop = 1;
+                    else {
+                        ngen++;
+                        if (on_token && on_token(preds[acc], ctx) != 0) stop = 1;
+                        else {
+                            if (hist_len < hcap) hist[hist_len++] = preds[acc];
+                            pending = 1;
+                            pending_tok = preds[acc];
+                            nxt_counted = 1;
+                        }
+                    }
+                }
+                if (stop) break;      /* hist 由循环后的统一 free 释放 */
+                continue;
+            }
+        }
         if (pos >= e->max_seq) break;
         engine_forward(e, nxt, pos);
         pos++;
         ngen++;
+        nxt_counted = 1;
         if (draft != 0xFFFFFFFFu) {
             n_try++;
             uint32_t real = 0, b3;
@@ -1442,6 +1601,7 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
             }
         }
     }
+    free(hist);
     if (e->mtp_enable && e->mtp_eh_slot && n_try > 0) {
         uint32_t nfwd = ngen > n_accept ? ngen - n_accept : 1;
         ylog_info("mtp: draft accepted %u/%u (%.0f%%) -> %.2f tok/forward", n_accept, n_try,
