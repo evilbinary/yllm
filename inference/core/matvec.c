@@ -2032,8 +2032,8 @@ size_t matmul_row_bytes(uint32_t dtype, uint32_t in)
  * 附带收益: 与串行 GEMV 数值路径一致(speculative verify 的 batch 一致性更好)。
  * token 按 G≤8 分块限栈(8×in int8 ≈ 88KB @ in=11008); B≤8 时权重单遍流式。 */
 #ifdef __AVX2__
-static void matmul_batch_q4k_i8(float* y, const float* x, const uint8_t* w,
-                                uint32_t out, uint32_t in, uint32_t B)
+void matmul_batch_q4k_i8(float* y, const float* x, const uint8_t* w,
+                         uint32_t out, uint32_t in, uint32_t B)
 {
     const uint32_t nb = in / 256;
     const uint32_t G = B < 8 ? B : 8;
@@ -2131,9 +2131,9 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
 {
     uint32_t nb = in / 256;
     uint32_t oo;
-    const uint32_t blk = (dtype == DT_Q6K) ? 210 : (dtype == DT_Q5K) ? 176 : 144;
 #ifdef __AVX2__
-    if (dtype == DT_Q4K) {                  /* int8 激活批量内核(见上) */
+    if (dtype == DT_Q4K && !getenv("YLLM_BATCH_F32")) {  /* int8 激活批量内核(见上);
+                                                          * YLLM_BATCH_F32=1 回退 f32 路径 */
         matmul_batch_q4k_i8(y, x, w, out, in, B);
         return;
     }
@@ -2469,6 +2469,18 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
         return;
     }
     /* 量化 dtype(Q4K/Q6K/IQ4XS): 块反量化共享 + 批量点积 */
+    matmul_batch_q(y, x, w, out, in, dtype, B);
+}
+
+/* 通用量化批量路径(块反量化共享 + f32 批量点积)。
+ * AVX2 构建下 Q4K 走 matmul_batch_q4k_i8, 此函数保留为非 AVX2 回退
+ * 与微基准基线(导出供 bench_matvec 对比)。 */
+void matmul_batch_q(float* y, const float* x, const uint8_t* w, uint32_t out,
+                    uint32_t in, uint32_t dtype, uint32_t B)
+{
+    uint32_t nb = in / 256;
+    uint32_t oo;
+    const uint32_t blk = (dtype == DT_Q6K) ? 210 : (dtype == DT_Q5K) ? 176 : 144;
     #pragma omp parallel for schedule(static)
     for (oo = 0; oo < out; oo++) {
         const uint8_t* row = w + (size_t)oo * nb * blk;

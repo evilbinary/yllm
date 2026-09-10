@@ -4,6 +4,16 @@
 #include <stdint.h>
 
 void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype);
+/* 批量: y[B×out] = x[B×in] · W^T。
+ * AVX2 构建下 Q4K 走 int8 激活内核(matmul_batch_q4k_i8); 其余走通用路径。 */
+void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in,
+                  uint32_t dtype, uint32_t B);
+/* 通用量化批量路径(块反量化共享 + f32 批量点积); Q4K 的非 AVX2 回退与基准基线 */
+void matmul_batch_q(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in,
+                    uint32_t dtype, uint32_t B);
+/* Q4K int8 激活批量内核(AVX2); 导出供微基准 */
+void matmul_batch_q4k_i8(float* y, const float* x, const uint8_t* w,
+                         uint32_t out, uint32_t in, uint32_t B);
 void matmul_f32_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out);
 void matmul_f16_t(float* y, const float* x, const uint8_t* w, uint32_t in, uint32_t out);
 void matmul_q4k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
