@@ -1527,22 +1527,12 @@ int engine_generate_mix(Engine* e, const uint32_t* prompt, int nprompt, int ntok
         if (e->ngram_max > 0 && temp <= 0.0f && !e->vis_ds && !e->mtp_enable && hist) {
             uint32_t dseg[16], preds[17], seg[17];
             int m = ngram_draft(hist, hist_len, e->ngram_max, dseg);
-            fprintf(stderr, "[ng1] enter m=%d pos=%u\n", m, pos);
             if (m > 0 && pos + m + 1 < e->max_seq) {
                 int j, acc = 0, stop = 0;
                 seg[0] = nxt;
                 for (j = 0; j < m; j++) seg[j + 1] = dseg[j];
-                fprintf(stderr, "[ng2] before verify\n");
                 engine_verify_segment(e, seg, m + 1, pos, preds);
-                fprintf(stderr, "[ng3] after verify\n");
                 if (!nxt_counted) { ngen++; nxt_counted = 1; }   /* nxt 首次计数 */
-                if (getenv("YLLM_NGRAMDBG")) {
-                    fprintf(stderr, "[ngdbg] pos=%u m=%d seg:", pos, m);
-                    for (j = 0; j < m + 1; j++) fprintf(stderr, " %u", seg[j]);
-                    fprintf(stderr, "  preds:");
-                    for (j = 0; j < m + 1; j++) fprintf(stderr, " %u", preds[j]);
-                    fprintf(stderr, "\n");
-                }
                 for (j = 0; j < m; j++) {             /* 贪心核对: 预测==草稿? */
                     if (preds[j] != seg[j + 1]) break;
                     if (ngen >= (uint32_t)ntokens) { stop = 1; break; }

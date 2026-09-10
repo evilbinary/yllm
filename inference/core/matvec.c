@@ -2023,6 +2023,103 @@ size_t matmul_row_bytes(uint32_t dtype, uint32_t in)
     }
 }
 
+/* ---- 批量 Q4K int8 激活内核(AVX2) ----
+ * y[B×out] = x[B×in] · W^T。与 f32 反量化批量路径的区别:
+ * 1) 激活每 token int8 量化一次(q8k_quant_i8, 与单流 GEMV matmul_q4k 同路径);
+ * 2) 权重 nibble 反打包每行块一次、由该块全部 token 共享;
+ * 3) 内层 maddubs(u8×i8)+madd 与单流 GEMV 同构 —— 每 token 每块 ~45 uops,
+ *    对比 f32 反量化路径 ~96 uops(64 load + 32 FMADD)。
+ * 附带收益: 与串行 GEMV 数值路径一致(speculative verify 的 batch 一致性更好)。
+ * token 按 G≤8 分块限栈(8×in int8 ≈ 88KB @ in=11008); B≤8 时权重单遍流式。 */
+#ifdef __AVX2__
+static void matmul_batch_q4k_i8(float* y, const float* x, const uint8_t* w,
+                                uint32_t out, uint32_t in, uint32_t B)
+{
+    const uint32_t nb = in / 256;
+    const uint32_t G = B < 8 ? B : 8;
+    const __m256i ones_u8 = _mm256_set1_epi8(1);
+    const __m256i ones_i16 = _mm256_set1_epi16(1);
+    const __m128i lowmask = _mm_set1_epi8(0x0F);
+    uint32_t c0, oo;
+    int8_t* xq8 = (int8_t*)alloca((size_t)G * in);
+    float* xs = (float*)alloca((size_t)G * nb * 4);
+    float* sxg = (float*)alloca((size_t)G * nb * 8 * 4);
+
+    for (c0 = 0; c0 < B; c0 += G) {
+        uint32_t gc = (B - c0 < G) ? B - c0 : G;
+        uint32_t g, b;
+        /* 1) 本组 token 激活 int8 量化 + 32 子块和预计算(dmin 校正项用) */
+        for (g = 0; g < gc; g++)
+            q8k_quant_i8(x + (size_t)(c0 + g) * in, xq8 + (size_t)g * in,
+                         xs + (size_t)g * nb, in);
+        for (g = 0; g < gc; g++) {
+            for (b = 0; b < nb; b++) {
+                const int8_t* xp = xq8 + (size_t)g * in + (size_t)b * 256;
+                float* sp = sxg + (size_t)g * nb * 8 + (size_t)b * 8;
+                uint32_t j;
+                for (j = 0; j < 8; j++)
+                    sp[j] = hsum_i32_avx2(_mm256_madd_epi16(_mm256_maddubs_epi16(
+                        ones_u8, _mm256_loadu_si256((const __m256i*)(xp + j * 32))),
+                        ones_i16));
+            }
+        }
+        /* 2) 输出行主循环: 反打包一次, B 个 token 共享 */
+        #pragma omp parallel for schedule(static)
+        for (oo = 0; oo < out; oo++) {
+            const uint8_t* row = w + (size_t)oo * nb * 144;
+            float acc[8], cmin[8];
+            uint32_t bb;
+            uint32_t g;
+            for (g = 0; g < gc; g++) { acc[g] = 0.0f; cmin[g] = 0.0f; }
+            for (bb = 0; bb < nb; bb++) {
+                const uint8_t* blk = row + (size_t)bb * 144;
+                const uint8_t* q = blk + 16;
+                uint8_t sc8[8], mn8[8];
+                __m256i qv[8];
+                float d = f16_to_f32(((const uint16_t*)blk)[0]);
+                float dmin = f16_to_f32(((const uint16_t*)blk)[1]);
+                int j;
+                q4k_unpack_sc(blk + 4, sc8, mn8);
+                for (j = 0; j < 4; j++) {          /* 反打包: 每 j 64 权重 nibble */
+                    __m128i q0 = _mm_loadu_si128((const __m128i*)q);
+                    __m128i q1 = _mm_loadu_si128((const __m128i*)(q + 16));
+                    __m128i lo0 = _mm_and_si128(q0, lowmask);
+                    __m128i hi0 = _mm_and_si128(_mm_srli_epi16(q0, 4), lowmask);
+                    __m128i lo1 = _mm_and_si128(q1, lowmask);
+                    __m128i hi1 = _mm_and_si128(_mm_srli_epi16(q1, 4), lowmask);
+                    qv[j * 2] = _mm256_inserti128_si256(_mm256_castsi128_si256(lo0), lo1, 1);
+                    qv[j * 2 + 1] = _mm256_inserti128_si256(_mm256_castsi128_si256(hi0), hi1, 1);
+                    q += 32;
+                }
+                for (g = 0; g < gc; g++) {
+                    const int8_t* xp = xq8 + (size_t)g * in + (size_t)bb * 256;
+                    const float* sg = sxg + (size_t)g * nb * 8 + (size_t)bb * 8;
+                    const float xsc = xs[(size_t)g * nb + bb];
+                    float sdot = 0.0f, mcorr = 0.0f;
+                    int32_t S[8];
+                    for (j = 0; j < 4; j++) {
+                        __m256i xv1 = _mm256_loadu_si256((const __m256i*)(xp + j * 64));
+                        __m256i xv2 = _mm256_loadu_si256((const __m256i*)(xp + j * 64 + 32));
+                        S[j * 2] = (int32_t)hsum_i32_avx2(_mm256_madd_epi16(
+                            _mm256_maddubs_epi16(qv[j * 2], xv1), ones_i16));
+                        S[j * 2 + 1] = (int32_t)hsum_i32_avx2(_mm256_madd_epi16(
+                            _mm256_maddubs_epi16(qv[j * 2 + 1], xv2), ones_i16));
+                    }
+                    for (j = 0; j < 8; j++) {
+                        sdot += (float)S[j] * (float)sc8[j];
+                        mcorr += sg[j] * (float)mn8[j];
+                    }
+                    acc[g] += sdot * d * xsc;
+                    cmin[g] -= mcorr * dmin * xsc;
+                }
+            }
+            for (g = 0; g < gc; g++)
+                y[(size_t)(c0 + g) * out + oo] = acc[g] + cmin[g];
+        }
+    }
+}
+#endif /* __AVX2__ */
+
 /* ---- 批量 matmul(批量 prefill 用): y[B×out] = x[B×in] · W^T
  * 每个输出行 oo: 同时算 B 个 token 的点积, 权重行只读一次(每 4 token 一组 SIMD)。 */
 /* ---- 批量 matmul(批量 prefill 用): y[B×out] = x[B×in] · W^T
@@ -2035,6 +2132,12 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     uint32_t nb = in / 256;
     uint32_t oo;
     const uint32_t blk = (dtype == DT_Q6K) ? 210 : (dtype == DT_Q5K) ? 176 : 144;
+#ifdef __AVX2__
+    if (dtype == DT_Q4K) {                  /* int8 激活批量内核(见上) */
+        matmul_batch_q4k_i8(y, x, w, out, in, B);
+        return;
+    }
+#endif
     if (dtype == DT_W4B64) {
         uint32_t nb64 = in / W4B64_BLK;
         uint32_t hu = (out + 7u) / 8u;

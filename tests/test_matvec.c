@@ -144,6 +144,40 @@ static void test_matmul_q4k(void)
     CHECK_NEAR(y2[0], y[0], 1e-6, "matmul dispatch q4k");
 }
 
+/* ---- matmul_batch(Q4K, int8 激活内核): 与逐行串行 matmul_q4k 一致性 ----
+ * 随机 q4k 权重 + 随机输入, B=3 与 B=1: batch 每行结果须与串行 GEMV 一致
+ * (两者共享 q8k_quant_i8 激活量化路径, 差异仅浮点结合顺序)。 */
+static void test_matmul_batch_q4k(void)
+{
+    const uint32_t IN = 512, OUT = 4, NB = IN / 256;
+    uint8_t w[OUT * NB * 144];
+    uint32_t r, b, i, g;
+    uint64_t rng = 12345;
+    float x[3 * IN], yb[3 * OUT], ys[OUT];
+#define TRAND() (rng = rng * 6364136223846793005ULL + 1442695040888963407ULL, rng >> 33)
+    for (r = 0; r < OUT; r++) {
+        for (b = 0; b < NB; b++) {
+            uint8_t* blk = w + r * NB * 144 + b * 144;
+            uint16_t d16 = f32_to_f16(0.02f);
+            uint16_t m16 = f32_to_f16(0.001f);
+            memcpy(blk, &d16, 2);
+            memcpy(blk + 2, &m16, 2);
+            for (i = 0; i < 12; i++) blk[4 + i] = (uint8_t)(TRAND() & 0x3F);
+            for (i = 0; i < 128; i++) blk[16 + i] = (uint8_t)(TRAND() & 0xFF);
+        }
+    }
+    for (i = 0; i < 3 * IN; i++)
+        x[i] = (float)((int64_t)(TRAND() % 2001) - 1000) / 500.0f;
+    matmul_batch(yb, x, w, OUT, IN, DT_Q4K, 3);
+    for (g = 0; g < 3; g++) {
+        matmul_q4k(ys, x + (size_t)g * IN, w, OUT, IN);
+        for (r = 0; r < OUT; r++)
+            CHECK_NEAR(yb[(size_t)g * OUT + r], ys[r], 1e-3,
+                       "matmul_batch q4k == serial q4k");
+    }
+#undef TRAND
+}
+
 /* ---- matmul_q5k: 2-block weight, known input ----
  * 每 block 176 字节: d@[0], min@[1], sc@[4..15], qh@[16..47], qs@[48..175]。
  * 4 组: 每组 qv1 = (qs&0xF)+(qh&u1?16:0), qv2 = (qs>>4)+(qh&u2?16:0)。
@@ -397,6 +431,8 @@ int main(void)
     test_embed_q4k();
     printf("running test_matmul_q4k...\n"); fflush(stdout);
     test_matmul_q4k();
+    printf("running test_matmul_batch_q4k...\n"); fflush(stdout);
+    test_matmul_batch_q4k();
     printf("running test_matmul_q5k...\n"); fflush(stdout);
     test_matmul_q5k();
     printf("running test_matmul_q6k...\n"); fflush(stdout);
