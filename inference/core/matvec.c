@@ -1905,18 +1905,34 @@ static void matmul_w4b64_arm82_sdot(float* y, const int8_t* xq, const float* xs,
             const float* wscale = (const float*)(panel + W4B64_LU * 16);
             const int8_t* xp = xq + (size_t)bl * W4B64_BLK;
             float xsc = xs[bl];
+            /* 4 组独立累加链: SDOT 延迟 ~4 周期, 单链会被延迟卡死;
+             * 拆链后靠多链交叠逼近吞吐上限 */
             int32x4_t iacc_hi = vdupq_n_s32(0);
             int32x4_t iacc_lo = vdupq_n_s32(0);
+            int32x4_t iacc_hi2 = vdupq_n_s32(0);
+            int32x4_t iacc_lo2 = vdupq_n_s32(0);
+            int32x4_t iacc_hi3 = vdupq_n_s32(0);
+            int32x4_t iacc_lo3 = vdupq_n_s32(0);
+            int32x4_t iacc_hi4 = vdupq_n_s32(0);
+            int32x4_t iacc_lo4 = vdupq_n_s32(0);
             int32x4_t corr = vdupq_n_s32(8 * xsum[bl]);
             __builtin_prefetch(panel + W4B64_PANEL_BYTES, 0, 3);
             __builtin_prefetch(panel + 2 * W4B64_PANEL_BYTES, 0, 2);
             __builtin_prefetch(panel + 3 * W4B64_PANEL_BYTES, 0, 2);
-            for (j = 0; j < W4B64_LU; j += 4) {
+            for (j = 0; j < W4B64_LU; j += 16) {
                 int8x16_t xv = vld1q_s8(xp + j * 4);
                 w4_sdot_4cells_xv(&iacc_hi, &iacc_lo, panel, xv, j, mask15, arm86);
+                xv = vld1q_s8(xp + (j + 4) * 4);
+                w4_sdot_4cells_xv(&iacc_hi2, &iacc_lo2, panel, xv, j + 4, mask15, arm86);
+                xv = vld1q_s8(xp + (j + 8) * 4);
+                w4_sdot_4cells_xv(&iacc_hi3, &iacc_lo3, panel, xv, j + 8, mask15, arm86);
+                xv = vld1q_s8(xp + (j + 12) * 4);
+                w4_sdot_4cells_xv(&iacc_hi4, &iacc_lo4, panel, xv, j + 12, mask15, arm86);
             }
-            iacc_hi = vsubq_s32(iacc_hi, corr);
-            iacc_lo = vsubq_s32(iacc_lo, corr);
+            iacc_hi = vsubq_s32(vaddq_s32(vaddq_s32(iacc_hi, iacc_hi2),
+                                          vaddq_s32(iacc_hi3, iacc_hi4)), corr);
+            iacc_lo = vsubq_s32(vaddq_s32(vaddq_s32(iacc_lo, iacc_lo2),
+                                          vaddq_s32(iacc_lo3, iacc_lo4)), corr);
             acc_hi = vmlaq_f32(acc_hi, vmulq_n_f32(vcvtq_f32_s32(iacc_hi), xsc), vld1q_f32(wscale));
             acc_lo = vmlaq_f32(acc_lo, vmulq_n_f32(vcvtq_f32_s32(iacc_lo), xsc), vld1q_f32(wscale + 4));
         }
