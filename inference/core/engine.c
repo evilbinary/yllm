@@ -151,9 +151,10 @@ static void sched_adapt_budget(Ws* ws)
     long pf = ru.ru_majflt;
     long delta = pf - ws->last_majflt;
     ws->last_majflt = pf;
-    long avph = sysconf(_SC_AVPHYS_PAGES);
-    long pgsz = sysconf(_SC_PAGESIZE);
-    uint64_t mem_free = (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
+    /* 用 MemAvailable(含页缓存) 判断余量: mmap 权重页驻留靠页缓存,
+     * _SC_AVPHYS_PAGES 接近 MemFree, 页缓存大时会误判内存紧张 → 层预算缩到 1,
+     * 每 token 释放再重读全部权重(decode 变成带宽拷贝瓶颈)。 */
+    uint64_t mem_free = ymem_available();
     uint64_t cap = ws->budget;
     if (delta > 0 && mem_free > cap + cap / 2) {
         if (ws->budget_layers < ws->model.n_layers) ws->budget_layers++;
@@ -291,6 +292,17 @@ int engine_init(Engine* e, const char* model_path, uint64_t budget, int depth, c
         ws->budget_layers = bl;
     }
     ws->last_majflt = 0;
+    /* 预算已覆盖全模型 → 等效全驻留, 直接关闭流式调度
+     * (省去逐 token mincore / 释放重取, 权重常驻页缓存零成本) */
+    if (ws->budget > 0) {
+        uint64_t tot = 0;
+        for (i = 0; i < m->n_layers; i++) tot += ws->layer_size[i];
+        if (ws->budget >= tot) {
+            ylog_info("engine: budget %.0f MB covers model %.0f MB, streaming off",
+                      (double)ws->budget / 1048576.0, (double)tot / 1048576.0);
+            ws->budget = 0;
+        }
+    }
 
     uint32_t hidden = m->h.hidden;
     uint32_t kv_dim = m->h.n_kv_heads * m->h.head_dim;

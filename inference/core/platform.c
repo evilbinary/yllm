@@ -618,6 +618,44 @@ uint64_t yrng(uint64_t* s)
     return z ^ (z >> 31);
 }
 
+/* 系统可用内存: Linux 读 MemAvailable(含可回收页缓存, mmap 权重页计入)。
+ * 注意 sysconf(_SC_AVPHYS_PAGES) 实际返回接近 MemFree 的值, 页缓存大时严重偏低,
+ * 不能用于判断 mmap 文件页能否驻留。 */
+uint64_t ymem_available(void)
+{
+#ifdef __linux__
+    {
+        FILE* f = fopen("/proc/meminfo", "r");
+        char l[256];
+        if (f) {
+            uint64_t kb = 0;
+            while (fgets(l, sizeof l, f))
+                if (!strncmp(l, "MemAvailable:", 13)) {
+                    sscanf(l + 13, "%llu", (unsigned long long*)&kb);
+                    break;
+                }
+            fclose(f);
+            if (kb > 0) return kb * 1024;
+        }
+    }
+#endif
+#ifdef _WIN32
+    {
+        MEMORY_STATUSEX st;
+        st.dwLength = sizeof(st);
+        if (GlobalMemoryStatusEx(&st))
+            return (uint64_t)st.ullAvailPhys;
+    }
+    return 0;
+#else
+    {
+        long avph = sysconf(_SC_AVPHYS_PAGES);
+        long pgsz = sysconf(_SC_PAGESIZE);
+        return (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
+    }
+#endif
+}
+
 uint64_t yproc_rss(void)
 {
 #ifdef __linux__

@@ -367,8 +367,8 @@ MODEL_VOCAB ?= models/tinyllama.vocab.txt
 CHAT_PROMPT ?= "Once upon a time"
 CHAT_TOKENS ?= 30
 
-# 推理线程数(OpenMP)。默认使用本机全部核心, 可用 NTHREADS=N 覆盖。
-NTHREADS ?= $(shell nproc 2>/dev/null || echo 4)
+# 推理线程数(OpenMP)。默认物理核数(lscpu; SMT 超订阅会拖慢 decode), 可用 NTHREADS=N 覆盖。
+NTHREADS ?= $(shell n=`lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -u | wc -l`; if [ -z "$$n" ] || [ "$$n" = 0 ]; then n=`nproc 2>/dev/null || echo 4`; fi; echo $$n)
 # 运行参数(默认无): MTP=1 开投机解码(模型需带 MTP/nextn 权重); KV=q8 开 KV int8 量化(仅 CPU, 内存减半)
 #   make chat-avx2 MTP=1            / make gen-avx2 KV=q8
 #   make chat-minicpm5-2b-avx2 MTP=1 KV=q8

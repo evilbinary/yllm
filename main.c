@@ -15,6 +15,54 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* 默认 OMP 线程数 = 物理核数(而非 SMT 逻辑核)。
+ * decode 的 GEMV 是小并行区 + 带宽受限, 用满逻辑核会超订阅,
+ * 上下文切换/自旋开销可拖慢 2-3 倍。显式设置 OMP_NUM_THREADS 时不干预。 */
+static void set_default_omp_threads(void)
+{
+#ifdef _OPENMP
+    const char* env = getenv("OMP_NUM_THREADS");
+    if (env && env[0]) return;
+    int phys = 0;
+#ifdef __linux__
+    {
+        FILE* f = fopen("/proc/cpuinfo", "r");
+        if (f) {
+            /* unique (physical id, core id) 对 = 物理核数 */
+            struct { unsigned p, c; } seen[512];
+            int nseen = 0;
+            char l[256];
+            unsigned cur_p = 0;
+            while (fgets(l, sizeof l, f)) {
+                if (!strncmp(l, "physical id", 11)) {
+                    sscanf(l + 11, " : %u", &cur_p);
+                } else if (!strncmp(l, "core id", 7)) {
+                    unsigned c = 0;
+                    int dup = 0, i;
+                    sscanf(l + 7, " : %u", &c);
+                    for (i = 0; i < nseen; i++)
+                        if (seen[i].p == cur_p && seen[i].c == c) { dup = 1; break; }
+                    if (!dup && nseen < 512) {
+                        seen[nseen].p = cur_p;
+                        seen[nseen].c = c;
+                        nseen++;
+                    }
+                }
+            }
+            fclose(f);
+            phys = nseen;
+        }
+    }
+#endif
+    if (phys <= 0) phys = omp_get_num_procs();
+    if (phys > 0 && phys < omp_get_max_threads())
+        omp_set_num_threads(phys);
+#endif
+}
 
 typedef struct {
     const char* key;
@@ -811,6 +859,7 @@ static int cmd_chat(int argc, char** argv)
 
 int main(int argc, char** argv)
 {
+    set_default_omp_threads();
     if (argc < 2) {
         fprintf(stderr, "usage: yllm <convert|file|check|gen|chat|rank|server|router|supervisor|hub|ctl|sync> [options]\n");
         return 1;
