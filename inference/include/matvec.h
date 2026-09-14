@@ -75,6 +75,11 @@ void softmax(float* v, uint32_t n);
 void swiglu(float* y, const float* gate, const float* up, uint32_t n);
 void geglu(float* y, const float* gate, const float* up, uint32_t n);
 void gelu_inplace(float* y, uint32_t n);
+/* 向量 tanh / tanh×scale(x86 AVX2 向量化; 其他平台标量回退)。
+ * y_tanh_vec: y[i] = tanh(x[i])
+ * y_tanh_scale_vec: y[i] = yout * tanh(x[i] * xin) */
+void y_tanh_vec(float* y, const float* x, uint32_t n);
+void y_tanh_scale_vec(float* y, const float* x, float xin, float yout, uint32_t n);
 void rmsnorm_unit(float* y, const float* x, uint32_t n, float eps);
 void add_inplace(float* y, const float* x, uint32_t n);
 float vec_dot_f32_f16(const float* a, const uint16_t* b, uint32_t n);

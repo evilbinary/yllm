@@ -854,10 +854,12 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
     uint32_t i;
     static int prof_init;
     static uint64_t prof_blk_ns, prof_head_ns, prof_n;
+    static int nandbg = -1;
     int do_prof = 0;
     if (!prof_init) {
         prof_init = 1;
         do_prof = getenv("YLLM_PROF") != NULL;
+        nandbg = getenv("YLLM_NANDBG") != NULL;
         if (!do_prof) prof_init = 2; /* off */
     } else if (prof_init == 1)
         do_prof = 1;
@@ -891,25 +893,27 @@ int engine_forward_range(Engine* e, uint32_t token, int need_embed, uint32_t pos
             if (i <= h->n_blocks) prof_blk_ns += dt;
             else                   prof_head_ns += dt;
         }
-        if (getenv("YLLM_NANDBG") && i == 33)
-            fprintf(stderr, "[nandbg] x after layer33 pos %u: %g %g %g %g\n", pos,
-                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
-        if (getenv("YLLM_NANDBG") && i == 59)
-            fprintf(stderr, "[nandbg] x after layer59 pos %u: %g %g %g %g\n", pos,
-                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
-        if (getenv("YLLM_NANDBG") && (i == 34 || i == 40 || i == 50))
-            fprintf(stderr, "[nandbg] x after layer%u pos %u: %g %g %g %g\n", i, pos,
-                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
-        if (getenv("YLLM_NANDBG") && (i == 35 || i == 36 || i == 37))
-            fprintf(stderr, "[nandbg] x after layer%u pos %u: %g %g %g %g\n", i, pos,
-                    (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
-        if (getenv("YLLM_NANDBG") && (i == 33 || i == 35 || i == 36 || i == 59)) {
-            float l2 = 0, s = 0; unsigned h = 0; uint32_t j, hd = e->ws.model.h.hidden;
-            for (j = 0; j < hd; j++) { l2 += e->x[j]*e->x[j]; s += e->x[j]; h = h*131 + (unsigned)floorf(e->x[j]*1000.0f); }
-            fprintf(stderr, "[nandbg] chk layer%u pos %u: l2=%.5g sum=%.5g hash=%u\n", i, pos, (double)l2, (double)s, h);
+        if (nandbg) {
+            if (i == 33)
+                fprintf(stderr, "[nandbg] x after layer33 pos %u: %g %g %g %g\n", pos,
+                        (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+            if (i == 59)
+                fprintf(stderr, "[nandbg] x after layer59 pos %u: %g %g %g %g\n", pos,
+                        (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+            if (i == 34 || i == 40 || i == 50)
+                fprintf(stderr, "[nandbg] x after layer%u pos %u: %g %g %g %g\n", i, pos,
+                        (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+            if (i == 35 || i == 36 || i == 37)
+                fprintf(stderr, "[nandbg] x after layer%u pos %u: %g %g %g %g\n", i, pos,
+                        (double)e->x[0], (double)e->x[1], (double)e->x[2], (double)e->x[3]);
+            if (i == 33 || i == 35 || i == 36 || i == 59) {
+                float l2 = 0, s = 0; unsigned h = 0; uint32_t j, hd = e->ws.model.h.hidden;
+                for (j = 0; j < hd; j++) { l2 += e->x[j]*e->x[j]; s += e->x[j]; h = h*131 + (unsigned)floorf(e->x[j]*1000.0f); }
+                fprintf(stderr, "[nandbg] chk layer%u pos %u: l2=%.5g sum=%.5g hash=%u\n", i, pos, (double)l2, (double)s, h);
+            }
+            if (e->x[0] != e->x[0])
+                fprintf(stderr, "[nandbg] rank rng NaN after layer %u pos %u\n", i, pos);
         }
-        if (getenv("YLLM_NANDBG") && e->x[0] != e->x[0])
-            fprintf(stderr, "[nandbg] rank rng NaN after layer %u pos %u\n", i, pos);
         if (w) {
             uint32_t d = (uint32_t)ws->depth;
             uint32_t nb = i + d;

@@ -2575,14 +2575,101 @@ void softmax(float* v, uint32_t n)
     for (i = 0; i < n; i++) v[i] /= s;
 }
 
+#ifdef __AVX2__
+static inline __m256 tanh256(__m256 x);
+#endif
+
 void swiglu(float* y, const float* gate, const float* up, uint32_t n)
 {
     uint32_t i;
+#ifdef __AVX2__
+    /* sigmoid(g) = 0.5*(1+tanh(g/2)): 向量化, 消逐元素 expf */
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256 g = _mm256_loadu_ps(gate + i);
+        __m256 s = tanh256(_mm256_mul_ps(g, _mm256_set1_ps(0.5f)));
+        s = _mm256_mul_ps(_mm256_add_ps(s, _mm256_set1_ps(1.0f)), _mm256_set1_ps(0.5f));
+        _mm256_storeu_ps(y + i,
+            _mm256_mul_ps(_mm256_mul_ps(g, s), _mm256_loadu_ps(up + i)));
+    }
+    for (; i < n; i++) {
+        float g = gate[i];
+        y[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+#else
     for (i = 0; i < n; i++) {
         float g = gate[i];
         y[i] = g / (1.0f + expf(-g)) * up[i];
     }
+#endif
 }
+
+#ifdef __AVX2__
+/* 向量 tanh: tanh(x) = 2/(1+exp(-2x)) - 1, |x|>=9 直接 ±1。
+ * exp 用 2^k * poly(r) (Taylor 6 阶, |r|<=ln2/2, 误差 ~1e-7)。 */
+static inline __m256 tanh256(__m256 x)
+{
+    const __m256 v9 = _mm256_set1_ps(9.0f);
+    /* x2 = clamp(2x, -40, 40): tanh(±20)=float 精度下即 ±1, exp(±40) 不溢出 */
+    __m256 x2 = _mm256_add_ps(x, x);
+    x2 = _mm256_max_ps(x2, _mm256_set1_ps(-40.0f));
+    x2 = _mm256_min_ps(x2, _mm256_set1_ps(40.0f));
+    /* e = exp(-x2): a = -x2, k = round(a*log2e), r = a - k*ln2, |r| <= ln2/2 */
+    const __m256 log2e = _mm256_set1_ps(1.4426950408889634f);
+    const __m256 ln2 = _mm256_set1_ps(0.6931471805599453f);
+    __m256 a = _mm256_sub_ps(_mm256_setzero_ps(), x2);
+    __m256 kf = _mm256_floor_ps(_mm256_fmadd_ps(a, log2e, _mm256_set1_ps(0.5f)));
+    __m256 r = _mm256_fnmadd_ps(kf, ln2, a);
+    /* poly(r): 1 + r(1 + r(1/2 + r(1/6 + r(1/24 + r(1/120 + r/720))))) */
+    __m256 p = _mm256_fmadd_ps(_mm256_set1_ps(1.0f / 720.0f), r, _mm256_set1_ps(1.0f / 120.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 24.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 6.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    __m256i k = _mm256_cvtps_epi32(kf);
+    __m256 scale = _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_add_epi32(k, _mm256_set1_epi32(127)), 23));
+    __m256 e = _mm256_mul_ps(p, scale);
+    __m256 t = _mm256_div_ps(_mm256_set1_ps(2.0f), _mm256_add_ps(e, _mm256_set1_ps(1.0f)));
+    __m256 th = _mm256_sub_ps(t, _mm256_set1_ps(1.0f));
+    /* |x| >= 9 → ±1 */
+    __m256 big = _mm256_cmp_ps(x, v9, _CMP_GT_OQ);
+    __m256 out = _mm256_blendv_ps(th, _mm256_set1_ps(1.0f), big);
+    __m256 neg = _mm256_cmp_ps(x, _mm256_set1_ps(-9.0f), _CMP_LT_OQ);
+    return _mm256_blendv_ps(out, _mm256_set1_ps(-1.0f), neg);
+}
+
+void y_tanh_vec(float* y, const float* x, uint32_t n)
+{
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, tanh256(_mm256_loadu_ps(x + i)));
+    for (; i < n; i++) y[i] = tanhf(x[i]);
+}
+
+void y_tanh_scale_vec(float* y, const float* x, float xin, float yout, uint32_t n)
+{
+    uint32_t i = 0;
+    const __m256 vin = _mm256_set1_ps(xin);
+    const __m256 vout = _mm256_set1_ps(yout);
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(vout,
+            tanh256(_mm256_mul_ps(vin, _mm256_loadu_ps(x + i)))));
+    for (; i < n; i++) y[i] = yout * tanhf(x[i] * xin);
+}
+#else /* 非 AVX2: 标量回退 */
+void y_tanh_vec(float* y, const float* x, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++) y[i] = tanhf(x[i]);
+}
+
+void y_tanh_scale_vec(float* y, const float* x, float xin, float yout, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++) y[i] = yout * tanhf(x[i] * xin);
+}
+#endif
 
 /* GeGLU: y[i] = gelu(gate[i]) * up[i]  (gemma4 FFN 激活) */
 static float gelu_approx(float x)
@@ -2596,15 +2683,41 @@ static float gelu_approx(float x)
 
 void geglu(float* y, const float* gate, const float* up, uint32_t n)
 {
-    uint32_t i;
-    for (i = 0; i < n; i++)
+    uint32_t i = 0;
+#ifdef __AVX2__
+    const __m256 vc = _mm256_set1_ps(0.7978845608f);
+    const __m256 vk = _mm256_set1_ps(0.044715f);
+    const __m256 vh = _mm256_set1_ps(0.5f);
+    for (; i + 8 <= n; i += 8) {
+        __m256 g = _mm256_loadu_ps(gate + i);
+        __m256 g2 = _mm256_mul_ps(g, g);
+        __m256 inner = _mm256_mul_ps(vc, _mm256_fmadd_ps(vk, _mm256_mul_ps(g2, g), g));
+        __m256 t = tanh256(inner);
+        t = _mm256_mul_ps(_mm256_add_ps(t, _mm256_set1_ps(1.0f)), vh);
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_mul_ps(g, t), _mm256_loadu_ps(up + i)));
+    }
+#endif
+    for (; i < n; i++)
         y[i] = gelu_approx(gate[i]) * up[i];
 }
 
 void gelu_inplace(float* y, uint32_t n)
 {
-    uint32_t i;
-    for (i = 0; i < n; i++)
+    uint32_t i = 0;
+#ifdef __AVX2__
+    const __m256 vc = _mm256_set1_ps(0.7978845608f);
+    const __m256 vk = _mm256_set1_ps(0.044715f);
+    const __m256 vh = _mm256_set1_ps(0.5f);
+    for (; i + 8 <= n; i += 8) {
+        __m256 g = _mm256_loadu_ps(y + i);
+        __m256 g2 = _mm256_mul_ps(g, g);
+        __m256 inner = _mm256_mul_ps(vc, _mm256_fmadd_ps(vk, _mm256_mul_ps(g2, g), g));
+        __m256 t = tanh256(inner);
+        t = _mm256_mul_ps(_mm256_add_ps(t, _mm256_set1_ps(1.0f)), vh);
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(g, t));
+    }
+#endif
+    for (; i < n; i++)
         y[i] = gelu_approx(y[i]);
 }
 

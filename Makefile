@@ -133,7 +133,7 @@ LIBS += $(PLATLIBS)
 BATCH_PREFILL ?= 1
 # 会话数据包调试: make YLLM_SESS_DEBUG=1 开启(0 默认关闭)
 YLLM_SESS_DEBUG ?= 0
-CFLAGS_BASE   := -O2 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) -DYLLM_SESS_DEBUG=$(YLLM_SESS_DEBUG) $(PLATDEF) $(OMPFLAG)
+CFLAGS_BASE   := -O3 -std=c99 -Wall -Wextra -DYLLM_BATCH_PREFILL=$(BATCH_PREFILL) -DYLLM_SESS_DEBUG=$(YLLM_SESS_DEBUG) $(PLATDEF) $(OMPFLAG)
 ifeq ($(YLLM_CUDA),1)
   ifeq ($(YLLM_CUDA_HOST),1)
     CFLAGS_BASE += -DYLLM_CUDA=1 -DYLLM_CUDA_HOST=1
@@ -278,10 +278,10 @@ $(OBJDIR_AVX2)/router_http.o: serve/router_http.c serve/router_http.h serve/rout
 # ---- 测试(标量 + AVX2 两套) ----
 TEST_SRC := tests/test_matvec.c tests/test_tokenizer.c tests/test_llf.c tests/test_engine.c tests/test_prefill_batch.c tests/test_cache.c
 
-$(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/core/platform.c inference/core/llf.c inference/core/matvec.c | $(OBJDIR)
-	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Itests -o $@ $< inference/core/platform.c inference/core/llf.c inference/core/matvec.c $(LDFLAGS) $(LIBS)
+$(OBJDIR)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/core/platform.c inference/core/llf.c inference/core/matvec.c inference/core/log.c | $(OBJDIR)
+	$(CC) $(CFLAGS_BASE) $(INFER_INC) -Itests -o $@ $< inference/core/platform.c inference/core/llf.c inference/core/matvec.c inference/core/log.c $(LDFLAGS) $(LIBS)
 
-$(OBJDIR)/test_tokenizer.exe: tests/test_tokenizer.c inference/core/platform.c inference/core/llf.c inference/core/tokenizer.c | $(OBJDIR)
+$(OBJDIR)/test_tokenizer.exe: tests/test_tokenizer.c inference/core/platform.c inference/core/llf.c inference/core/tokenizer.c inference/core/log.c | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR)
@@ -290,10 +290,10 @@ $(OBJDIR)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR)
 $(OBJDIR)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-$(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/core/platform.c inference/core/llf.c inference/core/matvec.c | $(OBJDIR_AVX2)
-	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Itests -o $@ $< inference/core/platform.c inference/core/llf.c inference/core/matvec.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
+$(OBJDIR_AVX2)/test_matvec.exe: tests/test_matvec.c tests/ref_data.h inference/core/platform.c inference/core/llf.c inference/core/matvec.c inference/core/log.c | $(OBJDIR_AVX2)
+	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -Itests -o $@ $< inference/core/platform.c inference/core/llf.c inference/core/matvec.c inference/core/log.c $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c inference/core/platform.c inference/core/llf.c inference/core/tokenizer.c | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/test_tokenizer.exe: tests/test_tokenizer.c inference/core/platform.c inference/core/llf.c inference/core/tokenizer.c inference/core/log.c | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR_AVX2)/test_llf.exe: tests/test_llf.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
@@ -305,13 +305,13 @@ $(OBJDIR_AVX2)/test_engine.exe: tests/test_engine.c $(TEST_ENGINE_CORE) | $(OBJD
 $(OBJDIR)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-$(OBJDIR)/test_cache.exe: tests/test_cache.c inference/core/cache.c inference/core/platform.c | $(OBJDIR)
+$(OBJDIR)/test_cache.exe: tests/test_cache.c inference/core/cache.c inference/core/platform.c inference/core/log.c | $(OBJDIR)
 	$(CC) $(CFLAGS_BASE) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 $(OBJDIR_AVX2)/test_prefill_batch.exe: tests/test_prefill_batch.c $(TEST_ENGINE_CORE) | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
-$(OBJDIR_AVX2)/test_cache.exe: tests/test_cache.c inference/core/cache.c inference/core/platform.c | $(OBJDIR_AVX2)
+$(OBJDIR_AVX2)/test_cache.exe: tests/test_cache.c inference/core/cache.c inference/core/platform.c inference/core/log.c | $(OBJDIR_AVX2)
 	$(CC) $(CFLAGS_AVX2) $(INFER_INC) -o $@ $^ $(LDFLAGS) $(LDFLAGS_AVX2) $(LIBS)
 
 $(OBJDIR)/test_long_chat.exe: tests/test_long_chat.c $(TEST_ENGINE_CORE) | $(OBJDIR)

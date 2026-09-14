@@ -352,9 +352,8 @@ void arch_gemma4_post_logits(Engine* e)
 {
     float cap = llf_gemma4_final_cap(&e->ws.model.h);
     if (cap > 0.0f) {
-        uint32_t vi, vocab = e->ws.model.h.vocab;
-        for (vi = 0; vi < vocab; vi++)
-            e->logits[vi] = cap * tanhf(e->logits[vi] / cap);
+        /* 26 万词表逐 token 全量 tanh, 向量化(标量 tanhf 每 token 数十毫秒级) */
+        y_tanh_scale_vec(e->logits, e->logits, 1.0f / cap, cap, e->ws.model.h.vocab);
     }
 }
 
