@@ -1309,11 +1309,182 @@ static void matmul_q6k_preq(float* y, const float* xq, const uint8_t* w, uint32_
 #endif
 }
 
+#ifdef __AVX2__
+static inline float hsum128(__m128 v)
+{
+    __m128 sh = _mm_movehl_ps(v, v);
+    v = _mm_add_ps(v, sh);
+    sh = _mm_shuffle_ps(v, v, 1);
+    return _mm_cvtss_f32(_mm_add_ss(v, sh));
+}
+#endif
+
 void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
 {
+#ifdef __AVX2__
+    /* 整数域 maddubs 路径: q6 值 0..63 = lo nibble | (2bit qh)<<4,
+     * 每 16 元素组一个 int8 scale; 激活 int8 量化(与 q4k 路径同构)。
+     * dot_g = Σ qv·x_i8; 贡献 = d·sc_g·xs_b·(dot_g − 32·sxg16_g),
+     * 修正在 int32 域折叠(m − 32·sxg16), 每组仅 1 次 cvt + 1 次 fmadd。 */
+    uint32_t nb = in / 256;
+    uint32_t rowb = nb * 210;
+    uint32_t oo;
+    int8_t* xq8 = (int8_t*)alloca((size_t)in);
+    float* xs = (float*)alloca((size_t)nb * 4);
+    int32_t* sxg = (int32_t*)alloca((size_t)nb * 16 * 4);
+    q8k_quant_i8(x, xq8, xs, in);
+    {
+        /* 每 16 元素组的 Σx_i8 (int32) */
+        for (uint32_t b = 0; b < nb; b++) {
+            const int8_t* xb = xq8 + (size_t)b * 256;
+            int32_t* sb = sxg + (size_t)b * 16;
+            for (uint32_t g = 0; g < 16; g++) {
+                int32_t s = 0;
+                for (uint32_t l = 0; l < 16; l++) s += xb[g * 16 + l];
+                sb[g] = s;
+            }
+        }
+    }
+    {
+        const __m128i mF = _mm_set1_epi8(0x0F);
+        const __m128i m3 = _mm_set1_epi8(0x03);
+        const __m128i ones = _mm_set1_epi16(1);
+        uint32_t n2 = out & ~1u;
+        #pragma omp parallel for schedule(static)
+        for (oo = 0; oo < n2; oo += 2) {
+            const uint8_t* row0 = w + (size_t)oo * rowb;
+            const uint8_t* row1 = row0 + rowb;
+            __m128 accA0 = _mm_setzero_ps(), accB0 = _mm_setzero_ps();
+            __m128 accA1 = _mm_setzero_ps(), accB1 = _mm_setzero_ps();
+            uint32_t b;
+            for (b = 0; b < nb; b++) {
+                const uint8_t* blk0 = row0 + (size_t)b * 210;
+                const uint8_t* blk1 = row1 + (size_t)b * 210;
+                const int32_t* sb = sxg + (size_t)b * 16;
+                if (b + 1 < nb) {
+                    _mm_prefetch((const char*)(blk0 + 210), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(blk1 + 210), _MM_HINT_T0);
+                }
+#ifdef __F16C__
+                float d0 = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)*(const uint16_t*)(blk0 + 208))));
+                float d1 = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)*(const uint16_t*)(blk1 + 208))));
+#else
+                float d0 = f16_to_f32(((const uint16_t*)blk0)[104]);
+                float d1 = f16_to_f32(((const uint16_t*)blk1)[104]);
+#endif
+                float xs_b = xs[b];
+                const int8_t* sc0 = (const int8_t*)(blk0 + 192);
+                const int8_t* sc1 = (const int8_t*)(blk1 + 192);
+                for (uint32_t h = 0; h < 2; h++) {
+                    const uint8_t* ql0 = blk0 + h * 64;
+                    const uint8_t* ql1 = blk1 + h * 64;
+                    const uint8_t* qh0 = blk0 + 128 + h * 32;
+                    const uint8_t* qh1 = blk1 + 128 + h * 32;
+                    __m128i qha0 = _mm_loadu_si128((const __m128i*)qh0);
+                    __m128i qha1 = _mm_loadu_si128((const __m128i*)qh1);
+                    __m128i qhb0 = _mm_loadu_si128((const __m128i*)(qh0 + 16));
+                    __m128i qhb1 = _mm_loadu_si128((const __m128i*)(qh1 + 16));
+                    for (uint32_t q = 0; q < 4; q++) {
+                        uint32_t off = (q & 1u) * 32;
+                        int shift = (int)q * 2;
+                        int hi = (q & 2u) != 0;
+                        __m128i qla0 = _mm_loadu_si128((const __m128i*)(ql0 + off));
+                        __m128i qlb0 = _mm_loadu_si128((const __m128i*)(ql0 + off + 16));
+                        __m128i qla1 = _mm_loadu_si128((const __m128i*)(ql1 + off));
+                        __m128i qlb1 = _mm_loadu_si128((const __m128i*)(ql1 + off + 16));
+                        __m128i lo0 = hi ? _mm_and_si128(_mm_srli_epi16(qla0, 4), mF) : _mm_and_si128(qla0, mF);
+                        __m128i lo0b = hi ? _mm_and_si128(_mm_srli_epi16(qlb0, 4), mF) : _mm_and_si128(qlb0, mF);
+                        __m128i lo1 = hi ? _mm_and_si128(_mm_srli_epi16(qla1, 4), mF) : _mm_and_si128(qla1, mF);
+                        __m128i lo1b = hi ? _mm_and_si128(_mm_srli_epi16(qlb1, 4), mF) : _mm_and_si128(qlb1, mF);
+                        __m128i h2a0 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qha0, shift), m3), 4);
+                        __m128i h2b0 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhb0, shift), m3), 4);
+                        __m128i h2a1 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qha1, shift), m3), 4);
+                        __m128i h2b1 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhb1, shift), m3), 4);
+                        for (uint32_t p = 0; p < 2; p++) {
+                            uint32_t g = h * 8 + q * 2 + p;
+                            const int8_t* xp = xq8 + (size_t)b * 256 + h * 128 + q * 32 + p * 16;
+                            __m128i xv = _mm_loadu_si128((const __m128i*)xp);
+                            __m128i p0 = _mm_maddubs_epi16(
+                                _mm_or_si128(p ? lo0b : lo0, p ? h2b0 : h2a0), xv);
+                            __m128i p1 = _mm_maddubs_epi16(
+                                _mm_or_si128(p ? lo1b : lo1, p ? h2b1 : h2a1), xv);
+                            int32_t corr = 8 * sb[g]; /* 32*sb 摊到 4 个 lane */
+                            __m128 wv;
+                            float w0 = d0 * xs_b * sc0[g];
+                            float w1 = d1 * xs_b * sc1[g];
+                            __m128i m0 = _mm_sub_epi32(_mm_madd_epi16(p0, ones), _mm_set1_epi32(corr));
+                            __m128i m1 = _mm_sub_epi32(_mm_madd_epi16(p1, ones), _mm_set1_epi32(corr));
+                            if (p == 0) {
+                                wv = _mm_set1_ps(d0 * xs_b * sc0[g]);
+                                accA0 = _mm_fmadd_ps(_mm_cvtepi32_ps(m0), wv, accA0);
+                                wv = _mm_set1_ps(d1 * xs_b * sc1[g]);
+                                accA1 = _mm_fmadd_ps(_mm_cvtepi32_ps(m1), wv, accA1);
+                            } else {
+                                wv = _mm_set1_ps(d0 * xs_b * sc0[g]);
+                                accB0 = _mm_fmadd_ps(_mm_cvtepi32_ps(m0), wv, accB0);
+                                wv = _mm_set1_ps(d1 * xs_b * sc1[g]);
+                                accB1 = _mm_fmadd_ps(_mm_cvtepi32_ps(m1), wv, accB1);
+                            }
+                        }
+                    }
+                }
+            }
+            y[oo]     = hsum128(_mm_add_ps(accA0, accB0));
+            y[oo + 1] = hsum128(_mm_add_ps(accA1, accB1));
+        }
+        if (out & 1u) {
+            oo = out - 1u;
+            const uint8_t* row = w + (size_t)oo * rowb;
+            __m128 accA = _mm_setzero_ps(), accB = _mm_setzero_ps();
+            uint32_t b;
+            for (b = 0; b < nb; b++) {
+                const uint8_t* blk = row + (size_t)b * 210;
+                const int32_t* sb = sxg + (size_t)b * 16;
+                float d;
+#ifdef __F16C__
+                d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)*(const uint16_t*)(blk + 208))));
+#else
+                d = f16_to_f32(((const uint16_t*)blk)[104]);
+#endif
+                float xs_b = xs[b];
+                const int8_t* sc = (const int8_t*)(blk + 192);
+                for (uint32_t h = 0; h < 2; h++) {
+                    const uint8_t* ql = blk + h * 64;
+                    const uint8_t* qh = blk + 128 + h * 32;
+                    __m128i qha = _mm_loadu_si128((const __m128i*)qh);
+                    __m128i qhb = _mm_loadu_si128((const __m128i*)(qh + 16));
+                    for (uint32_t q = 0; q < 4; q++) {
+                        uint32_t off = (q & 1u) * 32;
+                        int shift = (int)q * 2;
+                        int hi = (q & 2u) != 0;
+                        __m128i qla = _mm_loadu_si128((const __m128i*)(ql + off));
+                        __m128i qlb = _mm_loadu_si128((const __m128i*)(ql + off + 16));
+                        __m128i loa = hi ? _mm_and_si128(_mm_srli_epi16(qla, 4), mF) : _mm_and_si128(qla, mF);
+                        __m128i lob = hi ? _mm_and_si128(_mm_srli_epi16(qlb, 4), mF) : _mm_and_si128(qlb, mF);
+                        __m128i h2a = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qha, shift), m3), 4);
+                        __m128i h2b = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qhb, shift), m3), 4);
+                        for (uint32_t p = 0; p < 2; p++) {
+                            uint32_t g = h * 8 + q * 2 + p;
+                            const int8_t* xp = xq8 + (size_t)b * 256 + h * 128 + q * 32 + p * 16;
+                            __m128i xv = _mm_loadu_si128((const __m128i*)xp);
+                            __m128i pp = _mm_maddubs_epi16(
+                                _mm_or_si128(p ? lob : loa, p ? h2b : h2a), xv);
+                            __m128i m = _mm_sub_epi32(_mm_madd_epi16(pp, ones), _mm_set1_epi32(8 * sb[g]));
+                            __m128 wv = _mm_set1_ps(d * xs_b * sc[g]);
+                            if (p == 0) accA = _mm_fmadd_ps(_mm_cvtepi32_ps(m), wv, accA);
+                            else        accB = _mm_fmadd_ps(_mm_cvtepi32_ps(m), wv, accB);
+                        }
+                    }
+                }
+            }
+            y[oo] = hsum128(_mm_add_ps(accA, accB));
+        }
+    }
+#else
     float* xq = (float*)alloca((size_t)in * 4);
     q8k_quant(x, xq, in);
     matmul_q6k_preq(y, xq, w, out, in);
+#endif
 }
 
 size_t w4b64_bytes(uint32_t out, uint32_t in)

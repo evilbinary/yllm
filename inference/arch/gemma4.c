@@ -29,6 +29,12 @@ static Gemma4Ctx* g4c(Engine* e)
     return (e && e->arch_ctx) ? (Gemma4Ctx*)e->arch_ctx : NULL;
 }
 
+/* 层内分段剖析(YLLM_PROF=2 开启): qkv/attn/o/gateup/down/ple 每段耗时,
+ * 正常运行零开销(仅一次 getenv)。 */
+static int g4_seg_prof = -1;
+static double g4s_qkv, g4s_attn, g4s_o, g4s_gu, g4s_down, g4s_ple, g4s_tot;
+static int g4s_n;
+
 const ArchOps arch_gemma4_ops = {
     .name = "gemma4",
     .id = ARCH_GEMMA4,
@@ -571,6 +577,9 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
 {
     Gemma4Ctx* c = g4c(e);
     if (!c) return -1;
+    if (g4_seg_prof < 0) g4_seg_prof = getenv("YLLM_PROF") != NULL && strcmp(getenv("YLLM_PROF"), "2") == 0;
+    uint64_t pt0 = g4_seg_prof ? ynow_ns() : 0;
+    uint64_t ptD = 0, ptE = 0;
 
     Ws* ws = &e->ws;
     LlModel* m = &ws->model;
@@ -644,6 +653,7 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
                 memcpy(v, k, (size_t)kvd * 4);
         }
     }
+    uint64_t ptA = g4_seg_prof ? ynow_ns() : 0;
     if (mt[SLOT_QBIAS].size > 0) {
         const float* bq = (const float*)(base + mt[SLOT_QBIAS].offset);
         uint32_t j;
@@ -713,8 +723,10 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
             attn_kv_f16(att_out, q, (const uint16_t*)kcache, (const uint16_t*)vcache, s0, pos,
                         h->n_heads, h->n_kv_heads, hd, kv_dim, 1.0f, 0.0f);
     }
+    uint64_t ptB = g4_seg_prof ? ynow_ns() : 0;
     memcpy(x2, att_out, (size_t)q_dim * 4);
     matmul(att_out, x2, base + mt[SLOT_O].offset, hidden, q_dim, mt[SLOT_O].dtype);
+    uint64_t ptC = g4_seg_prof ? ynow_ns() : 0;
     {
         float ls = 1.0f;
         uint32_t j;
@@ -738,9 +750,11 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
             }
             geglu(x2, fg, fu, inter);
         }
+        if (g4_seg_prof) ptD = ynow_ns();
         matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
         rmsnorm(x2, att_out, base + mt[SLOT_NORM4].offset, hidden, eps, mt[SLOT_NORM4].dtype);
         add_inplace(x, x2, hidden);
+        if (g4_seg_prof) ptE = ynow_ns();
         if (c->ple && c->n_ple > 0 && mt[SLOT_PLE_GATE].size > 0) {
             uint32_t n_ple = c->n_ple;
             float* gate = c->ple_work;
@@ -758,6 +772,20 @@ int arch_gemma4_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
             if (mt[SLOT_LAYER_SCALE].dtype == DT_F32) memcpy(&ls, lsptr, 4);
             else { uint16_t lsh; memcpy(&lsh, lsptr, 2); ls = f16_to_f32(lsh); }
             for (j = 0; j < hidden; j++) x[j] *= ls;
+        }
+    }
+    if (g4_seg_prof) {
+        uint64_t tend = ynow_ns();
+        g4s_qkv += (ptA - pt0) / 1e6; g4s_attn += (ptB - ptA) / 1e6;
+        g4s_o += (ptC - ptB) / 1e6;
+        g4s_gu += (ptD - ptC) / 1e6; g4s_down += (ptE - ptD) / 1e6;
+        g4s_ple += (tend - ptE) / 1e6; g4s_tot += (tend - pt0) / 1e6;
+        if (layer == h->n_blocks && ++g4s_n % 16 == 0) {
+            fprintf(stderr,
+                "[g4seg] qkv=%.2f attn=%.2f o=%.2f gateup=%.2f down=%.2f ple+=%.2f blocks=%.2f ms/token\n",
+                g4s_qkv, g4s_attn, g4s_o, g4s_gu, g4s_down, g4s_ple, g4s_tot);
+            fflush(stderr);
+            g4s_qkv = g4s_attn = g4s_o = g4s_gu = g4s_down = g4s_ple = g4s_tot = 0;
         }
     }
     return 0;
