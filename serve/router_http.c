@@ -170,8 +170,12 @@ static void sse_on_token(const char* utf8, size_t len, void* ctx)
     /* 拼上残留的不完整 UTF-8 序列 */
     char buf[512];
     size_t blen = 0;
-    if (sc->pending_len) { memcpy(buf, sc->pending, sc->pending_len); blen = sc->pending_len; }
-    if (blen + len < sizeof(buf)) { memcpy(buf + blen, utf8, len); blen += len; }
+    if (sc->pending_len > 0 && (size_t)sc->pending_len <= sizeof(sc->pending)) {
+        memcpy(buf, sc->pending, (size_t)sc->pending_len);
+        blen = (size_t)sc->pending_len;
+    }
+    /* 用减法判断剩余空间: blen+len 为 size_t, len 极大时会回绕后误判通过 */
+    if (len < sizeof(buf) - blen) { memcpy(buf + blen, utf8, len); blen += len; }
     else { blen = 0; }   /* 超缓冲, 丢弃(罕见) */
     size_t complete = utf8_complete_len(buf, blen);
     /* 保存不完整尾部 */
@@ -627,6 +631,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     if (stream) {
         HttpResponse rr;
         SseCtx sc;
+        memset(&sc, 0, sizeof(sc));   /* pending_len 必须清零: 未初始化会被当作 memcpy 长度用 */
         sc.r = &rr;
         sc.model = model;
         sc.n_tokens = 0;
@@ -772,6 +777,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
     if (stream) {
         HttpResponse rr;
         SseCtx sc;
+        memset(&sc, 0, sizeof(sc));   /* pending_len/prompt_tokens 必须清零 */
         sc.r = &rr;
         sc.model = model;
         sc.n_tokens = 0;
