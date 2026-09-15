@@ -641,7 +641,7 @@ uint64_t ymem_available(void)
 #endif
 #ifdef _WIN32
     {
-        MEMORY_STATUSEX st;
+        MEMORYSTATUSEX st;
         st.dwLength = sizeof(st);
         if (GlobalMemoryStatusEx(&st))
             return (uint64_t)st.ullAvailPhys;
