@@ -11,6 +11,16 @@ void matmul_q6k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32
 void matmul_q5k(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_iq4xs(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
 void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
+/* PrismML PTQ1_0 三元 matmul (行主序, (in/128)*28B/行) */
+void matmul_ptq1(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in);
+
+/* PrismML Hadamard 激活变换 (rot = block-diag(H_1024/√1024), n 为 1024 倍数):
+ * fold:   buf = FWHT(sign ⊙ buf)   — 折叠权重 matmul 输入侧
+ * unfold: buf = sign ⊙ FWHT(buf)   — embedding 查表后逆变换 (sign 可 NULL) */
+void prism_fold(float* buf, const float* sign, uint32_t n);
+void prism_unfold(float* buf, const float* sign, uint32_t n);
+/* ssm_out 输入重排 [hd,nk,rep]→[hd,rep,nk] (vh 主序→分组主序, tmp ≥ hd*nk*rep) */
+void prism_perm_v(float* buf, float* tmp, uint32_t hd, uint32_t nk, uint32_t rep);
 /* 已量化激活的 W4 GEMV(同 x 多次 matmul 时复用, 省 quant) */
 void matmul_w4b64_xq(float* y, const int8_t* xq, const float* xs, const int32_t* xsum,
                      const uint8_t* w, uint32_t out, uint32_t in);
@@ -55,6 +65,7 @@ void embed_q4k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 void embed_q6k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 void embed_q5k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 void embed_iq4xs(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
+void embed_ptq1(float* y, const uint8_t* w, uint32_t row, uint32_t hidden);
 
 void rmsnorm(float* y, const float* x, const uint8_t* w, uint32_t n, float eps, uint32_t dtype);
 void rope_inplace(float* v, uint32_t d, uint32_t pos, float theta);

@@ -676,6 +676,40 @@ void embed_q5k(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
     }
 }
 
+/* ---- PrismML PTQ1_0 三元: 128 权/块 = qs[24](5 trit/B) + qh[2](4 trit/B) + f16 d ----
+ * trit 解码: q = byte*3^n (mod 256), t = (q*3)>>8 ∈ {0,1,2}, 权值 = (t-1)*d。
+ * 元素序: qs[0..15]→0..79(n 外 m 内), qs[16..23]→80..119, qh→120..127(n 外 h 内)。 */
+static const uint8_t ptq1_pow3[6] = { 1, 3, 9, 27, 81, 243 };
+
+static void ptq1_dequant_block(float* y, const uint8_t* blk)
+{
+    float d = f16_to_f32((uint16_t)(blk[26] | (blk[27] << 8)));
+    uint32_t j = 0, o = 0, st, n, m, h;
+    static const uint32_t stages[2] = { 16, 8 };
+    for (st = 0; st < 2; st++) {
+        uint32_t c = stages[st];
+        for (; j + c <= 24; j += c)
+            for (n = 0; n < 5; n++)
+                for (m = 0; m < c; m++) {
+                    uint8_t q = (uint8_t)(blk[j + m] * ptq1_pow3[n]);
+                    y[o++] = (float)(((uint16_t)q * 3) >> 8) * d - d;
+                }
+    }
+    for (n = 0; n < 4; n++)
+        for (h = 0; h < 2; h++) {
+            uint8_t q = (uint8_t)(blk[24 + h] * ptq1_pow3[n]);
+            y[o++] = (float)(((uint16_t)q * 3) >> 8) * d - d;
+        }
+}
+
+void embed_ptq1(float* y, const uint8_t* w, uint32_t row, uint32_t hidden)
+{
+    const uint8_t* r = w + (size_t)row * ((size_t)(hidden / 128) * 28);
+    uint32_t b, nb = hidden / 128;
+    for (b = 0; b < nb; b++)
+        ptq1_dequant_block(y + (size_t)b * 128, r + (size_t)b * 28);
+}
+
 int dequant_mat_f16(uint16_t* dst, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
 {
     float* tmp;
@@ -706,6 +740,13 @@ int dequant_mat_f16(uint16_t* dst, const uint8_t* w, uint32_t out, uint32_t in, 
             uint32_t i;
             const uint16_t* bp = (const uint16_t*)w + (size_t)oo * in;
             for (i = 0; i < in; i++) row[i] = f16_to_f32(bf16_to_f16(bp[i]));
+            f32_to_f16_buf(row, drow, in);
+            continue;
+        }
+        if (dtype == DT_PTQ1) {
+            const uint8_t* r = w + (size_t)oo * ((size_t)(in / 128) * 28);
+            uint32_t b, nb1 = in / 128;
+            for (b = 0; b < nb1; b++) ptq1_dequant_block(row + (size_t)b * 128, r + (size_t)b * 28);
             f32_to_f16_buf(row, drow, in);
             continue;
         }
@@ -788,6 +829,12 @@ int dequant_mat_f32(float* dst, const uint8_t* w, uint32_t out, uint32_t in, uin
             const uint16_t* bp = (const uint16_t*)w + (size_t)oo * in;
             uint32_t i;
             for (i = 0; i < in; i++) drow[i] = f16_to_f32(bf16_to_f16(bp[i]));
+            continue;
+        }
+        if (dtype == DT_PTQ1) {
+            const uint8_t* r = w + (size_t)oo * ((size_t)(in / 128) * 28);
+            uint32_t b, nb1 = in / 128;
+            for (b = 0; b < nb1; b++) ptq1_dequant_block(drow + (size_t)b * 128, r + (size_t)b * 28);
             continue;
         }
         if (in % 256 != 0) return -1;
@@ -2145,6 +2192,188 @@ void matmul_w4b64(float* y, const float* x, const uint8_t* w, uint32_t out, uint
     matmul_w4b64_xq(y, xq, xs, xsum, w, out, in);
 }
 
+/* PTQ1 三元 matmul: y = W·x, W 行主序 (in/128)*28B/行。
+ * AVX2: 激活 int8 量化(每 256 块), 三元解码为 trit{0,1,2} 后 maddubs 整数点积,
+ * Σt·xq - Σxq 还原 ±1 符号, 再乘块 scale d 与激活 scale xs[256块]。 */
+void matmul_ptq1(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in)
+{
+    uint32_t nb = in / 128;
+    uint32_t rowb = nb * 28;
+    uint32_t oo;
+#ifdef __AVX2__
+    int8_t* xq8 = (int8_t*)alloca((size_t)in);
+    float* xs = (float*)alloca((size_t)(in / 256) * 4);
+    float* sxb = (float*)alloca((size_t)nb * 4);   /* 每 PTQ1 128 窗口 Σxq */
+    q8k_quant_i8(x, xq8, xs, in);
+    {
+        const __m256i ones_u8 = _mm256_set1_epi8(1);
+        const __m256i ones_i16 = _mm256_set1_epi16(1);
+        uint32_t b, g4;
+        for (b = 0; b < nb; b++) {
+            float s = 0.0f;
+            for (g4 = 0; g4 < 4; g4++) {
+                const int8_t* xp = xq8 + (size_t)b * 128 + g4 * 32;
+                s += hsum_i32_avx2(_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(ones_u8, _mm256_loadu_si256((const __m256i*)xp)), ones_i16));
+            }
+            sxb[b] = s;
+        }
+    }
+    #pragma omp parallel for schedule(static)
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        const __m256i c3 = _mm256_set1_epi16(3);
+        const __m256i cFF = _mm256_set1_epi16(0x00FF);
+        const __m256i ones_i16 = _mm256_set1_epi16(1);
+        __m256i pw3[5];
+        float acc = 0.0f;
+        uint32_t b, n, c;
+        for (n = 0; n < 5; n++) pw3[n] = _mm256_set1_epi16((int16_t)ptq1_pow3[n]);
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 28;
+            uint8_t tr[128];
+            __m256i v, q16, t16, sum;
+            __m128i t8;
+            __m256i tv;
+            /* qs[0..15] → trit[0..79]: trit[n*16+m] = byte m 的第 n 位 */
+            v = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)blk));
+            for (n = 0; n < 5; n++) {
+                q16 = _mm256_and_si256(_mm256_mullo_epi16(v, pw3[n]), cFF);
+                t16 = _mm256_srli_epi16(_mm256_mullo_epi16(q16, c3), 8);
+                t8 = _mm256_castsi256_si128(
+                    _mm256_permute4x64_epi64(_mm256_packus_epi16(t16, t16), 0xD8));
+                _mm_storeu_si128((__m128i*)(tr + n * 16), t8);
+            }
+            /* qs[16..23] → trit[80..119]: trit[80+n*8+m] */
+            v = _mm256_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)(blk + 16)));
+            for (n = 0; n < 5; n++) {
+                q16 = _mm256_and_si256(_mm256_mullo_epi16(v, pw3[n]), cFF);
+                t16 = _mm256_srli_epi16(_mm256_mullo_epi16(q16, c3), 8);
+                t8 = _mm256_castsi256_si128(
+                    _mm256_permute4x64_epi64(_mm256_packus_epi16(t16, t16), 0xD8));
+                _mm_storel_epi64((__m128i*)(tr + 80 + n * 8), t8);
+            }
+            /* qh[2] → trit[120..127]: trit[120+n*2+h] */
+            for (n = 0; n < 4; n++) {
+                uint32_t m;
+                for (m = 0; m < 2; m++) {
+                    uint8_t q = (uint8_t)(blk[24 + m] * ptq1_pow3[n]);
+                    tr[120 + n * 2 + m] = (uint8_t)(((uint16_t)q * 3) >> 8);
+                }
+            }
+            sum = _mm256_setzero_si256();
+            for (c = 0; c < 4; c++) {
+                tv = _mm256_loadu_si256((const __m256i*)(tr + c * 32));
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(tv,
+                        _mm256_loadu_si256((const __m256i*)(xq8 + (size_t)b * 128 + c * 32))),
+                    ones_i16));
+            }
+            acc += f16_to_f32((uint16_t)(blk[26] | (blk[27] << 8))) * xs[b / 2]
+                   * ((float)hsum_i32_avx2(sum) - sxb[b]);
+        }
+        y[oo] = acc;
+    }
+#else
+    float* tmp = (float*)alloca(128 * sizeof(float));
+    (void)nb; (void)rowb;
+    for (oo = 0; oo < out; oo++) {
+        const uint8_t* row = w + (size_t)oo * rowb;
+        float acc = 0.0f;
+        uint32_t b, i;
+        for (b = 0; b < nb; b++) {
+            const uint8_t* blk = row + (size_t)b * 28;
+            float s = 0.0f;
+            ptq1_dequant_block(tmp, blk);
+            for (i = 0; i < 128; i++) s += tmp[i] * x[(size_t)b * 128 + i];
+            acc += s;
+        }
+        y[oo] = acc;
+    }
+#endif
+}
+
+/* ---- PrismML Hadamard 激活变换 ----
+ * rot = block-diag(H_1024/√1024) (normalized sylvester walsh-hadamard, 块 1024)。
+ * H 蝶形: (a+b, a-b) 递归, 尾乘 1/√1024 = 1/32。n 须为 1024 倍数。 */
+static void prism_fwht_chunks(float* buf, uint32_t n)
+{
+    uint32_t c0;
+    for (c0 = 0; c0 < n; c0 += 1024) {
+        float* v = buf + c0;
+        uint32_t len, i, j;
+        for (len = 1; len < 1024; len <<= 1) {
+            if (len >= 8) {
+#ifdef __AVX2__
+                for (i = 0; i < 1024; i += len << 1) {
+                    float* p = v + i;
+                    for (j = 0; j < len; j += 8) {
+                        __m256 a = _mm256_loadu_ps(p + j);
+                        __m256 b = _mm256_loadu_ps(p + j + len);
+                        _mm256_storeu_ps(p + j, _mm256_add_ps(a, b));
+                        _mm256_storeu_ps(p + j + len, _mm256_sub_ps(a, b));
+                    }
+                }
+                continue;
+#else
+                for (i = 0; i < 1024; i += len << 1) {
+                    float* p = v + i;
+                    for (j = 0; j < len; j++) {
+                        float a = p[j], b = p[j + len];
+                        p[j] = a + b;
+                        p[j + len] = a - b;
+                    }
+                }
+                continue;
+#endif
+            }
+            for (i = 0; i < 1024; i += len << 1) {
+                for (j = 0; j < len; j++) {
+                    float a = v[i + j], b = v[i + j + len];
+                    v[i + j] = a + b;
+                    v[i + j + len] = a - b;
+                }
+            }
+        }
+#ifdef __AVX2__
+        {
+            __m256 s8 = _mm256_set1_ps(1.0f / 32.0f);
+            for (i = 0; i < 1024; i += 8)
+                _mm256_storeu_ps(v + i, _mm256_mul_ps(_mm256_loadu_ps(v + i), s8));
+        }
+#else
+        for (i = 0; i < 1024; i++) v[i] *= (1.0f / 32.0f);
+#endif
+    }
+}
+
+void prism_fold(float* buf, const float* sign, uint32_t n)
+{
+    uint32_t i;
+    if (sign)
+        for (i = 0; i < n; i++) buf[i] *= sign[i];
+    prism_fwht_chunks(buf, n);
+}
+
+void prism_unfold(float* buf, const float* sign, uint32_t n)
+{
+    uint32_t i;
+    prism_fwht_chunks(buf, n);
+    if (sign)
+        for (i = 0; i < n; i++) buf[i] *= sign[i];
+}
+
+void prism_perm_v(float* buf, float* tmp, uint32_t hd, uint32_t nk, uint32_t rep)
+{
+    uint32_t r, k, d;
+    for (r = 0; r < rep; r++)
+        for (k = 0; k < nk; k++)
+            for (d = 0; d < hd; d++)
+                tmp[(size_t)d + (size_t)r * hd + (size_t)k * hd * rep] =
+                    buf[(size_t)d + (size_t)(r * nk + k) * hd];
+    memcpy(buf, tmp, (size_t)hd * nk * rep * 4);
+}
+
 void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t in, uint32_t dtype)
 {
     switch (dtype) {
@@ -2154,6 +2383,7 @@ void matmul(float* y, const float* x, const uint8_t* w, uint32_t out, uint32_t i
     case DT_Q5K: matmul_q5k(y, x, w, out, in); break;
     case DT_IQ4XS: matmul_iq4xs(y, x, w, out, in); break;
     case DT_W4B64: matmul_w4b64(y, x, w, out, in); break;
+    case DT_PTQ1: matmul_ptq1(y, x, w, out, in); break;
     default: matmul_f16(y, x, w, out, in); break;
     }
 }
@@ -2167,6 +2397,7 @@ void matmul_rows(float* y, const float* x, const uint8_t* w,
     case DT_Q6K:   matmul_q6k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 210), n_rows, in); break;
     case DT_Q5K:   matmul_q5k(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 176), n_rows, in); break;
     case DT_IQ4XS: matmul_iq4xs(y, x, w + (size_t)row_begin * ((size_t)(in / 256) * 144), n_rows, in); break;
+    case DT_PTQ1:  matmul_ptq1(y, x, w + (size_t)row_begin * ((size_t)(in / 128) * 28), n_rows, in); break;
     case DT_W4B64:
         /* Arm82 按 OC×8 tile; 要求 row_begin%8==0 */
         if ((row_begin % W4B64_HP) != 0) {
@@ -2205,6 +2436,7 @@ size_t matmul_row_bytes(uint32_t dtype, uint32_t in)
     case DT_Q4K:
     case DT_IQ4XS: return (size_t)(in / 256) * 144;
     case DT_Q6K:   return (size_t)(in / 256) * 210;
+    case DT_PTQ1:  return (size_t)(in / 128) * 28;
     case DT_W4B64: return 0; /* 非行主序, 不支持按行字节 */
     default:       return 0;   /* F16/F32 列主序, 行不连续, 不支持行分块 */
     }
@@ -2549,6 +2781,29 @@ void matmul_batch(float* y, const float* x, const uint8_t* w, uint32_t out, uint
                 }
                 y[(size_t)g * out + oo] = acc;
             }
+        }
+        return;
+    }
+    /* PTQ1 三元: 128 权/块, 反量化共享 + 批量点积 */
+    if (dtype == DT_PTQ1) {
+        uint32_t nb1 = in / 128;
+        #pragma omp parallel for schedule(static)
+        for (oo = 0; oo < out; oo++) {
+            const uint8_t* row = w + (size_t)oo * nb1 * 28;
+            float acc[64];   /* B ≤ 64, 栈上避免每行 malloc/free */
+            float tmp[128];
+            uint32_t b, g, i;
+            for (g = 0; g < B; g++) acc[g] = 0.0f;
+            for (b = 0; b < nb1; b++) {
+                ptq1_dequant_block(tmp, row + (size_t)b * 28);
+                for (g = 0; g < B; g++) {
+                    const float* xg = x + (size_t)g * in + (size_t)b * 128;
+                    float s = 0.0f;
+                    for (i = 0; i < 128; i++) s += xg[i] * tmp[i];
+                    acc[g] += s;
+                }
+            }
+            for (g = 0; g < B; g++) y[(size_t)g * out + oo] = acc[g];
         }
         return;
     }

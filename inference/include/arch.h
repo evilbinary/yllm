@@ -24,6 +24,12 @@ typedef struct ArchOps {
     void (*after_embed_batch)(Engine* e, const uint32_t* tokens, uint32_t B);
     void (*refresh_ple_pp)(Engine* e, uint32_t token);
     void (*post_logits)(Engine* e);
+    /* lm_head 主机 matmul: output.weight 预折叠的模型(PrismML, ops 内查 prism)
+     * 先把激活变换到旋转空间; 其它模型等价裸 matmul */
+    void (*head_matmul)(Engine* e, const uint8_t* w, uint32_t dtype);
+    /* lm_head 前置激活变换(fold-only): lm_head_chunked 分块路径在 matmul_rows
+     * 前单独调用; 无需求架构留空 */
+    void (*head_fold)(Engine* e);
 
     int (*fwd_block)(Engine* e, uint32_t layer, uint32_t pos);
     int (*fwd_block_batch)(Engine* e, uint32_t layer, uint32_t pos0, uint32_t B);

@@ -218,6 +218,12 @@ static inline const uint64_t* prism_mask(const LlfPrismExt* ext)
     return (const uint64_t*)p;
 }
 
+static inline int prism_is_folded(const LlfPrismExt* ext, uint32_t layer, uint32_t slot)
+{
+    const uint64_t* mask = prism_mask(ext);
+    return (int)((mask[(size_t)layer * 2 + (slot / 64)] >> (slot & 63)) & 1ull);
+}
+
 typedef struct {
     LlfHeader h;
     uint32_t n_layers;

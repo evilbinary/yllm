@@ -42,8 +42,27 @@ static void engine_embed_into(Engine* e, float* dst, uint32_t token)
     case DT_Q6K: embed_q6k(dst, base + tm->offset, token, h->hidden); break;
     case DT_Q5K: embed_q5k(dst, base + tm->offset, token, h->hidden); break;
     case DT_IQ4XS: embed_iq4xs(dst, base + tm->offset, token, h->hidden); break;
+    case DT_PTQ1: embed_ptq1(dst, base + tm->offset, token, h->hidden); break;
     default: embed_f16(dst, base + tm->offset, token, h->hidden); break;
     }
+    /* PrismML: token_embd 行存于旋转空间, 查表后逆变换回残差流空间 */
+    if (m->prism && (m->prism->flags & PRISM_FLAG_EMBED_INVERSE)) {
+        const LlfPrismSign* ps = prism_sign(m->prism, h->hidden);
+        if (ps)
+            prism_unfold(dst, (const float*)((const uint8_t*)m->prism + ps->off), h->hidden);
+    }
+}
+
+/* lm_head 主机 matmul: 架构自定义(如 qwen35 PrismML output.weight 预折叠需先
+ * 变换激活, 见 ops->head_fold/head_matmul); ops 未定义时等价裸 matmul。
+ * 注意: lm_head_chunked 顶部单独走 ops->head_fold, 其内部路径不得再走本函数
+ * (防双折叠)。 */
+static void head_matmul(Engine* e, const uint8_t* w, uint32_t dtype)
+{
+    if (e->ops->head_matmul)
+        e->ops->head_matmul(e, w, dtype);
+    else
+        matmul(e->logits, e->x, w, e->ws.model.h.vocab, e->ws.model.h.hidden, dtype);
 }
 
 static int cmp_prob_desc(const void* a, const void* b)
@@ -214,6 +233,7 @@ static void lm_head_chunked(Engine* e, const uint8_t* w, uint64_t w_file_off,
                             uint32_t hidden, uint32_t vocab, uint32_t dtype)
 {
     Ws* ws = &e->ws;
+    if (e->ops->head_fold) e->ops->head_fold(e); /* PrismML: 激活折到旋转空间 */
     size_t rbytes = matmul_row_bytes(dtype, hidden);
     uint32_t chunk = head_chunk_rows(rbytes,
         ws->budget < 32u * 1024 * 1024 ? 2048u : 4096u);
@@ -586,15 +606,12 @@ static void prefill_run_batch(Engine* e, int n, int start_pos, int off, uint32_t
                                 m->dir[dl].offset + out->offset,
                                 h->hidden, h->vocab, out->dtype);
             else
-                matmul(e->logits, e->x, base + m->dir[dl].offset + out->offset,
-                       h->vocab, hidden, out->dtype);
+                head_matmul(e, base + m->dir[dl].offset + out->offset, out->dtype);
         } else {
-            matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
-                   h->vocab, hidden, out->dtype);
+            head_matmul(e, base + m->dir[h->n_blocks + 2].offset + out->offset, out->dtype);
         }
 #else
-        matmul(e->logits, e->x, base + m->dir[h->n_blocks + 2].offset + out->offset,
-               h->vocab, hidden, out->dtype);
+        head_matmul(e, base + m->dir[h->n_blocks + 2].offset + out->offset, out->dtype);
 #endif
         if (e->ops && e->ops->post_logits)
             e->ops->post_logits(e);
@@ -800,10 +817,10 @@ static void forward_layer(Engine* e, uint32_t i, uint32_t token, uint32_t pos)
                         e->ops->post_logits(e);
                     return;
                 }
-                matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+                head_matmul(e, base + tm->offset, tm->dtype);
                 if (ws->budget > 0) ws_release(ws, i);
 #else
-                matmul(e->logits, e->x, base + tm->offset, h->vocab, h->hidden, tm->dtype);
+                head_matmul(e, base + tm->offset, tm->dtype);
 #endif
             } else {
                 switch (tm->dtype) {

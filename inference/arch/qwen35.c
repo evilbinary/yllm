@@ -58,6 +58,25 @@ void arch_qwen35_free(Engine* e)
     e->arch_ctx = NULL;
 }
 
+/* PrismML: output.weight 预折叠 → lm_head 前把残差流激活折到旋转空间(就地);
+ * 非 prism 模型(同架构 qwen3.8 等) prism==NULL 短路 */
+static void qwen35_head_fold(Engine* e)
+{
+    LlModel* m = &e->ws.model;
+    if (m->prism && (m->prism->flags & PRISM_FLAG_OUTPUT_FOLDED)) {
+        const LlfPrismSign* ps = prism_sign(m->prism, m->h.hidden);
+        if (ps)
+            prism_fold(e->x, (const float*)((const uint8_t*)m->prism + ps->off), m->h.hidden);
+    }
+}
+
+/* lm_head(PrismML): 先折激活再 matmul; 分块路径(lm_head_chunked)只调 head_fold */
+static void qwen35_head_matmul(Engine* e, const uint8_t* w, uint32_t dtype)
+{
+    qwen35_head_fold(e);
+    matmul(e->logits, e->x, w, e->ws.model.h.vocab, e->ws.model.h.hidden, dtype);
+}
+
 const ArchOps arch_qwen35_ops = {
     .name = "qwen35",
     .id = ARCH_QWEN35,
@@ -67,6 +86,8 @@ const ArchOps arch_qwen35_ops = {
     .qwen_rope = 0,
     .alloc = arch_qwen35_alloc,
     .free = arch_qwen35_free,
+    .head_matmul = qwen35_head_matmul,
+    .head_fold = qwen35_head_fold,
     .fwd_block = arch_qwen35_fwd_block,
     .fwd_block_batch = arch_qwen35_fwd_block_batch,
 };
@@ -142,8 +163,19 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         float* ssm_o = scratch + 40000;    /* [hidden] ssm_out 输出缓冲 */
 
         rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
-        matmul(qkv, x2, base + mt[SLOT_QKV].offset, conv_chan, hidden, mt[SLOT_QKV].dtype);
-        matmul(z, x2, base + mt[SLOT_GATE_ATTN].offset, value_dim, hidden, mt[SLOT_GATE_ATTN].dtype);
+        /* PrismML: qkv/attn_gate 输入侧折叠(ssm_alpha/beta 权重不在折叠表, 用原始 x2) */
+        {
+            float* x2f = NULL;
+            if (m->prism && (prism_is_folded(m->prism, layer, SLOT_QKV) ||
+                             prism_is_folded(m->prism, layer, SLOT_GATE_ATTN))) {
+                const LlfPrismSign* ps = prism_sign(m->prism, hidden);
+                x2f = c->scratch + 46080;
+                memcpy(x2f, x2, (size_t)hidden * 4);
+                prism_fold(x2f, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, hidden);
+            }
+            matmul(qkv, x2f ? x2f : x2, base + mt[SLOT_QKV].offset, conv_chan, hidden, mt[SLOT_QKV].dtype);
+            matmul(z, x2f ? x2f : x2, base + mt[SLOT_GATE_ATTN].offset, value_dim, hidden, mt[SLOT_GATE_ATTN].dtype);
+        }
         matmul(alpha, x2, base + mt[SLOT_SSM_ALPHA].offset, n_vheads, hidden, mt[SLOT_SSM_ALPHA].dtype);
         matmul(beta, x2, base + mt[SLOT_SSM_BETA].offset, n_vheads, hidden, mt[SLOT_SSM_BETA].dtype);
 
@@ -223,6 +255,16 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         /* 输出投影 + 残差 + FFN */
         if (getenv("YLLM_QDBG") && layer == 1 && pos == 0)
             fprintf(stderr, "[qdbg] layer1 pre-ssmo attn_out[0]=%g ssm_o=%p attn_out=%p dtype=%u off=%llu\n", (double)attn_out[0], (void*)ssm_o, (void*)attn_out, mt[SLOT_SSM_OUT].dtype, (unsigned long long)mt[SLOT_SSM_OUT].offset);
+        /* PrismML: ssm_out 输入侧 [hd,nk,rep]→[hd,rep,nk] 重排 + 折叠 */
+        if (m->prism && prism_is_folded(m->prism, layer, SLOT_SSM_OUT)) {
+            if (m->prism->gdn_v_grouped)
+                prism_perm_v(attn_out, scratch + 16384, hvd, num_k_heads, n_vheads / num_k_heads);
+            {
+                const LlfPrismSign* ps = prism_sign(m->prism, value_dim);
+                prism_fold(attn_out, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL,
+                           value_dim);
+            }
+        }
         matmul(ssm_o, attn_out, base + mt[SLOT_SSM_OUT].offset, hidden, value_dim, mt[SLOT_SSM_OUT].dtype);
         if (getenv("YLLM_QDBG") && layer == 1 && pos == 0)
             fprintf(stderr, "[qdbg] layer1 post-ssmo attn_out[0]=%g\n", (double)attn_out[0]);
@@ -239,9 +281,25 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         }
         float* fg = e->ffn;
         float* fu = e->ffn + inter;
-        matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
-        matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        {
+            /* PrismML: ffn_gate/up 输入侧折叠 */
+            float* xg = x2;
+            if (m->prism && (prism_is_folded(m->prism, layer, SLOT_GATE) ||
+                             prism_is_folded(m->prism, layer, SLOT_UP))) {
+                const LlfPrismSign* ps = prism_sign(m->prism, hidden);
+                xg = c->scratch + 46080;
+                memcpy(xg, x2, (size_t)hidden * 4);
+                prism_fold(xg, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, hidden);
+            }
+            matmul(fg, xg, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+            matmul(fu, xg, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        }
         swiglu(x2, fg, fu, inter);
+        /* PrismML: ffn_down 输入侧折叠(就地, swiglu 结果之后不再用) */
+        if (m->prism && prism_is_folded(m->prism, layer, SLOT_DOWN)) {
+            const LlfPrismSign* ps = prism_sign(m->prism, inter);
+            prism_fold(x2, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, inter);
+        }
         matmul(attn_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
         for (j = 0; j < hidden; j++) x[j] += attn_out[j];
         return 0;
@@ -264,10 +322,23 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         float* att_out = e->hb2;              /* [6144] 复用 */
 
         rmsnorm(x2, x, base + mt[SLOT_NORM1].offset, hidden, eps, mt[SLOT_NORM1].dtype);
-        matmul(q, x2, base + mt[SLOT_Q].offset, qdim, hidden, mt[SLOT_Q].dtype);
-        matmul(gate, x2, base + mt[SLOT_QGATE].offset, qdim, hidden, mt[SLOT_QGATE].dtype);
-        matmul(k, x2, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
-        matmul(v, x2, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+        {
+            /* PrismML: q/gate/k/v 共用 x2, 折叠一次到副本 */
+            float* xg = x2;
+            if (m->prism && (prism_is_folded(m->prism, layer, SLOT_Q) ||
+                             prism_is_folded(m->prism, layer, SLOT_QGATE) ||
+                             prism_is_folded(m->prism, layer, SLOT_K) ||
+                             prism_is_folded(m->prism, layer, SLOT_V))) {
+                const LlfPrismSign* ps = prism_sign(m->prism, hidden);
+                xg = scratch + 16384;
+                memcpy(xg, x2, (size_t)hidden * 4);
+                prism_fold(xg, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, hidden);
+            }
+            matmul(q, xg, base + mt[SLOT_Q].offset, qdim, hidden, mt[SLOT_Q].dtype);
+            matmul(gate, xg, base + mt[SLOT_QGATE].offset, qdim, hidden, mt[SLOT_QGATE].dtype);
+            matmul(k, xg, base + mt[SLOT_K].offset, kv_dim, hidden, mt[SLOT_K].dtype);
+            matmul(v, xg, base + mt[SLOT_V].offset, kv_dim, hidden, mt[SLOT_V].dtype);
+        }
 
         uint32_t hh, ii;
         if (getenv("YLLM_QDBG")) {
@@ -310,6 +381,11 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         /* gate 门控: att_out *= sigmoid(gate) */
         for (ii = 0; ii < qdim; ii++)
             att_out[ii] *= 1.0f / (1.0f + expf(-gate[ii]));
+        /* PrismML: attn_output 输入侧折叠(就地) */
+        if (m->prism && prism_is_folded(m->prism, layer, SLOT_O)) {
+            const LlfPrismSign* ps = prism_sign(m->prism, qdim);
+            prism_fold(att_out, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, qdim);
+        }
         if (getenv("YLLM_QDBG")) {
             float an = 0, gn = 0; uint32_t kk;
             for (kk = 0; kk < qdim; kk++) { if (att_out[kk] != att_out[kk]) an++; if (gate[kk] != gate[kk]) gn++; }
@@ -325,9 +401,25 @@ int arch_qwen35_fwd_block(Engine* e, uint32_t layer, uint32_t pos)
         rmsnorm(x2, x, base + mt[SLOT_NORM2].offset, hidden, eps, mt[SLOT_NORM2].dtype);
         float* fg = e->ffn;
         float* fu = e->ffn + inter;
-        matmul(fg, x2, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
-        matmul(fu, x2, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        {
+            /* PrismML: ffn_gate/up 输入侧折叠 */
+            float* xg = x2;
+            if (m->prism && (prism_is_folded(m->prism, layer, SLOT_GATE) ||
+                             prism_is_folded(m->prism, layer, SLOT_UP))) {
+                const LlfPrismSign* ps = prism_sign(m->prism, hidden);
+                xg = scratch + 16384;
+                memcpy(xg, x2, (size_t)hidden * 4);
+                prism_fold(xg, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, hidden);
+            }
+            matmul(fg, xg, base + mt[SLOT_GATE].offset, inter, hidden, mt[SLOT_GATE].dtype);
+            matmul(fu, xg, base + mt[SLOT_UP].offset, inter, hidden, mt[SLOT_UP].dtype);
+        }
         swiglu(x2, fg, fu, inter);
+        /* PrismML: ffn_down 输入侧折叠(就地) */
+        if (m->prism && prism_is_folded(m->prism, layer, SLOT_DOWN)) {
+            const LlfPrismSign* ps = prism_sign(m->prism, inter);
+            prism_fold(x2, ps ? (const float*)((const uint8_t*)m->prism + ps->off) : NULL, inter);
+        }
         matmul(att_out, x2, base + mt[SLOT_DOWN].offset, hidden, inter, mt[SLOT_DOWN].dtype);
         add_inplace(x, att_out, hidden);
     }

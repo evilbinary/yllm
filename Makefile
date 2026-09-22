@@ -711,6 +711,21 @@ chat-qwen3.8-27b-cuda: cuda $(Q3_27B_LLF)
 	$(RUN_CUDA) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) $(RUNARGS)
 
+# ---- ternary-bonsai-2-27b(PTQ1_0 三元权重 + Prism Hadamard; 仅 CPU: AVX2 三元内核) ----
+BONSAI_GGUF  ?= models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+BONSAI_LLF   ?= models/bonsai-27b.llf
+BONSAI_VOCAB ?= models/bonsai-27b.vocab.txt
+
+$(BONSAI_LLF): $(BONSAI_GGUF) | $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(BONSAI_GGUF) --out $(BONSAI_LLF) --vocab $(BONSAI_VOCAB) --seq 4096
+
+chat-bonsai: $(BIN) $(BONSAI_LLF)
+	$(RUN) chat --model $(BONSAI_LLF) --vocab $(BONSAI_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
+
+chat-bonsai-avx2: $(BIN_AVX2) $(BONSAI_LLF)
+	$(RUN_AVX2) chat --model $(BONSAI_LLF) --vocab $(BONSAI_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
+
 # ---- minicpm-v-4.6(qwen35 文本塔 + clip mmproj 视觉; 无 --image 则纯文本) ----
 MCPM_V46_GGUF  ?= models/MiniCPM-V-4_6-Q4_K_M.gguf
 MCPM_V46_LLF   ?= models/minicpm-v-4.6.llf

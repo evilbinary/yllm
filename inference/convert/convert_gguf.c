@@ -818,12 +818,14 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             }
             /* reject truncated/corrupt file: tensor data must fit inside the file */
             if (c.offset > fsize - data_start || c.nbytes > fsize - data_start - c.offset) {
+                char tname[256];
+                snprintf(tname, sizeof(tname), "%s", t->name); /* t 随 list 一起释放, 先留名 */
                 for (int k = 0; k < keep.n; k++) free(keep.t[k].name);
                 free(keep.t);
                 while (i < (uint64_t)list.n) free(list.t[i++].name);
                 free(list.t);
                 wmap_close(&gmap);
-                snprintf(err, errlen, "gguf tensor '%s' data out of range (truncated file?)", t->name);
+                snprintf(err, errlen, "gguf tensor '%s' data out of range (truncated file?)", tname);
                 return -1;
             }
             gg_add(&keep, &c);
