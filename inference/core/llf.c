@@ -14,6 +14,7 @@ const char* llf_dtype_name(uint32_t dtype)
     case DT_IQ4XS: return "iq4_xs";
     case DT_Q5K: return "q5_k";
     case DT_W4B64: return "w4_b64";
+    case DT_PTQ1: return "ptq1";
     default: return "?";
     }
 }
@@ -42,6 +43,23 @@ int llf_read(const WMap* map, LlModel* out)
         LlfLayerDir* d = &out->dir[j];
         if (d->offset % LLF_ALIGN != 0) { free(out->base_idx); return -1; }
         if (d->offset + d->size > map->size) { free(out->base_idx); return -1; }
+    }
+    out->prism = NULL;
+    if (h->ext_ptr) {
+        /* Prism Hadamard 扩展 blob(文件尾部, 4096 对齐) */
+        if (h->ext_ptr % LLF_ALIGN != 0 || h->ext_ptr + sizeof(LlfPrismExt) > map->size) {
+            free(out->base_idx);
+            return -1;
+        }
+        LlfPrismExt* pe = (LlfPrismExt*)((uint8_t*)map->base + h->ext_ptr);
+        if (memcmp(pe->magic, PRISM_MAGIC, 8) != 0 || pe->version != 1) {
+            free(out->base_idx);
+            return -1;
+        }
+        uint64_t need = sizeof(LlfPrismExt) + (uint64_t)pe->n_signs * sizeof(LlfPrismSign) +
+                        (uint64_t)pe->sign_total * 4 + (uint64_t)pe->n_blocks * 16;
+        if (h->ext_ptr + need > map->size) { free(out->base_idx); return -1; }
+        out->prism = pe;
     }
     return 0;
 }

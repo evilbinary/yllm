@@ -20,6 +20,7 @@
 #define DT_IQ4XS 5
 #define DT_Q5K 6
 #define DT_W4B64 7   /* int4 block-64, MNN Arm82/Arm86 tile; 见 matvec w4b64_* */
+#define DT_PTQ1 8    /* PrismML PTQ1_0 三元: 128 权/块, 28B (qs[24] 5trit/B + qh[2] + f16 d) */
 #define DT_KEEP 0xFFFFFFFFu  /* convert: 保持源 dtype, 不重打包 */
 /* LlfHeader.reserved[40]: W4 权布局. Gemma4Ext 占 reserved[0..39] */
 #define LLF_W4_LAYOUT_OFF 40
@@ -172,12 +173,58 @@ static inline float llf_gemma4_final_cap(const LlfHeader* h)
     return cap;
 }
 
+/* ---- PrismML Hadamard 三元扩展 (Bonsai PTQ1_0) ----
+ * 位于文件尾部, header.ext_ptr 指向 4096 对齐的 blob:
+ *   [LlfPrismExt 头][LlfPrismSign 表 × n_signs][符号数据 f32 ±1][层槽位掩码 n_blocks×2 u64]
+ * 掩码: (n_blocks+3) 层 × 2 u64, word[layer*2 + slot/64] 的 bit (slot&63)=1 →
+ * 该张量权重为 Hadamard 旋转基, 激活侧需 prism_fold (layer 同 LLF 编号:
+ * 0=embed, 1..n_blocks=blocks, n_blocks+2=output)。
+ * flag: bit0=token_embd 需逆变换(输出空间不变, 查表后 prism_unfold);
+ *       bit1=output.weight 已折叠进普通 matmul(无需处理)。 */
+#define PRISM_MAGIC "PRISMHD1"
+#define PRISM_FLAG_EMBED_INVERSE 1u
+#define PRISM_FLAG_OUTPUT_FOLDED 2u
+typedef struct {
+    uint8_t magic[8];
+    uint32_t version;      /* 1 */
+    uint32_t block_size;   /* 1024 */
+    uint32_t flags;        /* PRISM_FLAG_* */
+    uint32_t gdn_v_grouped;/* 1 = ssm_out 输入需 [hd,nk,rep]→[hd,rep,nk] permute */
+    uint32_t n_signs;      /* 符号向量条数(按宽度共享) */
+    uint64_t sign_total;   /* 符号 f32 总数 */
+    uint32_t n_blocks;
+    uint32_t reserved;
+} LlfPrismExt;
+
+typedef struct {
+    uint32_t width; /* 符号向量元素数 */
+    uint32_t off;   /* 相对 ext blob 起点的字节偏移(f32 ±1 数组) */
+} LlfPrismSign;
+
+static inline const LlfPrismSign* prism_sign(const LlfPrismExt* ext, uint32_t width)
+{
+    const LlfPrismSign* t = (const LlfPrismSign*)(ext + 1);
+    uint32_t i;
+    for (i = 0; i < ext->n_signs; i++)
+        if (t[i].width == width) return &t[i];
+    return NULL;
+}
+
+static inline const uint64_t* prism_mask(const LlfPrismExt* ext)
+{
+    const uint8_t* p = (const uint8_t*)(ext + 1);
+    p += (size_t)ext->n_signs * sizeof(LlfPrismSign);
+    p += (size_t)ext->sign_total * 4;
+    return (const uint64_t*)p;
+}
+
 typedef struct {
     LlfHeader h;
     uint32_t n_layers;
     LlfLayerDir* dir;
     LlfTensorMeta* metas;
     uint32_t* base_idx;
+    const LlfPrismExt* prism; /* 非空 = 含 Hadamard 三元扩展 */
 } LlModel;
 
 typedef struct {

@@ -420,7 +420,7 @@ int convert_safetensors(const char* in_path, const char* out_path, uint32_t max_
         }
     }
 
-    int rc = llf_emit(out_path, &h, items, n, err, errlen);
+    int rc = llf_emit(out_path, &h, items, n, NULL, 0, err, errlen);
     for (i = 0; i < n; i++) free(bufs[i]);
     free(bufs);
     free(stmap);

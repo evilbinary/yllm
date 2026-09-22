@@ -34,7 +34,7 @@ int conv_item_compare(const void* a, const void* b)
 }
 
 int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
-             char* err, size_t errlen)
+             const void* ext, uint64_t ext_size, char* err, size_t errlen)
 {
     if (n <= 0) { snprintf(err, errlen, "no tensors to write"); return -1; }
     qsort(items, (size_t)n, sizeof(ConvItem), conv_item_compare);
@@ -99,6 +99,13 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
         dir[i].n_tensors = per[i];
     }
     h->file_size = align_up(cursor, LLF_ALIGN);
+    /* Prism 扩展 blob: 紧跟张量数据(对齐), header.ext_ptr 指向 */
+    uint64_t ext_off = 0;
+    if (ext && ext_size > 0) {
+        ext_off = h->file_size;
+        h->ext_ptr = ext_off;
+        h->file_size = align_up(ext_off + ext_size, LLF_ALIGN);
+    }
 
     FILE* out = fopen(out_path, "wb");
     if (!out) {
@@ -132,7 +139,7 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
     }
     /* pad the file to the aligned size declared in the header */
     {
-        uint64_t pos = align_up(cursor, LLF_ALIGN);
+        uint64_t pos = ext_off ? ext_off : align_up(cursor, LLF_ALIGN);
         if (pos > cursor) {
             uint64_t rest = pos - cursor;
             memset(buf, 0, 4096);
@@ -142,6 +149,20 @@ int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
                 if (take > 4096) take = 4096;
                 write_at(out, cursor + done, buf, (size_t)take);
                 done += take;
+            }
+        }
+        if (ext && ext_size > 0) {
+            write_at(out, ext_off, ext, (size_t)ext_size);
+            uint64_t tail = h->file_size - (ext_off + ext_size);
+            if (tail) {
+                memset(buf, 0, 4096);
+                uint64_t done = 0;
+                while (done < tail) {
+                    uint64_t take = tail - done;
+                    if (take > 4096) take = 4096;
+                    write_at(out, ext_off + ext_size + done, buf, (size_t)take);
+                    done += take;
+                }
             }
         }
     }
@@ -584,7 +605,7 @@ int convert_llf_repack(const char* in_path, const char* out_path, uint32_t out_d
         wmap_close(&map);
         return -1;
     }
-    rc = llf_emit(out_path, &h, items, n, err, errlen);
+    rc = llf_emit(out_path, &h, items, n, NULL, 0, err, errlen);
     for (ti = 0; ti < n_owned; ti++) free(owned[ti]);
     free(owned);
     free(items);

@@ -26,8 +26,9 @@ int conv_items_apply_dtype(ConvItem* items, int n, uint32_t n_blocks, uint32_t o
                            uint8_t*** owned, int* n_owned, LlfHeader* h,
                            char* err, size_t errlen);
 
-/* 布局 + 写 header/dir/metas + 数据复制,完成后调用方无需再写文件 */
+/* 布局 + 写 header/dir/metas + 数据复制,完成后调用方无需再写文件。
+ * ext/ext_size 非零时追加为文件尾扩展 blob(header.ext_ptr 指向, 如 Prism Hadamard) */
 int llf_emit(const char* out_path, LlfHeader* h, ConvItem* items, int n,
-             char* err, size_t errlen);
+             const void* ext, uint64_t ext_size, char* err, size_t errlen);
 
 #endif

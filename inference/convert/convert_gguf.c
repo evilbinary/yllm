@@ -105,7 +105,33 @@ typedef struct {
     uint32_t n_kv_shared_layers; /* shared KV 层数 (默认 1) */
     uint32_t n_embd_per_layer;   /* PLE 每层宽度 */
     uint64_t swa_mask;           /* bit i = is_swa(i); 0 = 用 swa_pattern */
+    /* prism.hadamard (Bonsai 三元) */
+    uint32_t prism_version;
+    uint32_t prism_block;
+    uint32_t prism_gdn_v_grouped;
+    char* prism_transform;
+    char* prism_sign_mode;
+    uint32_t* sign_widths;       /* 每组符号向量宽度 */
+    uint32_t n_sign_widths;
+    int8_t* sign_values;         /* ±1 值, 按宽度顺序拼接 */
+    uint64_t n_sign_values;
+    char** wnames;               /* 折叠权重名(Hadamard 基) */
+    uint32_t n_wnames;
+    uint32_t cap_wnames;
+    char** inv_wnames;           /* 需逆变换的权重名(如 token_embd) */
+    uint32_t n_inv_wnames;
+    uint32_t cap_inv_wnames;
 } GgufMeta;
+
+static void gg_str_push(char*** arr, uint32_t* n, uint32_t* cap, char* s)
+{
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *arr = (char**)realloc(*arr, (size_t)*cap * sizeof(char*));
+        if (!*arr) exit(1);
+    }
+    (*arr)[(*n)++] = s;
+}
 
 static void gg_merges_grow(GgufMeta* g, uint64_t need)
 {
@@ -155,6 +181,7 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         if (b->p < b->end) v = *b->p;
         gb_skip(b, 1);
         if (!strcmp(key, "tokenizer.ggml.add_bos_token")) g->add_bos = (int)v;
+        else if (!strcmp(key, "prism.hadamard.gdn_v_grouped")) g->prism_gdn_v_grouped = v;
         break;
     }
     case GVT_U16:
@@ -185,6 +212,10 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         else if (!strcmp(k, "attention.sliding_window_pattern")) g->swa_pattern = v;
         else if (!strcmp(k, "attention.shared_kv_layers")) g->n_kv_shared_layers = v;
         else if (!strcmp(k, "embedding_length_per_layer_input")) g->n_embd_per_layer = v;
+        /* prism.hadamard */
+        else if (!strcmp(key, "prism.hadamard.version")) g->prism_version = v;
+        else if (!strcmp(key, "prism.hadamard.block_size")) g->prism_block = v;
+        else if (!strcmp(key, "prism.hadamard.gdn_v_grouped")) g->prism_gdn_v_grouped = v;
         break;
     }
     case GVT_U64:
@@ -221,6 +252,12 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
             } else if (!strcmp(key, "tokenizer.chat_template")) {
                 free(g->chat_template);
                 g->chat_template = s;
+            } else if (!strcmp(key, "prism.hadamard.transform")) {
+                free(g->prism_transform);
+                g->prism_transform = s;
+            } else if (!strcmp(key, "prism.hadamard.sign_mode")) {
+                free(g->prism_sign_mode);
+                g->prism_sign_mode = s;
             } else {
                 free(s);
             }
@@ -234,6 +271,10 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
         int is_scores = !strcmp(key, "tokenizer.ggml.scores");
         int is_merges = !strcmp(key, "tokenizer.ggml.merges");
         int is_swa_arr = !strcmp(k, "attention.sliding_window_pattern");
+        int is_sw = !strcmp(key, "prism.hadamard.sign_widths");
+        int is_sv = !strcmp(key, "prism.hadamard.sign_values");
+        int is_wn = !strcmp(key, "prism.hadamard.weight_names");
+        int is_iwn = !strcmp(key, "prism.hadamard.inverse_weight_names");
         if (is_tokens) gg_tokens_grow(g, (uint64_t)g->n_tokens + n);
         if (is_scores) gg_scores_grow(g, (uint64_t)g->n_scores + n);
         if (is_merges) gg_merges_grow(g, (uint64_t)g->n_merges + n);
@@ -252,6 +293,27 @@ static void gg_kv_value(GB* b, const char* key, uint32_t type, GgufMeta* g)
                 char* s = gb_str(b);
                 if (!s) break;
                 g->merges[g->n_merges++] = s;
+            } else if (is_sw && (at == GVT_U32 || at == GVT_I32)) {
+                uint32_t v = gb_u32(b);
+                g->sign_widths = (uint32_t*)realloc(g->sign_widths, (size_t)(g->n_sign_widths + 1) * 4);
+                if (!g->sign_widths) exit(1);
+                g->sign_widths[g->n_sign_widths++] = v;
+            } else if (is_sv && (at == GVT_I8 || at == GVT_U8 || at == GVT_BOOL)) {
+                int8_t v = (int8_t)b->p[0];
+                gb_skip(b, 1);
+                g->sign_values = (int8_t*)realloc(g->sign_values, (size_t)g->n_sign_values + 1);
+                if (!g->sign_values) exit(1);
+                g->sign_values[g->n_sign_values++] = v;
+            } else if (is_sv && (at == GVT_I32 || at == GVT_U32)) {
+                int8_t v = (int8_t)gb_u32(b);   /* ±1 (gguf-py int 数组默认 I32) */
+                g->sign_values = (int8_t*)realloc(g->sign_values, (size_t)g->n_sign_values + 1);
+                if (!g->sign_values) exit(1);
+                g->sign_values[g->n_sign_values++] = v;
+            } else if ((is_wn || is_iwn) && at == GVT_STR) {
+                char* s = gb_str(b);
+                if (!s) break;
+                if (is_wn) gg_str_push(&g->wnames, &g->n_wnames, &g->cap_wnames, s);
+                else gg_str_push(&g->inv_wnames, &g->n_inv_wnames, &g->cap_inv_wnames, s);
             } else if (is_swa_arr && i < 64 &&
                        (at == GVT_U8 || at == GVT_I8 || at == GVT_BOOL ||
                         at == GVT_U32 || at == GVT_I32)) {
@@ -317,6 +379,7 @@ static void gg_probe_layout(GGList* l, const uint8_t* dptr, uint64_t data_start,
         { 176, DT_Q5K },
         { 144, DT_Q4K },
         { 144, DT_IQ4XS },
+        { 56, DT_PTQ1 },   /* PrismML PTQ1_0 三元: 28B/128 元素 = 56B/256 */
         { 80, 0 },
         { 110, 0 },
         { 36, 0 },
@@ -709,12 +772,12 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     uint8_t type_map[256];
     gg_probe_layout(&list, data, data_start, fsize, alignment, type_map);
     {
-        static const char* dn[8] = { "f16", "f32", "bf16", "q4_k", "q6_k", "iq4_xs", "q5_k" };
+        static const char* dn[9] = { "f16", "f32", "bf16", "q4_k", "q6_k", "iq4_xs", "q5_k", "w4b64", "ptq1" };
         int a;
         for (a = 0; a < 256; a++) {
             int has = 0;
             for (i = 0; i < (uint64_t)list.n; i++) if (list.t[i].gtype == (uint32_t)a) { has = 1; break; }
-            if (has) printf("probe: gguf type %d -> %s\n", a, type_map[a] < 7 ? dn[type_map[a]] : "?");
+            if (has) printf("probe: gguf type %d -> %s\n", a, type_map[a] < 8 ? dn[type_map[a]] : "?");
         }
     }
     {
@@ -748,6 +811,7 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
                 c.nbytes = (nelem / 256) * 272;   /* Q8_0 块大小 */
             } else if (dt == DT_F32) c.nbytes = nelem * 4;
             else if (dt == DT_F16 || dt == DT_BF16) c.nbytes = nelem * 2;
+            else if (dt == DT_PTQ1) c.nbytes = (nelem / 128) * 28;
             else {
                 uint64_t nb = (dt == DT_Q6K) ? 210 : (dt == DT_Q5K) ? 176 : 144;
                 c.nbytes = (nelem / 256) * nb;
@@ -1091,7 +1155,102 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
             printf("convert: dtype q4km (Q4_K)\n");
     }
 
-    int rc = llf_emit(out_path, &h, items, n, err, errlen);
+    /* PrismML Hadamard 三元扩展: 校验元数据, 构建文件尾 ext blob (布局见 llf.h)。
+     * DT_PTQ1 张量在 conv_items_apply_dtype 中原样保留, 权重字节不动。 */
+    uint8_t* prism_blob = NULL;
+    uint64_t prism_size = 0;
+    if (g.prism_version != 0 || g.n_wnames != 0 || g.n_inv_wnames != 0) {
+        uint64_t sign_total = 0, sign_off0, mask_bytes;
+        LlfPrismExt pe;
+        LlfPrismSign* st;
+        float* sv;
+        uint64_t* mask;
+        uint32_t w2, k2, flags = 0;
+        int bad = 0;
+        if (g.prism_version != 1 || g.prism_block != 1024 ||
+            !g.prism_transform || strcmp(g.prism_transform, "normalized-sylvester-walsh-hadamard") != 0 ||
+            !g.prism_sign_mode || strcmp(g.prism_sign_mode, "explicit") != 0) {
+            snprintf(err, errlen, "unsupported prism.hadamard metadata (v=%u blk=%u transform='%s' sign_mode='%s')",
+                     g.prism_version, g.prism_block,
+                     g.prism_transform ? g.prism_transform : "",
+                     g.prism_sign_mode ? g.prism_sign_mode : "");
+            goto prism_fail;
+        }
+        for (w2 = 0; w2 < g.n_sign_widths; w2++) sign_total += g.sign_widths[w2];
+        if (g.n_sign_widths == 0 || !g.sign_values || sign_total != (uint64_t)g.n_sign_values) {
+            snprintf(err, errlen, "prism.hadamard sign table mismatch (%u widths, %llu values, need %llu)",
+                     g.n_sign_widths, (unsigned long long)g.n_sign_values, (unsigned long long)sign_total);
+            goto prism_fail;
+        }
+        sign_off0 = sizeof(LlfPrismExt) + (uint64_t)g.n_sign_widths * sizeof(LlfPrismSign);
+        mask_bytes = (uint64_t)(g.n_blocks + 3) * 2 * 8;
+        prism_size = sign_off0 + sign_total * 4 + mask_bytes;
+        prism_blob = (uint8_t*)ymalloc((size_t)prism_size);
+        memset(prism_blob, 0, (size_t)prism_size);
+        memset(&pe, 0, sizeof(pe));
+        memcpy(pe.magic, PRISM_MAGIC, 8);
+        pe.version = 1;
+        pe.block_size = g.prism_block;
+        pe.gdn_v_grouped = g.prism_gdn_v_grouped;
+        pe.n_signs = g.n_sign_widths;
+        pe.sign_total = sign_total;
+        pe.n_blocks = g.n_blocks;
+        memcpy(prism_blob, &pe, sizeof(pe));
+        st = (LlfPrismSign*)(prism_blob + sizeof(LlfPrismExt));
+        sv = (float*)(prism_blob + sign_off0);
+        {
+            uint64_t acc = 0;
+            for (w2 = 0; w2 < g.n_sign_widths; w2++) {
+                uint32_t width = g.sign_widths[w2];
+                uint64_t j;
+                st[w2].width = width;
+                st[w2].off = (uint32_t)(sign_off0 + acc * 4);
+                for (j = 0; j < width; j++)
+                    sv[acc + j] = g.sign_values[acc + j] < 0 ? -1.0f : 1.0f;
+                acc += width;
+            }
+        }
+        /* 折叠权重名 → (layer, slot) 掩码; layer 编号同 LLF:
+         * 0=embed, 1..n_blocks=blocks, n_blocks+2=output。 */
+        mask = (uint64_t*)((uint8_t*)sv + sign_total * 4);
+        for (k2 = 0; k2 < g.n_wnames; k2++) {
+            int layer;
+            int slot = gg_slot_for(g.wnames[k2], &layer, is_gemma4);
+            uint32_t ll;
+            int slots[2], n_slots = 0, q2;
+            if (slot == SP_EMBED) { ll = 0; slots[n_slots++] = 0; }
+            else if (slot == SP_OUTPUT) { ll = g.n_blocks + 2; slots[n_slots++] = 0; }
+            else if (slot >= 0 && layer >= 0) {
+                ll = (uint32_t)layer + 1;
+                slots[n_slots++] = slot;
+                /* qwen35 attention: attn_q = [q|gate] 融合, 转换期拆成 Q/QGATE 两张量 */
+                if (slot == SLOT_Q) slots[n_slots++] = SLOT_QGATE;
+            }
+            if (n_slots == 0) {
+                printf("convert: prism: folded weight '%s' not on a matmul path\n", g.wnames[k2]);
+                bad = 1;
+                continue;
+            }
+            for (q2 = 0; q2 < n_slots; q2++)
+                mask[ll * 2 + (slots[q2] / 64)] |= 1ull << (slots[q2] & 63);
+        }
+        for (k2 = 0; k2 < g.n_inv_wnames; k2++) {
+            if (!strcmp(g.inv_wnames[k2], "token_embd.weight")) flags |= PRISM_FLAG_EMBED_INVERSE;
+            else { printf("convert: prism: unexpected inverse weight '%s'\n", g.inv_wnames[k2]); bad = 1; }
+        }
+        for (k2 = 0; k2 < g.n_wnames; k2++)
+            if (!strcmp(g.wnames[k2], "output.weight")) flags |= PRISM_FLAG_OUTPUT_FOLDED;
+        ((LlfPrismExt*)prism_blob)->flags = flags;
+        if (bad) {
+            snprintf(err, errlen, "prism.hadamard has weights outside the verified matmul path");
+            goto prism_fail;
+        }
+        printf("prism: %u folded + %u inverse weight(s), %u sign vec(s), %llu sign values, flags=%u\n",
+               g.n_wnames, g.n_inv_wnames, g.n_sign_widths,
+               (unsigned long long)sign_total, flags);
+    }
+
+    int rc = llf_emit(out_path, &h, items, n, prism_blob, prism_size, err, errlen);
 
     if (rc == 0 && vocab_out) {
         FILE* vf = fopen(vocab_out, "wb");
@@ -1161,6 +1320,37 @@ int convert_gguf(const char* in_path, const char* out_path, const char* vocab_ou
     for (i = 0; i < (uint32_t)dtype_n_owned; i++) free(dtype_owned[i]);
     free(dtype_owned);
     free(items);
+    for (i = 0; i < g.n_wnames; i++) free(g.wnames[i]);
+    for (i = 0; i < g.n_inv_wnames; i++) free(g.inv_wnames[i]);
+    free(g.wnames);
+    free(g.inv_wnames);
+    free(g.prism_transform);
+    free(g.prism_sign_mode);
+    free(g.sign_widths);
+    free(g.sign_values);
+    free(prism_blob);
     wmap_close(&gmap);
     return rc;
+prism_fail:
+    for (i = 0; i < g.n_tokens; i++) free(g.tokens[i]);
+    free(g.tokens);
+    free(g.scores);
+    free(g.chat_template);
+    for (i = 0; i < (uint64_t)list.n; i++) free(list.t[i].name);
+    free(list.t);
+    for (i = 0; i < (uint32_t)qg_n; i++) free(qg_bufs[i]);
+    for (i = 0; i < (uint32_t)dtype_n_owned; i++) free(dtype_owned[i]);
+    free(dtype_owned);
+    free(items);
+    for (i = 0; i < g.n_wnames; i++) free(g.wnames[i]);
+    for (i = 0; i < g.n_inv_wnames; i++) free(g.inv_wnames[i]);
+    free(g.wnames);
+    free(g.inv_wnames);
+    free(g.prism_transform);
+    free(g.prism_sign_mode);
+    free(g.sign_widths);
+    free(g.sign_values);
+    free(prism_blob);
+    wmap_close(&gmap);
+    return -1;
 }
