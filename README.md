@@ -22,6 +22,7 @@ make test-avx2                   # 跑测试
 | qwen | Qwen2.5-Instruct 1.5B / 7B | `make chat-qwen2.5-1.5b` / `chat-qwen2.5-7b` |
 | qwen | Qwen3 8B | `make chat-qwen3-8b` |
 | qwen35 | Qwen3.8-27B | Gated Attention + GDN 混合;`make chat-qwen3.8-27b-avx2`(-cuda) |
+| qwen35 | Qwen3.5-0.8B | `make chat-qwen3.5-0.8b`(小模型,内存/CPU 友好) |
 | qwen35 | MiniCPM5-2B | `make chat-minicpm5-2b` |
 | qwen35 | Ternary-Bonsai-2-27B | PTQ1_0 三元 + Prism Hadamard,仅 CPU;`yllm convert --gguf` 转换 |
 | gemma4 | Gemma 4 E2B / E4B | `make chat-gemma4-e2b` / `chat-gemma4-e4b` |

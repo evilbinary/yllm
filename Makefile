@@ -711,6 +711,33 @@ chat-qwen3.8-27b-cuda: cuda $(Q3_27B_LLF)
 	$(RUN_CUDA) chat --model $(Q3_27B_LLF) --vocab $(Q3_27B_VOCAB) --prompt $(CHAT_PROMPT) \
 		--tokens $(CHAT_TOKENS) --device cuda --gpu $(GPU) --gpu-weights $(GPU_WEIGHTS) $(RUNARGS)
 
+# ---- qwen3.5-0.8b(qwen35 架构, 小模型; 内存/CPU 友好) ----
+# 模型文件默认放 models/ 下, 名字不一样就覆盖变量:
+#   make chat-qwen3.5-0.8b-avx2 Q35_08B_GGUF=models/xxx.gguf
+Q35_08B_GGUF  ?= models/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf
+Q35_08B_LLF   ?= models/qwen3.5-0.8b.llf
+Q35_08B_VOCAB ?= models/qwen3.5-0.8b.vocab.txt
+
+$(Q35_08B_LLF): $(Q35_08B_GGUF) | $(BIN)
+	@mkdir -p $(dir $@)
+	$(BIN) convert --gguf $(Q35_08B_GGUF) --out $(Q35_08B_LLF) --vocab $(Q35_08B_VOCAB) --seq 2048
+
+gen-qwen3.5-0.8b: $(BIN) $(Q35_08B_LLF)
+	$(RUN) gen --model $(Q35_08B_LLF) --vocab $(Q35_08B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
+
+gen-qwen3.5-0.8b-avx2: $(BIN_AVX2) $(Q35_08B_LLF)
+	$(RUN_AVX2) gen --model $(Q35_08B_LLF) --vocab $(Q35_08B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
+
+chat-qwen3.5-0.8b: $(BIN) $(Q35_08B_LLF)
+	$(RUN) chat --model $(Q35_08B_LLF) --vocab $(Q35_08B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
+
+chat-qwen3.5-0.8b-avx2: $(BIN_AVX2) $(Q35_08B_LLF)
+	$(RUN_AVX2) chat --model $(Q35_08B_LLF) --vocab $(Q35_08B_VOCAB) --prompt $(CHAT_PROMPT) --tokens $(CHAT_TOKENS) $(RUNARGS)
+
+# 目标名大小写别名: 模型名写 0.8B, 直接 make chat-qwen3.5-0.8B 也能用
+chat-qwen3.5-0.8B: chat-qwen3.5-0.8b
+chat-qwen3.5-0.8B-avx2: chat-qwen3.5-0.8b-avx2
+
 # ---- minicpm-v-4.6(qwen35 文本塔 + clip mmproj 视觉; 无 --image 则纯文本) ----
 MCPM_V46_GGUF  ?= models/MiniCPM-V-4_6-Q4_K_M.gguf
 MCPM_V46_LLF   ?= models/minicpm-v-4.6.llf
