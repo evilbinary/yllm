@@ -375,29 +375,13 @@ static int cmd_file(int argc, char** argv)
     return yllm_file_dump(path, verbose);
 }
 
-/* 系统可用内存(MemAvailable, Linux): 内核估算的可分配内存, 含可回收页缓存 */
+/* 系统可用内存: 统一走 platform.c 的 ymem_available()
+ * （Linux 读 MemAvailable / macOS host_statistics64 / Windows GlobalMemoryStatusEx）。
+ * 原来这里自己读 /proc 并调 sysconf(_SC_AVPHYS_PAGES) —— 后者是 glibc 专有，
+ * macOS 上编不过（'_SC_AVPHYS_PAGES' undeclared）。 */
 static uint64_t mem_available_bytes(void)
 {
-#ifdef _WIN32
-    return 0;
-#else
-    FILE* f = fopen("/proc/meminfo", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "MemAvailable:", 13) == 0) {
-                uint64_t kb = 0;
-                sscanf(line + 13, "%llu", (unsigned long long*)&kb);
-                fclose(f);
-                return kb * 1024;
-            }
-        }
-        fclose(f);
-    }
-    long avph = sysconf(_SC_AVPHYS_PAGES);
-    long pgsz = sysconf(_SC_PAGESIZE);
-    return (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
-#endif
+    return ymem_available();
 }
 
 /* 自动内存模式: 预算 = min(模型大小, 可用内存 - 余量)。

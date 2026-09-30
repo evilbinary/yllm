@@ -1242,27 +1242,10 @@ static int rank_ensure_peers(Rank* r)
 /* budget auto: 预算 = min(模型大小, 可用内存 - 余量) */
 static uint64_t rank_auto_budget(ServeConfig* cfg)
 {
-    uint64_t avail = 0;
-#ifndef _WIN32
-    FILE* f = fopen("/proc/meminfo", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "MemAvailable:", 13) == 0) {
-                uint64_t kb = 0;
-                sscanf(line + 13, "%llu", (unsigned long long*)&kb);
-                avail = kb * 1024;
-                break;
-            }
-        }
-        fclose(f);
-    }
-    if (avail == 0) {
-        long avph = sysconf(_SC_AVPHYS_PAGES);
-        long pgsz = sysconf(_SC_PAGESIZE);
-        avail = (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
-    }
-#endif
+    /* 统一走 platform.c 的 ymem_available()（Linux MemAvailable /
+     * macOS host_statistics64 / Windows GlobalMemoryStatusEx）——
+     * 原来这里直接调 sysconf(_SC_AVPHYS_PAGES)，macOS 上编不过。 */
+    uint64_t avail = ymem_available();
     struct stat st;
     uint64_t model_bytes = stat(cfg->model, &st) == 0 ? (uint64_t)st.st_size : 0;
     if (avail == 0) return model_bytes;

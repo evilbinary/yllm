@@ -23,6 +23,11 @@
 #include <sched.h>
 #include <dirent.h>
 #endif
+#if defined(__APPLE__)
+/* ymem_available: macOS 没有 _SC_AVPHYS_PAGES，用 host_statistics64 估算 */
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -647,12 +652,34 @@ uint64_t ymem_available(void)
             return (uint64_t)st.ullAvailPhys;
     }
     return 0;
+#elif defined(__APPLE__)
+    {
+        /* macOS 没有 _SC_AVPHYS_PAGES（glibc 才有）。用 host_statistics64 的
+         * free + inactive 估算可用内存：inactive 页可被回收，语义接近 Linux
+         * 的 MemAvailable。失败返回 0（调用方按"未知"处理）。 */
+        mach_port_t host = mach_host_self();
+        vm_statistics64_data_t vmstat;
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host != MACH_PORT_NULL &&
+            host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vmstat,
+                              &count) == KERN_SUCCESS) {
+            long pgsz = sysconf(_SC_PAGESIZE);
+            if (pgsz > 0)
+                return ((uint64_t)vmstat.free_count +
+                        (uint64_t)vmstat.inactive_count) * (uint64_t)pgsz;
+        }
+        return 0;
+    }
 #else
+#ifdef _SC_AVPHYS_PAGES
     {
         long avph = sysconf(_SC_AVPHYS_PAGES);
         long pgsz = sysconf(_SC_PAGESIZE);
         return (avph > 0 && pgsz > 0) ? (uint64_t)avph * (uint64_t)pgsz : 0;
     }
+#else
+    return 0; /* 平台不支持：按"未知"处理 */
+#endif
 #endif
 }
 
