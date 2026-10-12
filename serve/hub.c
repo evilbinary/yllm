@@ -160,6 +160,7 @@ int cmd_hub(ServeConfig* cfg)
         int p, bad = 0;
         int ports[CFG_MAX_MODELS + 3];
         int np = 0;
+        sock_init();   /* cmd_hub 早于各线程, 需先初始化 Winsock 才能探测端口 */
         ports[np++] = cfg->sv_port;
         ports[np++] = cfg->router_port;
         if (cfg->http_port > 0) ports[np++] = cfg->http_port;
