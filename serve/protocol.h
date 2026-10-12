@@ -43,7 +43,12 @@
 /* STAT\n → OK inflight=<n> queued=<n> work=serial|parallel threads=<n> kv_mb=<f> prefix_hits=<n>
  *          uptime_s=<t> layers[<begin>,<end>) omp=<n> job_pos=<p> job_need=<n> job_ms=<ms>
  *          job_phase=prefill|decode|- job_pf_tps=<f> job_dec_tps=<f>\n
- * 状态上报(供 server 路由决策: 忙闲 / KV 占用; job_* 为进行中 INFER 的 pos/prompt 数/已耗时/tok/s) */
+ * 状态上报(供 server 路由决策: 忙闲 / KV 占用; job_* 为进行中 INFER 的 pos/prompt 数/已耗时/tok/s)
+ *
+ * server 的 STAT 额外带排队统计(会话推理在 infer_lock 上串行, 非会话 INFER 不排队):
+ *   inflight=<n> waiting=<n> serving=<n> q_total=<n> wait_ms=<最近等待ms> wait_max_ms=<历史最大ms>
+ *   waiting = 当前排队等待中的请求数; serving = 正在推理的请求数; q_total = 累计入队数。
+ * router 的 STAT 汇总其下各 server: servers=<n> inflight=<n> waiting=<n>。 */
 #define PROTO_STAT "STAT"
 
 /* INFER <max_tokens> <n_bytes> seg=<r> segs=<n> peers=<ip1,ip2,...>\n<prompt bytes>
@@ -75,7 +80,7 @@
 /* ---- 统一心跳(所有常驻进程共用, 数据面: 活着就报) ----
  *
  * HEARTBEAT <node-id> type=<rank|server|router|supervisor> state=<loading|ready|busy|dead>
- *            inflight=<n> kv_mb=<f> model=<name>\n → OK\n
+ *            inflight=<n> waiting=<n> kv_mb=<f> model=<name>\n → OK\n
  *
  * 发送方(数据面): 每个进程周期上报(默认 2s)。
  * 接收方(监控面): supervisor 收全部; router 收 type=server; server 收 type=rank。
@@ -97,7 +102,7 @@
  * supervisor 通知 router: server 已死/下线, 剔除 */
 #define PROTO_SERVER_DEL "SERVER_DEL"
 
-/* SERVER_UPDATE <server-id> inflight=<n> kv_mb=<f>\n → OK\n
+/* SERVER_UPDATE <server-id> inflight=<n> waiting=<n> kv_mb=<f>\n → OK\n
  * supervisor 推送 server 运行状态(路由决策用, 方式A) */
 #define PROTO_SERVER_UPDATE "SERVER_UPDATE"
 
@@ -131,7 +136,8 @@
 #define PROTO_TOKEN "T"
 
 /* DONE <gen_tokens> <eos=0|1> <ms>\n: 生成结束。
- * 会话模式时 server 会在末尾追加 <prompt_tokens>(HTTP usage 统计用)。 */
+ * 会话模式时 server 会在末尾追加 wait_ms=<n>(本请求排队等待时长, 供 HTTP 响应头/body)
+ * 与 <prompt_tokens>(HTTP usage 统计用, 恒为最后一个字段)。 */
 #define PROTO_DONE "DONE"
 
 /* ERR <msg>\n: 推理/管理失败。帧级发送时常带 v=<ver>, 正文见 proto_error_msg。

@@ -7,6 +7,11 @@
  *   GET  /health                 存活/就绪
  *
  * 由 router 的 --http-port 启用, 独立线程跑, 复用 Router 路由逻辑。
+ *
+ * 排队可见性:
+ *   每个生成响应带 X-Queue-Inflight / X-Queue-Waiting 头(集群汇总快照);
+ *   非流式额外带 X-Queue-Wait-Ms(本请求实际排队时长)与 body "queue" 字段;
+ *   汇总 waiting 达 queue-cap 时直接回 429 + Retry-After(背压, 见 --queue-cap)。
  */
 #include "router.h"
 #include "json.h"
@@ -32,6 +37,58 @@ static char g_api_key[CFG_STR_MAX] = "";
 void router_http_set_api_key(const char* key) {
     if (key) snprintf(g_api_key, sizeof(g_api_key), "%s", key);
     else g_api_key[0] = '\0';
+}
+
+/* HTTP 入口排队上限(汇总 waiting 超过则回 429 + Retry-After; 0 = 关闭) */
+static int g_queue_cap = 0;
+void router_http_set_queue_cap(int cap) { g_queue_cap = cap > 0 ? cap : 0; }
+
+/* 汇总各 server 的排队快照(心跳缓存): nservers/inflight/waiting 均可空 */
+static void queue_snapshot(Router* r, int* nservers, int* inflight, int* waiting)
+{
+    int i, in = 0, wt = 0;
+    pthread_mutex_lock(&r->lock);
+    for (i = 0; i < r->n_servers; i++) {
+        in += r->servers[i].inflight;
+        wt += r->servers[i].waiting;
+    }
+    pthread_mutex_unlock(&r->lock);
+    if (nservers) *nservers = r->n_servers;
+    if (inflight) *inflight = in;
+    if (waiting)  *waiting = wt;
+}
+
+/* 给响应追加 X-Queue-* 头; wait_ms < 0 表示本次请求等待时长未知(如流式, 头在推理前发出) */
+static void http_queue_headers(HttpResponse* rr, int inflight, int waiting, int wait_ms)
+{
+    char vb[32];
+    snprintf(vb, sizeof(vb), "%d", inflight);
+    http_add_header(rr, "X-Queue-Inflight", vb);
+    snprintf(vb, sizeof(vb), "%d", waiting);
+    http_add_header(rr, "X-Queue-Waiting", vb);
+    if (wait_ms >= 0) {
+        snprintf(vb, sizeof(vb), "%d", wait_ms);
+        http_add_header(rr, "X-Queue-Wait-Ms", vb);
+    }
+}
+
+/* 过载保护: 汇总排队数达到 queue_cap 时回 429 + Retry-After。返回 1 = 已拒绝并应答。 */
+static int http_reject_if_busy(int fd, Router* r)
+{
+    int in = 0, wt = 0;
+    if (g_queue_cap <= 0) return 0;
+    queue_snapshot(r, NULL, &in, &wt);
+    if (wt < g_queue_cap) return 0;
+    HttpResponse rr;
+    char ej[192];
+    http_begin(&rr, fd, 429, NULL);
+    http_queue_headers(&rr, in, wt, -1);
+    http_add_header(&rr, "Retry-After", "1");
+    snprintf(ej, sizeof(ej),
+             "{\"error\":{\"message\":\"server busy: %d requests queued\","
+             "\"type\":\"rate_limit_error\",\"code\":\"queue_full\"}}", wt);
+    http_reply(&rr, ej);
+    return 1;
 }
 
 /* 校验请求 key; 返回 0 通过, -1 拒绝 */
@@ -541,6 +598,9 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         if (v.start) bv = (v.start[0] == 't');
         include_usage = bv;
     }
+    /* 排队快照(路由汇总的心跳缓存): 用于响应头/body; 在入队时刻取值 */
+    int q_in = 0, q_wt = 0;
+    queue_snapshot(r, NULL, &q_in, &q_wt);
     /* 会话模式: 提取全部消息 + 会话 key, 渲染后只发增量 token 给 rank */
     char* pool = (char*)malloc(HTTP_MAX_BODY);
     char* roles[32];
@@ -641,13 +701,19 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
             ylog_info("HTTP CHAT stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d sess_ok=%d n_msgs=%d plen=%zu key=%s",
                       model, max_tokens, rtemp, rtop_p, include_usage, sess_ok, n_msgs, plen,
                       sess_key[0] ? sess_key : "-");
-        http_sse_begin(&rr, fd);
+        /* 流式: 头在推理前发出, 只能带集群排队快照(本请求排多久此时未知) */
+        {
+            HttpResponse hdrs;
+            memset(&hdrs, 0, sizeof(hdrs));
+            http_queue_headers(&hdrs, q_in, q_wt, -1);
+            http_sse_begin_extra(&rr, fd, hdrs.extra);
+        }
         int rc;
         char errbuf[256] = "";
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
                                    packed, packlen, sse_on_token, &sc,
-                                   rtemp, rtop_p, &sc.prompt_tokens, errbuf, sizeof(errbuf));
+                                   rtemp, rtop_p, &sc.prompt_tokens, NULL, errbuf, sizeof(errbuf));
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
@@ -672,12 +738,13 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         cc.n_tokens = 0;
         collected[0] = '\0';
         int ptoken = 0;
+        int wait_ms = 0;
         int rc;
         char errbuf[256] = "";
         if (sess_ok)
             rc = router_infer_sess(r, model, max_tokens, sess_key,
                                    packed, packlen, collect_on_token, &cc,
-                                   rtemp, rtop_p, &ptoken, errbuf, sizeof(errbuf));
+                                   rtemp, rtop_p, &ptoken, &wait_ms, errbuf, sizeof(errbuf));
         else
             rc = router_infer(r, model, max_tokens, prompt, plen, collect_on_token, &cc,
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
@@ -711,10 +778,13 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                  "\"created\":%lld,\"model\":\"%s\","
                  "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                  "\"finish_reason\":\"length\"}],"
+                 "\"queue\":{\"waiting\":%d,\"inflight\":%d,\"wait_ms\":%d},"
                  "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-                 (long long)time(NULL), model, collected, ptoken, cc.n_tokens, ptoken + cc.n_tokens);
+                 (long long)time(NULL), model, collected, q_wt, q_in, wait_ms,
+                 ptoken, cc.n_tokens, ptoken + cc.n_tokens);
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
+        http_queue_headers(&rr, q_in, q_wt, wait_ms);
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d ptoken=%d", cc.n_tokens, ptoken); ylog_body("HTTP CHAT reply-json", json); }
         free(json);
@@ -765,6 +835,9 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         if (v.start) bv = (v.start[0] == 't');
         include_usage = bv;
     }
+    /* 排队快照(路由汇总的心跳缓存): 用于响应头/body */
+    int q_in = 0, q_wt = 0;
+    queue_snapshot(r, NULL, &q_in, &q_wt);
 
     if (plen == 0) {
         free(prompt);
@@ -785,7 +858,12 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         if (g_api_log)
             ylog_info("HTTP COMPLETIONS stream model=%s max_tokens=%d temp=%.3g top_p=%.3g include_usage=%d plen=%zu",
                       model, max_tokens, rtemp, rtop_p, include_usage, plen);
-        http_sse_begin(&rr, fd);
+        {
+            HttpResponse hdrs;
+            memset(&hdrs, 0, sizeof(hdrs));
+            http_queue_headers(&hdrs, q_in, q_wt, -1);
+            http_sse_begin_extra(&rr, fd, hdrs.extra);
+        }
         char errbuf[256] = "";
         int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
@@ -832,10 +910,12 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         snprintf(json, HTTP_MAX_BODY + 256,
                  "{\"id\":\"cmpl-1\",\"object\":\"text_completion\","
                  "\"created\":%lld,\"model\":\"%s\","
-                 "\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"length\"}]}",
-                 (long long)time(NULL), model, collected);
+                 "\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"length\"}],"
+                 "\"queue\":{\"waiting\":%d,\"inflight\":%d}}",
+                 (long long)time(NULL), model, collected, q_wt, q_in);
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
+        http_queue_headers(&rr, q_in, q_wt, -1);
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP COMPLETIONS reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP COMPLETIONS reply-json", json); }
         free(json);
@@ -887,20 +967,33 @@ static void handle_conn(int fd, Router* r)
     }
 
     if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/health") == 0) {
+        /* 附带队列快照(server 心跳汇总): 调用方可据此判断是否该重试/退避 */
+        int nsv = 0, inflight = 0, waiting = 0;
+        char body[192];
+        queue_snapshot(r, &nsv, &inflight, &waiting);
+        snprintf(body, sizeof(body),
+                 "{\"status\":\"ok\",\"servers\":%d,\"inflight\":%d,\"waiting\":%d}",
+                 nsv, inflight, waiting);
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
-        http_reply(&rr, "{\"status\":\"ok\"}");
+        http_reply(&rr, body);
     } else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/v1/models") == 0) {
         handle_models(fd, r);
     } else if (strcmp(req.method, "POST") == 0 &&
                strcmp(req.path, "/v1/chat/completions") == 0) {
-        if (g_api_log) ylog_body("HTTP CHAT", req.body);
-        int stream = req.body && strstr(req.body, "\"stream\":true");
-        handle_chat_completions(fd, r, req.body ? req.body : "", stream, &req);
+        if (http_reject_if_busy(fd, r)) { /* 过载: 已回 429 + Retry-After */ }
+        else {
+            if (g_api_log) ylog_body("HTTP CHAT", req.body);
+            int stream = req.body && strstr(req.body, "\"stream\":true");
+            handle_chat_completions(fd, r, req.body ? req.body : "", stream, &req);
+        }
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/completions") == 0) {
-        if (g_api_log) ylog_body("HTTP COMPLETIONS", req.body);
-        int stream = req.body && strstr(req.body, "\"stream\":true");
-        handle_completions(fd, r, req.body ? req.body : "", stream);
+        if (http_reject_if_busy(fd, r)) { /* 过载: 已回 429 + Retry-After */ }
+        else {
+            if (g_api_log) ylog_body("HTTP COMPLETIONS", req.body);
+            int stream = req.body && strstr(req.body, "\"stream\":true");
+            handle_completions(fd, r, req.body ? req.body : "", stream);
+        }
     } else {
         HttpResponse rr;
         http_begin(&rr, fd, 404, NULL);

@@ -94,18 +94,24 @@ static void handle_server_del(Router* r, const char* args)
 static void handle_server_update(Router* r, const char* args)
 {
     char id[128];
-    int inflight = 0;
+    const char* ip;
+    const char* wp;
+    const char* kp;
     double kv = 0;
-    if (sscanf(args, "%127s inflight=%d kv_mb=%lf", id, &inflight, &kv) >= 1) {
-        pthread_mutex_lock(&r->lock);
-        RtServer* s = find_server_locked(r, id);
-        if (s) {
-            s->inflight = inflight;
-            s->kv_mb = kv;
-            s->last_update = (uint64_t)time(NULL);
-        }
-        pthread_mutex_unlock(&r->lock);
+    if (sscanf(args, "%127s", id) != 1) return;
+    ip = proto_get(args, "inflight");
+    wp = proto_get(args, "waiting");
+    kp = proto_get(args, "kv_mb");
+    if (kp) kv = atof(kp);
+    pthread_mutex_lock(&r->lock);
+    RtServer* s = find_server_locked(r, id);
+    if (s) {
+        if (ip) s->inflight = atoi(ip);
+        if (wp) s->waiting = atoi(wp);
+        s->kv_mb = kv;
+        s->last_update = (uint64_t)time(NULL);
     }
+    pthread_mutex_unlock(&r->lock);
 }
 
 /* 主动查询 supervisor: 拉取 server 快照(方式B) */
@@ -155,6 +161,8 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
                     }
                     if (frame_get(&ff, "model", vb, sizeof(vb)) == 0)
                         snprintf(s->model, sizeof(s->model), "%s", vb);
+                    if (frame_get(&ff, "inflight", vb, sizeof(vb)) == 0) s->inflight = atoi(vb);
+                    if (frame_get(&ff, "waiting", vb, sizeof(vb)) == 0) s->waiting = atoi(vb);
                     pthread_mutex_unlock(&r->lock);
                 }
             }
@@ -289,10 +297,11 @@ int router_infer(Router* r, const char* model, int max_tokens,
 int router_infer_sess(Router* r, const char* model, int max_tokens,
                       const char* sess_key, const char* new_msg, size_t msg_len,
                       void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
-                      float temp, float top_p, int* prompt_tokens,
+                      float temp, float top_p, int* prompt_tokens, int* wait_ms,
                       char* err, size_t errlen)
 {
     if (err && errlen) err[0] = '\0';
+    if (wait_ms) *wait_ms = 0;
     RtServer* s = pick_server(r, model);
     if (!s) {
         if (!router_model_known(r, model)) {
@@ -341,10 +350,14 @@ int router_infer_sess(Router* r, const char* model, int max_tokens,
             break;
         }
         if (strncmp(out, PROTO_DONE, 4) == 0) {
-            /* DONE <gen> <eos> <ms> [prompt_tokens]: 末尾字段为 server 追加的 prompt 数 */
+            /* DONE <gen> <eos> <ms> [wait_ms=<n>] [prompt_tokens]: 末尾字段为 server 追加的 prompt 数 */
             if (prompt_tokens) {
                 const char* sp = strrchr(out, ' ');
                 if (sp) *prompt_tokens = atoi(sp + 1);
+            }
+            if (wait_ms) {
+                const char* wp = proto_get(out, "wait_ms");
+                if (wp) *wait_ms = atoi(wp);
             }
             done = 1;
         } else if (proto_is_error(out)) {
@@ -510,13 +523,16 @@ static void* router_conn(void* arg)
         } else if (strcmp(f.cmd, PROTO_PING) == 0) {
             frame_send(fd, "OK", "READY");
         } else if (strcmp(f.cmd, PROTO_STAT) == 0) {
-            int total = 0, i2;
+            int total = 0, wait_total = 0, i2;
             pthread_mutex_lock(&r->lock);
-            for (i2 = 0; i2 < r->n_servers; i2++) total += r->servers[i2].inflight;
+            for (i2 = 0; i2 < r->n_servers; i2++) {
+                total += r->servers[i2].inflight;
+                wait_total += r->servers[i2].waiting;
+            }
             pthread_mutex_unlock(&r->lock);
             char st[256];
-            snprintf(st, sizeof(st), "servers=%d inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=0",
-                     r->n_servers, total);
+            snprintf(st, sizeof(st), "servers=%d inflight=%d waiting=%d kv_mb=0.0 prefix_hits=0 uptime_s=0",
+                     r->n_servers, total, wait_total);
             frame_send(fd, "OK", st);
         } else
             frame_send(fd, PROTO_ERROR, "unknown cmd");
@@ -584,6 +600,7 @@ int cmd_router(ServeConfig* cfg)
     if (cfg->http_port > 0) {
         router_http_set_api_log(cfg->api_log);
         router_http_set_api_key(cfg->api_key[0] ? cfg->api_key : NULL);
+        router_http_set_queue_cap(cfg->queue_cap);
         router_http_start(&r, (uint16_t)cfg->http_port);
     }
     return router_run(&r, sv_host, sv_port);

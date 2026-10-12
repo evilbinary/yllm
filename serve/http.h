@@ -34,7 +34,16 @@ typedef struct {
     int status;
     const char* content_type;
     int chunked;         /* SSE 用: 连接保持, 流式写 */
+    char extra[512];     /* 附加响应头(每行以 \r\n 结尾; http_add_header 追加) */
 } HttpResponse;
+
+/* 追加一个响应头(在 http_begin/http_sse_begin_extra 之后、http_reply 之前调用有效) */
+static inline void http_add_header(HttpResponse* r, const char* name, const char* val)
+{
+    size_t n = strlen(r->extra);
+    if (n >= sizeof(r->extra) - 1) return;
+    snprintf(r->extra + n, sizeof(r->extra) - n, "%s: %s\r\n", name, val);
+}
 
 /* 从请求头提取 Bearer token(Authorization: Bearer <key>)。返回 key 指针或 NULL。
  * 也兼容 "api-key: <key>" 头。写入 out(截断到 outsz)。返回 0 找到, -1 无。 */
@@ -144,15 +153,17 @@ static inline void http_write_head(HttpResponse* r)
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Access-Control-Allow-Origin: *\r\n"
-                     "Connection: close\r\n"
-                     "\r\n",
+                     "Connection: close\r\n",
                      r->status,
                      r->status == 200 ? "OK" :
                      r->status == 404 ? "Not Found" :
                      r->status == 400 ? "Bad Request" :
+                     r->status == 429 ? "Too Many Requests" :
                      r->status == 503 ? "Service Unavailable" : "Error",
                      r->content_type);
     sock_send_n(r->fd, buf, (size_t)n);
+    if (r->extra[0]) sock_send_n(r->fd, r->extra, strlen(r->extra));
+    sock_send_n(r->fd, "\r\n", 2);
 }
 
 /* 写完整响应(body 一次给全) */
@@ -162,14 +173,20 @@ static inline void http_reply(HttpResponse* r, const char* body)
     sock_send_n(r->fd, body, strlen(body));
 }
 
-/* SSE: 开始流(保持连接, 分块写) */
-static inline void http_sse_begin(HttpResponse* r, int fd)
+/* SSE: 开始流(保持连接, 分块写)。extra 为预置附加头(可为 NULL)。 */
+static inline void http_sse_begin_extra(HttpResponse* r, int fd, const char* extra)
 {
     memset(r, 0, sizeof(*r));
     r->fd = fd;
     r->status = 200;
     r->content_type = "text/event-stream; charset=utf-8";
+    if (extra && extra[0]) snprintf(r->extra, sizeof(r->extra), "%s", extra);
     http_write_head(r);
+}
+
+static inline void http_sse_begin(HttpResponse* r, int fd)
+{
+    http_sse_begin_extra(r, fd, NULL);
 }
 
 /* SSE: 写一个 data 块 */

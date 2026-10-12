@@ -14,6 +14,7 @@ typedef struct {
     uint16_t leader_port;
     int state;           /* NODE_STATE_* */
     int inflight;
+    int waiting;         /* 该 server 排队等待中的请求数 */
     double kv_mb;
     uint64_t last_update;
 } RtServer;
@@ -43,11 +44,12 @@ int router_infer(Router* r, const char* model, int max_tokens,
 /* 会话模式推理(转发): 带会话 key + 新消息文本发给 server(会话管理在 server 侧),
  * server 渲染/缓存后只把增量 token 发给 rank。on_token 同 router_infer。
  * prompt_tokens(可空): 传出本请求 prompt 总 token 数(server 真实渲染统计)。
+ * wait_ms(可空): 传出本请求在 server 侧的实际排队等待时长(毫秒)。
  * err/errlen(可空): 失败时写入后端 ERR 正文(已剥 v=)。 */
 int router_infer_sess(Router* r, const char* model, int max_tokens,
                       const char* sess_key, const char* new_msg, size_t msg_len,
                       void (*on_token)(const char* utf8, size_t len, void* ctx), void* ctx,
-                      float temp, float top_p, int* prompt_tokens,
+                      float temp, float top_p, int* prompt_tokens, int* wait_ms,
                       char* err, size_t errlen);
 
 #endif

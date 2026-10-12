@@ -110,6 +110,9 @@ typedef struct {
     /* OpenAI 兼容 API key(Authorization: Bearer <key>; 空 = 不校验) */
     char api_key[CFG_STR_MAX];
 
+    /* HTTP 入口排队上限(router 汇总 waiting 超过则回 429 + Retry-After; 0 = 关闭) */
+    int  queue_cap;
+
     /* hub/supervisor 按模型名筛选(多模型 serve.yaml 只拉起指定模型; 逗号分隔多个) */
     char only_model[CFG_STR_MAX];
 } ServeConfig;
@@ -187,6 +190,7 @@ static inline void config_defaults(ServeConfig* c)
     c->gpu_stream = 0;
     c->mtp = 0;
     c->api_log = 1;   /* 默认开启 */
+    c->queue_cap = 8; /* HTTP 入口排队上限(0 = 关闭) */
     snprintf(c->work_mode, sizeof(c->work_mode), "serial");
     c->work_threads = 1;
 }
@@ -321,6 +325,8 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         c->api_log = atoi(val);
     } else if (strcmp(key, "api-key") == 0 || strcmp(key, "api_key") == 0) {
         snprintf(c->api_key, sizeof(c->api_key), "%s", val);
+    } else if (strcmp(key, "queue-cap") == 0 || strcmp(key, "queue_cap") == 0) {
+        c->queue_cap = atoi(val);
     } else {
         return 0;
     }

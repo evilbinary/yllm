@@ -225,6 +225,42 @@ static void sess_try_disk(Server* s, SessVal* sv, const char* key, uint32_t* res
     }
 }
 
+/* 排队统计: 入队(等锁前) / 出队(拿到锁后) / 释放锁 */
+static void sess_q_enter(Server* s, uint64_t* t0)
+{
+    pthread_mutex_lock(&s->q_lock);
+    s->q_waiting++;
+    s->q_total++;
+    pthread_mutex_unlock(&s->q_lock);
+    *t0 = ynow_ms();
+}
+
+static uint64_t sess_q_acquired(Server* s, uint64_t t0)
+{
+    uint64_t waited = ynow_ms() - t0;
+    int still;
+    pthread_mutex_lock(&s->q_lock);
+    if (s->q_waiting > 0) s->q_waiting--;
+    s->q_serving++;
+    s->q_wait_ms_last = waited;
+    if (waited > s->q_wait_ms_max) s->q_wait_ms_max = waited;
+    still = s->q_waiting;
+    pthread_mutex_unlock(&s->q_lock);
+    if (waited >= 1000)
+        ylog_info("server: sess queued %llu ms (still waiting=%d)",
+                  (unsigned long long)waited, still);
+    return waited;   /* 本请求实际排队时长, 随 DONE 回传给调用方 */
+}
+
+/* 释放会话推理锁并结算 serving 计数 */
+static void sess_infer_unlock(Server* s)
+{
+    pthread_mutex_lock(&s->q_lock);
+    if (s->q_serving > 0) s->q_serving--;
+    pthread_mutex_unlock(&s->q_lock);
+    pthread_mutex_unlock(&s->infer_lock);
+}
+
 /* 会话 INFER: INFER_SESS <max_tokens> <nbytes> key=<id|->"\n<MSGS 或单条文本>
  * key 即客户端会话 id; 无则 "-" , server 按 token 前缀续接或自动分配。
  * rank kv 损坏: 先全量重发; 仍失败则按新会话重渲染。 */
@@ -269,7 +305,11 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         nfull = vocab_chat_ids(&s->sess_vocab, msg, full_ids, 65536, 1);
     }
 
+    uint64_t q_t0;
+    uint64_t q_waited;
+    sess_q_enter(s, &q_t0);      /* 排队统计: 等 infer_lock 期间算 waiting */
     pthread_mutex_lock(&s->infer_lock);
+    q_waited = sess_q_acquired(s, q_t0);
     pthread_mutex_lock(&s->sess_lock);
     SessVal* sv = NULL;
     uint32_t resume = 0;
@@ -315,7 +355,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     if (nfull <= 0) {
         free(full_ids); free(tokens); free(store); free(msg);
         pthread_mutex_unlock(&s->sess_lock);
-        pthread_mutex_unlock(&s->infer_lock);
+        sess_infer_unlock(s);
         sock_send_line(client_fd, PROTO_ERROR " server: render failed");
         return;
     }
@@ -335,7 +375,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
     if (n <= 0 && resume == 0) {
         free(full_ids); free(tokens); free(store); free(msg);
         pthread_mutex_unlock(&s->sess_lock);
-        pthread_mutex_unlock(&s->infer_lock);
+        sess_infer_unlock(s);
         sock_send_line(client_fd, PROTO_ERROR " server: render failed");
         return;
     }
@@ -351,7 +391,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         int fd = server_connect_leader(s);
         if (fd < 0) {
             free(gen); free(full_ids); free(tokens); free(store); free(msg);
-            pthread_mutex_unlock(&s->infer_lock);
+            sess_infer_unlock(s);
             sock_send_line(client_fd, PROTO_ERROR " server: cannot connect leader");
             return;
         }
@@ -366,7 +406,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
             if (!rv) {
                 pthread_mutex_unlock(&s->sess_lock);
                 sock_close(fd); free(gen); free(full_ids); free(tokens); free(store); free(msg);
-                pthread_mutex_unlock(&s->infer_lock);
+                sess_infer_unlock(s);
                 return;
             }
             sn = rv->n + (uint32_t)n;
@@ -444,7 +484,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
                     pthread_mutex_unlock(&s->sess_lock);
                     if (n <= 0) {
                         free(full); free(gen); free(full_ids); free(tokens); free(store); free(msg);
-                        pthread_mutex_unlock(&s->infer_lock);
+                        sess_infer_unlock(s);
                         sock_send_line(client_fd, PROTO_ERROR " server: sess reset render failed");
                         return;
                     }
@@ -480,7 +520,9 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
                     }
                     if (s->sess_vocab.eos >= 0) sess_append(ev, (uint32_t)s->sess_vocab.eos);
                     char dline[SRV_MAX_LINE];
-                    snprintf(dline, sizeof(dline), "%s %u", out, ev->n);
+                    /* 末尾再追加本请求排队时长(router_http 转为响应头 X-Queue-Wait-Ms) */
+                    snprintf(dline, sizeof(dline), "%s wait_ms=%llu %u",
+                             out, (unsigned long long)q_waited, ev->n);
                     sock_send_line(client_fd, "%s", dline);
                     if (s->cache_dir[0]) {
                         char path[512];
@@ -520,7 +562,7 @@ static void forward_infer_sess(int client_fd, Server* s, const char* args)
         free(full);
         if (rc == -2) continue;
         free(gen); free(full_ids); free(tokens); free(store); free(msg);
-        pthread_mutex_unlock(&s->infer_lock);
+        sess_infer_unlock(s);
         return;
     }
 }
@@ -580,12 +622,22 @@ static void server_release(Server* s)
     sock_close(fd);
 }
 
+/* 心跳前刷新排队快照: 排队数随心跳经 supervisor 汇总到 router(对外可见) */
+static void srv_hb_now(Server* s)
+{
+    pthread_mutex_lock(&s->q_lock);
+    s->node.waiting = s->q_waiting;
+    pthread_mutex_unlock(&s->q_lock);
+    s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
+    node_heartbeat(&s->node);
+}
+
 static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
 {
     if (strcmp(cmd, PROTO_INFER_SESS) == 0) {
         s->node.inflight++;
         s->node.state = NODE_STATE_BUSY;   /* 转发中, 通知 supervisor */
-        node_heartbeat(&s->node);
+        srv_hb_now(s);
         int request_lease = strcmp(s->lease_strategy, "request") == 0;
         int ok = 1;
         if (request_lease && server_lease(s) != 0) {
@@ -599,13 +651,13 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         }
         s->node.inflight--;
         s->node.state = NODE_STATE_READY;  /* 转发结束 */
-        node_heartbeat(&s->node);
+        srv_hb_now(s);
         return;
     }
     if (strcmp(cmd, PROTO_INFER) == 0) {
         s->node.inflight++;
         s->node.state = NODE_STATE_BUSY;   /* 转发中, 通知 supervisor */
-        node_heartbeat(&s->node);
+        srv_hb_now(s);
         int request_lease = strcmp(s->lease_strategy, "request") == 0;
         int ok = 1;
         if (request_lease && server_lease(s) != 0) {
@@ -617,16 +669,28 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         if (request_lease) server_release(s);
         s->node.inflight--;
         s->node.state = NODE_STATE_READY;  /* 转发结束 */
-        node_heartbeat(&s->node);
+        srv_hb_now(s);
     } else if (strcmp(cmd, PROTO_PING) == 0) {
         frame_send(fd, "OK", "READY");
     } else if (strcmp(cmd, PROTO_STAT) == 0) {
         uint64_t uptime = s->start_s ? (uint64_t)(time(NULL) - (time_t)s->start_s) : 0;
-        char st[640];
+        int q_waiting, q_serving;
+        uint64_t q_total, q_last, q_max;
+        char st[896];
+        pthread_mutex_lock(&s->q_lock);
+        q_waiting = s->q_waiting;
+        q_serving = s->q_serving;
+        q_total = s->q_total;
+        q_last = s->q_wait_ms_last;
+        q_max = s->q_wait_ms_max;
+        pthread_mutex_unlock(&s->q_lock);
         snprintf(st, sizeof(st),
-                 "inflight=%d kv_mb=0.0 prefix_hits=0 uptime_s=%llu "
+                 "inflight=%d waiting=%d serving=%d q_total=%llu wait_ms=%llu wait_max_ms=%llu "
+                 "kv_mb=0.0 prefix_hits=0 uptime_s=%llu "
                  "lease_ranks=%d lease_peers=%s lease_rank_ids=%s",
-                 s->node.inflight, (unsigned long long)uptime,
+                 s->node.inflight, q_waiting, q_serving,
+                 (unsigned long long)q_total, (unsigned long long)q_last,
+                 (unsigned long long)q_max, (unsigned long long)uptime,
                  s->lease_ranks > 0 ? s->lease_ranks : 1,
                  s->lease_peers[0] ? s->lease_peers : "127.0.0.1",
                  s->lease_rank_ids[0] ? s->lease_rank_ids : "?");
@@ -661,13 +725,13 @@ static void srv_hb_thread(void* arg)
     Server* s = (Server*)arg;
     while (!s->quit) {
         sock_sleep_ms(2000);
-        s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
-        node_heartbeat(&s->node);
+        srv_hb_now(s);
     }
 }
 
 static void server_sess_init(Server* s)
 {
+    pthread_mutex_init(&s->q_lock, NULL); /* 无条件初始化: STAT 随时可能读排队计数 */
     if (s->vocab_path[0]) {
         if (vocab_load(s->vocab_path, &s->sess_vocab) == 0) {
             s->sess_vocab_ok = 1;

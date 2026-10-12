@@ -300,7 +300,8 @@ static void sync_server_to_router(Supervisor* s, SvNode* n)
         n->router_notified = 0;
         ylog_warn("supervisor: SERVER_DEL %s (dead)", nd->node_id);
     } else if (n->router_notified) {
-        snprintf(args, sizeof(args), "%s inflight=%d kv_mb=%.1f", nd->node_id, nd->inflight, nd->kv_mb);
+        snprintf(args, sizeof(args), "%s inflight=%d waiting=%d kv_mb=%.1f",
+                 nd->node_id, nd->inflight, nd->waiting, nd->kv_mb);
         notify_routers(s, PROTO_SERVER_UPDATE, args);
     }
 }
@@ -321,6 +322,7 @@ static void handle_heartbeat(Supervisor* s, int fd, const char* args)
     } else {
         sv->node.state = n.state;
         sv->node.inflight = n.inflight;
+        sv->node.waiting = n.waiting;
         sv->node.kv_mb = n.kv_mb;
         if (n.model[0]) snprintf(sv->node.model, sizeof(sv->node.model), "%s", n.model);
         if (n.addr[0])  snprintf(sv->node.addr, sizeof(sv->node.addr), "%s", n.addr);
@@ -359,12 +361,12 @@ static void handle_query_servers(Supervisor* s, int fd)
     for (i = 0; i < s->n_nodes; i++) {
         Node* n = &s->nodes[i].node;
         char args[512];
-        snprintf(args, sizeof(args), "%s type=%s model=%s leader=%s state=%s inflight=%d kv_mb=%.1f",
+        snprintf(args, sizeof(args), "%s type=%s model=%s leader=%s state=%s inflight=%d waiting=%d kv_mb=%.1f",
                  n->node_id, n->type, n->model, n->addr,
                  n->state == NODE_STATE_READY ? "ready" :
                  n->state == NODE_STATE_BUSY ? "busy" :
                  n->state == NODE_STATE_DEAD ? "dead" : "loading",
-                 n->inflight, n->kv_mb);
+                 n->inflight, n->waiting, n->kv_mb);
         frame_send(fd, "SERVER_INFO", args);
     }
     /* router 节点(注册表, 无心跳, 固定 READY) */

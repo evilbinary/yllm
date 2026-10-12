@@ -160,8 +160,10 @@ int cmd_hub(ServeConfig* cfg)
         extern int router_http_start(Router* r, uint16_t http_port);
         extern void router_http_set_api_log(int on);
         extern void router_http_set_api_key(const char* key);
+        extern void router_http_set_queue_cap(int cap);
         router_http_set_api_log(cfg->api_log);
         router_http_set_api_key(cfg->api_key[0] ? cfg->api_key : NULL);
+        router_http_set_queue_cap(cfg->queue_cap);
         router_http_start(&rt, (uint16_t)cfg->http_port);
     }
     ythread_create(&t1, sv_thread, &c1);

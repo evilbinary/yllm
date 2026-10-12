@@ -13,4 +13,7 @@ void router_http_set_api_log(int on);
 /* 设置 OpenAI 兼容 API key(空 = 不校验) */
 void router_http_set_api_key(const char* key);
 
+/* 设置 HTTP 入口排队上限(汇总 waiting 超过则回 429 + Retry-After; 0 = 关闭) */
+void router_http_set_queue_cap(int cap);
+
 #endif

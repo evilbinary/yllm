@@ -28,6 +28,13 @@ typedef struct {
     SessCache sess;
     pthread_mutex_t sess_lock;
     pthread_mutex_t infer_lock; /* 同一 server 上会话推理串行, 避免超时重试把 token 账打乱 */
+    /* 排队统计(会话推理在 infer_lock 上串行; 非会话 INFER 不排队) */
+    pthread_mutex_t q_lock;     /* 保护下列计数 */
+    int q_waiting;              /* 正阻塞在 infer_lock 等推理的请求数(排队人数) */
+    int q_serving;              /* 已持锁正在推理的请求数(0/1) */
+    uint64_t q_total;           /* 累计入队请求数 */
+    uint64_t q_wait_ms_last;    /* 最近一次排队等待时长 */
+    uint64_t q_wait_ms_max;     /* 历史最大排队等待时长 */
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */

@@ -217,8 +217,8 @@ static void query_ranks(ServeConfig* cfg, const NodeInfo* infos, int n)
 static void query_servers(ServeConfig* cfg, const NodeInfo* infos, int n)
 {
     int r;
-    printf("  %-10s %-4s %3s %6s %6s %5s %-28s %-16s\n",
-           "id", "st", "in", "kv", "up", "ranks", "peers", "ids");
+    printf("  %-10s %-4s %3s %4s %7s %6s %6s %5s %-28s %-16s\n",
+           "id", "st", "in", "wait", "wmax", "kv", "up", "ranks", "peers", "ids");
     for (r = 0; r < n; r++) {
         char label[32], addr[128];
         snprintf(label, sizeof(label), "server-%d", infos[r].idx);
@@ -238,9 +238,12 @@ static void query_servers(ServeConfig* cfg, const NodeInfo* infos, int n)
         double kv = 0.0;
         const char* kp = strstr(f.args, "kv_mb=");
         if (kp) kv = atof(kp + 6);
-        printf("  %-10s %-4s %3d %6.1f %6llu %5d %-28s %-16s\n",
+        printf("  %-10s %-4s %3d %4d %7llu %6.1f %6llu %5d %-28s %-16s\n",
                label, f.cmd,
-               stat_int(f.args, "inflight", 0), kv,
+               stat_int(f.args, "inflight", 0),
+               stat_int(f.args, "waiting", 0),
+               stat_ull(f.args, "wait_max_ms"),
+               kv,
                stat_ull(f.args, "uptime_s"),
                stat_int(f.args, "lease_ranks", 0),
                peers, ids);
@@ -251,8 +254,8 @@ static void query_router(ServeConfig* cfg)
 {
     char addr[128];
     snprintf(addr, sizeof(addr), "127.0.0.1:%d", cfg->router_port);
-    printf("  %-10s %-4s %7s %3s %6s %6s\n",
-           "id", "st", "servers", "in", "kv", "up");
+    printf("  %-10s %-4s %7s %3s %5s %6s %6s\n",
+           "id", "st", "servers", "in", "wait", "kv", "up");
     Frame f;
     int rc = stat_fetch(addr, &f);
     if (rc != 0) {
@@ -262,10 +265,11 @@ static void query_router(ServeConfig* cfg)
     double kv = 0.0;
     const char* kp = strstr(f.args, "kv_mb=");
     if (kp) kv = atof(kp + 6);
-    printf("  %-10s %-4s %7d %3d %6.1f %6llu\n",
+    printf("  %-10s %-4s %7d %3d %5d %6.1f %6llu\n",
            "router-0", f.cmd,
            stat_int(f.args, "servers", 0),
-           stat_int(f.args, "inflight", 0), kv,
+           stat_int(f.args, "inflight", 0),
+           stat_int(f.args, "waiting", 0), kv,
            stat_ull(f.args, "uptime_s"));
 }
 
