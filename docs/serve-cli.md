@@ -272,17 +272,17 @@ curl http://127.0.0.1:8000/v1/models
 # chat 补全
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-yllm-123' 
   -d '{"model":"tinyllama","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":64}'
 
 # 文本补全
 curl -X POST http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer ksk-yllm-123ey' 
   -d '{"model":"tinyllama","prompt":"Once upon a time","max_tokens":64}'
 
 # 流式(SSE)
-curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"tinyllama","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"stream":true}'
+curl -N -X POST http://127.0.0.1:8000/v1/chat/completions   -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-yllm-123'   -d '{"model":"gemma4-e2b","messages":[{"role":"user","content":"Hi"}],"max_tokens":32,"stream":true}'
 ```
 
 ### 请求字段
