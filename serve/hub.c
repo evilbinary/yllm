@@ -12,6 +12,7 @@
 #include "supervisor.h"
 #include "router.h"
 #include "server.h"
+#include "sock.h"
 #include "../inference/include/yllm.h"
 #include "../inference/include/log.h"
 #include <string.h>
@@ -152,6 +153,27 @@ int cmd_hub(ServeConfig* cfg)
 
     ylog_info("hub: merged mode (sv=%u rt=%u srv=%u model(s)=%d)",
               sv.port, rt.port, cfg->server_port, cfg->n_models);
+
+    /* 端口占用保护: 任一监听端口已被占用则直接失败退出。
+     * (Windows 下 SO_REUSEADDR 会让重复实例静默共享端口, 造成脑裂) */
+    {
+        int p, bad = 0;
+        int ports[CFG_MAX_MODELS + 3];
+        int np = 0;
+        ports[np++] = cfg->sv_port;
+        ports[np++] = cfg->router_port;
+        if (cfg->http_port > 0) ports[np++] = cfg->http_port;
+        for (mi = 0; mi < cfg->n_models; mi++)
+            ports[np++] = cfg->server_port + mi * cfg_model_stride(cfg);
+        for (p = 0; p < np; p++) {
+            if (ports[p] > 0 && sock_port_in_use((uint16_t)ports[p])) {
+                fprintf(stderr, "hub: port %d already in use — another yllm instance running? abort.\n",
+                        ports[p]);
+                bad = 1;
+            }
+        }
+        if (bad) return 1;
+    }
 
     void* t1 = NULL, *t2 = NULL;
     HubCtxSv c1; c1.s = &sv;

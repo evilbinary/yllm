@@ -207,11 +207,33 @@ static inline void sock_sleep_ms(int ms)
 #endif
 }
 
+/* 端口是否已被监听(connect 成功 = 有进程在听): 1 = 占用, 0 = 空闲。
+ * 用于 bind 前拦截重复实例: Windows 下 SO_REUSEADDR 会让第二个进程也
+ * 绑定同一端口(静默脑裂), 故先显式探测。 */
+static inline int sock_port_in_use(uint16_t port)
+{
+    int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int rc = connect(fd, (struct sockaddr*)&a, sizeof(a));
+    sock_close(fd);
+    return rc == 0 ? 1 : 0;
+}
+
 /* 创建 TCP 监听 socket。
  * 绑定地址: YLLM_BIND_HOST(默认环回; 0.0.0.0/* = 全网卡; 其它为指定 IPv4)。
- * 成功返回 fd, 失败返回 -1。 */
+ * 成功返回 fd; -2 = 端口已被监听(重复实例), -1 = 其它失败。 */
 static inline int sock_listen(uint16_t port, int backlog)
 {
+    if (sock_port_in_use(port)) {
+        fprintf(stderr, "[sock] port %u already in use (another yllm instance running?)\n",
+                (unsigned)port);
+        return -2;
+    }
     int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) return -1;
 #ifndef _WIN32
