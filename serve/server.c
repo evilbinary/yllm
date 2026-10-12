@@ -261,6 +261,18 @@ static void sess_infer_unlock(Server* s)
     pthread_mutex_unlock(&s->infer_lock);
 }
 
+/* 记录一次推理耗时(只算真正占用算力的时间, 不含排队等待), 用 EMA 平滑。
+ * 供排队 ETA 估算: 平均推理耗时 × 前方请求数。 */
+static void sess_infer_record(Server* s, uint64_t elapsed_ms)
+{
+    pthread_mutex_lock(&s->q_lock);
+    if (s->q_infer_n == 0) s->q_infer_ms_avg = (double)elapsed_ms;
+    else s->q_infer_ms_avg = s->q_infer_ms_avg * 0.7 + (double)elapsed_ms * 0.3;
+    s->q_infer_ms_last = elapsed_ms;
+    s->q_infer_n++;
+    pthread_mutex_unlock(&s->q_lock);
+}
+
 /* 会话 INFER: INFER_SESS <max_tokens> <nbytes> key=<id|->"\n<MSGS 或单条文本>
  * key 即客户端会话 id; 无则 "-" , server 按 token 前缀续接或自动分配。
  * rank kv 损坏: 先全量重发; 仍失败则按新会话重渲染。 */
@@ -627,9 +639,46 @@ static void srv_hb_now(Server* s)
 {
     pthread_mutex_lock(&s->q_lock);
     s->node.waiting = s->q_waiting;
+    /* 样本不足(冷启动)不上报平均推理时间, 避免调用方按 0 估算等待 */
+    s->node.avg_infer_ms = s->q_infer_n >= 3 ? s->q_infer_ms_avg : 0.0;
     pthread_mutex_unlock(&s->q_lock);
     s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
     node_heartbeat(&s->node);
+}
+
+/* 无空闲 rank 时的最长排队等待(ms); 超过则仍按原逻辑拒绝 */
+#define SERVER_LEASE_WAIT_MS 30000
+#define SERVER_LEASE_POLL_MS 200
+
+/* 排队等待空闲 rank: 退避重试租用, 等待期间计入 q_waiting(经心跳对外暴露为排队人数)。
+ * 返回 0 = 已租到; -1 = 超过 SERVER_LEASE_WAIT_MS 仍未租到。
+ * 注意: server 是每连接一线程, 这里阻塞只影响本请求, 不会卡住其它请求。 */
+static int server_lease_wait(Server* s)
+{
+    int waited = 0;
+    if (server_lease(s) == 0) return 0;
+    pthread_mutex_lock(&s->q_lock);
+    s->q_waiting++;
+    pthread_mutex_unlock(&s->q_lock);
+    srv_hb_now(s);                      /* 立刻上报排队数, 让 router 尽快看到 waiting */
+    while (waited < SERVER_LEASE_WAIT_MS) {
+        sock_sleep_ms(SERVER_LEASE_POLL_MS);
+        waited += SERVER_LEASE_POLL_MS;
+        if (server_lease(s) == 0) {
+            pthread_mutex_lock(&s->q_lock);
+            if (s->q_waiting > 0) s->q_waiting--;
+            pthread_mutex_unlock(&s->q_lock);
+            ylog_info("server: rank leased after waiting %d ms", waited);
+            return 0;
+        }
+        srv_hb_now(s);                  /* 刷新排队快照 */
+    }
+    pthread_mutex_lock(&s->q_lock);
+    if (s->q_waiting > 0) s->q_waiting--;
+    pthread_mutex_unlock(&s->q_lock);
+    srv_hb_now(s);
+    ylog_warn("server: rank still busy after waiting %d ms, reject", waited);
+    return -1;
 }
 
 static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
@@ -640,13 +689,15 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         srv_hb_now(s);
         int request_lease = strcmp(s->lease_strategy, "request") == 0;
         int ok = 1;
-        if (request_lease && server_lease(s) != 0) {
+        if (request_lease && server_lease_wait(s) != 0) {
             ylog_warn("server: sess lease failed (no free rank), reject");
             sock_send_line(fd, PROTO_ERROR " server: no rank leased");
             ok = 0;
         }
         if (ok) {
+            uint64_t t_infer = ynow_ms();
             forward_infer_sess(fd, s, args);
+            sess_infer_record(s, ynow_ms() - t_infer);
             if (request_lease) server_release(s);
         }
         s->node.inflight--;
@@ -660,13 +711,18 @@ static void handle_frame(int fd, Server* s, const char* cmd, const char* args)
         srv_hb_now(s);
         int request_lease = strcmp(s->lease_strategy, "request") == 0;
         int ok = 1;
-        if (request_lease && server_lease(s) != 0) {
+        if (request_lease && server_lease_wait(s) != 0) {
             ylog_warn("server: lease failed (no free rank), reject");
             sock_send_line(fd, PROTO_ERROR " server: no rank leased");
             ok = 0;
         }
-        if (ok) forward_infer(fd, s, args);
-        if (request_lease) server_release(s);
+        if (ok) {
+            uint64_t t_infer = ynow_ms();
+            forward_infer(fd, s, args);
+            sess_infer_record(s, ynow_ms() - t_infer);
+            /* 只有真租到 rank 才释放: 排队超时未租到时释放会误放别的请求持有的租约 */
+            if (request_lease) server_release(s);
+        }
         s->node.inflight--;
         s->node.state = NODE_STATE_READY;  /* 转发结束 */
         srv_hb_now(s);

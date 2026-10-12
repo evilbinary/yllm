@@ -15,6 +15,7 @@ typedef struct {
     int state;           /* NODE_STATE_* */
     int inflight;
     int waiting;         /* 该 server 排队等待中的请求数 */
+    double avg_infer_ms; /* 该 server 的平均推理耗时(ms, 由心跳带入; 0 = 样本不足) */
     double kv_mb;
     uint64_t last_update;
 } RtServer;

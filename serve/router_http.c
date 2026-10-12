@@ -106,23 +106,29 @@ static void rl_bump_tokens(long long n)
     pthread_mutex_unlock(&g_rl_lock);
 }
 
-/* 汇总各 server 的排队快照(心跳缓存): nservers/inflight/waiting 均可空 */
-static void queue_snapshot(Router* r, int* nservers, int* inflight, int* waiting)
+/* 汇总各 server 的排队快照(心跳缓存): nservers/inflight/waiting 均可空;
+ * avg_infer_ms 取各 server 最大值(保守估计, 宁可多等不早试) */
+static void queue_snapshot(Router* r, int* nservers, int* inflight, int* waiting, double* avg_infer_ms)
 {
     int i, in = 0, wt = 0;
+    double avg = 0;
     pthread_mutex_lock(&r->lock);
     for (i = 0; i < r->n_servers; i++) {
         in += r->servers[i].inflight;
         wt += r->servers[i].waiting;
+        if (r->servers[i].avg_infer_ms > avg) avg = r->servers[i].avg_infer_ms;
     }
     pthread_mutex_unlock(&r->lock);
     if (nservers) *nservers = r->n_servers;
     if (inflight) *inflight = in;
     if (waiting)  *waiting = wt;
+    if (avg_infer_ms) *avg_infer_ms = avg;
 }
 
-/* 给响应追加 X-Queue-* 头; wait_ms < 0 表示本次请求等待时长未知(如流式, 头在推理前发出) */
-static void http_queue_headers(HttpResponse* rr, int inflight, int waiting, int wait_ms)
+/* 给响应追加 X-Queue-* 头; wait_ms < 0 表示本次请求等待时长未知(如流式, 头在推理前发出)。
+ * avg_infer_ms > 0 时额外带出平均推理耗时与据此估算的排队预计等待时间(Eta)。 */
+static void http_queue_headers(HttpResponse* rr, int inflight, int waiting, int wait_ms,
+                               double avg_infer_ms)
 {
     char vb[32];
     snprintf(vb, sizeof(vb), "%d", inflight);
@@ -133,21 +139,29 @@ static void http_queue_headers(HttpResponse* rr, int inflight, int waiting, int 
         snprintf(vb, sizeof(vb), "%d", wait_ms);
         http_add_header(rr, "X-Queue-Wait-Ms", vb);
     }
+    if (avg_infer_ms > 0) {
+        snprintf(vb, sizeof(vb), "%.0f", avg_infer_ms);
+        http_add_header(rr, "X-Queue-Avg-Infer-Ms", vb);
+        /* 预计等待 = 平均推理耗时 × 前方请求数(在途 + 排队) */
+        snprintf(vb, sizeof(vb), "%d", (int)(avg_infer_ms * (double)(inflight + waiting)));
+        http_add_header(rr, "X-Queue-Eta-Ms", vb);
+    }
 }
 
 /* 过载保护: 汇总排队数达到 queue_cap 时回 429 + Retry-After。返回 1 = 已拒绝并应答。 */
 static int http_reject_if_busy(int fd, Router* r)
 {
     int in = 0, wt = 0, ra;
+    double q_avg = 0;
     HttpResponse rr;
     char vb[16], ej[240];
     if (g_queue_cap <= 0) return 0;
-    queue_snapshot(r, NULL, &in, &wt);
+    queue_snapshot(r, NULL, &in, &wt, &q_avg);
     if (wt < g_queue_cap) return 0;
     ra = 1 + (wt - g_queue_cap + 1);   /* 积压越多退避越久, 上限 30s */
     if (ra > 30) ra = 30;
     http_begin(&rr, fd, 429, NULL);
-    http_queue_headers(&rr, in, wt, -1);
+    http_queue_headers(&rr, in, wt, -1, q_avg);
     snprintf(vb, sizeof(vb), "%d", ra);
     http_add_header(&rr, "Retry-After", vb);
     snprintf(ej, sizeof(ej),
@@ -161,6 +175,7 @@ static int http_reject_if_busy(int fd, Router* r)
 static int http_reject_if_rate_limited(int fd, Router* r)
 {
     int reqs = 0, age = -1, over, ra, in = 0, wt = 0;
+    double q_avg = 0;
     long long tok;
     HttpResponse rr;
     char vb[16], ej[256];
@@ -170,9 +185,9 @@ static int http_reject_if_rate_limited(int fd, Router* r)
            (g_tpm_limit > 0 && tok >= g_tpm_limit);
     if (!over) { rl_bump_req(); return 0; }
     ra = (age >= 0 && age < RL_WIN) ? (RL_WIN - age) : 1;
-    queue_snapshot(r, NULL, &in, &wt);
+    queue_snapshot(r, NULL, &in, &wt, &q_avg);
     http_begin(&rr, fd, 429, NULL);
-    http_queue_headers(&rr, in, wt, -1);
+    http_queue_headers(&rr, in, wt, -1, q_avg);
     snprintf(vb, sizeof(vb), "%d", ra);
     http_add_header(&rr, "Retry-After", vb);
     snprintf(ej, sizeof(ej),
@@ -738,7 +753,8 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
     }
     /* 排队快照(路由汇总的心跳缓存): 用于响应头/body; 在入队时刻取值 */
     int q_in = 0, q_wt = 0;
-    queue_snapshot(r, NULL, &q_in, &q_wt);
+    double q_avg = 0;
+    queue_snapshot(r, NULL, &q_in, &q_wt, &q_avg);
     /* 会话模式: 提取全部消息 + 会话 key, 渲染后只发增量 token 给 rank */
     char* pool = (char*)malloc(HTTP_MAX_BODY);
     char* roles[32];
@@ -843,7 +859,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
         {
             HttpResponse hdrs;
             memset(&hdrs, 0, sizeof(hdrs));
-            http_queue_headers(&hdrs, q_in, q_wt, -1);
+            http_queue_headers(&hdrs, q_in, q_wt, -1, q_avg);
             http_sse_begin_extra(&rr, fd, hdrs.extra);
         }
         int rc;
@@ -903,14 +919,16 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                  "\"created\":%lld,\"model\":\"%s\","
                  "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                  "\"finish_reason\":\"length\"}],"
-                 "\"queue\":{\"waiting\":%d,\"inflight\":%d,\"wait_ms\":%d},"
+                 "\"queue\":{\"waiting\":%d,\"inflight\":%d,\"wait_ms\":%d,"
+                 "\"avg_infer_ms\":%.0f,\"eta_ms\":%d},"
                  "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
                  (long long)time(NULL), model, collected, q_wt, q_in, wait_ms,
+                 q_avg, (int)(q_avg * (double)(q_in + q_wt)),
                  ptoken, cc.n_tokens, ptoken + cc.n_tokens);
         rl_bump_tokens((long long)ptoken + cc.n_tokens);   /* TPM 记账(实耗) */
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
-        http_queue_headers(&rr, q_in, q_wt, wait_ms);
+        http_queue_headers(&rr, q_in, q_wt, wait_ms, q_avg);
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP CHAT reply n_tokens=%d ptoken=%d", cc.n_tokens, ptoken); ylog_body("HTTP CHAT reply-json", json); }
         free(json);
@@ -963,7 +981,8 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
     }
     /* 排队快照(路由汇总的心跳缓存): 用于响应头/body */
     int q_in = 0, q_wt = 0;
-    queue_snapshot(r, NULL, &q_in, &q_wt);
+    double q_avg = 0;
+    queue_snapshot(r, NULL, &q_in, &q_wt, &q_avg);
 
     if (plen == 0) {
         free(prompt);
@@ -987,7 +1006,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         {
             HttpResponse hdrs;
             memset(&hdrs, 0, sizeof(hdrs));
-            http_queue_headers(&hdrs, q_in, q_wt, -1);
+            http_queue_headers(&hdrs, q_in, q_wt, -1, q_avg);
             http_sse_begin_extra(&rr, fd, hdrs.extra);
         }
         char errbuf[256] = "";
@@ -1024,12 +1043,14 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
                  "{\"id\":\"cmpl-1\",\"object\":\"text_completion\","
                  "\"created\":%lld,\"model\":\"%s\","
                  "\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"length\"}],"
-                 "\"queue\":{\"waiting\":%d,\"inflight\":%d}}",
-                 (long long)time(NULL), model, collected, q_wt, q_in);
+                 "\"queue\":{\"waiting\":%d,\"inflight\":%d,"
+                 "\"avg_infer_ms\":%.0f,\"eta_ms\":%d}}",
+                 (long long)time(NULL), model, collected, q_wt, q_in,
+                 q_avg, (int)(q_avg * (double)(q_in + q_wt)));
         rl_bump_tokens((long long)cc.n_tokens);   /* TPM 记账(补全路径无 prompt 统计, 只计生成) */
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
-        http_queue_headers(&rr, q_in, q_wt, -1);
+        http_queue_headers(&rr, q_in, q_wt, -1, q_avg);
         http_reply(&rr, json);
         if (g_api_log) { ylog_info("HTTP COMPLETIONS reply n_tokens=%d", cc.n_tokens); ylog_body("HTTP COMPLETIONS reply-json", json); }
         free(json);
@@ -1083,11 +1104,13 @@ static void handle_conn(int fd, Router* r)
     if (strcmp(req.method, "GET") == 0 && strcmp(req.path, "/health") == 0) {
         /* 附带队列快照(server 心跳汇总): 调用方可据此判断是否该重试/退避 */
         int nsv = 0, inflight = 0, waiting = 0;
-        char body[192];
-        queue_snapshot(r, &nsv, &inflight, &waiting);
+        double avg = 0;
+        char body[256];
+        queue_snapshot(r, &nsv, &inflight, &waiting, &avg);
         snprintf(body, sizeof(body),
-                 "{\"status\":\"ok\",\"servers\":%d,\"inflight\":%d,\"waiting\":%d}",
-                 nsv, inflight, waiting);
+                 "{\"status\":\"ok\",\"servers\":%d,\"inflight\":%d,\"waiting\":%d,"
+                 "\"avg_infer_ms\":%.0f,\"eta_ms\":%d}",
+                 nsv, inflight, waiting, avg, (int)(avg * (double)(inflight + waiting)));
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
         http_reply(&rr, body);

@@ -97,17 +97,20 @@ static void handle_server_update(Router* r, const char* args)
     const char* ip;
     const char* wp;
     const char* kp;
+    const char* ap;
     double kv = 0;
     if (sscanf(args, "%127s", id) != 1) return;
     ip = proto_get(args, "inflight");
     wp = proto_get(args, "waiting");
     kp = proto_get(args, "kv_mb");
+    ap = proto_get(args, "avg_infer_ms");
     if (kp) kv = atof(kp);
     pthread_mutex_lock(&r->lock);
     RtServer* s = find_server_locked(r, id);
     if (s) {
         if (ip) s->inflight = atoi(ip);
         if (wp) s->waiting = atoi(wp);
+        if (ap) s->avg_infer_ms = atof(ap);
         s->kv_mb = kv;
         s->last_update = (uint64_t)time(NULL);
     }
@@ -163,6 +166,7 @@ static void query_servers(Router* r, const char* sv_host, uint16_t sv_port)
                         snprintf(s->model, sizeof(s->model), "%s", vb);
                     if (frame_get(&ff, "inflight", vb, sizeof(vb)) == 0) s->inflight = atoi(vb);
                     if (frame_get(&ff, "waiting", vb, sizeof(vb)) == 0) s->waiting = atoi(vb);
+                    if (frame_get(&ff, "avg_infer_ms", vb, sizeof(vb)) == 0) s->avg_infer_ms = atof(vb);
                     pthread_mutex_unlock(&r->lock);
                 }
             }

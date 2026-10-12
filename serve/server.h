@@ -35,6 +35,9 @@ typedef struct {
     uint64_t q_total;           /* 累计入队请求数 */
     uint64_t q_wait_ms_last;    /* 最近一次排队等待时长 */
     uint64_t q_wait_ms_max;     /* 历史最大排队等待时长 */
+    uint64_t q_infer_ms_last;   /* 最近一次推理耗时(不含排队等待) */
+    double   q_infer_ms_avg;    /* 平均推理耗时(EMA 平滑, 供排队 ETA 估算) */
+    uint64_t q_infer_n;         /* 推理耗时样本数 */
 } Server;
 
 /* yllm server: 业务逻辑组(租用 rank 组, 转发请求, 广播注册/心跳) */

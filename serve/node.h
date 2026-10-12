@@ -24,6 +24,7 @@ typedef struct {
     int state;            /* NODE_STATE_* */
     int inflight;
     int waiting;          /* 排队等待中的请求数(server 会话串行队列深度) */
+    double avg_infer_ms;  /* 平均推理耗时(ms, server 侧统计, 供排队 ETA 估算; 0 = 样本不足) */
     double kv_mb;
     uint64_t last_hb;
     /* 心跳目标(supervisor) */
@@ -40,9 +41,9 @@ static inline int node_hb_args(const Node* n, char* out, size_t outsz)
         n->state == NODE_STATE_BUSY ? "busy" :
         n->state == NODE_STATE_DEAD ? "dead" : "loading";
     return snprintf(out, outsz,
-                    "%s type=%s state=%s inflight=%d waiting=%d kv_mb=%.1f%s%s%s%s",
+                    "%s type=%s state=%s inflight=%d waiting=%d kv_mb=%.1f avg_infer_ms=%.1f%s%s%s%s",
                     n->node_id, n->type, st,
-                    n->inflight, n->waiting, n->kv_mb,
+                    n->inflight, n->waiting, n->kv_mb, n->avg_infer_ms,
                     n->addr[0] ? " addr=" : "", n->addr[0] ? n->addr : "",
                     n->model[0] ? " model=" : "",
                     n->model[0] ? n->model : "");
@@ -85,6 +86,7 @@ static inline void node_parse_hb(const char* args, Node* out)
     }
     if (frame_get(&f, "inflight", v, sizeof(v)) == 0) out->inflight = atoi(v);
     if (frame_get(&f, "waiting", v, sizeof(v)) == 0) out->waiting = atoi(v);
+    if (frame_get(&f, "avg_infer_ms", v, sizeof(v)) == 0) out->avg_infer_ms = atof(v);
     if (frame_get(&f, "kv_mb", v, sizeof(v)) == 0) out->kv_mb = atof(v);
     out->last_hb = (uint64_t)time(NULL);
 }
