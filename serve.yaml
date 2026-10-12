@@ -45,6 +45,8 @@ auto-heal: 0
 strategy: least
 lease-strategy: request
 
+rpm-limit: 3
+
 # ---- 多模型 ----
 # ranks: 总段数; local: 本机拉起段数(0=全外部; N=前 N 段本地)
 models:
