@@ -639,8 +639,8 @@ static void srv_hb_now(Server* s)
 {
     pthread_mutex_lock(&s->q_lock);
     s->node.waiting = s->q_waiting;
-    /* 样本不足(冷启动)不上报平均推理时间, 避免调用方按 0 估算等待 */
-    s->node.avg_infer_ms = s->q_infer_n >= 3 ? s->q_infer_ms_avg : 0.0;
+    /* 有样本就上报平均推理时间(首个样本即可用, EMA 会快速收敛) */
+    s->node.avg_infer_ms = s->q_infer_n > 0 ? s->q_infer_ms_avg : 0.0;
     pthread_mutex_unlock(&s->q_lock);
     s->node.kv_mb = 0; /* P2: 无组内汇总, 占位 */
     node_heartbeat(&s->node);
