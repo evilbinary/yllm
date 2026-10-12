@@ -16,4 +16,7 @@ void router_http_set_api_key(const char* key);
 /* 设置 HTTP 入口排队上限(汇总 waiting 超过则回 429 + Retry-After; 0 = 关闭) */
 void router_http_set_queue_cap(int cap);
 
+/* 设置 RPM/TPM 滑动窗口限速(60s, 0 = 关闭) */
+void router_http_set_rate_limits(int rpm, long long tpm);
+
 #endif

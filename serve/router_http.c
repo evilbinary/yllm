@@ -11,7 +11,11 @@
  * 排队可见性:
  *   每个生成响应带 X-Queue-Inflight / X-Queue-Waiting 头(集群汇总快照);
  *   非流式额外带 X-Queue-Wait-Ms(本请求实际排队时长)与 body "queue" 字段;
- *   汇总 waiting 达 queue-cap 时直接回 429 + Retry-After(背压, 见 --queue-cap)。
+ *   汇总 waiting 达 queue-cap 时回 429 + Retry-After(背压, 见 serve.yaml queue-cap)。
+ * 限流/错误码(对齐 OpenAI):
+ *   RPM/TPM 超限 → 429 + Retry-After, type=rate_limit_error, code=rate_limit_exceeded;
+ *   无就绪 server → 503, type=server_error, code=server_is_overloaded;
+ *   模型不存在 → 404, code=model_not_found。
  */
 #include "router.h"
 #include "json.h"
@@ -42,6 +46,65 @@ void router_http_set_api_key(const char* key) {
 /* HTTP 入口排队上限(汇总 waiting 超过则回 429 + Retry-After; 0 = 关闭) */
 static int g_queue_cap = 0;
 void router_http_set_queue_cap(int cap) { g_queue_cap = cap > 0 ? cap : 0; }
+
+/* RPM/TPM 滑动窗口限速器(全局, 60s 窗口; 0 = 关闭) */
+#define RL_WIN 60
+typedef struct { time_t sec; int req; long long tok; } RlSlot;
+static RlSlot g_rl[RL_WIN];
+static pthread_mutex_t g_rl_lock = PTHREAD_MUTEX_INITIALIZER;
+static int       g_rpm_limit = 0;
+static long long g_tpm_limit = 0;
+void router_http_set_rate_limits(int rpm, long long tpm)
+{
+    g_rpm_limit = rpm > 0 ? rpm : 0;
+    g_tpm_limit = tpm > 0 ? tpm : 0;
+}
+
+/* 扫描窗口: 返回累计 token; *reqs 回填请求数, *age 回填最老槽存活秒数(-1 = 空) */
+static long long rl_scan(int* reqs, int* age)
+{
+    time_t now = time(NULL);
+    int i, req = 0, oldest = -1;
+    long long tok = 0;
+    pthread_mutex_lock(&g_rl_lock);
+    for (i = 0; i < RL_WIN; i++) {
+        int a;
+        if (g_rl[i].sec == 0) continue;
+        a = (int)(now - g_rl[i].sec);
+        if (a >= RL_WIN) { g_rl[i].sec = 0; g_rl[i].req = 0; g_rl[i].tok = 0; continue; }
+        req += g_rl[i].req;
+        tok += g_rl[i].tok;
+        if (oldest < 0 || a > oldest) oldest = a;
+    }
+    pthread_mutex_unlock(&g_rl_lock);
+    if (reqs) *reqs = req;
+    if (age) *age = oldest;
+    return tok;
+}
+
+static void rl_slot_reset(int idx, time_t now)
+{
+    if (g_rl[idx].sec != now) { g_rl[idx].sec = now; g_rl[idx].req = 0; g_rl[idx].tok = 0; }
+}
+static void rl_bump_req(void)
+{
+    time_t now = time(NULL);
+    int idx = (int)(now % RL_WIN);
+    pthread_mutex_lock(&g_rl_lock);
+    rl_slot_reset(idx, now);
+    g_rl[idx].req++;
+    pthread_mutex_unlock(&g_rl_lock);
+}
+static void rl_bump_tokens(long long n)
+{
+    time_t now = time(NULL);
+    int idx = (int)(now % RL_WIN);
+    if (n <= 0) return;
+    pthread_mutex_lock(&g_rl_lock);
+    rl_slot_reset(idx, now);
+    g_rl[idx].tok += n;
+    pthread_mutex_unlock(&g_rl_lock);
+}
 
 /* 汇总各 server 的排队快照(心跳缓存): nservers/inflight/waiting 均可空 */
 static void queue_snapshot(Router* r, int* nservers, int* inflight, int* waiting)
@@ -75,18 +138,47 @@ static void http_queue_headers(HttpResponse* rr, int inflight, int waiting, int 
 /* 过载保护: 汇总排队数达到 queue_cap 时回 429 + Retry-After。返回 1 = 已拒绝并应答。 */
 static int http_reject_if_busy(int fd, Router* r)
 {
-    int in = 0, wt = 0;
+    int in = 0, wt = 0, ra;
+    HttpResponse rr;
+    char vb[16], ej[240];
     if (g_queue_cap <= 0) return 0;
     queue_snapshot(r, NULL, &in, &wt);
     if (wt < g_queue_cap) return 0;
-    HttpResponse rr;
-    char ej[192];
+    ra = 1 + (wt - g_queue_cap + 1);   /* 积压越多退避越久, 上限 30s */
+    if (ra > 30) ra = 30;
     http_begin(&rr, fd, 429, NULL);
     http_queue_headers(&rr, in, wt, -1);
-    http_add_header(&rr, "Retry-After", "1");
+    snprintf(vb, sizeof(vb), "%d", ra);
+    http_add_header(&rr, "Retry-After", vb);
     snprintf(ej, sizeof(ej),
-             "{\"error\":{\"message\":\"server busy: %d requests queued\","
-             "\"type\":\"rate_limit_error\",\"code\":\"queue_full\"}}", wt);
+             "{\"error\":{\"message\":\"Too many requests queued (%d), please retry later\","
+             "\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}", wt);
+    http_reply(&rr, ej);
+    return 1;
+}
+
+/* 限速准入: 超限回 429 + Retry-After。返回 1 = 已拒绝应答; 0 = 放行(已计入本次请求) */
+static int http_reject_if_rate_limited(int fd, Router* r)
+{
+    int reqs = 0, age = -1, over, ra, in = 0, wt = 0;
+    long long tok;
+    HttpResponse rr;
+    char vb[16], ej[256];
+    if (g_rpm_limit <= 0 && g_tpm_limit <= 0) return 0;
+    tok = rl_scan(&reqs, &age);
+    over = (g_rpm_limit > 0 && reqs >= g_rpm_limit) ||
+           (g_tpm_limit > 0 && tok >= g_tpm_limit);
+    if (!over) { rl_bump_req(); return 0; }
+    ra = (age >= 0 && age < RL_WIN) ? (RL_WIN - age) : 1;
+    queue_snapshot(r, NULL, &in, &wt);
+    http_begin(&rr, fd, 429, NULL);
+    http_queue_headers(&rr, in, wt, -1);
+    snprintf(vb, sizeof(vb), "%d", ra);
+    http_add_header(&rr, "Retry-After", vb);
+    snprintf(ej, sizeof(ej),
+             "{\"error\":{\"message\":\"Rate limit reached: %d requests / %lld tokens "
+             "in %ds window\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}",
+             reqs, tok, RL_WIN);
     http_reply(&rr, ej);
     return 1;
 }
@@ -144,6 +236,52 @@ static void http_infer_error_json(char* out, size_t outsz, const char* msg, cons
     size_t sl = strlen(suffix);
     if (o + sl >= outsz) o = outsz - sl - 1;
     memcpy(out + o, suffix, sl + 1);
+}
+
+/* 后端推理失败 → 404/503/502: 无就绪节点视作过载(OpenAI server_is_overloaded) */
+static void http_infer_fail(HttpResponse* rr, int fd, int rc, const char* errbuf, const char* fallback)
+{
+    if (rc == -2) {
+        http_begin(rr, fd, 404, NULL);
+        http_reply(rr, "{\"error\":{\"message\":\"model not found\","
+                       "\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}");
+        return;
+    }
+    if (errbuf && strstr(errbuf, "no ready server")) {
+        http_begin(rr, fd, 503, NULL);
+        http_add_header(rr, "Retry-After", "1");
+        http_reply(rr, "{\"error\":{\"message\":\"The engine is currently overloaded, "
+                       "please try again later\",\"type\":\"server_error\","
+                       "\"code\":\"server_is_overloaded\"}}");
+        return;
+    }
+    {
+        char ej[384];
+        http_infer_error_json(ej, sizeof(ej), errbuf, fallback);
+        http_begin(rr, fd, 502, NULL);
+        http_reply(rr, ej);
+    }
+}
+
+/* 流式版(响应头已发出, 错误只能写进 SSE data) */
+static void http_infer_fail_sse(HttpResponse* rr, int rc, const char* errbuf, const char* fallback)
+{
+    if (rc == -2) {
+        http_sse_data(rr, "{\"error\":{\"message\":\"model not found\","
+                          "\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}");
+        return;
+    }
+    if (errbuf && strstr(errbuf, "no ready server")) {
+        http_sse_data(rr, "{\"error\":{\"message\":\"The engine is currently overloaded, "
+                          "please try again later\",\"type\":\"server_error\","
+                          "\"code\":\"server_is_overloaded\"}}");
+        return;
+    }
+    {
+        char ej[384];
+        http_infer_error_json(ej, sizeof(ej), errbuf, fallback);
+        http_sse_data(rr, ej);
+    }
 }
 
 /* 收集回调: token 拼进 buffer(转义 JSON 特殊字符) */
@@ -718,14 +856,9 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
             rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
-            if (rc == -2)
-                http_sse_data(&rr, "{\"error\":{\"message\":\"model not found\"}}");
-            else {
-                char ej[384];
-                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
-                http_sse_data(&rr, ej);
-            }
+            http_infer_fail_sse(&rr, rc, errbuf, "backend timeout/disconnect");
         } else {
+            rl_bump_tokens((long long)sc.prompt_tokens + sc.n_tokens);
             sse_on_done(&sc, "stop");
         }
         http_sse_done(&rr);
@@ -752,15 +885,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
             HttpResponse rr;
             int ii;
             for (ii = 0; ii < n_imgs; ii++) free(imgs[ii].data);
-            if (rc == -2) {
-                http_begin(&rr, fd, 404, NULL);
-                http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
-            } else {
-                char ej[384];
-                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
-                http_begin(&rr, fd, 502, NULL);
-                http_reply(&rr, ej);
-            }
+            http_infer_fail(&rr, fd, rc, errbuf, "backend timeout/disconnect");
             free(packed);
             if (pool) free(pool);
             free(prompt);
@@ -782,6 +907,7 @@ static void handle_chat_completions(int fd, Router* r, const char* body, int str
                  "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
                  (long long)time(NULL), model, collected, q_wt, q_in, wait_ms,
                  ptoken, cc.n_tokens, ptoken + cc.n_tokens);
+        rl_bump_tokens((long long)ptoken + cc.n_tokens);   /* TPM 记账(实耗) */
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
         http_queue_headers(&rr, q_in, q_wt, wait_ms);
@@ -868,14 +994,9 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
         int rc = router_infer(r, model, max_tokens, prompt, plen, sse_on_token, &sc,
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
-            if (rc == -2)
-                http_sse_data(&rr, "{\"error\":{\"message\":\"model not found\"}}");
-            else {
-                char ej[384];
-                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
-                http_sse_data(&rr, ej);
-            }
+            http_infer_fail_sse(&rr, rc, errbuf, "backend timeout/disconnect");
         } else {
+            rl_bump_tokens((long long)sc.prompt_tokens + sc.n_tokens);
             sse_on_done(&sc, "length");
         }
         http_sse_done(&rr);
@@ -892,15 +1013,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
                               rtemp, rtop_p, errbuf, sizeof(errbuf));
         if (rc != 0) {
             HttpResponse rr;
-            if (rc == -2) {
-                http_begin(&rr, fd, 404, NULL);
-                http_reply(&rr, "{\"error\":{\"message\":\"model not found\"}}");
-            } else {
-                char ej[384];
-                http_infer_error_json(ej, sizeof(ej), errbuf, "backend timeout/disconnect");
-                http_begin(&rr, fd, 502, NULL);
-                http_reply(&rr, ej);
-            }
+            http_infer_fail(&rr, fd, rc, errbuf, "backend timeout/disconnect");
             free(prompt);
             free(collected);
             return;
@@ -913,6 +1026,7 @@ static void handle_completions(int fd, Router* r, const char* body, int stream)
                  "\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"length\"}],"
                  "\"queue\":{\"waiting\":%d,\"inflight\":%d}}",
                  (long long)time(NULL), model, collected, q_wt, q_in);
+        rl_bump_tokens((long long)cc.n_tokens);   /* TPM 记账(补全路径无 prompt 统计, 只计生成) */
         HttpResponse rr;
         http_begin(&rr, fd, 200, NULL);
         http_queue_headers(&rr, q_in, q_wt, -1);
@@ -981,14 +1095,16 @@ static void handle_conn(int fd, Router* r)
         handle_models(fd, r);
     } else if (strcmp(req.method, "POST") == 0 &&
                strcmp(req.path, "/v1/chat/completions") == 0) {
-        if (http_reject_if_busy(fd, r)) { /* 过载: 已回 429 + Retry-After */ }
+        if (http_reject_if_rate_limited(fd, r)) { /* 限速: 已回 429 + Retry-After */ }
+        else if (http_reject_if_busy(fd, r)) { /* 过载: 已回 429 + Retry-After */ }
         else {
             if (g_api_log) ylog_body("HTTP CHAT", req.body);
             int stream = req.body && strstr(req.body, "\"stream\":true");
             handle_chat_completions(fd, r, req.body ? req.body : "", stream, &req);
         }
     } else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/completions") == 0) {
-        if (http_reject_if_busy(fd, r)) { /* 过载: 已回 429 + Retry-After */ }
+        if (http_reject_if_rate_limited(fd, r)) { /* 限速: 已回 429 + Retry-After */ }
+        else if (http_reject_if_busy(fd, r)) { /* 过载: 已回 429 + Retry-After */ }
         else {
             if (g_api_log) ylog_body("HTTP COMPLETIONS", req.body);
             int stream = req.body && strstr(req.body, "\"stream\":true");

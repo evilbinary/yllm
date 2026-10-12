@@ -113,6 +113,10 @@ typedef struct {
     /* HTTP 入口排队上限(router 汇总 waiting 超过则回 429 + Retry-After; 0 = 关闭) */
     int  queue_cap;
 
+    /* RPM/TPM 滑动窗口限速(60s 窗口; 0 = 关闭) */
+    int       rpm_limit;
+    long long tpm_limit;
+
     /* hub/supervisor 按模型名筛选(多模型 serve.yaml 只拉起指定模型; 逗号分隔多个) */
     char only_model[CFG_STR_MAX];
 } ServeConfig;
@@ -191,6 +195,8 @@ static inline void config_defaults(ServeConfig* c)
     c->mtp = 0;
     c->api_log = 1;   /* 默认开启 */
     c->queue_cap = 8; /* HTTP 入口排队上限(0 = 关闭) */
+    c->rpm_limit = 0; /* RPM/TPM 限速默认关闭 */
+    c->tpm_limit = 0;
     snprintf(c->work_mode, sizeof(c->work_mode), "serial");
     c->work_threads = 1;
 }
@@ -327,6 +333,10 @@ static inline int config_set(ServeConfig* c, const char* key, const char* val)
         snprintf(c->api_key, sizeof(c->api_key), "%s", val);
     } else if (strcmp(key, "queue-cap") == 0 || strcmp(key, "queue_cap") == 0) {
         c->queue_cap = atoi(val);
+    } else if (strcmp(key, "rpm-limit") == 0 || strcmp(key, "rpm_limit") == 0) {
+        c->rpm_limit = atoi(val);
+    } else if (strcmp(key, "tpm-limit") == 0 || strcmp(key, "tpm_limit") == 0) {
+        c->tpm_limit = atoll(val);
     } else {
         return 0;
     }

@@ -161,9 +161,13 @@ int cmd_hub(ServeConfig* cfg)
         extern void router_http_set_api_log(int on);
         extern void router_http_set_api_key(const char* key);
         extern void router_http_set_queue_cap(int cap);
+        extern void router_http_set_rate_limits(int rpm, long long tpm);
         router_http_set_api_log(cfg->api_log);
         router_http_set_api_key(cfg->api_key[0] ? cfg->api_key : NULL);
         router_http_set_queue_cap(cfg->queue_cap);
+        router_http_set_rate_limits(cfg->rpm_limit, cfg->tpm_limit);
+        ylog_info("hub: http limits queue_cap=%d rpm=%d tpm=%lld",
+                  cfg->queue_cap, cfg->rpm_limit, cfg->tpm_limit);
         router_http_start(&rt, (uint16_t)cfg->http_port);
     }
     ythread_create(&t1, sv_thread, &c1);
